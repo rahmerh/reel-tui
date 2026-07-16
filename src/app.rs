@@ -2,7 +2,11 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender},
+    },
     time::{Duration, Instant},
 };
 
@@ -10,7 +14,7 @@ use anyhow::Result;
 use ratatui::widgets::ListState;
 
 use crate::{
-    edit::{EditEvent, EditRequest, stream_index, validate_deletion},
+    edit::{EditEvent, EditOutcome, EditRequest, stream_index, validate_deletion},
     files::{FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
 };
@@ -67,6 +71,7 @@ pub struct App {
     pub scan_error: Option<String>,
     request_tx: Sender<ProbeRequest>,
     edit_tx: Sender<EditRequest>,
+    edit_cancel: Option<Arc<AtomicBool>>,
     generation: u64,
     pending_since: Option<Instant>,
     cache: HashMap<CacheKey, ProbeOutcome>,
@@ -97,6 +102,7 @@ impl App {
             scan_error: None,
             request_tx,
             edit_tx,
+            edit_cancel: None,
             generation: 0,
             pending_since: None,
             cache: HashMap::new(),
@@ -269,8 +275,9 @@ impl App {
             }
             match event {
                 EditEvent::Progress(progress) => self.edit_progress = progress,
-                EditEvent::Finished { path, result } => match result {
-                    Ok(()) => {
+                EditEvent::Finished { path, outcome } => match outcome {
+                    EditOutcome::Completed => {
+                        self.edit_cancel = None;
                         self.marked_streams.clear();
                         self.dialog = None;
                         self.edit_error = None;
@@ -281,7 +288,11 @@ impl App {
                         self.queue_probe();
                         self.layer = Layer::Streams;
                     }
-                    Err(error) => {
+                    EditOutcome::Cancelled => {
+                        self.edit_cancel = None;
+                    }
+                    EditOutcome::Failed(error) => {
+                        self.edit_cancel = None;
                         self.dialog = Some(Dialog::Error);
                         self.edit_error = Some(error);
                         self.edit_progress = None;
@@ -396,9 +407,11 @@ impl App {
             self.edit_error = Some("The selected file is no longer available.".to_string());
             return;
         };
+        let cancelled = Arc::new(AtomicBool::new(false));
         let request = EditRequest {
             path,
             stream_indices: self.marked_streams.clone(),
+            cancelled: cancelled.clone(),
         };
         match self.edit_tx.send(request) {
             Ok(()) => {
@@ -406,12 +419,29 @@ impl App {
                 self.edit_error = None;
                 self.edit_progress = None;
                 self.edit_started = Some(Instant::now());
+                self.edit_cancel = Some(cancelled);
             }
             Err(error) => {
                 self.dialog = Some(Dialog::Error);
                 self.edit_error = Some(format!("Could not start the edit worker: {error}"));
             }
         }
+    }
+
+    pub fn cancel_edit(&mut self) {
+        if self.dialog != Some(Dialog::Processing) {
+            return;
+        }
+        if let Some(cancelled) = self.edit_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.marked_streams.clear();
+        self.dialog = None;
+        self.edit_error = None;
+        self.edit_progress = None;
+        self.edit_started = None;
+        self.notice = Some("Remux cancelled.".to_string());
+        self.layer = Layer::Files;
     }
 
     pub fn dismiss_dialog(&mut self) {
@@ -422,6 +452,7 @@ impl App {
         self.edit_error = None;
         self.edit_progress = None;
         self.edit_started = None;
+        self.edit_cancel = None;
     }
 
     pub fn scroll_down(&mut self) {

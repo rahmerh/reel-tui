@@ -31,6 +31,14 @@ fn main() -> Result<()> {
                 && key.kind == KeyEventKind::Press
             {
                 if app.dialog == Some(Dialog::Processing) {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                        || matches!(
+                            (key.code, key.modifiers),
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                        )
+                    {
+                        app.cancel_edit();
+                    }
                     continue;
                 }
                 if key.code != KeyCode::Char('g') {

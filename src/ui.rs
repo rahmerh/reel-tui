@@ -408,7 +408,7 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Deleting tracks ")
-        .title_bottom(Line::from(" Please wait ").right_aligned());
+        .title_bottom(Line::from(" Esc/q/Ctrl-C cancel ").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

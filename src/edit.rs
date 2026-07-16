@@ -4,7 +4,11 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,15 +20,20 @@ use crate::probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_file};
 pub struct EditRequest {
     pub path: PathBuf,
     pub stream_indices: BTreeSet<u64>,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
 pub enum EditEvent {
     Progress(Option<f64>),
-    Finished {
-        path: PathBuf,
-        result: Result<(), String>,
-    },
+    Finished { path: PathBuf, outcome: EditOutcome },
+}
+
+#[derive(Clone, Debug)]
+pub enum EditOutcome {
+    Completed,
+    Cancelled,
+    Failed(String),
 }
 
 pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
@@ -34,12 +43,22 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
     std::thread::spawn(move || {
         while let Ok(request) = request_rx.recv() {
             let progress_tx = result_tx.clone();
-            let result = delete_streams(&request.path, &request.stream_indices, |progress| {
-                let _ = progress_tx.send(EditEvent::Progress(progress));
-            });
+            let result = delete_streams(
+                &request.path,
+                &request.stream_indices,
+                &request.cancelled,
+                |progress| {
+                    let _ = progress_tx.send(EditEvent::Progress(progress));
+                },
+            );
+            let outcome = match result {
+                Ok(()) => EditOutcome::Completed,
+                Err(EditError::Cancelled) => EditOutcome::Cancelled,
+                Err(EditError::Failed(error)) => EditOutcome::Failed(error),
+            };
             let response = EditEvent::Finished {
                 path: request.path.clone(),
-                result,
+                outcome,
             };
             if result_tx.send(response).is_err() {
                 break;
@@ -93,41 +112,60 @@ pub(crate) fn validate_deletion(info: &MediaInfo, selected: &BTreeSet<u64>) -> R
 fn delete_streams(
     path: &Path,
     selected: &BTreeSet<u64>,
+    cancelled: &AtomicBool,
     mut report_progress: impl FnMut(Option<f64>),
-) -> Result<(), String> {
-    let source_info = media_info(path)?;
-    validate_deletion(&source_info, selected)?;
+) -> Result<(), EditError> {
+    let source_info = media_info(path).map_err(EditError::Failed)?;
+    validate_deletion(&source_info, selected).map_err(EditError::Failed)?;
     let duration = media_duration(&source_info);
     report_progress(duration.map(|_| 0.0));
 
-    let temporary = temporary_path(path)?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(EditError::Cancelled);
+    }
+    let temporary = temporary_path(path).map_err(EditError::Failed)?;
     let mut cleanup = TempCleanup(Some(temporary.clone()));
-    let output = run_ffmpeg(path, &temporary, selected, duration, &mut report_progress)?;
+    let output = run_ffmpeg(
+        path,
+        &temporary,
+        selected,
+        duration,
+        cancelled,
+        &mut report_progress,
+    )?;
     if !output.status.success() {
-        return Err(command_error(
+        return Err(EditError::Failed(command_error(
             "ffmpeg could not remove the selected tracks",
             &output.stderr,
-        ));
+        )));
     }
     report_progress(duration.map(|_| 0.98));
 
-    let output_info = media_info(&temporary)?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(EditError::Cancelled);
+    }
+    let output_info = media_info(&temporary).map_err(EditError::Failed)?;
     let expected_count = source_info.streams.len().saturating_sub(selected.len());
     if output_info.streams.len() != expected_count {
-        return Err(format!(
+        return Err(EditError::Failed(format!(
             "The remuxed file has {} tracks; expected {expected_count}.",
             output_info.streams.len()
-        ));
+        )));
     }
-    validate_result(&output_info)?;
+    validate_result(&output_info).map_err(EditError::Failed)?;
 
     let permissions = fs::metadata(path)
-        .map_err(|error| format!("Could not read source permissions: {error}"))?
+        .map_err(|error| EditError::Failed(format!("Could not read source permissions: {error}")))?
         .permissions();
-    fs::set_permissions(&temporary, permissions)
-        .map_err(|error| format!("Could not preserve source permissions: {error}"))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("Could not replace the original file: {error}"))?;
+    fs::set_permissions(&temporary, permissions).map_err(|error| {
+        EditError::Failed(format!("Could not preserve source permissions: {error}"))
+    })?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(EditError::Cancelled);
+    }
+    fs::rename(&temporary, path).map_err(|error| {
+        EditError::Failed(format!("Could not replace the original file: {error}"))
+    })?;
     cleanup.0 = None;
     report_progress(Some(1.0));
     Ok(())
@@ -156,13 +194,20 @@ struct FfmpegOutput {
     stderr: Vec<u8>,
 }
 
+#[derive(Debug)]
+enum EditError {
+    Cancelled,
+    Failed(String),
+}
+
 fn run_ffmpeg(
     source: &Path,
     temporary: &Path,
     selected: &BTreeSet<u64>,
     duration: Option<f64>,
+    cancelled: &AtomicBool,
     report_progress: &mut impl FnMut(Option<f64>),
-) -> Result<FfmpegOutput, String> {
+) -> Result<FfmpegOutput, EditError> {
     let mut command = Command::new("ffmpeg");
     command
         .args([
@@ -186,17 +231,17 @@ fn run_ffmpeg(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+        EditError::Failed(if error.kind() == std::io::ErrorKind::NotFound {
             "ffmpeg was not found in PATH. Install FFmpeg to edit media.".to_string()
         } else {
             format!("Could not start ffmpeg: {error}")
-        }
+        })
     })?;
 
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "Could not capture ffmpeg errors.".to_string())?;
+        .ok_or_else(|| EditError::Failed("Could not capture ffmpeg errors.".to_string()))?;
     let stderr_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = BufReader::new(stderr).read_to_end(&mut bytes);
@@ -205,8 +250,14 @@ fn run_ffmpeg(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "Could not capture ffmpeg progress.".to_string())?;
+        .ok_or_else(|| EditError::Failed("Could not capture ffmpeg progress.".to_string()))?;
+    let mut was_cancelled = false;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            was_cancelled = true;
+            break;
+        }
         if let Some(microseconds) = line
             .strip_prefix("out_time_us=")
             .and_then(|value| value.parse::<f64>().ok())
@@ -218,8 +269,11 @@ fn run_ffmpeg(
     }
     let status = child
         .wait()
-        .map_err(|error| format!("Could not wait for ffmpeg: {error}"))?;
+        .map_err(|error| EditError::Failed(format!("Could not wait for ffmpeg: {error}")))?;
     let stderr = stderr_reader.join().unwrap_or_default();
+    if was_cancelled || cancelled.load(Ordering::Relaxed) {
+        return Err(EditError::Cancelled);
+    }
     Ok(FfmpegOutput { status, stderr })
 }
 
@@ -393,9 +447,12 @@ mod tests {
         assert!(status.success());
 
         let mut progress = Vec::new();
-        delete_streams(&source, &BTreeSet::from([1, 3]), |value| {
-            progress.push(value)
-        })
+        delete_streams(
+            &source,
+            &BTreeSet::from([1, 3]),
+            &AtomicBool::new(false),
+            |value| progress.push(value),
+        )
         .unwrap();
         let info = media_info(&source).unwrap();
         let kinds: Vec<_> = info.streams.iter().filter_map(stream_kind).collect();
