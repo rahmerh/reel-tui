@@ -5,12 +5,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
 
 use crate::{
-    app::{App, Layer, grouped_stream_indices},
+    app::{App, Dialog, Layer, grouped_stream_indices},
+    edit::stream_index,
     probe::{MediaInfo, ProbeOutcome},
 };
 
@@ -40,6 +41,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, rows[1]);
     if app.layer == Layer::StreamDetails {
         render_stream_popup(frame, app);
+    }
+    if let Some(dialog) = app.dialog {
+        render_dialog(frame, app, dialog);
     }
 }
 
@@ -86,10 +90,20 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
     } else {
         match &app.outcome {
-            Some(ProbeOutcome::Video(info)) => media_text(
-                info,
-                (app.layer != Layer::Files).then_some(app.selected_stream),
-            ),
+            Some(ProbeOutcome::Video(info)) => {
+                let (text, selected_line) = media_text(
+                    info,
+                    (app.layer != Layer::Files).then_some(app.selected_stream),
+                    &app.marked_streams,
+                );
+                if app.layer == Layer::Streams
+                    && let Some(selected_line) = selected_line
+                {
+                    app.details_scroll =
+                        scroll_to_show_line(&text, area, selected_line, app.details_scroll);
+                }
+                text
+            }
             Some(ProbeOutcome::NotVideo(reason)) => {
                 message("Not a video file", reason, Color::Yellow)
             }
@@ -114,10 +128,22 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(notice) = &app.notice {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(notice, area.width as usize),
+                Style::default().fg(Color::Yellow),
+            )),
+            area,
+        );
+        return;
+    }
     let directory = app.directory.to_string_lossy();
     let keys = match app.layer {
-        Layer::Files => " j/k move  Enter select  r refresh  q/Esc quit ",
-        Layer::Streams => " j/k move  Enter details  Esc files  q quit ",
+        Layer::Files => " j/k move  gg/G first/last  Enter select  r refresh  q/Esc quit ",
+        Layer::Streams => {
+            " j/k move  gg/G first/last  Space mark  d delete  Enter details  Esc files "
+        }
         Layer::StreamDetails => " j/k scroll  Esc streams  q quit ",
     };
     let available = area.width as usize;
@@ -138,8 +164,13 @@ fn message(heading: &str, detail: &str, color: Color) -> Text<'static> {
     ])
 }
 
-fn media_text(info: &MediaInfo, selected: Option<usize>) -> Text<'static> {
+fn media_text(
+    info: &MediaInfo,
+    selected: Option<usize>,
+    marked: &std::collections::BTreeSet<u64>,
+) -> (Text<'static>, Option<usize>) {
     let mut lines = Vec::new();
+    let mut selected_line = None;
     section(&mut lines, "Overview");
     lines.push(Line::from(format_overview(info)));
 
@@ -161,9 +192,17 @@ fn media_text(info: &MediaInfo, selected: Option<usize>) -> Text<'static> {
             .collect();
         if !streams.is_empty() {
             section(&mut lines, &format!("{heading} ({})", streams.len()));
-            lines.extend(streams.into_iter().map(|(selection_index, stream)| {
-                stream_line(stream, selection_index, selected == Some(selection_index))
-            }));
+            for (selection_index, stream) in streams {
+                if selected == Some(selection_index) {
+                    selected_line = Some(lines.len());
+                }
+                lines.push(stream_line(
+                    stream,
+                    selection_index,
+                    selected == Some(selection_index),
+                    stream_index(stream).is_some_and(|index| marked.contains(&index)),
+                ));
+            }
         }
     }
 
@@ -181,9 +220,17 @@ fn media_text(info: &MediaInfo, selected: Option<usize>) -> Text<'static> {
         .collect();
     if !other.is_empty() {
         section(&mut lines, &format!("Other ({})", other.len()));
-        lines.extend(other.into_iter().map(|(selection_index, stream)| {
-            stream_line(stream, selection_index, selected == Some(selection_index))
-        }));
+        for (selection_index, stream) in other {
+            if selected == Some(selection_index) {
+                selected_line = Some(lines.len());
+            }
+            lines.push(stream_line(
+                stream,
+                selection_index,
+                selected == Some(selection_index),
+                stream_index(stream).is_some_and(|index| marked.contains(&index)),
+            ));
+        }
     }
 
     if !info.chapters.is_empty() {
@@ -196,7 +243,7 @@ fn media_text(info: &MediaInfo, selected: Option<usize>) -> Text<'static> {
         );
     }
 
-    Text::from(lines)
+    (Text::from(lines), selected_line)
 }
 
 fn section(lines: &mut Vec<Line<'static>>, name: &str) {
@@ -232,6 +279,7 @@ fn stream_line(
     stream: &std::collections::BTreeMap<String, Value>,
     fallback_index: usize,
     selected: bool,
+    marked: bool,
 ) -> Line<'static> {
     let index = number_string(stream, "index").unwrap_or_else(|| fallback_index.to_string());
     let kind = string(stream, "codec_type").unwrap_or("unknown");
@@ -282,9 +330,14 @@ fn stream_line(
     details.extend(disposition_flags(stream));
 
     let line = Line::from(vec![
+        if marked {
+            Span::styled("× ", Style::default().fg(Color::Red).bold())
+        } else {
+            Span::raw("  ")
+        },
         Span::styled(
             format!("#{index:<2} "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(if marked { Color::Red } else { Color::DarkGray }),
         ),
         Span::raw(details.join("  ·  ")),
     ]);
@@ -296,7 +349,106 @@ fn stream_line(
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        line
+        line.style(if marked {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        })
+    }
+}
+
+fn render_dialog(frame: &mut Frame, app: &App, dialog: Dialog) {
+    if dialog == Dialog::Processing {
+        render_progress_dialog(frame, app);
+        return;
+    }
+    let (title, body, footer, color) = match dialog {
+        Dialog::ConfirmDelete => {
+            let count = app.marked_streams.len();
+            (
+                " Confirm deletion ",
+                format!(
+                    "Permanently delete {count} selected track{}?\n\nThe original file will be replaced after a successful remux.",
+                    if count == 1 { "" } else { "s" }
+                ),
+                " Enter/y confirm · Esc/n cancel ",
+                Color::Yellow,
+            )
+        }
+        Dialog::Processing => unreachable!(),
+        Dialog::Error => (
+            " Error ",
+            app.edit_error
+                .clone()
+                .unwrap_or_else(|| "An unknown editing error occurred.".to_string()),
+            " Enter/Esc close ",
+            Color::Red,
+        ),
+    };
+    let area = centered_fixed(frame.area(), 64, 9);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(color))
+                    .title(title)
+                    .title_bottom(Line::from(footer).right_aligned()),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_progress_dialog(frame: &mut Frame, app: &App) {
+    let area = centered_fixed(frame.area(), 64, 7);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Deleting tracks ")
+        .title_bottom(Line::from(" Please wait ").right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .margin(1)
+    .split(inner);
+
+    if let Some(progress) = app.edit_progress {
+        let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u16;
+        frame.render_widget(Paragraph::new("Remuxing with ffmpeg…").centered(), rows[0]);
+        frame.render_widget(
+            Gauge::default()
+                .gauge_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .percent(percent)
+                .label(format!("{percent}%")),
+            rows[2],
+        );
+    } else {
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let tick = app
+            .edit_started
+            .map_or(0, |started| (started.elapsed().as_millis() / 80) as usize);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}  Remuxing with ffmpeg…",
+                SPINNER[tick % SPINNER.len()]
+            ))
+            .centered()
+            .style(Style::default().fg(Color::Cyan).bold()),
+            rows[1],
+        );
     }
 }
 
@@ -343,6 +495,23 @@ fn max_scroll(text: &Text<'_>, area: Rect) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
+fn scroll_to_show_line(text: &Text<'_>, area: Rect, line_index: usize, current: u16) -> u16 {
+    let content_width = area.width.saturating_sub(2).max(1) as usize;
+    let viewport_height = area.height.saturating_sub(2).max(1) as usize;
+    let line_height = |line: &Line<'_>| line.width().max(1).div_ceil(content_width);
+    let start: usize = text.lines.iter().take(line_index).map(line_height).sum();
+    let end = start + text.lines.get(line_index).map_or(1, line_height);
+    let current = current as usize;
+
+    if start < current {
+        start.min(u16::MAX as usize) as u16
+    } else if end > current + viewport_height {
+        end.saturating_sub(viewport_height).min(u16::MAX as usize) as u16
+    } else {
+        current.min(u16::MAX as usize) as u16
+    }
+}
+
 fn append_map(lines: &mut Vec<Line<'static>>, map: &BTreeMap<String, Value>, depth: usize) {
     for (key, value) in map {
         match value {
@@ -387,6 +556,17 @@ fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
         Constraint::Percentage((100 - width_percent) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn focus_border(focused: bool) -> Style {
@@ -551,7 +731,7 @@ mod tests {
         )
         .unwrap();
 
-        let line = stream_line(&stream, 0, false).to_string();
+        let line = stream_line(&stream, 0, false, false).to_string();
         assert!(line.contains("#2"));
         assert!(line.contains("OPUS"));
         assert!(line.contains("5.1"));
@@ -570,5 +750,21 @@ mod tests {
         assert_eq!(max_scroll(&text, Rect::new(0, 0, 12, 4)), 1);
         assert_eq!(max_scroll(&text, Rect::new(0, 0, 7, 4)), 3);
         assert_eq!(max_scroll(&Text::from("short"), Rect::new(0, 0, 20, 10)), 0);
+    }
+
+    #[test]
+    fn scroll_follows_selected_line_beyond_viewport() {
+        let text = Text::from(vec![
+            Line::from("zero"),
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+            Line::from("four"),
+        ]);
+        let area = Rect::new(0, 0, 20, 5);
+
+        assert_eq!(scroll_to_show_line(&text, area, 0, 2), 0);
+        assert_eq!(scroll_to_show_line(&text, area, 4, 0), 2);
+        assert_eq!(scroll_to_show_line(&text, area, 2, 0), 0);
     }
 }

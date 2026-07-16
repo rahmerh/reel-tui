@@ -35,7 +35,7 @@ pub struct MediaInfo {
 }
 
 impl MediaInfo {
-    fn from_json(value: Value) -> Result<Self, String> {
+    pub(crate) fn from_json(value: Value) -> Result<Self, String> {
         let object = value
             .as_object()
             .ok_or_else(|| "ffprobe returned an invalid JSON document".to_string())?;
@@ -80,7 +80,7 @@ fn object_array(value: Option<&Value>) -> Vec<BTreeMap<String, Value>> {
         .unwrap_or_default()
 }
 
-fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {
+pub(crate) fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {
     stream
         .get("disposition")
         .and_then(Value::as_object)
@@ -115,7 +115,7 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
     (request_tx, result_rx)
 }
 
-fn probe_file(path: &Path) -> ProbeOutcome {
+pub(crate) fn probe_file(path: &Path) -> ProbeOutcome {
     let output = match Command::new("ffprobe")
         .args([
             "-v",

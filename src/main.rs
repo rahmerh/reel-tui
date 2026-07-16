@@ -1,23 +1,28 @@
 mod app;
+mod edit;
 mod files;
 mod probe;
 mod ui;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use app::App;
+use app::{App, Dialog};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use edit::spawn_edit_worker;
 use probe::spawn_probe_worker;
 
 fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let (request_tx, result_rx) = spawn_probe_worker();
-    let mut app = App::new(cwd, request_tx)?;
+    let (edit_tx, edit_rx) = spawn_edit_worker();
+    let mut app = App::new(cwd, request_tx, edit_tx)?;
+    let mut pending_g: Option<Instant> = None;
 
     ratatui::run(|terminal| -> Result<()> {
         loop {
             app.receive_probe_results(&result_rx);
+            app.receive_edit_results(&edit_rx);
             app.start_pending_probe();
             terminal.draw(|frame| ui::render(frame, &mut app))?;
 
@@ -25,17 +30,47 @@ fn main() -> Result<()> {
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
+                if app.dialog == Some(Dialog::Processing) {
+                    continue;
+                }
+                if key.code != KeyCode::Char('g') {
+                    pending_g = None;
+                }
                 match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _) => break,
+                    (KeyCode::Char('y'), _) if app.dialog == Some(Dialog::ConfirmDelete) => {
+                        app.confirm_delete()
+                    }
+                    (KeyCode::Char('n'), _) if app.dialog == Some(Dialog::ConfirmDelete) => {
+                        app.dismiss_dialog()
+                    }
+                    (KeyCode::Enter, _) if app.dialog == Some(Dialog::ConfirmDelete) => {
+                        app.confirm_delete()
+                    }
+                    (KeyCode::Enter, _) if app.dialog == Some(Dialog::Error) => {
+                        app.dismiss_dialog()
+                    }
+                    (KeyCode::Esc, _) if app.dialog.is_some() => app.dismiss_dialog(),
+                    (KeyCode::Char('q'), _) if app.dialog.is_none() => break,
                     (KeyCode::Esc, _) if !app.back() => break,
+                    (KeyCode::Char(' '), _) => app.toggle_selected_stream(),
+                    (KeyCode::Char('d'), KeyModifiers::NONE) => app.request_delete(),
                     (KeyCode::Enter, _) => app.enter(),
                     (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.select_next(),
                     (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.select_previous(),
-                    (KeyCode::Char('g'), _) => app.select_first(),
+                    (KeyCode::Char('g'), _) => {
+                        if pending_g
+                            .is_some_and(|pressed| pressed.elapsed() <= Duration::from_millis(750))
+                        {
+                            app.select_first();
+                            pending_g = None;
+                        } else {
+                            pending_g = Some(Instant::now());
+                        }
+                    }
                     (KeyCode::Char('G'), _) => app.select_last(),
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.scroll_down(),
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.scroll_up(),
-                    (KeyCode::Char('r'), _) => app.refresh()?,
+                    (KeyCode::Char('r'), _) if app.dialog.is_none() => app.refresh()?,
                     _ => {}
                 }
             }

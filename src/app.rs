@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     path::PathBuf,
     sync::mpsc::{Receiver, Sender},
@@ -10,6 +10,7 @@ use anyhow::Result;
 use ratatui::widgets::ListState;
 
 use crate::{
+    edit::{EditEvent, EditRequest, stream_index, validate_deletion},
     files::{FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
 };
@@ -20,6 +21,13 @@ pub enum Layer {
     Files,
     Streams,
     StreamDetails,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Dialog {
+    ConfirmDelete,
+    Processing,
+    Error,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -50,15 +58,26 @@ pub struct App {
     pub details_max_scroll: u16,
     pub layer: Layer,
     pub selected_stream: usize,
+    pub marked_streams: BTreeSet<u64>,
+    pub dialog: Option<Dialog>,
+    pub notice: Option<String>,
+    pub edit_error: Option<String>,
+    pub edit_progress: Option<f64>,
+    pub edit_started: Option<Instant>,
     pub scan_error: Option<String>,
     request_tx: Sender<ProbeRequest>,
+    edit_tx: Sender<EditRequest>,
     generation: u64,
     pending_since: Option<Instant>,
     cache: HashMap<CacheKey, ProbeOutcome>,
 }
 
 impl App {
-    pub fn new(directory: PathBuf, request_tx: Sender<ProbeRequest>) -> Result<Self> {
+    pub fn new(
+        directory: PathBuf,
+        request_tx: Sender<ProbeRequest>,
+        edit_tx: Sender<EditRequest>,
+    ) -> Result<Self> {
         let mut app = Self {
             directory,
             files: Vec::new(),
@@ -69,8 +88,15 @@ impl App {
             details_max_scroll: 0,
             layer: Layer::Files,
             selected_stream: 0,
+            marked_streams: BTreeSet::new(),
+            dialog: None,
+            notice: None,
+            edit_error: None,
+            edit_progress: None,
+            edit_started: None,
             scan_error: None,
             request_tx,
+            edit_tx,
             generation: 0,
             pending_since: None,
             cache: HashMap::new(),
@@ -80,6 +106,7 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        self.clear_edit_state();
         let selected_path = self.selected_file().map(|file| file.path.clone());
         match scan_directory(&self.directory) {
             Ok(files) => {
@@ -107,6 +134,7 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
+        self.notice = None;
         if self.layer == Layer::Streams {
             let count = self.stream_count();
             if count > 0 {
@@ -130,6 +158,7 @@ impl App {
     }
 
     pub fn select_previous(&mut self) {
+        self.notice = None;
         if self.layer == Layer::Streams {
             self.selected_stream = self.selected_stream.saturating_sub(1);
             return;
@@ -147,6 +176,7 @@ impl App {
     }
 
     pub fn select_first(&mut self) {
+        self.notice = None;
         if self.layer == Layer::Streams {
             self.selected_stream = 0;
             return;
@@ -157,6 +187,7 @@ impl App {
     }
 
     pub fn select_last(&mut self) {
+        self.notice = None;
         if self.layer == Layer::Streams {
             self.selected_stream = self.stream_count().saturating_sub(1);
             return;
@@ -168,6 +199,7 @@ impl App {
 
     fn select(&mut self, index: usize) {
         if self.list_state.selected() != Some(index) {
+            self.clear_edit_state();
             self.list_state.select(Some(index));
             self.queue_probe();
         }
@@ -230,7 +262,40 @@ impl App {
         }
     }
 
+    pub fn receive_edit_results(&mut self, receiver: &Receiver<EditEvent>) {
+        while let Ok(event) = receiver.try_recv() {
+            if self.dialog != Some(Dialog::Processing) {
+                continue;
+            }
+            match event {
+                EditEvent::Progress(progress) => self.edit_progress = progress,
+                EditEvent::Finished { path, result } => match result {
+                    Ok(()) => {
+                        self.marked_streams.clear();
+                        self.dialog = None;
+                        self.edit_error = None;
+                        self.edit_progress = None;
+                        self.edit_started = None;
+                        self.notice = Some("Selected tracks deleted.".to_string());
+                        self.cache.retain(|key, _| key.path != path);
+                        self.queue_probe();
+                        self.layer = Layer::Streams;
+                    }
+                    Err(error) => {
+                        self.dialog = Some(Dialog::Error);
+                        self.edit_error = Some(error);
+                        self.edit_progress = None;
+                        self.edit_started = None;
+                    }
+                },
+            }
+        }
+    }
+
     pub fn enter(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
         match self.layer {
             Layer::Files if self.stream_count() > 0 => {
                 self.layer = Layer::Streams;
@@ -281,6 +346,84 @@ impl App {
             .and_then(|index| info.streams.get(*index))
     }
 
+    pub fn selected_stream_index(&self) -> Option<u64> {
+        self.selected_stream_info().and_then(stream_index)
+    }
+
+    pub fn toggle_selected_stream(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        let Some(index) = self.selected_stream_index() else {
+            self.show_error("This track has no usable stream index.");
+            return;
+        };
+        if self.marked_streams.remove(&index) {
+            self.notice = None;
+            return;
+        }
+
+        self.marked_streams.insert(index);
+        self.notice = None;
+        self.selected_stream =
+            (self.selected_stream + 1).min(self.stream_count().saturating_sub(1));
+    }
+
+    pub fn request_delete(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        if self.marked_streams.is_empty() {
+            self.show_error("Mark one or more tracks with Space first.");
+            return;
+        }
+        if let Some(info) = self.media_info()
+            && let Err(error) = validate_deletion(info, &self.marked_streams)
+        {
+            self.show_error(error);
+            return;
+        }
+        self.notice = None;
+        self.dialog = Some(Dialog::ConfirmDelete);
+    }
+
+    pub fn confirm_delete(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmDelete) {
+            return;
+        }
+        let Some(path) = self.selected_file().map(|file| file.path.clone()) else {
+            self.dialog = Some(Dialog::Error);
+            self.edit_error = Some("The selected file is no longer available.".to_string());
+            return;
+        };
+        let request = EditRequest {
+            path,
+            stream_indices: self.marked_streams.clone(),
+        };
+        match self.edit_tx.send(request) {
+            Ok(()) => {
+                self.dialog = Some(Dialog::Processing);
+                self.edit_error = None;
+                self.edit_progress = None;
+                self.edit_started = Some(Instant::now());
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Error);
+                self.edit_error = Some(format!("Could not start the edit worker: {error}"));
+            }
+        }
+    }
+
+    pub fn dismiss_dialog(&mut self) {
+        if self.dialog == Some(Dialog::Processing) {
+            return;
+        }
+        self.dialog = None;
+        self.edit_error = None;
+        self.edit_progress = None;
+        self.edit_started = None;
+    }
+
     pub fn scroll_down(&mut self) {
         self.details_scroll = self
             .details_scroll
@@ -295,6 +438,21 @@ impl App {
     pub fn set_details_max_scroll(&mut self, maximum: u16) {
         self.details_max_scroll = maximum;
         self.details_scroll = self.details_scroll.min(maximum);
+    }
+
+    fn clear_edit_state(&mut self) {
+        self.marked_streams.clear();
+        self.dialog = None;
+        self.notice = None;
+        self.edit_error = None;
+        self.edit_progress = None;
+        self.edit_started = None;
+    }
+
+    fn show_error(&mut self, error: impl Into<String>) {
+        self.notice = None;
+        self.edit_error = Some(error.into());
+        self.dialog = Some(Dialog::Error);
     }
 }
 
