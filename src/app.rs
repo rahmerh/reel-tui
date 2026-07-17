@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -18,7 +17,7 @@ use crate::{
         EditEvent, EditOutcome, EditRequest, VideoCodec, VideoResolution, VideoSettings,
         stream_index, validate_edit,
     },
-    files::{FileEntry, scan_directory},
+    files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
 };
 
@@ -70,13 +69,18 @@ struct CacheKey {
 }
 
 impl CacheKey {
-    fn for_path(path: PathBuf) -> Option<Self> {
-        let metadata = fs::metadata(&path).ok()?;
-        Some(Self {
-            path,
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-        })
+    fn for_file(file: &FileEntry) -> Self {
+        Self {
+            path: file.path.clone(),
+            length: file.fingerprint.length,
+            modified: file.fingerprint.modified,
+        }
+    }
+
+    fn matches_file(&self, file: &FileEntry) -> bool {
+        self.path == file.path
+            && self.length == file.fingerprint.length
+            && self.modified == file.fingerprint.modified
     }
 }
 
@@ -151,30 +155,84 @@ impl App {
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
         };
-        app.refresh()?;
+        let snapshot = match scan_directory(&app.directory) {
+            Ok(files) => DirectorySnapshot::Files(files),
+            Err(error) => DirectorySnapshot::Error(error.to_string()),
+        };
+        app.apply_directory_snapshot(snapshot);
         Ok(app)
     }
 
-    pub fn refresh(&mut self) -> Result<()> {
-        self.clear_edit_state();
-        let selected_path = self.selected_file().map(|file| file.path.clone());
-        match scan_directory(&self.directory) {
-            Ok(files) => {
-                self.files = files;
+    pub fn receive_directory_snapshots(&mut self, receiver: &Receiver<DirectorySnapshot>) {
+        while let Ok(snapshot) = receiver.try_recv() {
+            self.apply_directory_snapshot(snapshot);
+        }
+    }
+
+    fn apply_directory_snapshot(&mut self, snapshot: DirectorySnapshot) {
+        match snapshot {
+            DirectorySnapshot::Files(files) => {
                 self.scan_error = None;
+                self.reconcile_files(files);
             }
-            Err(error) => {
-                self.files.clear();
-                self.scan_error = Some(error.to_string());
+            DirectorySnapshot::Error(error) => {
+                self.scan_error = Some(error);
+                self.reconcile_files(Vec::new());
             }
         }
+    }
 
-        let selection = selected_path
-            .and_then(|path| self.files.iter().position(|file| file.path == path))
-            .or_else(|| (!self.files.is_empty()).then_some(0));
+    fn reconcile_files(&mut self, files: Vec<FileEntry>) {
+        let old_selection = self.list_state.selected();
+        let old_file = self.selected_file().cloned();
+        let old_path = old_file.as_ref().map(|file| file.path.clone());
+        let selected_position = old_path
+            .as_ref()
+            .and_then(|path| files.iter().position(|file| &file.path == path));
+        let selected_changed = selected_position
+            .zip(old_file.as_ref())
+            .is_some_and(|(index, old)| files[index].fingerprint != old.fingerprint);
+        let selected_removed = old_path.is_some() && selected_position.is_none();
+        let was_processing = self.dialog == Some(Dialog::Processing);
+
+        self.files = files;
+        self.cache
+            .retain(|key, _| self.files.iter().any(|file| key.matches_file(file)));
+
+        if let Some(position) = selected_position {
+            self.list_state.select(Some(position));
+            if selected_changed && !was_processing {
+                self.clear_edit_state();
+                self.notice = Some("Selected file changed; reloaded latest metadata.".to_string());
+                self.queue_probe();
+            }
+            return;
+        }
+
+        let selection = (!self.files.is_empty()).then(|| {
+            old_selection
+                .unwrap_or(0)
+                .min(self.files.len().saturating_sub(1))
+        });
         self.list_state.select(selection);
-        self.queue_probe();
-        Ok(())
+
+        if selected_removed {
+            if let Some(cancelled) = self.edit_cancel.take() {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            self.clear_edit_state();
+            self.notice = Some(
+                if was_processing {
+                    "Selected file was removed; media edit cancelled."
+                } else {
+                    "Selected file was removed; returned to the file list."
+                }
+                .to_string(),
+            );
+            self.queue_probe();
+        } else {
+            self.queue_probe();
+        }
     }
 
     pub fn selected_file(&self) -> Option<&FileEntry> {
@@ -265,9 +323,7 @@ impl App {
         self.loading = self.selected_file().is_some();
         self.pending_since = self.loading.then(Instant::now);
 
-        if let Some(key) = self
-            .selected_file()
-            .and_then(|file| CacheKey::for_path(file.path.clone()))
+        if let Some(key) = self.selected_file().map(CacheKey::for_file)
             && let Some(cached) = self.cache.get(&key)
         {
             self.outcome = Some(cached.clone());
@@ -284,27 +340,33 @@ impl App {
         if since.elapsed() < Duration::from_millis(120) {
             return;
         }
-        let Some(path) = self.selected_file().map(|file| file.path.clone()) else {
+        let Some(file) = self.selected_file() else {
             self.pending_since = None;
             return;
         };
 
         let _ = self.request_tx.send(ProbeRequest {
             generation: self.generation,
-            path,
+            path: file.path.clone(),
+            fingerprint: file.fingerprint,
         });
         self.pending_since = None;
     }
 
     pub fn receive_probe_results(&mut self, receiver: &Receiver<ProbeResponse>) {
         while let Ok(response) = receiver.try_recv() {
-            if let Some(key) = CacheKey::for_path(response.path.clone()) {
+            let key = CacheKey {
+                path: response.path.clone(),
+                length: response.fingerprint.length,
+                modified: response.fingerprint.modified,
+            };
+            if self.files.iter().any(|file| key.matches_file(file)) {
                 self.cache.insert(key, response.outcome.clone());
             }
             if response.generation == self.generation
-                && self
-                    .selected_file()
-                    .is_some_and(|file| file.path == response.path)
+                && self.selected_file().is_some_and(|file| {
+                    file.path == response.path && file.fingerprint == response.fingerprint
+                })
             {
                 self.outcome = Some(response.outcome);
                 self.loading = false;
@@ -323,6 +385,9 @@ impl App {
                 EditEvent::Progress(progress) => self.edit_progress = progress,
                 EditEvent::Finished { path, outcome } => match outcome {
                     EditOutcome::Completed => {
+                        if let Ok(files) = scan_directory(&self.directory) {
+                            self.reconcile_files(files);
+                        }
                         self.edit_cancel = None;
                         self.clear_track_edits();
                         self.dialog = None;
@@ -336,6 +401,17 @@ impl App {
                     }
                     EditOutcome::Cancelled => {
                         self.edit_cancel = None;
+                    }
+                    EditOutcome::SourceChanged(error) => {
+                        self.edit_cancel = None;
+                        let snapshot = match scan_directory(&self.directory) {
+                            Ok(files) => DirectorySnapshot::Files(files),
+                            Err(error) => DirectorySnapshot::Error(error.to_string()),
+                        };
+                        self.apply_directory_snapshot(snapshot);
+                        self.clear_edit_state();
+                        self.notice = Some(error);
+                        self.queue_probe();
                     }
                     EditOutcome::Failed(error) => {
                         self.edit_cancel = None;
@@ -1237,6 +1313,33 @@ mod tests {
         app
     }
 
+    fn test_file_app(names: &[&str]) -> App {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-live-app-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in names {
+            std::fs::write(directory.join(name), b"media").unwrap();
+        }
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory, probe_tx, edit_tx).unwrap();
+        app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
+        ]))));
+        app.loading = false;
+        app.reset_track_edits();
+        app.layer = Layer::Streams;
+        app
+    }
+
     #[test]
     fn scroll_forward_should_add_amount_when_result_is_below_maximum() {
         // Arrange
@@ -1596,6 +1699,128 @@ mod tests {
         assert_that!(app.video_settings.get(&0).map(|settings| settings.codec))
             .contains(VideoCodec::Hevc);
         assert_that!(app.changed_streams()).contains(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_preserve_edit_state_when_unrelated_file_is_added() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv", "beta.mkv"]);
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+        std::fs::write(directory.join("gamma.mkv"), b"media").unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(&app.deleted_streams).contains(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_cancel_processing_when_selected_file_is_deleted() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv", "beta.mkv"]);
+        let directory = app.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.edit_cancel = Some(cancelled.clone());
+        app.dialog = Some(Dialog::Processing);
+        std::fs::remove_file(directory.join("alpha.mkv")).unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+        assert_that!(app.notice.as_deref().unwrap()).contains("cancelled");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_discard_staged_edits_and_reprobe_when_selected_file_changes() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+        std::fs::write(directory.join("alpha.mkv"), b"changed media contents").unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(&app.deleted_streams).is_empty();
+        assert_that!(app.loading).is_true();
+        assert_that!(app.notice.as_deref().unwrap()).contains("reloaded");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_treat_selected_rename_as_removal() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv", "beta.mkv"]);
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+        std::fs::rename(directory.join("alpha.mkv"), directory.join("renamed.mkv")).unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(&app.deleted_streams).is_empty();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+        assert_that!(app.notice.as_deref().unwrap()).contains("removed");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_recover_automatically_after_scan_error() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+
+        // Act: scan failure
+        app.apply_directory_snapshot(DirectorySnapshot::Error(
+            "Directory is temporarily unavailable".to_string(),
+        ));
+
+        // Assert
+        assert_that!(&app.files).is_empty();
+        assert_that!(app.scan_error.as_deref().unwrap()).contains("temporarily unavailable");
+
+        // Act: automatic retry succeeds
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(&app.scan_error).is_none();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

@@ -10,10 +10,12 @@ use anyhow::Result;
 use app::{App, Dialog};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use edit::spawn_edit_worker;
+use files::spawn_directory_monitor;
 use probe::spawn_probe_worker;
 
 fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let directory_rx = spawn_directory_monitor(cwd.clone());
     let (request_tx, result_rx) = spawn_probe_worker();
     let (edit_tx, edit_rx) = spawn_edit_worker();
     let mut app = App::new(cwd, request_tx, edit_tx)?;
@@ -21,6 +23,7 @@ fn main() -> Result<()> {
 
     ratatui::run(|terminal| -> Result<()> {
         loop {
+            app.receive_directory_snapshots(&directory_rx);
             app.receive_probe_results(&result_rx);
             app.receive_edit_results(&edit_rx);
             app.start_pending_probe();
@@ -118,7 +121,6 @@ fn main() -> Result<()> {
                     (KeyCode::Char('G'), _) => app.select_last(),
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.scroll_down(),
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.scroll_up(),
-                    (KeyCode::Char('r'), _) if app.dialog.is_none() => app.refresh()?,
                     _ => {}
                 }
             }

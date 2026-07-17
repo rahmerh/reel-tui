@@ -467,8 +467,6 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "?", "Open keybindings");
     keybinding(&mut lines, "Esc", "Close or go back");
     keybinding(&mut lines, "q", "Quit");
-    keybinding(&mut lines, "r", "Refresh the current directory");
-
     keybindings_section(&mut lines, "Files");
     keybinding(&mut lines, "j / Down", "Move to the next file");
     keybinding(&mut lines, "k / Up", "Move to the previous file");
@@ -1196,5 +1194,16 @@ mod tests {
 
         // Assert
         assert_that!(help).does_not_contain("Space");
+    }
+
+    #[test]
+    fn keybindings_text_should_exclude_refresh_when_files_are_live() {
+        // Arrange
+
+        // Act
+        let help = keybindings_text().to_string();
+
+        // Assert
+        assert_that!(help).does_not_contain("Refresh");
     }
 }

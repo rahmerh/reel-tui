@@ -7,16 +7,20 @@ use std::{
 
 use serde_json::Value;
 
+use crate::files::FileFingerprint;
+
 #[derive(Clone, Debug)]
 pub struct ProbeRequest {
     pub generation: u64,
     pub path: PathBuf,
+    pub fingerprint: FileFingerprint,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProbeResponse {
     pub generation: u64,
     pub path: PathBuf,
+    pub fingerprint: FileFingerprint,
     pub outcome: ProbeOutcome,
 }
 
@@ -103,6 +107,7 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
                 .send(ProbeResponse {
                     generation: request.generation,
                     path: request.path,
+                    fingerprint: request.fingerprint,
                     outcome,
                 })
                 .is_err()

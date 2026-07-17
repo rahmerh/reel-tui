@@ -14,7 +14,10 @@ use std::{
 
 use serde_json::Value;
 
-use crate::probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_file};
+use crate::{
+    files::FileFingerprint,
+    probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_file},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoCodec {
@@ -123,6 +126,7 @@ pub enum EditEvent {
 pub enum EditOutcome {
     Completed,
     Cancelled,
+    SourceChanged(String),
     Failed(String),
 }
 
@@ -147,6 +151,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
             let outcome = match result {
                 Ok(()) => EditOutcome::Completed,
                 Err(EditError::Cancelled) => EditOutcome::Cancelled,
+                Err(EditError::SourceChanged(error)) => EditOutcome::SourceChanged(error),
                 Err(EditError::Failed(error)) => EditOutcome::Failed(error),
             };
             let response = EditEvent::Finished {
@@ -281,7 +286,29 @@ fn apply_edits(
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(Option<f64>),
 ) -> Result<(), EditError> {
-    let source_info = media_info(path).map_err(EditError::Failed)?;
+    let source_metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EditError::SourceChanged(
+                "Source file was removed; the media edit was not saved.".to_string(),
+            )
+        } else {
+            EditError::Failed(format!("Could not read source metadata: {error}"))
+        }
+    })?;
+    let source_fingerprint = FileFingerprint {
+        length: source_metadata.len(),
+        modified: source_metadata.modified().ok(),
+    };
+    let source_permissions = source_metadata.permissions();
+    let source_info = media_info(path).map_err(|error| {
+        if FileFingerprint::for_path(path).is_err() {
+            EditError::SourceChanged(
+                "Source file was removed; the media edit was not saved.".to_string(),
+            )
+        } else {
+            EditError::Failed(error)
+        }
+    })?;
     validate_edit(
         &source_info,
         stream_order,
@@ -339,10 +366,21 @@ fn apply_edits(
     )
     .map_err(EditError::Failed)?;
 
-    let permissions = fs::metadata(path)
-        .map_err(|error| EditError::Failed(format!("Could not read source permissions: {error}")))?
-        .permissions();
-    fs::set_permissions(&temporary, permissions).map_err(|error| {
+    match source_matches_fingerprint(path, source_fingerprint) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(EditError::SourceChanged(
+                "Source file changed; reloaded latest metadata without saving the media edit."
+                    .to_string(),
+            ));
+        }
+        Err(_) => {
+            return Err(EditError::SourceChanged(
+                "Source file was removed; the media edit was not saved.".to_string(),
+            ));
+        }
+    }
+    fs::set_permissions(&temporary, source_permissions).map_err(|error| {
         EditError::Failed(format!("Could not preserve source permissions: {error}"))
     })?;
     if cancelled.load(Ordering::Relaxed) {
@@ -354,6 +392,10 @@ fn apply_edits(
     cleanup.0 = None;
     report_progress(Some(1.0));
     Ok(())
+}
+
+fn source_matches_fingerprint(path: &Path, expected: FileFingerprint) -> std::io::Result<bool> {
+    FileFingerprint::for_path(path).map(|current| current == expected)
 }
 
 fn media_info(path: &Path) -> Result<MediaInfo, String> {
@@ -445,6 +487,7 @@ struct FfmpegOutput {
 #[derive(Debug)]
 enum EditError {
     Cancelled,
+    SourceChanged(String),
     Failed(String),
 }
 
@@ -1130,6 +1173,34 @@ mod tests {
         assert_that!(info.streams[0]["height"].as_u64()).contains(480);
         assert_that!(info.streams[0]["width"].as_u64()).contains(600);
         assert_that!(info.streams[1]["codec_name"].as_str()).contains("pcm_s16le");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_fingerprint_guard_should_reject_changed_and_removed_source() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-source-guard-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("video.mkv");
+        fs::write(&source, b"original").unwrap();
+        let fingerprint = FileFingerprint::for_path(&source).unwrap();
+
+        // Act / Assert: changed
+        fs::write(&source, b"externally changed contents").unwrap();
+        assert_that!(source_matches_fingerprint(&source, fingerprint).unwrap()).is_false();
+
+        // Act / Assert: removed
+        fs::remove_file(&source).unwrap();
+        assert_that!(source_matches_fingerprint(&source, fingerprint)).is_err();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
