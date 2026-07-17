@@ -162,10 +162,13 @@ pub(crate) fn probe_file(path: &Path) -> ProbeOutcome {
 
 #[cfg(test)]
 mod tests {
+    use kernal::prelude::*;
+
     use super::*;
 
     #[test]
-    fn parses_video_and_preserves_all_streams() {
+    fn from_json_should_preserve_streams_chapters_and_format_when_input_contains_video() {
+        // Arrange
         let value: Value = serde_json::from_str(
             r#"{
                 "streams": [
@@ -179,14 +182,18 @@ mod tests {
         )
         .unwrap();
 
+        // Act
         let info = MediaInfo::from_json(value).unwrap();
-        assert_eq!(info.streams.len(), 3);
-        assert_eq!(info.chapters.len(), 1);
-        assert_eq!(info.format["format_name"], "matroska");
+
+        // Assert
+        assert_that!(info.streams).has_length(3);
+        assert_that!(info.chapters).has_length(1);
+        assert_that!(info.format["format_name"].as_str()).contains("matroska");
     }
 
     #[test]
-    fn rejects_audio_with_attached_cover_art() {
+    fn from_json_should_return_error_when_input_only_contains_audio_and_attached_picture() {
+        // Arrange
         let value: Value = serde_json::from_str(
             r#"{"streams":[
                 {"codec_type":"audio"},
@@ -195,6 +202,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(MediaInfo::from_json(value).is_err());
+        // Act
+        let result = MediaInfo::from_json(value);
+
+        // Assert
+        assert_that!(result).is_err();
     }
 }

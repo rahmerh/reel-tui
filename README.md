@@ -17,4 +17,5 @@ TODO
 
 - Inspect container, duration, file size, bitrate, and chapter count
 - View video, audio, subtitle, and other tracks grouped by type
-- Remove tracks without re-encoding by remuxing with `ffmpeg`
+- Reorder tracks, choose default tracks, and remove unwanted tracks
+- Apply track edits without re-encoding by remuxing with `ffmpeg`

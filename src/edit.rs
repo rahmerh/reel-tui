@@ -19,7 +19,9 @@ use crate::probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_file};
 #[derive(Clone, Debug)]
 pub struct EditRequest {
     pub path: PathBuf,
-    pub stream_indices: BTreeSet<u64>,
+    pub stream_order: Vec<u64>,
+    pub deleted_streams: BTreeSet<u64>,
+    pub default_streams: BTreeSet<u64>,
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -43,9 +45,11 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
     std::thread::spawn(move || {
         while let Ok(request) = request_rx.recv() {
             let progress_tx = result_tx.clone();
-            let result = delete_streams(
+            let result = apply_edits(
                 &request.path,
-                &request.stream_indices,
+                &request.stream_order,
+                &request.deleted_streams,
+                &request.default_streams,
                 &request.cancelled,
                 |progress| {
                     let _ = progress_tx.send(EditEvent::Progress(progress));
@@ -109,14 +113,47 @@ pub(crate) fn validate_deletion(info: &MediaInfo, selected: &BTreeSet<u64>) -> R
     Ok(())
 }
 
-fn delete_streams(
+pub(crate) fn validate_edit(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    default_streams: &BTreeSet<u64>,
+) -> Result<(), String> {
+    let available: BTreeSet<_> = info.streams.iter().filter_map(stream_index).collect();
+    if available.len() != info.streams.len() {
+        return Err("One or more tracks have no usable stream index.".to_string());
+    }
+    let ordered: BTreeSet<_> = stream_order.iter().copied().collect();
+    if ordered.len() != stream_order.len()
+        || !ordered.is_disjoint(deleted_streams)
+        || ordered
+            .union(deleted_streams)
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != available
+    {
+        return Err("The file's tracks changed. Reopen it and try again.".to_string());
+    }
+    if !default_streams.is_subset(&ordered) {
+        return Err("A default track is also marked for deletion.".to_string());
+    }
+    if !deleted_streams.is_empty() {
+        validate_deletion(info, deleted_streams)?;
+    }
+    Ok(())
+}
+
+fn apply_edits(
     path: &Path,
-    selected: &BTreeSet<u64>,
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    default_streams: &BTreeSet<u64>,
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(Option<f64>),
 ) -> Result<(), EditError> {
     let source_info = media_info(path).map_err(EditError::Failed)?;
-    validate_deletion(&source_info, selected).map_err(EditError::Failed)?;
+    validate_edit(&source_info, stream_order, deleted_streams, default_streams)
+        .map_err(EditError::Failed)?;
     let duration = media_duration(&source_info);
     report_progress(duration.map(|_| 0.0));
 
@@ -128,14 +165,15 @@ fn delete_streams(
     let output = run_ffmpeg(
         path,
         &temporary,
-        selected,
+        stream_order,
+        default_streams,
         duration,
         cancelled,
         &mut report_progress,
     )?;
     if !output.status.success() {
         return Err(EditError::Failed(command_error(
-            "ffmpeg could not remove the selected tracks",
+            "ffmpeg could not apply the track edits",
             &output.stderr,
         )));
     }
@@ -145,14 +183,15 @@ fn delete_streams(
         return Err(EditError::Cancelled);
     }
     let output_info = media_info(&temporary).map_err(EditError::Failed)?;
-    let expected_count = source_info.streams.len().saturating_sub(selected.len());
+    let expected_count = stream_order.len();
     if output_info.streams.len() != expected_count {
         return Err(EditError::Failed(format!(
             "The remuxed file has {} tracks; expected {expected_count}.",
             output_info.streams.len()
         )));
     }
-    validate_result(&output_info).map_err(EditError::Failed)?;
+    validate_result(&source_info, &output_info, stream_order, default_streams)
+        .map_err(EditError::Failed)?;
 
     let permissions = fs::metadata(path)
         .map_err(|error| EditError::Failed(format!("Could not read source permissions: {error}")))?
@@ -178,13 +217,46 @@ fn media_info(path: &Path) -> Result<MediaInfo, String> {
     }
 }
 
-fn validate_result(info: &MediaInfo) -> Result<(), String> {
-    let has_video = info
+fn validate_result(
+    source: &MediaInfo,
+    output: &MediaInfo,
+    stream_order: &[u64],
+    default_streams: &BTreeSet<u64>,
+) -> Result<(), String> {
+    let has_video = output
         .streams
         .iter()
         .any(|stream| stream_kind(stream) == Some("video") && !is_attached_picture(stream));
     if !has_video {
         return Err("The remuxed file has no playable video track.".to_string());
+    }
+    let expected_kinds = stream_order
+        .iter()
+        .filter_map(|index| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(*index))
+                .and_then(stream_kind)
+        })
+        .collect::<Vec<_>>();
+    let output_kinds = output
+        .streams
+        .iter()
+        .filter_map(stream_kind)
+        .collect::<Vec<_>>();
+    if output_kinds != expected_kinds {
+        return Err("The remuxed tracks are not in the requested order.".to_string());
+    }
+    for (position, stream) in output.streams.iter().enumerate() {
+        let expected = stream_order
+            .get(position)
+            .is_some_and(|index| default_streams.contains(index));
+        if is_default(stream) != expected {
+            return Err(format!(
+                "The remuxed track at position {position} has the wrong default flag."
+            ));
+        }
     }
     Ok(())
 }
@@ -203,7 +275,8 @@ enum EditError {
 fn run_ffmpeg(
     source: &Path,
     temporary: &Path,
-    selected: &BTreeSet<u64>,
+    stream_order: &[u64],
+    default_streams: &BTreeSet<u64>,
     duration: Option<f64>,
     cancelled: &AtomicBool,
     report_progress: &mut impl FnMut(Option<f64>),
@@ -220,13 +293,21 @@ fn run_ffmpeg(
             "-nostats",
             "-i",
         ])
-        .arg(source)
-        .args(["-map", "0"]);
-    for index in selected {
-        command.args(["-map", &format!("-0:{index}")]);
+        .arg(source);
+    for index in stream_order {
+        command.args(["-map", &format!("0:{index}")]);
+    }
+    command.args(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]);
+    for (output_index, source_index) in stream_order.iter().enumerate() {
+        command.arg(format!("-disposition:{output_index}")).arg(
+            if default_streams.contains(source_index) {
+                "+default"
+            } else {
+                "-default"
+            },
+        );
     }
     command
-        .args(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"])
         .arg(temporary)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -334,6 +415,15 @@ fn stream_kind(stream: &BTreeMap<String, Value>) -> Option<&str> {
     stream.get("codec_type").and_then(Value::as_str)
 }
 
+fn is_default(stream: &BTreeMap<String, Value>) -> bool {
+    stream
+        .get("disposition")
+        .and_then(Value::as_object)
+        .and_then(|disposition| disposition.get("default"))
+        .and_then(Value::as_i64)
+        == Some(1)
+}
+
 struct TempCleanup(Option<PathBuf>);
 
 impl Drop for TempCleanup {
@@ -346,6 +436,8 @@ impl Drop for TempCleanup {
 
 #[cfg(test)]
 mod tests {
+    use kernal::prelude::*;
+
     use super::*;
     use std::process::Stdio;
 
@@ -354,40 +446,164 @@ mod tests {
     }
 
     #[test]
-    fn protects_last_video_and_last_audio() {
+    fn validate_deletion_should_return_error_when_last_video_is_selected() {
+        // Arrange
         let info = media(serde_json::json!([
             {"index": 0, "codec_type": "video"},
             {"index": 1, "codec_type": "audio"},
             {"index": 2, "codec_type": "subtitle"}
         ]));
+        let selected = BTreeSet::from([0]);
 
-        assert_eq!(
-            validate_deletion(&info, &BTreeSet::from([0])).unwrap_err(),
-            "Can't delete the last remaining video track."
-        );
-        assert_eq!(
-            validate_deletion(&info, &BTreeSet::from([1])).unwrap_err(),
-            "Can't delete the last remaining audio track."
-        );
-        assert!(validate_deletion(&info, &BTreeSet::from([2])).is_ok());
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result)
+            .contains_error("Can't delete the last remaining video track.".to_string());
     }
 
     #[test]
-    fn permits_one_of_multiple_video_and_audio_tracks() {
+    fn validate_deletion_should_return_error_when_last_audio_is_selected() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"}
+        ]));
+        let selected = BTreeSet::from([1]);
+
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result)
+            .contains_error("Can't delete the last remaining audio track.".to_string());
+    }
+
+    #[test]
+    fn validate_deletion_should_succeed_when_subtitle_is_selected() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"}
+        ]));
+        let selected = BTreeSet::from([2]);
+
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result).is_ok();
+    }
+
+    #[test]
+    fn validate_deletion_should_succeed_when_one_of_multiple_video_and_audio_tracks_is_selected() {
+        // Arrange
         let info = media(serde_json::json!([
             {"index": 0, "codec_type": "video"},
             {"index": 4, "codec_type": "video"},
             {"index": 7, "codec_type": "audio"},
             {"index": 9, "codec_type": "audio"}
         ]));
+        let selected = BTreeSet::from([0, 7]);
 
-        assert!(validate_deletion(&info, &BTreeSet::from([0, 7])).is_ok());
-        assert!(validate_deletion(&info, &BTreeSet::from([0, 4])).is_err());
-        assert!(validate_deletion(&info, &BTreeSet::from([7, 9])).is_err());
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result).is_ok();
     }
 
     #[test]
-    fn ffmpeg_remux_removes_selected_tracks_and_replaces_source() {
+    fn validate_deletion_should_return_error_when_every_video_track_is_selected() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 4, "codec_type": "video"},
+            {"index": 7, "codec_type": "audio"},
+            {"index": 9, "codec_type": "audio"}
+        ]));
+        let selected = BTreeSet::from([0, 4]);
+
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn validate_deletion_should_return_error_when_every_audio_track_is_selected() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 4, "codec_type": "video"},
+            {"index": 7, "codec_type": "audio"},
+            {"index": 9, "codec_type": "audio"}
+        ]));
+        let selected = BTreeSet::from([7, 9]);
+
+        // Act
+        let result = validate_deletion(&info, &selected);
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn validate_edit_should_return_error_when_request_omits_unmarked_stream() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"}
+        ]));
+
+        // Act
+        let result = validate_edit(&info, &[0, 1], &BTreeSet::new(), &BTreeSet::new());
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn validate_edit_should_return_error_when_default_stream_is_marked_for_deletion() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"}
+        ]));
+
+        // Act
+        let result = validate_edit(&info, &[0, 1], &BTreeSet::from([2]), &BTreeSet::from([2]));
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn validate_edit_should_succeed_when_request_contains_all_streams_and_valid_default() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"}
+        ]));
+
+        // Act
+        let result = validate_edit(&info, &[0, 1, 2], &BTreeSet::new(), &BTreeSet::from([1]));
+
+        // Assert
+        assert_that!(result).is_ok();
+    }
+
+    #[test]
+    fn apply_edits_should_remux_order_defaults_and_deletions_when_source_contains_multiple_tracks()
+    {
+        // Arrange
         if Command::new("ffmpeg")
             .arg("-version")
             .stdout(Stdio::null())
@@ -440,15 +656,37 @@ mod tests {
                 "ffv1",
                 "-c:a",
                 "pcm_s16le",
+                "-metadata:s:v:0",
+                "title=Black",
+                "-metadata:s:v:1",
+                "title=White",
+                "-metadata:s:a:0",
+                "title=Main",
+                "-metadata:s:a:1",
+                "title=Commentary",
+                "-disposition:v:0",
+                "default",
+                "-disposition:v:1",
+                "0",
+                "-disposition:a:0",
+                "default+original",
+                "-disposition:a:1",
+                "comment",
             ])
             .arg(&source)
             .status()
             .unwrap();
-        assert!(status.success());
+        status
+            .success()
+            .then_some(())
+            .expect("ffmpeg should create the test fixture");
 
+        // Act
         let mut progress = Vec::new();
-        delete_streams(
+        apply_edits(
             &source,
+            &[1, 0, 3],
+            &BTreeSet::from([2]),
             &BTreeSet::from([1, 3]),
             &AtomicBool::new(false),
             |value| progress.push(value),
@@ -456,27 +694,73 @@ mod tests {
         .unwrap();
         let info = media_info(&source).unwrap();
         let kinds: Vec<_> = info.streams.iter().filter_map(stream_kind).collect();
-        assert_eq!(kinds, vec!["video", "audio"]);
-        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+        let titles = info
+            .streams
+            .iter()
+            .map(|stream| {
+                stream
+                    .get("tags")
+                    .and_then(Value::as_object)
+                    .and_then(|tags| tags.get("title"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        let comment_disposition = info.streams[2]
+            .get("disposition")
+            .and_then(Value::as_object)
+            .and_then(|flags| flags.get("comment"))
+            .and_then(Value::as_i64);
+        let temporary_files_removed = fs::read_dir(&directory).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".reel-tui-")
-        }));
-        assert_eq!(progress.last(), Some(&Some(1.0)));
+        });
 
+        // Assert
+        assert_that!(kinds).contains_exactly_in_given_order(["video", "video", "audio"]);
+        assert_that!(titles).contains_exactly_in_given_order([
+            Some("White"),
+            Some("Black"),
+            Some("Commentary"),
+        ]);
+        assert_that!(is_default(&info.streams[0])).is_true();
+        assert_that!(is_default(&info.streams[1])).is_false();
+        assert_that!(is_default(&info.streams[2])).is_true();
+        assert_that!(comment_disposition).contains(1);
+        assert_that!(temporary_files_removed).is_true();
+        assert_that!(progress.last().copied()).contains(Some(1.0));
+
+        // Cleanup
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn reads_duration_from_string_or_number() {
+    fn media_duration_should_return_seconds_when_duration_is_string() {
+        // Arrange
         let mut info = media(serde_json::json!([{"index": 0, "codec_type": "video"}]));
         info.format
             .insert("duration".to_string(), Value::String("42.5".to_string()));
-        assert_eq!(media_duration(&info), Some(42.5));
+
+        // Act
+        let result = media_duration(&info);
+
+        // Assert
+        assert_that!(result).contains(42.5);
+    }
+
+    #[test]
+    fn media_duration_should_return_seconds_when_duration_is_number() {
+        // Arrange
+        let mut info = media(serde_json::json!([{"index": 0, "codec_type": "video"}]));
         info.format
             .insert("duration".to_string(), serde_json::json!(12.0));
-        assert_eq!(media_duration(&info), Some(12.0));
+
+        // Act
+        let result = media_duration(&info);
+
+        // Assert
+        assert_that!(result).contains(12.0);
     }
 }

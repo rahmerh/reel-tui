@@ -10,7 +10,7 @@ use ratatui::{
 use serde_json::Value;
 
 use crate::{
-    app::{App, Dialog, Layer, grouped_stream_indices},
+    app::{App, Dialog, Layer},
     edit::stream_index,
     probe::{MediaInfo, ProbeOutcome},
 };
@@ -91,10 +91,14 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         match &app.outcome {
             Some(ProbeOutcome::Video(info)) => {
+                let changed = app.changed_streams();
                 let (text, selected_line) = media_text(
                     info,
                     (app.layer != Layer::Files).then_some(app.selected_stream),
-                    &app.marked_streams,
+                    &app.stream_order,
+                    &app.deleted_streams,
+                    &app.default_streams,
+                    &changed,
                 );
                 if app.layer == Layer::Streams
                     && let Some(selected_line) = selected_line
@@ -167,7 +171,10 @@ fn message(heading: &str, detail: &str, color: Color) -> Text<'static> {
 fn media_text(
     info: &MediaInfo,
     selected: Option<usize>,
-    marked: &std::collections::BTreeSet<u64>,
+    order: &[u64],
+    deleted: &std::collections::BTreeSet<u64>,
+    defaults: &std::collections::BTreeSet<u64>,
+    changed: &std::collections::BTreeSet<u64>,
 ) -> (Text<'static>, Option<usize>) {
     let mut lines = Vec::new();
     let mut selected_line = None;
@@ -180,13 +187,15 @@ fn media_text(
         ("Subtitles", "subtitle"),
     ];
 
-    let ordered_indices = grouped_stream_indices(info);
     for (heading, kind) in groups {
-        let streams: Vec<_> = ordered_indices
+        let streams: Vec<_> = order
             .iter()
             .enumerate()
-            .filter_map(|(selection_index, stream_index)| {
-                let stream = &info.streams[*stream_index];
+            .filter_map(|(selection_index, index)| {
+                let stream = info
+                    .streams
+                    .iter()
+                    .find(|stream| stream_index(stream) == Some(*index))?;
                 (string(stream, "codec_type") == Some(kind)).then_some((selection_index, stream))
             })
             .collect();
@@ -200,17 +209,22 @@ fn media_text(
                     stream,
                     selection_index,
                     selected == Some(selection_index),
-                    stream_index(stream).is_some_and(|index| marked.contains(&index)),
+                    stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                    stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                    stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                 ));
             }
         }
     }
 
-    let other: Vec<_> = ordered_indices
+    let other: Vec<_> = order
         .iter()
         .enumerate()
-        .filter_map(|(selection_index, stream_index)| {
-            let stream = &info.streams[*stream_index];
+        .filter_map(|(selection_index, index)| {
+            let stream = info
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(*index))?;
             (!matches!(
                 string(stream, "codec_type"),
                 Some("video" | "audio" | "subtitle")
@@ -228,7 +242,9 @@ fn media_text(
                 stream,
                 selection_index,
                 selected == Some(selection_index),
-                stream_index(stream).is_some_and(|index| marked.contains(&index)),
+                stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                stream_index(stream).is_some_and(|index| defaults.contains(&index)),
             ));
         }
     }
@@ -279,7 +295,9 @@ fn stream_line(
     stream: &std::collections::BTreeMap<String, Value>,
     fallback_index: usize,
     selected: bool,
-    marked: bool,
+    deleted: bool,
+    changed: bool,
+    default: bool,
 ) -> Line<'static> {
     let index = number_string(stream, "index").unwrap_or_else(|| fallback_index.to_string());
     let kind = string(stream, "codec_type").unwrap_or("unknown");
@@ -327,17 +345,25 @@ fn stream_line(
     if let Some(title) = tag(stream, "title") {
         details.push(title.to_string());
     }
-    details.extend(disposition_flags(stream));
+    details.extend(disposition_flags(stream, default));
 
     let line = Line::from(vec![
-        if marked {
+        if deleted {
             Span::styled("× ", Style::default().fg(Color::Red).bold())
+        } else if changed {
+            Span::styled("~ ", Style::default().fg(Color::Yellow).bold())
         } else {
             Span::raw("  ")
         },
         Span::styled(
             format!("#{index:<2} "),
-            Style::default().fg(if marked { Color::Red } else { Color::DarkGray }),
+            Style::default().fg(if deleted {
+                Color::Red
+            } else if changed {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
         ),
         Span::raw(details.join("  ·  ")),
     ]);
@@ -349,8 +375,10 @@ fn stream_line(
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        line.style(if marked {
+        line.style(if deleted {
             Style::default().fg(Color::Red)
+        } else if changed {
+            Style::default().fg(Color::Yellow)
         } else {
             Style::default()
         })
@@ -368,14 +396,11 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
     }
     let (title, body, footer, color) = match dialog {
         Dialog::Keybindings => unreachable!(),
-        Dialog::ConfirmDelete => {
-            let count = app.marked_streams.len();
+        Dialog::ConfirmSave => {
+            let summary = app.save_summary();
             (
-                " Confirm deletion ",
-                format!(
-                    "Permanently delete {count} selected track{}?\n\nThe original file will be replaced after a successful remux.",
-                    if count == 1 { "" } else { "s" }
-                ),
+                " Save track edits ",
+                format!("Save these changes?\n\n{}", summary.join("\n")),
                 " Enter/y confirm · Esc/n cancel ",
                 Color::Yellow,
             )
@@ -390,7 +415,12 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
             Color::Red,
         ),
     };
-    let area = centered_fixed(frame.area(), 64, 9);
+    let height = if dialog == Dialog::ConfirmSave {
+        (app.save_summary().len() as u16 + 6).max(8)
+    } else {
+        9
+    };
+    let area = centered_fixed(frame.area(), 64, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(body)
@@ -445,8 +475,14 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "j / Down", "Move to the next track");
     keybinding(&mut lines, "k / Up", "Move to the previous track");
     keybinding(&mut lines, "gg / G", "Move to the first / last track");
-    keybinding(&mut lines, "Space", "Select or deselect a track");
-    keybinding(&mut lines, "d", "Delete selected tracks");
+    keybinding(
+        &mut lines,
+        "Ctrl-j / Ctrl-k",
+        "Move track down / up within its type",
+    );
+    keybinding(&mut lines, "a", "Make track the default for its type");
+    keybinding(&mut lines, "d", "Mark or unmark track for deletion");
+    keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
     keybinding(&mut lines, "Enter", "Open full stream details");
 
     keybindings_section(&mut lines, "Stream details");
@@ -479,7 +515,7 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Deleting tracks ")
+        .title(" Saving track edits ")
         .title_bottom(Line::from(" Esc/q/Ctrl-C cancel ").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -669,7 +705,10 @@ fn tag<'a>(stream: &'a std::collections::BTreeMap<String, Value>, key: &str) -> 
         .and_then(Value::as_str)
 }
 
-fn disposition_flags(stream: &std::collections::BTreeMap<String, Value>) -> Vec<String> {
+fn disposition_flags(
+    stream: &std::collections::BTreeMap<String, Value>,
+    default: bool,
+) -> Vec<String> {
     const FLAGS: [(&str, &str); 7] = [
         ("default", "default"),
         ("forced", "forced"),
@@ -680,14 +719,19 @@ fn disposition_flags(stream: &std::collections::BTreeMap<String, Value>) -> Vec<
         ("original", "original"),
     ];
 
-    let Some(disposition) = stream.get("disposition").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    FLAGS
-        .iter()
-        .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
-        .map(|(_, label)| format!("[{label}]"))
-        .collect()
+    let disposition = stream.get("disposition").and_then(Value::as_object);
+    let mut flags = disposition.map_or_else(Vec::new, |disposition| {
+        FLAGS
+            .iter()
+            .filter(|(key, _)| *key != "default")
+            .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
+            .map(|(_, label)| format!("[{label}]"))
+            .collect::<Vec<_>>()
+    });
+    if default {
+        flags.insert(0, "[default]".to_string());
+    }
+    flags
 }
 
 fn parse_number(value: String) -> Option<f64> {
@@ -772,24 +816,87 @@ fn truncate(value: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use kernal::prelude::*;
+
     use super::*;
 
     #[test]
-    fn truncates_from_the_left() {
-        assert_eq!(truncate("/a/long/path", 6), "…/path");
-        assert_eq!(truncate("short", 10), "short");
+    fn truncate_should_keep_tail_with_ellipsis_when_value_exceeds_width() {
+        // Arrange
+        let value = "/a/long/path";
+        let width = 6;
+
+        // Act
+        let result = truncate(value, width);
+
+        // Assert
+        assert_that!(result).is_equal_to("…/path".to_string());
     }
 
     #[test]
-    fn formats_common_media_values_compactly() {
-        assert_eq!(format_duration(3723.0), "1:02:03");
-        assert_eq!(format_bytes(1_572_864.0), "1.5 MiB");
-        assert_eq!(format_bitrate(4_200_000.0), "4.2 Mb/s");
-        assert_eq!(format_frame_rate("30000/1001").as_deref(), Some("29.97"));
+    fn truncate_should_return_original_value_when_value_fits_width() {
+        // Arrange
+        let value = "short";
+        let width = 10;
+
+        // Act
+        let result = truncate(value, width);
+
+        // Assert
+        assert_that!(result).is_equal_to("short".to_string());
     }
 
     #[test]
-    fn stream_line_contains_track_essentials() {
+    fn format_duration_should_include_hours_when_duration_exceeds_one_hour() {
+        // Arrange
+        let seconds = 3723.0;
+
+        // Act
+        let result = format_duration(seconds);
+
+        // Assert
+        assert_that!(result).is_equal_to("1:02:03".to_string());
+    }
+
+    #[test]
+    fn format_bytes_should_use_binary_units_when_value_exceeds_one_mebibyte() {
+        // Arrange
+        let bytes = 1_572_864.0;
+
+        // Act
+        let result = format_bytes(bytes);
+
+        // Assert
+        assert_that!(result).is_equal_to("1.5 MiB".to_string());
+    }
+
+    #[test]
+    fn format_bitrate_should_use_megabits_when_value_exceeds_one_megabit() {
+        // Arrange
+        let bits = 4_200_000.0;
+
+        // Act
+        let result = format_bitrate(bits);
+
+        // Assert
+        assert_that!(result).is_equal_to("4.2 Mb/s".to_string());
+    }
+
+    #[test]
+    fn format_frame_rate_should_format_decimal_rate_when_input_is_fractional() {
+        // Arrange
+        let rate = "30000/1001";
+
+        // Act
+        let result = format_frame_rate(rate);
+
+        // Assert
+        assert_that!(result.as_deref()).contains("29.97");
+    }
+
+    #[test]
+    fn stream_line_should_include_track_essentials_when_audio_metadata_is_present() {
+        // Arrange
         let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
                 "index": 2,
@@ -803,29 +910,68 @@ mod tests {
         )
         .unwrap();
 
-        let line = stream_line(&stream, 0, false, false).to_string();
-        assert!(line.contains("#2"));
-        assert!(line.contains("OPUS"));
-        assert!(line.contains("5.1"));
-        assert!(line.contains("ENG"));
-        assert!(line.contains("[default]"));
+        // Act
+        let line = stream_line(&stream, 0, false, false, false, true).to_string();
+
+        // Assert
+        assert_that!(line)
+            .contains("#2")
+            .contains("OPUS")
+            .contains("5.1")
+            .contains("ENG")
+            .contains("[default]");
     }
 
     #[test]
-    fn maximum_scroll_accounts_for_viewport_and_wrapping() {
+    fn max_scroll_should_count_hidden_lines_when_content_exceeds_viewport() {
+        // Arrange
         let text = Text::from(vec![
             Line::from("1234567890"),
             Line::from("abcdefghij"),
             Line::from("last"),
         ]);
+        let area = Rect::new(0, 0, 12, 4);
 
-        assert_eq!(max_scroll(&text, Rect::new(0, 0, 12, 4)), 1);
-        assert_eq!(max_scroll(&text, Rect::new(0, 0, 7, 4)), 3);
-        assert_eq!(max_scroll(&Text::from("short"), Rect::new(0, 0, 20, 10)), 0);
+        // Act
+        let result = max_scroll(&text, area);
+
+        // Assert
+        assert_that!(result).is_equal_to(1);
     }
 
     #[test]
-    fn scroll_follows_selected_line_beyond_viewport() {
+    fn max_scroll_should_account_for_wrapping_when_viewport_is_narrow() {
+        // Arrange
+        let text = Text::from(vec![
+            Line::from("1234567890"),
+            Line::from("abcdefghij"),
+            Line::from("last"),
+        ]);
+        let area = Rect::new(0, 0, 7, 4);
+
+        // Act
+        let result = max_scroll(&text, area);
+
+        // Assert
+        assert_that!(result).is_equal_to(3);
+    }
+
+    #[test]
+    fn max_scroll_should_return_zero_when_content_fits_viewport() {
+        // Arrange
+        let text = Text::from("short");
+        let area = Rect::new(0, 0, 20, 10);
+
+        // Act
+        let result = max_scroll(&text, area);
+
+        // Assert
+        assert_that!(result).is_equal_to(0);
+    }
+
+    #[test]
+    fn scroll_to_show_line_should_return_zero_when_selected_line_is_first() {
+        // Arrange
         let text = Text::from(vec![
             Line::from("zero"),
             Line::from("one"),
@@ -835,23 +981,83 @@ mod tests {
         ]);
         let area = Rect::new(0, 0, 20, 5);
 
-        assert_eq!(scroll_to_show_line(&text, area, 0, 2), 0);
-        assert_eq!(scroll_to_show_line(&text, area, 4, 0), 2);
-        assert_eq!(scroll_to_show_line(&text, area, 2, 0), 0);
+        // Act
+        let result = scroll_to_show_line(&text, area, 0, 2);
+
+        // Assert
+        assert_that!(result).is_equal_to(0);
     }
 
     #[test]
-    fn keybindings_help_covers_every_context() {
+    fn scroll_to_show_line_should_scroll_down_when_selected_line_is_below_viewport() {
+        // Arrange
+        let text = Text::from(vec![
+            Line::from("zero"),
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+            Line::from("four"),
+        ]);
+        let area = Rect::new(0, 0, 20, 5);
+
+        // Act
+        let result = scroll_to_show_line(&text, area, 4, 0);
+
+        // Assert
+        assert_that!(result).is_equal_to(2);
+    }
+
+    #[test]
+    fn scroll_to_show_line_should_keep_position_when_selected_line_is_visible() {
+        // Arrange
+        let text = Text::from(vec![
+            Line::from("zero"),
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+            Line::from("four"),
+        ]);
+        let area = Rect::new(0, 0, 20, 5);
+
+        // Act
+        let result = scroll_to_show_line(&text, area, 2, 0);
+
+        // Assert
+        assert_that!(result).is_equal_to(0);
+    }
+
+    #[test]
+    fn keybindings_text_should_include_active_bindings_when_help_is_rendered() {
+        // Arrange
+        let expected = [
+            "General",
+            "Files",
+            "Tracks",
+            "Stream details",
+            "Esc",
+            "gg / G",
+            "Ctrl-j / Ctrl-k",
+            "Ctrl-s",
+            "Ctrl-d / Ctrl-u",
+        ];
+
+        // Act
         let help = keybindings_text().to_string();
 
-        for section in ["General", "Files", "Tracks", "Stream details"] {
-            assert!(
-                help.contains(section),
-                "missing keybinding section: {section}"
-            );
+        // Assert
+        for value in expected {
+            assert_that!(&help).contains(value);
         }
-        for binding in ["Esc", "gg / G", "Space", "Ctrl-d / Ctrl-u"] {
-            assert!(help.contains(binding), "missing keybinding: {binding}");
-        }
+    }
+
+    #[test]
+    fn keybindings_text_should_exclude_space_binding_when_space_action_is_removed() {
+        // Arrange
+
+        // Act
+        let help = keybindings_text().to_string();
+
+        // Assert
+        assert_that!(help).does_not_contain("Space");
     }
 }

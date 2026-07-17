@@ -63,14 +63,14 @@ fn main() -> Result<()> {
                 }
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('?'), _) if app.dialog.is_none() => app.show_keybindings(),
-                    (KeyCode::Char('y'), _) if app.dialog == Some(Dialog::ConfirmDelete) => {
-                        app.confirm_delete()
+                    (KeyCode::Char('y'), _) if app.dialog == Some(Dialog::ConfirmSave) => {
+                        app.confirm_save()
                     }
-                    (KeyCode::Char('n'), _) if app.dialog == Some(Dialog::ConfirmDelete) => {
+                    (KeyCode::Char('n'), _) if app.dialog == Some(Dialog::ConfirmSave) => {
                         app.dismiss_dialog()
                     }
-                    (KeyCode::Enter, _) if app.dialog == Some(Dialog::ConfirmDelete) => {
-                        app.confirm_delete()
+                    (KeyCode::Enter, _) if app.dialog == Some(Dialog::ConfirmSave) => {
+                        app.confirm_save()
                     }
                     (KeyCode::Enter, _) if app.dialog == Some(Dialog::Error) => {
                         app.dismiss_dialog()
@@ -78,8 +78,11 @@ fn main() -> Result<()> {
                     (KeyCode::Esc, _) if app.dialog.is_some() => app.dismiss_dialog(),
                     (KeyCode::Char('q'), _) if app.dialog.is_none() => break,
                     (KeyCode::Esc, _) if !app.back() => break,
-                    (KeyCode::Char(' '), _) => app.toggle_selected_stream(),
-                    (KeyCode::Char('d'), KeyModifiers::NONE) => app.request_delete(),
+                    (KeyCode::Char('d'), KeyModifiers::NONE) => app.toggle_delete_selected_stream(),
+                    (KeyCode::Char('a'), KeyModifiers::NONE) => app.set_selected_stream_default(),
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.request_save(),
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => app.move_selected_stream(-1),
+                    (KeyCode::Char('j'), KeyModifiers::CONTROL) => app.move_selected_stream(1),
                     (KeyCode::Enter, _) => app.enter(),
                     (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.select_next(),
                     (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.select_previous(),

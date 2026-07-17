@@ -50,10 +50,14 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
 mod tests {
     use std::{fs::File, path::PathBuf};
 
+    use kernal::prelude::*;
+
     use super::*;
 
     #[test]
-    fn scans_regular_files_and_sorts_case_insensitively() {
+    fn scan_directory_should_return_regular_files_in_case_insensitive_order_when_directory_contains_files_and_folder()
+     {
+        // Arrange
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-files-{}-{}",
             std::process::id(),
@@ -65,23 +69,35 @@ mod tests {
         File::create(directory.join("Alpha.txt")).unwrap();
         File::create(directory.join(".hidden")).unwrap();
 
+        // Act
         let result = scan_directory(&directory).unwrap();
         let names: Vec<_> = result
             .iter()
             .map(|entry| entry.display_name.as_str())
             .collect();
 
-        assert_eq!(names, vec![".hidden", "Alpha.txt", "zeta.mp4"]);
+        // Assert
+        assert_that!(names).contains_exactly_in_given_order([".hidden", "Alpha.txt", "zeta.mp4"]);
+
+        // Cleanup
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn empty_directory_returns_empty_list() {
+    fn scan_directory_should_return_empty_list_when_directory_is_empty() {
+        // Arrange
         let directory: PathBuf =
             std::env::temp_dir().join(format!("reel-tui-empty-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        assert!(scan_directory(&directory).unwrap().is_empty());
+
+        // Act
+        let result = scan_directory(&directory).unwrap();
+
+        // Assert
+        assert_that!(result).is_empty();
+
+        // Cleanup
         fs::remove_dir_all(directory).unwrap();
     }
 }
