@@ -10,8 +10,8 @@ use ratatui::{
 use serde_json::Value;
 
 use crate::{
-    app::{App, Dialog, Layer, VideoSettingsField},
-    edit::{VideoCodec, stream_index},
+    app::{App, Dialog, Layer, SaveDialogField, VideoSettingsField},
+    edit::{SaveDestination, VideoCodec, stream_index},
     probe::{MediaInfo, ProbeOutcome},
 };
 
@@ -398,33 +398,22 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_progress_dialog(frame, app);
         return;
     }
-    let (title, body, footer, color) = match dialog {
-        Dialog::Keybindings | Dialog::VideoSettings => unreachable!(),
-        Dialog::ConfirmSave => {
-            let summary = app.save_summary();
-            (
-                " Save media edits ",
-                format!("Save these changes?\n\n{}", summary.join("\n")),
-                " Enter/y confirm · Esc/n cancel ",
-                Color::Yellow,
-            )
-        }
+    if dialog == Dialog::ConfirmSave {
+        render_save_dialog(frame, app);
+        return;
+    }
+    let (title, body, color) = match dialog {
+        Dialog::Keybindings | Dialog::VideoSettings | Dialog::ConfirmSave => unreachable!(),
         Dialog::Processing => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
                 .clone()
                 .unwrap_or_else(|| "An unknown editing error occurred.".to_string()),
-            " Enter/Esc close ",
             Color::Red,
         ),
     };
-    let height = if dialog == Dialog::ConfirmSave {
-        (app.save_summary().len() as u16 + 6).max(8)
-    } else {
-        9
-    };
-    let area = centered_fixed(frame.area(), 64, height);
+    let area = centered_fixed(frame.area(), 64, 9);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(body)
@@ -432,12 +421,90 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(color))
-                    .title(title)
-                    .title_bottom(Line::from(footer).right_aligned()),
+                    .title(title),
             )
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_save_dialog(frame: &mut Frame, app: &App) {
+    let summary = app.save_summary();
+    let mut lines = vec![Line::styled(
+        "Changes",
+        Style::default().fg(Color::Cyan).bold(),
+    )];
+    lines.extend(summary.into_iter().map(Line::from));
+    lines.push(Line::from(""));
+
+    let destination_focused = app.save_dialog_field == SaveDialogField::Destination;
+    lines.push(Line::from(vec![
+        Span::styled(
+            if destination_focused {
+                "› Output  "
+            } else {
+                "  Output  "
+            },
+            Style::default().add_modifier(if destination_focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ),
+        save_option(
+            " Replace original ",
+            app.save_destination == SaveDestination::ReplaceOriginal,
+        ),
+        Span::raw("  "),
+        save_option(
+            " Create a copy ",
+            app.save_destination == SaveDestination::CreateCopy,
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let start_focused = app.save_dialog_field == SaveDialogField::Start;
+    lines.push(
+        Line::from(Span::styled(
+            if start_focused {
+                "       ▶  START       "
+            } else {
+                "          START       "
+            },
+            if start_focused {
+                Style::default().fg(Color::White).bg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::White).bold()
+            },
+        ))
+        .centered(),
+    );
+
+    let height = (lines.len() as u16 + 2).max(10);
+    let area = centered_fixed(frame.area(), 68, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Save media edits "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn save_option(label: &'static str, selected: bool) -> Span<'static> {
+    Span::styled(
+        label,
+        if selected {
+            Style::default().fg(Color::White).bg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )
 }
 
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
@@ -452,8 +519,7 @@ fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Keybindings ")
-                    .title_bottom(Line::from(" j/k scroll · Esc close ").right_aligned()),
+                    .title(" Keybindings "),
             )
             .wrap(Wrap { trim: false })
             .scroll((app.keybindings_scroll, 0)),
@@ -464,34 +530,26 @@ fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
 fn keybindings_text() -> Text<'static> {
     let mut lines = Vec::new();
     keybindings_section(&mut lines, "General");
-    keybinding(&mut lines, "?", "Open keybindings");
-    keybinding(&mut lines, "Esc", "Close or go back");
-    keybinding(&mut lines, "q", "Quit");
-    keybindings_section(&mut lines, "Files");
-    keybinding(&mut lines, "j / Down", "Move to the next file");
-    keybinding(&mut lines, "k / Up", "Move to the previous file");
-    keybinding(&mut lines, "gg / G", "Move to the first / last file");
-    keybinding(&mut lines, "Enter", "Open the track list");
+    keybinding(&mut lines, "?", "Open or close keybindings");
+    keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
+    keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
+    keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
+    keybinding(&mut lines, "gg / G", "Go to the first/top or last/bottom");
+    keybinding(&mut lines, "Ctrl-d / Ctrl-u", "Scroll ten lines");
+    keybinding(&mut lines, "Enter", "Open, select, or confirm");
 
-    keybindings_section(&mut lines, "Tracks");
-    keybinding(&mut lines, "j / Down", "Move to the next track");
-    keybinding(&mut lines, "k / Up", "Move to the previous track");
-    keybinding(&mut lines, "gg / G", "Move to the first / last track");
+    keybindings_section(&mut lines, "Track editing");
     keybinding(
         &mut lines,
         "Ctrl-j / Ctrl-k",
         "Move track down / up within its type",
     );
     keybinding(&mut lines, "a", "Make track the default for its type");
-    keybinding(&mut lines, "e", "Edit video codec and resolution");
+    keybinding(&mut lines, "Enter", "Edit video codec and resolution");
+    keybinding(&mut lines, "i", "Open full ffprobe stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
-    keybinding(&mut lines, "Enter", "Open full stream details");
-
-    keybindings_section(&mut lines, "Stream details");
-    keybinding(&mut lines, "j / Down", "Scroll down");
-    keybinding(&mut lines, "k / Up", "Scroll up");
-    keybinding(&mut lines, "Ctrl-d / Ctrl-u", "Scroll down / up by a page");
+    keybinding(&mut lines, "Ctrl-c", "Cancel processing");
     Text::from(lines)
 }
 
@@ -518,8 +576,7 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Saving media edits ")
-        .title_bottom(Line::from(" Esc/q/Ctrl-C cancel ").right_aligned());
+        .title(" Saving media edits ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -643,19 +700,13 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
 
     let height = (lines.len() as u16 + 4).max(7);
     let area = centered_fixed(frame.area(), 58, height);
-    let footer = if popup.dropdown_open {
-        " j/k choose · Enter select · Esc back "
-    } else {
-        " j/k field · Enter open · Ctrl-S save · Esc close "
-    };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" Video track #{} settings ", popup.stream_index))
-                .title_bottom(Line::from(footer).right_aligned()),
+                .title(format!(" Video track #{} settings ", popup.stream_index)),
         ),
         area,
     );
@@ -716,8 +767,7 @@ fn render_stream_popup(frame: &mut Frame, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(format!(" Stream #{index} · {kind} "))
-                    .title_bottom(Line::from(" j/k scroll · Esc back ").right_aligned()),
+                    .title(format!(" Stream #{index} · {kind} ")),
             )
             .wrap(Wrap { trim: false })
             .scroll((app.details_scroll, 0)),
@@ -1166,14 +1216,14 @@ mod tests {
         // Arrange
         let expected = [
             "General",
-            "Files",
-            "Tracks",
-            "Stream details",
+            "Track editing",
             "Esc",
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
+            "i",
             "Ctrl-d / Ctrl-u",
+            "Ctrl-c",
         ];
 
         // Act

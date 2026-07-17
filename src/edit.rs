@@ -97,6 +97,13 @@ pub struct VideoSettings {
     pub resolution: VideoResolution,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SaveDestination {
+    #[default]
+    ReplaceOriginal,
+    CreateCopy,
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
@@ -109,6 +116,7 @@ impl Default for VideoSettings {
 #[derive(Clone, Debug)]
 pub struct EditRequest {
     pub path: PathBuf,
+    pub destination: SaveDestination,
     pub stream_order: Vec<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
@@ -124,7 +132,7 @@ pub enum EditEvent {
 
 #[derive(Clone, Debug)]
 pub enum EditOutcome {
-    Completed,
+    Completed { output_path: PathBuf },
     Cancelled,
     SourceChanged(String),
     Failed(String),
@@ -138,7 +146,10 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
         while let Ok(request) = request_rx.recv() {
             let progress_tx = result_tx.clone();
             let result = apply_edits(
-                &request.path,
+                EditTarget {
+                    source: &request.path,
+                    destination: request.destination,
+                },
                 &request.stream_order,
                 &request.deleted_streams,
                 &request.default_streams,
@@ -149,7 +160,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
                 },
             );
             let outcome = match result {
-                Ok(()) => EditOutcome::Completed,
+                Ok(output_path) => EditOutcome::Completed { output_path },
                 Err(EditError::Cancelled) => EditOutcome::Cancelled,
                 Err(EditError::SourceChanged(error)) => EditOutcome::SourceChanged(error),
                 Err(EditError::Failed(error)) => EditOutcome::Failed(error),
@@ -278,14 +289,16 @@ pub(crate) fn validate_edit(
 }
 
 fn apply_edits(
-    path: &Path,
+    target: EditTarget<'_>,
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
     default_streams: &BTreeSet<u64>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(Option<f64>),
-) -> Result<(), EditError> {
+) -> Result<PathBuf, EditError> {
+    let path = target.source;
+    let destination = target.destination;
     let source_metadata = fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EditError::SourceChanged(
@@ -386,12 +399,60 @@ fn apply_edits(
     if cancelled.load(Ordering::Relaxed) {
         return Err(EditError::Cancelled);
     }
-    fs::rename(&temporary, path).map_err(|error| {
-        EditError::Failed(format!("Could not replace the original file: {error}"))
-    })?;
-    cleanup.0 = None;
+    let output_path = match destination {
+        SaveDestination::ReplaceOriginal => {
+            fs::rename(&temporary, path).map_err(|error| {
+                EditError::Failed(format!("Could not replace the original file: {error}"))
+            })?;
+            cleanup.0 = None;
+            path.to_path_buf()
+        }
+        SaveDestination::CreateCopy => publish_copy(&temporary, path)?,
+    };
     report_progress(Some(1.0));
-    Ok(())
+    Ok(output_path)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditTarget<'a> {
+    source: &'a Path,
+    destination: SaveDestination,
+}
+
+fn publish_copy(temporary: &Path, source: &Path) -> Result<PathBuf, EditError> {
+    for number in 1.. {
+        let candidate = copy_path(source, number).map_err(EditError::Failed)?;
+        match fs::hard_link(temporary, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(EditError::Failed(format!(
+                    "Could not create the edited copy: {error}"
+                )));
+            }
+        }
+    }
+    unreachable!("copy suffix counter cannot be exhausted")
+}
+
+fn copy_path(source: &Path, number: usize) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "The source file has no parent directory.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "The source filename is not valid UTF-8.".to_string())?;
+    let suffix = if number == 1 {
+        "-edited".to_string()
+    } else {
+        format!("-edited-{number}")
+    };
+    let name = match source.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => format!("{stem}{suffix}.{extension}"),
+        None => format!("{stem}{suffix}"),
+    };
+    Ok(parent.join(name))
 }
 
 fn source_matches_fingerprint(path: &Path, expected: FileFingerprint) -> std::io::Result<bool> {
@@ -1047,7 +1108,10 @@ mod tests {
         // Act
         let mut progress = Vec::new();
         apply_edits(
-            &source,
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+            },
             &[1, 0, 3],
             &BTreeSet::from([2]),
             &BTreeSet::from([1, 3]),
@@ -1101,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_edits_should_transcode_and_downscale_only_the_selected_video_stream() {
+    fn apply_edits_should_create_an_edited_copy_without_changing_the_source() {
         // Arrange
         if !Command::new("ffmpeg")
             .args(["-v", "error", "-h", "encoder=libx264"])
@@ -1156,8 +1220,11 @@ mod tests {
         )]);
 
         // Act
-        apply_edits(
-            &source,
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::CreateCopy,
+            },
             &[0, 1],
             &BTreeSet::new(),
             &BTreeSet::new(),
@@ -1166,9 +1233,13 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        let info = media_info(&source).unwrap();
+        let info = media_info(&output).unwrap();
+        let source_info = media_info(&source).unwrap();
 
         // Assert
+        assert_that!(output.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("transcode-edited.mkv");
+        assert_that!(source_info.streams[0]["codec_name"].as_str()).contains("ffv1");
         assert_that!(info.streams[0]["codec_name"].as_str()).contains("h264");
         assert_that!(info.streams[0]["height"].as_u64()).contains(480);
         assert_that!(info.streams[0]["width"].as_u64()).contains(600);
@@ -1176,6 +1247,50 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publish_copy_should_increment_the_suffix_instead_of_overwriting_a_copy() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-copy-name-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("video.mkv");
+        let temporary = directory.join(".temporary-video.mkv");
+        let existing = directory.join("video-edited.mkv");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&temporary, b"new copy").unwrap();
+        fs::write(&existing, b"existing copy").unwrap();
+
+        // Act
+        let output = publish_copy(&temporary, &source).unwrap();
+
+        // Assert
+        assert_that!(output.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("video-edited-2.mkv");
+        assert_that!(fs::read(&existing).unwrap()).is_equal_to(b"existing copy".to_vec());
+        assert_that!(fs::read(&output).unwrap()).is_equal_to(b"new copy".to_vec());
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn copy_path_should_support_files_without_an_extension() {
+        // Arrange
+        let source = Path::new("/videos/movie");
+
+        // Act
+        let output = copy_path(source, 1).unwrap();
+
+        // Assert
+        assert_that!(output).is_equal_to(PathBuf::from("/videos/movie-edited"));
     }
 
     #[test]
