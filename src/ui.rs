@@ -10,8 +10,8 @@ use ratatui::{
 use serde_json::Value;
 
 use crate::{
-    app::{App, Dialog, Layer},
-    edit::stream_index,
+    app::{App, Dialog, Layer, VideoSettingsField},
+    edit::{VideoCodec, stream_index},
     probe::{MediaInfo, ProbeOutcome},
 };
 
@@ -390,16 +390,20 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_keybindings_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::VideoSettings {
+        render_video_settings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::Processing {
         render_progress_dialog(frame, app);
         return;
     }
     let (title, body, footer, color) = match dialog {
-        Dialog::Keybindings => unreachable!(),
+        Dialog::Keybindings | Dialog::VideoSettings => unreachable!(),
         Dialog::ConfirmSave => {
             let summary = app.save_summary();
             (
-                " Save track edits ",
+                " Save media edits ",
                 format!("Save these changes?\n\n{}", summary.join("\n")),
                 " Enter/y confirm · Esc/n cancel ",
                 Color::Yellow,
@@ -481,6 +485,7 @@ fn keybindings_text() -> Text<'static> {
         "Move track down / up within its type",
     );
     keybinding(&mut lines, "a", "Make track the default for its type");
+    keybinding(&mut lines, "e", "Edit video codec and resolution");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
     keybinding(&mut lines, "Enter", "Open full stream details");
@@ -515,7 +520,7 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Saving track edits ")
+        .title(" Saving media edits ")
         .title_bottom(Line::from(" Esc/q/Ctrl-C cancel ").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -530,7 +535,12 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
 
     if let Some(progress) = app.edit_progress {
         let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u16;
-        frame.render_widget(Paragraph::new("Remuxing with ffmpeg…").centered(), rows[0]);
+        let action = if app.video_settings.is_empty() {
+            "Remuxing with ffmpeg…"
+        } else {
+            "Transcoding with ffmpeg…"
+        };
+        frame.render_widget(Paragraph::new(action).centered(), rows[0]);
         frame.render_widget(
             Gauge::default()
                 .gauge_style(
@@ -550,13 +560,140 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
             .map_or(0, |started| (started.elapsed().as_millis() / 80) as usize);
         frame.render_widget(
             Paragraph::new(format!(
-                "{}  Remuxing with ffmpeg…",
-                SPINNER[tick % SPINNER.len()]
+                "{}  {}",
+                SPINNER[tick % SPINNER.len()],
+                if app.video_settings.is_empty() {
+                    "Remuxing with ffmpeg…"
+                } else {
+                    "Transcoding with ffmpeg…"
+                }
             ))
             .centered()
             .style(Style::default().fg(Color::Cyan).bold()),
             rows[1],
         );
+    }
+}
+
+fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.video_settings_popup.as_ref() else {
+        return;
+    };
+    let settings = app
+        .video_settings
+        .get(&popup.stream_index)
+        .copied()
+        .unwrap_or_default();
+    let stream = app.selected_stream_info();
+    let source_codec = stream
+        .and_then(|stream| string(stream, "codec_name"))
+        .unwrap_or("unknown")
+        .to_uppercase();
+    let codec_label = match settings.codec {
+        VideoCodec::Original => format!("Original ({source_codec})"),
+        codec => codec.label().to_string(),
+    };
+    let resolution_choices = app.resolution_choices(popup.stream_index);
+    let resolution_label = resolution_choices
+        .iter()
+        .find(|choice| choice.value == settings.resolution)
+        .map(|choice| choice.label.clone())
+        .unwrap_or_else(|| settings.resolution.label().to_string());
+
+    let mut lines = vec![
+        setting_line(
+            "Codec",
+            &codec_label,
+            popup.field == VideoSettingsField::Codec,
+        ),
+        setting_line(
+            "Resolution",
+            &resolution_label,
+            popup.field == VideoSettingsField::Resolution,
+        ),
+    ];
+    if popup.dropdown_open {
+        lines.push(Line::from(""));
+        match popup.field {
+            VideoSettingsField::Codec => {
+                for (position, codec) in VideoCodec::OPTIONS.iter().enumerate() {
+                    let label = if *codec == VideoCodec::Original {
+                        format!("Original ({source_codec})")
+                    } else {
+                        codec.label().to_string()
+                    };
+                    lines.push(dropdown_line(
+                        &label,
+                        position == popup.codec_cursor,
+                        *codec == settings.codec,
+                        true,
+                    ));
+                }
+            }
+            VideoSettingsField::Resolution => {
+                for (position, choice) in resolution_choices.iter().enumerate() {
+                    lines.push(dropdown_line(
+                        &choice.label,
+                        position == popup.resolution_cursor,
+                        choice.value == settings.resolution,
+                        choice.enabled,
+                    ));
+                }
+            }
+        }
+    }
+
+    let height = (lines.len() as u16 + 4).max(7);
+    let area = centered_fixed(frame.area(), 58, height);
+    let footer = if popup.dropdown_open {
+        " j/k choose · Enter select · Esc back "
+    } else {
+        " j/k field · Enter open · Ctrl-S save · Esc close "
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!(" Video track #{} settings ", popup.stream_index))
+                .title_bottom(Line::from(footer).right_aligned()),
+        ),
+        area,
+    );
+}
+
+fn setting_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<12}"),
+            Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
+        ),
+        Span::styled(
+            format!("[ {value} ]"),
+            if selected {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default()
+            },
+        ),
+    ])
+}
+
+fn dropdown_line(label: &str, cursor: bool, selected: bool, enabled: bool) -> Line<'static> {
+    let marker = if selected { "●" } else { " " };
+    let line = Line::from(format!("  {marker} {label}"));
+    if !enabled {
+        line.style(Style::default().fg(Color::DarkGray))
+    } else if cursor {
+        line.style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        line
     }
 }
 

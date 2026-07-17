@@ -41,6 +41,24 @@ fn main() -> Result<()> {
                     }
                     continue;
                 }
+                if app.dialog == Some(Dialog::VideoSettings) {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            app.move_video_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            app.move_video_settings_cursor(-1)
+                        }
+                        (KeyCode::Enter, _) => app.activate_video_settings(),
+                        (KeyCode::Esc, _) => app.escape_video_settings(),
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            app.close_video_settings();
+                            app.request_save();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if app.dialog == Some(Dialog::Keybindings) {
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q'), _) => {
@@ -80,6 +98,7 @@ fn main() -> Result<()> {
                     (KeyCode::Esc, _) if !app.back() => break,
                     (KeyCode::Char('d'), KeyModifiers::NONE) => app.toggle_delete_selected_stream(),
                     (KeyCode::Char('a'), KeyModifiers::NONE) => app.set_selected_stream_default(),
+                    (KeyCode::Char('e'), KeyModifiers::NONE) => app.open_video_settings(),
                     (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.request_save(),
                     (KeyCode::Char('k'), KeyModifiers::CONTROL) => app.move_selected_stream(-1),
                     (KeyCode::Char('j'), KeyModifiers::CONTROL) => app.move_selected_stream(1),

@@ -14,7 +14,10 @@ use anyhow::Result;
 use ratatui::widgets::ListState;
 
 use crate::{
-    edit::{EditEvent, EditOutcome, EditRequest, stream_index, validate_edit},
+    edit::{
+        EditEvent, EditOutcome, EditRequest, VideoCodec, VideoResolution, VideoSettings,
+        stream_index, validate_edit,
+    },
     files::{FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
 };
@@ -30,9 +33,33 @@ pub enum Layer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialog {
     Keybindings,
+    VideoSettings,
     ConfirmSave,
     Processing,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoSettingsField {
+    #[default]
+    Codec,
+    Resolution,
+}
+
+#[derive(Clone, Debug)]
+pub struct VideoSettingsPopup {
+    pub stream_index: u64,
+    pub field: VideoSettingsField,
+    pub dropdown_open: bool,
+    pub codec_cursor: usize,
+    pub resolution_cursor: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionChoice {
+    pub value: VideoResolution,
+    pub label: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -68,6 +95,8 @@ pub struct App {
     pub stream_order: Vec<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
+    pub video_settings: BTreeMap<u64, VideoSettings>,
+    pub video_settings_popup: Option<VideoSettingsPopup>,
     pub dialog: Option<Dialog>,
     pub notice: Option<String>,
     pub edit_error: Option<String>,
@@ -105,6 +134,8 @@ impl App {
             stream_order: Vec::new(),
             deleted_streams: BTreeSet::new(),
             default_streams: BTreeSet::new(),
+            video_settings: BTreeMap::new(),
+            video_settings_popup: None,
             dialog: None,
             notice: None,
             edit_error: None,
@@ -298,7 +329,7 @@ impl App {
                         self.edit_error = None;
                         self.edit_progress = None;
                         self.edit_started = None;
-                        self.notice = Some("Track edits saved.".to_string());
+                        self.notice = Some("Media edits saved.".to_string());
                         self.cache.retain(|key, _| key.path != path);
                         self.queue_probe();
                         self.layer = Layer::Streams;
@@ -389,6 +420,7 @@ impl App {
         }
 
         self.deleted_streams.insert(index);
+        self.video_settings.remove(&index);
         self.notice = None;
         self.selected_stream =
             (self.selected_stream + 1).min(self.stream_count().saturating_sub(1));
@@ -467,6 +499,230 @@ impl App {
         self.notice = None;
     }
 
+    pub fn open_video_settings(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        let Some(index) = self.selected_stream_index() else {
+            return;
+        };
+        if self.deleted_streams.contains(&index) {
+            self.notice =
+                Some("Unmark this track for deletion before changing its video settings.".into());
+            return;
+        }
+        let playable_video = self.selected_stream_info().is_some_and(|stream| {
+            stream_kind(stream) == Some("video") && !crate::probe::is_attached_picture(stream)
+        });
+        if !playable_video {
+            self.notice = Some("Encoding settings are only available for video tracks.".into());
+            return;
+        }
+
+        let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        let resolutions = self.resolution_choices(index);
+        self.video_settings_popup = Some(VideoSettingsPopup {
+            stream_index: index,
+            field: VideoSettingsField::Codec,
+            dropdown_open: false,
+            codec_cursor: VideoCodec::OPTIONS
+                .iter()
+                .position(|codec| *codec == settings.codec)
+                .unwrap_or(0),
+            resolution_cursor: resolutions
+                .iter()
+                .position(|choice| choice.value == settings.resolution)
+                .unwrap_or_else(|| {
+                    resolutions
+                        .iter()
+                        .position(|choice| choice.value == VideoResolution::Original)
+                        .unwrap_or(0)
+                }),
+        });
+        self.notice = None;
+        self.dialog = Some(Dialog::VideoSettings);
+    }
+
+    pub fn move_video_settings_cursor(&mut self, direction: isize) {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            return;
+        };
+        if !popup.dropdown_open {
+            let popup = self.video_settings_popup.as_mut().unwrap();
+            popup.field = match (popup.field, direction.is_positive()) {
+                (VideoSettingsField::Codec, true) => VideoSettingsField::Resolution,
+                (VideoSettingsField::Resolution, false) => VideoSettingsField::Codec,
+                (field, _) => field,
+            };
+            return;
+        }
+
+        match popup.field {
+            VideoSettingsField::Codec => {
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.codec_cursor = move_cursor(
+                    popup.codec_cursor,
+                    VideoCodec::OPTIONS.len(),
+                    direction,
+                    |_| true,
+                );
+            }
+            VideoSettingsField::Resolution => {
+                let choices = self.resolution_choices(popup.stream_index);
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.resolution_cursor = move_cursor(
+                    popup.resolution_cursor,
+                    choices.len(),
+                    direction,
+                    |position| choices[position].enabled,
+                );
+            }
+        }
+    }
+
+    pub fn activate_video_settings(&mut self) {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            return;
+        };
+        if !popup.dropdown_open {
+            self.video_settings_popup.as_mut().unwrap().dropdown_open = true;
+            return;
+        }
+
+        let index = popup.stream_index;
+        let field = popup.field;
+        let codec_cursor = popup.codec_cursor;
+        let resolution_cursor = popup.resolution_cursor;
+        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        match field {
+            VideoSettingsField::Codec => settings.codec = VideoCodec::OPTIONS[codec_cursor],
+            VideoSettingsField::Resolution => {
+                let choices = self.resolution_choices(index);
+                let Some(choice) = choices
+                    .get(resolution_cursor)
+                    .filter(|choice| choice.enabled)
+                else {
+                    return;
+                };
+                settings.resolution = choice.value;
+            }
+        }
+        if self.settings_change_stream(index, settings) {
+            self.video_settings.insert(index, settings);
+        } else {
+            self.video_settings.remove(&index);
+        }
+        self.video_settings_popup.as_mut().unwrap().dropdown_open = false;
+    }
+
+    pub fn escape_video_settings(&mut self) {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            self.dialog = None;
+            return;
+        };
+        if popup.dropdown_open {
+            let index = popup.stream_index;
+            let field = popup.field;
+            let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+            let resolution_cursor = (field == VideoSettingsField::Resolution).then(|| {
+                self.resolution_choices(index)
+                    .iter()
+                    .position(|choice| choice.value == settings.resolution)
+                    .unwrap_or(0)
+            });
+            let popup = self.video_settings_popup.as_mut().unwrap();
+            popup.dropdown_open = false;
+            match field {
+                VideoSettingsField::Codec => {
+                    popup.codec_cursor = VideoCodec::OPTIONS
+                        .iter()
+                        .position(|codec| *codec == settings.codec)
+                        .unwrap_or(0);
+                }
+                VideoSettingsField::Resolution => {
+                    popup.resolution_cursor = resolution_cursor.unwrap_or(0);
+                }
+            }
+            return;
+        }
+        self.video_settings_popup = None;
+        self.dialog = None;
+    }
+
+    pub fn close_video_settings(&mut self) {
+        self.video_settings_popup = None;
+        self.dialog = None;
+    }
+
+    pub fn resolution_choices(&self, index: u64) -> Vec<ResolutionChoice> {
+        let stream = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index));
+        let width = stream.and_then(|stream| stream_number(stream, "width"));
+        let height = stream.and_then(|stream| stream_number(stream, "height"));
+        let original_label = match (width, height) {
+            (Some(width), Some(height)) => format!("Original ({width}×{height})"),
+            _ => "Original".to_string(),
+        };
+        let original = ResolutionChoice {
+            value: VideoResolution::Original,
+            label: original_label,
+            enabled: true,
+        };
+        let Some(source_height) = height else {
+            return std::iter::once(original)
+                .chain(
+                    VideoResolution::PRESETS
+                        .into_iter()
+                        .map(|value| ResolutionChoice {
+                            label: value.label().to_string(),
+                            value,
+                            enabled: false,
+                        }),
+                )
+                .collect();
+        };
+
+        let mut choices = Vec::new();
+        let mut inserted_original = false;
+        for value in VideoResolution::PRESETS {
+            let preset_height = value.height().unwrap();
+            if !inserted_original && source_height >= preset_height {
+                choices.push(original.clone());
+                inserted_original = true;
+                if source_height == preset_height {
+                    continue;
+                }
+            }
+            choices.push(ResolutionChoice {
+                label: value.label().to_string(),
+                value,
+                enabled: preset_height < source_height,
+            });
+        }
+        if !inserted_original {
+            choices.push(original);
+        }
+        choices
+    }
+
+    fn settings_change_stream(&self, index: u64, settings: VideoSettings) -> bool {
+        if settings.resolution != VideoResolution::Original {
+            return true;
+        }
+        let source_codec = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))
+            .and_then(|stream| stream.get("codec_name"))
+            .and_then(serde_json::Value::as_str);
+        match settings.codec {
+            VideoCodec::Original => false,
+            VideoCodec::H264 => source_codec != Some("h264"),
+            VideoCodec::Hevc => source_codec != Some("hevc"),
+            VideoCodec::Av1 => source_codec != Some("av1"),
+        }
+    }
+
     pub fn request_save(&mut self) {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
@@ -484,7 +740,13 @@ impl App {
             .difference(&self.deleted_streams)
             .copied()
             .collect();
-        if let Err(error) = validate_edit(info, &order, &self.deleted_streams, &defaults) {
+        if let Err(error) = validate_edit(
+            info,
+            &order,
+            &self.deleted_streams,
+            &defaults,
+            &self.video_settings,
+        ) {
             self.show_error(error);
             return;
         }
@@ -517,6 +779,7 @@ impl App {
             stream_order,
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
+            video_settings: self.video_settings.clone(),
             cancelled: cancelled.clone(),
         };
         match self.edit_tx.send(request) {
@@ -546,7 +809,7 @@ impl App {
         self.edit_error = None;
         self.edit_progress = None;
         self.edit_started = None;
-        self.notice = Some("Remux cancelled.".to_string());
+        self.notice = Some("Media edit cancelled.".to_string());
         self.layer = Layer::Files;
     }
 
@@ -625,6 +888,8 @@ impl App {
         self.default_streams = defaults.clone();
         self.original_default_streams = defaults;
         self.deleted_streams.clear();
+        self.video_settings.clear();
+        self.video_settings_popup = None;
     }
 
     fn clear_track_edits(&mut self) {
@@ -633,17 +898,21 @@ impl App {
         self.deleted_streams.clear();
         self.default_streams.clear();
         self.original_default_streams.clear();
+        self.video_settings.clear();
+        self.video_settings_popup = None;
     }
 
     pub fn changed_streams(&self) -> BTreeSet<u64> {
-        changed_streams(
+        let mut changed = changed_streams(
             &self.original_stream_order,
             &self.stream_order,
             &self.deleted_streams,
             &self.original_default_streams,
             &self.default_streams,
             self.media_info(),
-        )
+        );
+        changed.extend(self.video_settings.keys().copied());
+        changed
     }
 
     pub fn has_track_edits(&self) -> bool {
@@ -654,14 +923,34 @@ impl App {
         let Some(info) = self.media_info() else {
             return Vec::new();
         };
-        edit_summary(
+        let mut lines = edit_summary(
             info,
             &self.original_stream_order,
             &self.stream_order,
             &self.deleted_streams,
             &self.original_default_streams,
             &self.default_streams,
-        )
+        );
+        for (index, settings) in &self.video_settings {
+            let codec = match settings.codec {
+                VideoCodec::Original => self
+                    .media_info()
+                    .and_then(|info| stream_by_index(info, *index))
+                    .and_then(|stream| stream.get("codec_name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|codec| codec.to_uppercase())
+                    .unwrap_or_else(|| "original codec".to_string()),
+                codec => codec.label().to_string(),
+            };
+            let resolution = settings.resolution.label();
+            lines.push(match settings.resolution {
+                VideoResolution::Original => {
+                    format!("Encoding video track #{index} as {codec}")
+                }
+                _ => format!("Encoding video track #{index} as {codec} at {resolution}"),
+            });
+        }
+        lines
     }
 
     fn show_error(&mut self, error: impl Into<String>) {
@@ -673,6 +962,41 @@ impl App {
 
 fn scroll_forward(current: u16, maximum: u16, amount: u16) -> u16 {
     current.saturating_add(amount).min(maximum)
+}
+
+fn move_cursor(
+    current: usize,
+    length: usize,
+    direction: isize,
+    enabled: impl Fn(usize) -> bool,
+) -> usize {
+    if length == 0 || direction == 0 {
+        return current;
+    }
+    let mut position = current;
+    loop {
+        let Some(next) = position.checked_add_signed(direction.signum()) else {
+            return current;
+        };
+        if next >= length {
+            return current;
+        }
+        position = next;
+        if enabled(position) {
+            return position;
+        }
+    }
+}
+
+fn stream_number(
+    stream: &std::collections::BTreeMap<String, serde_json::Value>,
+    name: &str,
+) -> Option<u64> {
+    stream.get(name).and_then(|value| match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(number) => number.parse().ok(),
+        _ => None,
+    })
 }
 
 fn scroll_backward(current: u16, amount: u16) -> u16 {
@@ -1165,6 +1489,113 @@ mod tests {
 
         // Assert
         assert_that!(app.notice.as_deref().unwrap()).contains("Unmark");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_show_higher_presets_disabled_and_original_in_size_order() {
+        // Arrange
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.resolution_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([
+            "2160p",
+            "1440p",
+            "Original (1920×1080)",
+            "720p",
+            "480p",
+        ]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.enabled)
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, true, true, true]);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selecting_source_codec_should_remain_a_no_op_when_popup_closes() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.open_video_settings();
+        app.activate_video_settings();
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+
+        // Act
+        app.escape_video_settings();
+
+        // Assert
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.video_settings).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn video_resolution_cursor_should_skip_disabled_higher_presets() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.open_video_settings();
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+        let original_cursor = app.video_settings_popup.as_ref().unwrap().resolution_cursor;
+
+        // Act
+        app.move_video_settings_cursor(-1);
+
+        // Assert
+        assert_that!(app.video_settings_popup.as_ref().unwrap().resolution_cursor)
+            .is_equal_to(original_cursor);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changed_codec_should_be_staged_and_mark_the_video_stream_as_changed() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.open_video_settings();
+        app.activate_video_settings();
+        app.move_video_settings_cursor(1);
+        app.move_video_settings_cursor(1);
+
+        // Act
+        app.activate_video_settings();
+
+        // Assert
+        assert_that!(app.video_settings.get(&0).map(|settings| settings.codec))
+            .contains(VideoCodec::Hevc);
+        assert_that!(app.changed_streams()).contains(0);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

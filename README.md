@@ -19,3 +19,4 @@ TODO
 - View video, audio, subtitle, and other tracks grouped by type
 - Reorder tracks, choose default tracks, and remove unwanted tracks
 - Apply track edits without re-encoding by remuxing with `ffmpeg`
+- Change individual video tracks to H.264, HEVC, or AV1 and downscale their resolution
