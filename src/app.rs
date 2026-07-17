@@ -29,6 +29,7 @@ pub enum Layer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialog {
+    Keybindings,
     ConfirmDelete,
     Processing,
     Error,
@@ -60,6 +61,8 @@ pub struct App {
     pub loading: bool,
     pub details_scroll: u16,
     pub details_max_scroll: u16,
+    pub keybindings_scroll: u16,
+    pub keybindings_max_scroll: u16,
     pub layer: Layer,
     pub selected_stream: usize,
     pub marked_streams: BTreeSet<u64>,
@@ -91,6 +94,8 @@ impl App {
             loading: false,
             details_scroll: 0,
             details_max_scroll: 0,
+            keybindings_scroll: 0,
+            keybindings_max_scroll: 0,
             layer: Layer::Files,
             selected_stream: 0,
             marked_streams: BTreeSet::new(),
@@ -385,7 +390,7 @@ impl App {
             return;
         }
         if self.marked_streams.is_empty() {
-            self.show_error("Mark one or more tracks with Space first.");
+            self.show_error("Select one or more tracks with Space first.");
             return;
         }
         if let Some(info) = self.media_info()
@@ -455,15 +460,34 @@ impl App {
         self.edit_cancel = None;
     }
 
+    pub fn show_keybindings(&mut self) {
+        if self.dialog.is_none() {
+            self.keybindings_scroll = 0;
+            self.keybindings_max_scroll = 0;
+            self.dialog = Some(Dialog::Keybindings);
+        }
+    }
+
+    pub fn scroll_keybindings_down(&mut self, amount: u16) {
+        self.keybindings_scroll =
+            scroll_forward(self.keybindings_scroll, self.keybindings_max_scroll, amount);
+    }
+
+    pub fn scroll_keybindings_up(&mut self, amount: u16) {
+        self.keybindings_scroll = scroll_backward(self.keybindings_scroll, amount);
+    }
+
+    pub fn set_keybindings_max_scroll(&mut self, maximum: u16) {
+        self.keybindings_max_scroll = maximum;
+        self.keybindings_scroll = self.keybindings_scroll.min(maximum);
+    }
+
     pub fn scroll_down(&mut self) {
-        self.details_scroll = self
-            .details_scroll
-            .saturating_add(10)
-            .min(self.details_max_scroll);
+        self.details_scroll = scroll_forward(self.details_scroll, self.details_max_scroll, 10);
     }
 
     pub fn scroll_up(&mut self) {
-        self.details_scroll = self.details_scroll.saturating_sub(10);
+        self.details_scroll = scroll_backward(self.details_scroll, 10);
     }
 
     pub fn set_details_max_scroll(&mut self, maximum: u16) {
@@ -485,6 +509,14 @@ impl App {
         self.edit_error = Some(error.into());
         self.dialog = Some(Dialog::Error);
     }
+}
+
+fn scroll_forward(current: u16, maximum: u16, amount: u16) -> u16 {
+    current.saturating_add(amount).min(maximum)
+}
+
+fn scroll_backward(current: u16, amount: u16) -> u16 {
+    current.saturating_sub(amount)
 }
 
 pub fn grouped_stream_indices(info: &MediaInfo) -> Vec<usize> {
@@ -512,4 +544,18 @@ pub fn grouped_stream_indices(info: &MediaInfo) -> Vec<usize> {
                 }),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scroll_backward, scroll_forward};
+
+    #[test]
+    fn scrolling_stays_within_its_bounds() {
+        assert_eq!(scroll_forward(4, 10, 3), 7);
+        assert_eq!(scroll_forward(7, 10, 10), 10);
+        assert_eq!(scroll_forward(u16::MAX, 10, 1), 10);
+        assert_eq!(scroll_backward(7, 3), 4);
+        assert_eq!(scroll_backward(2, 10), 0);
+    }
 }

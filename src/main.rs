@@ -41,10 +41,28 @@ fn main() -> Result<()> {
                     }
                     continue;
                 }
+                if app.dialog == Some(Dialog::Keybindings) {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q'), _) => {
+                            app.dismiss_dialog()
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, _) => app.scroll_keybindings_down(1),
+                        (KeyCode::Char('k') | KeyCode::Up, _) => app.scroll_keybindings_up(1),
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            app.scroll_keybindings_down(10)
+                        }
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                            app.scroll_keybindings_up(10)
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if key.code != KeyCode::Char('g') {
                     pending_g = None;
                 }
                 match (key.code, key.modifiers) {
+                    (KeyCode::Char('?'), _) if app.dialog.is_none() => app.show_keybindings(),
                     (KeyCode::Char('y'), _) if app.dialog == Some(Dialog::ConfirmDelete) => {
                         app.confirm_delete()
                     }

@@ -139,19 +139,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let directory = app.directory.to_string_lossy();
-    let keys = match app.layer {
-        Layer::Files => " j/k move  gg/G first/last  Enter select  r refresh  q/Esc quit ",
-        Layer::Streams => {
-            " j/k move  gg/G first/last  Space mark  d delete  Enter details  Esc files "
-        }
-        Layer::StreamDetails => " j/k scroll  Esc streams  q quit ",
-    };
+    let hint = " ? keybinds ";
     let available = area.width as usize;
-    let directory_width = available.saturating_sub(keys.len());
+    let directory_width = available.saturating_sub(hint.len());
     let directory = truncate(&directory, directory_width);
+    let padding = " ".repeat(
+        available
+            .saturating_sub(directory.chars().count())
+            .saturating_sub(hint.len()),
+    );
     let line = Line::from(vec![
         Span::styled(directory, Style::default().fg(Color::DarkGray)),
-        Span::raw(keys),
+        Span::raw(padding),
+        Span::styled(hint, Style::default().fg(Color::Cyan)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -357,12 +357,17 @@ fn stream_line(
     }
 }
 
-fn render_dialog(frame: &mut Frame, app: &App, dialog: Dialog) {
+fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
+    if dialog == Dialog::Keybindings {
+        render_keybindings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::Processing {
         render_progress_dialog(frame, app);
         return;
     }
     let (title, body, footer, color) = match dialog {
+        Dialog::Keybindings => unreachable!(),
         Dialog::ConfirmDelete => {
             let count = app.marked_streams.len();
             (
@@ -399,6 +404,73 @@ fn render_dialog(frame: &mut Frame, app: &App, dialog: Dialog) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
+    let area = popup_area(frame.area(), 80, 80);
+    let text = keybindings_text();
+    app.set_keybindings_max_scroll(max_scroll(&text, area));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Keybindings ")
+                    .title_bottom(Line::from(" j/k scroll · Esc close ").right_aligned()),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.keybindings_scroll, 0)),
+        area,
+    );
+}
+
+fn keybindings_text() -> Text<'static> {
+    let mut lines = Vec::new();
+    keybindings_section(&mut lines, "General");
+    keybinding(&mut lines, "?", "Open keybindings");
+    keybinding(&mut lines, "Esc", "Close or go back");
+    keybinding(&mut lines, "q", "Quit");
+    keybinding(&mut lines, "r", "Refresh the current directory");
+
+    keybindings_section(&mut lines, "Files");
+    keybinding(&mut lines, "j / Down", "Move to the next file");
+    keybinding(&mut lines, "k / Up", "Move to the previous file");
+    keybinding(&mut lines, "gg / G", "Move to the first / last file");
+    keybinding(&mut lines, "Enter", "Open the track list");
+
+    keybindings_section(&mut lines, "Tracks");
+    keybinding(&mut lines, "j / Down", "Move to the next track");
+    keybinding(&mut lines, "k / Up", "Move to the previous track");
+    keybinding(&mut lines, "gg / G", "Move to the first / last track");
+    keybinding(&mut lines, "Space", "Select or deselect a track");
+    keybinding(&mut lines, "d", "Delete selected tracks");
+    keybinding(&mut lines, "Enter", "Open full stream details");
+
+    keybindings_section(&mut lines, "Stream details");
+    keybinding(&mut lines, "j / Down", "Scroll down");
+    keybinding(&mut lines, "k / Up", "Scroll up");
+    keybinding(&mut lines, "Ctrl-d / Ctrl-u", "Scroll down / up by a page");
+    Text::from(lines)
+}
+
+fn keybindings_section(lines: &mut Vec<Line<'static>>, name: &str) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::styled(
+        name.to_string(),
+        Style::default().fg(Color::Cyan).bold(),
+    ));
+}
+
+fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
+        Span::raw(description.to_string()),
+    ]));
 }
 
 fn render_progress_dialog(frame: &mut Frame, app: &App) {
@@ -766,5 +838,20 @@ mod tests {
         assert_eq!(scroll_to_show_line(&text, area, 0, 2), 0);
         assert_eq!(scroll_to_show_line(&text, area, 4, 0), 2);
         assert_eq!(scroll_to_show_line(&text, area, 2, 0), 0);
+    }
+
+    #[test]
+    fn keybindings_help_covers_every_context() {
+        let help = keybindings_text().to_string();
+
+        for section in ["General", "Files", "Tracks", "Stream details"] {
+            assert!(
+                help.contains(section),
+                "missing keybinding section: {section}"
+            );
+        }
+        for binding in ["Esc", "gg / G", "Space", "Ctrl-d / Ctrl-u"] {
+            assert!(help.contains(binding), "missing keybinding: {binding}");
+        }
     }
 }

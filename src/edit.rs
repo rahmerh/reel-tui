@@ -71,7 +71,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
 
 pub(crate) fn validate_deletion(info: &MediaInfo, selected: &BTreeSet<u64>) -> Result<(), String> {
     if selected.is_empty() {
-        return Err("No tracks are marked for deletion.".to_string());
+        return Err("No tracks are selected for deletion.".to_string());
     }
 
     let available: BTreeSet<_> = info.streams.iter().filter_map(stream_index).collect();
