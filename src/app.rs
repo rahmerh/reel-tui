@@ -14,8 +14,8 @@ use ratatui::widgets::ListState;
 
 use crate::{
     edit::{
-        EditEvent, EditOutcome, EditRequest, VideoCodec, VideoResolution, VideoSettings,
-        stream_index, validate_edit,
+        EditEvent, EditOutcome, EditRequest, SaveDestination, VideoCodec, VideoResolution,
+        VideoSettings, stream_index, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -43,6 +43,13 @@ pub enum VideoSettingsField {
     #[default]
     Codec,
     Resolution,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SaveDialogField {
+    Destination,
+    #[default]
+    Start,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +108,8 @@ pub struct App {
     pub default_streams: BTreeSet<u64>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub video_settings_popup: Option<VideoSettingsPopup>,
+    pub save_destination: SaveDestination,
+    pub save_dialog_field: SaveDialogField,
     pub dialog: Option<Dialog>,
     pub notice: Option<String>,
     pub edit_error: Option<String>,
@@ -140,6 +149,8 @@ impl App {
             default_streams: BTreeSet::new(),
             video_settings: BTreeMap::new(),
             video_settings_popup: None,
+            save_destination: SaveDestination::ReplaceOriginal,
+            save_dialog_field: SaveDialogField::Start,
             dialog: None,
             notice: None,
             edit_error: None,
@@ -251,7 +262,7 @@ impl App {
             return;
         }
         if self.layer == Layer::StreamDetails {
-            self.scroll_down();
+            self.scroll_details_down(1);
             return;
         }
         if self.files.is_empty() {
@@ -272,7 +283,7 @@ impl App {
             return;
         }
         if self.layer == Layer::StreamDetails {
-            self.scroll_up();
+            self.scroll_details_up(1);
             return;
         }
         let previous = self
@@ -285,6 +296,10 @@ impl App {
 
     pub fn select_first(&mut self) {
         self.notice = None;
+        if self.layer == Layer::StreamDetails {
+            self.details_scroll = 0;
+            return;
+        }
         if self.layer == Layer::Streams {
             self.selected_stream = 0;
             return;
@@ -296,6 +311,10 @@ impl App {
 
     pub fn select_last(&mut self) {
         self.notice = None;
+        if self.layer == Layer::StreamDetails {
+            self.details_scroll = self.details_max_scroll;
+            return;
+        }
         if self.layer == Layer::Streams {
             self.selected_stream = self.stream_count().saturating_sub(1);
             return;
@@ -384,9 +403,14 @@ impl App {
             match event {
                 EditEvent::Progress(progress) => self.edit_progress = progress,
                 EditEvent::Finished { path, outcome } => match outcome {
-                    EditOutcome::Completed => {
+                    EditOutcome::Completed { output_path } => {
                         if let Ok(files) = scan_directory(&self.directory) {
                             self.reconcile_files(files);
+                        }
+                        if let Some(index) =
+                            self.files.iter().position(|file| file.path == output_path)
+                        {
+                            self.list_state.select(Some(index));
                         }
                         self.edit_cancel = None;
                         self.clear_track_edits();
@@ -394,8 +418,19 @@ impl App {
                         self.edit_error = None;
                         self.edit_progress = None;
                         self.edit_started = None;
-                        self.notice = Some("Media edits saved.".to_string());
-                        self.cache.retain(|key, _| key.path != path);
+                        self.notice = Some(if output_path == path {
+                            "Media edits saved.".to_string()
+                        } else {
+                            format!(
+                                "Media edits saved to {}.",
+                                output_path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("edited copy")
+                            )
+                        });
+                        self.cache
+                            .retain(|key, _| key.path != path && key.path != output_path);
                         self.queue_probe();
                         self.layer = Layer::Streams;
                     }
@@ -429,17 +464,20 @@ impl App {
         if self.dialog.is_some() {
             return;
         }
-        match self.layer {
-            Layer::Files if self.stream_count() > 0 => {
-                self.layer = Layer::Streams;
-                self.selected_stream = 0;
-            }
-            Layer::Streams if self.selected_stream_info().is_some() => {
-                self.layer = Layer::StreamDetails;
-                self.details_scroll = 0;
-                self.details_max_scroll = 0;
-            }
-            _ => {}
+        if self.layer == Layer::Files && self.stream_count() > 0 {
+            self.layer = Layer::Streams;
+            self.selected_stream = 0;
+        }
+    }
+
+    pub fn open_stream_details(&mut self) {
+        if self.dialog.is_none()
+            && self.layer == Layer::Streams
+            && self.selected_stream_info().is_some()
+        {
+            self.layer = Layer::StreamDetails;
+            self.details_scroll = 0;
+            self.details_max_scroll = 0;
         }
     }
 
@@ -827,7 +865,49 @@ impl App {
             return;
         }
         self.notice = None;
+        self.save_destination = SaveDestination::ReplaceOriginal;
+        self.save_dialog_field = SaveDialogField::Start;
         self.dialog = Some(Dialog::ConfirmSave);
+    }
+
+    pub fn move_save_dialog_cursor(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmSave) || direction == 0 {
+            return;
+        }
+        self.save_dialog_field = match (self.save_dialog_field, direction.is_positive()) {
+            (SaveDialogField::Destination, true) => SaveDialogField::Start,
+            (SaveDialogField::Start, false) => SaveDialogField::Destination,
+            (field, _) => field,
+        };
+    }
+
+    pub fn choose_save_destination(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmSave)
+            || self.save_dialog_field != SaveDialogField::Destination
+            || direction == 0
+        {
+            return;
+        }
+        self.save_destination = if direction.is_positive() {
+            SaveDestination::CreateCopy
+        } else {
+            SaveDestination::ReplaceOriginal
+        };
+    }
+
+    pub fn activate_save_dialog(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmSave) {
+            return;
+        }
+        match self.save_dialog_field {
+            SaveDialogField::Destination => {
+                self.save_destination = match self.save_destination {
+                    SaveDestination::ReplaceOriginal => SaveDestination::CreateCopy,
+                    SaveDestination::CreateCopy => SaveDestination::ReplaceOriginal,
+                };
+            }
+            SaveDialogField::Start => self.confirm_save(),
+        }
     }
 
     pub fn confirm_save(&mut self) {
@@ -852,6 +932,7 @@ impl App {
         let cancelled = Arc::new(AtomicBool::new(false));
         let request = EditRequest {
             path,
+            destination: self.save_destination,
             stream_order,
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
@@ -880,13 +961,12 @@ impl App {
         if let Some(cancelled) = self.edit_cancel.take() {
             cancelled.store(true, Ordering::Relaxed);
         }
-        self.clear_track_edits();
         self.dialog = None;
         self.edit_error = None;
         self.edit_progress = None;
         self.edit_started = None;
         self.notice = Some("Media edit cancelled.".to_string());
-        self.layer = Layer::Files;
+        self.layer = Layer::Streams;
     }
 
     pub fn dismiss_dialog(&mut self) {
@@ -917,17 +997,33 @@ impl App {
         self.keybindings_scroll = scroll_backward(self.keybindings_scroll, amount);
     }
 
+    pub fn scroll_keybindings_to_start(&mut self) {
+        self.keybindings_scroll = 0;
+    }
+
+    pub fn scroll_keybindings_to_end(&mut self) {
+        self.keybindings_scroll = self.keybindings_max_scroll;
+    }
+
     pub fn set_keybindings_max_scroll(&mut self, maximum: u16) {
         self.keybindings_max_scroll = maximum;
         self.keybindings_scroll = self.keybindings_scroll.min(maximum);
     }
 
     pub fn scroll_down(&mut self) {
-        self.details_scroll = scroll_forward(self.details_scroll, self.details_max_scroll, 10);
+        self.scroll_details_down(10);
     }
 
     pub fn scroll_up(&mut self) {
-        self.details_scroll = scroll_backward(self.details_scroll, 10);
+        self.scroll_details_up(10);
+    }
+
+    fn scroll_details_down(&mut self, amount: u16) {
+        self.details_scroll = scroll_forward(self.details_scroll, self.details_max_scroll, amount);
+    }
+
+    fn scroll_details_up(&mut self, amount: u16) {
+        self.details_scroll = scroll_backward(self.details_scroll, amount);
     }
 
     pub fn set_details_max_scroll(&mut self, maximum: u16) {
@@ -1821,6 +1917,155 @@ mod tests {
         // Assert
         assert_that!(&app.scan_error).is_none();
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_dialog_should_open_on_replace_with_start_selected_and_allow_copy_selection() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
+        ])));
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+
+        // Act
+        app.request_save();
+        let initial_field = app.save_dialog_field;
+        app.move_save_dialog_cursor(-1);
+        app.activate_save_dialog();
+
+        // Assert
+        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+        assert_that!(initial_field).is_equal_to(SaveDialogField::Start);
+        assert_that!(app.save_destination).is_equal_to(SaveDestination::CreateCopy);
+        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Destination);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn activating_start_should_send_the_selected_destination_to_the_worker() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-save-dialog-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("alpha.mkv"), b"media").unwrap();
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (edit_tx, edit_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
+        ]))));
+        app.loading = false;
+        app.reset_track_edits();
+        app.layer = Layer::Streams;
+        app.deleted_streams.insert(2);
+        app.request_save();
+        app.move_save_dialog_cursor(-1);
+        app.activate_save_dialog();
+        app.move_save_dialog_cursor(1);
+
+        // Act
+        app.activate_save_dialog();
+        let request = edit_rx.try_recv().unwrap();
+
+        // Assert
+        assert_that!(request.destination).is_equal_to(SaveDestination::CreateCopy);
+        assert_that!(app.dialog).contains(Dialog::Processing);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completed_copy_should_refresh_and_select_the_output_file() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        let source = directory.join("alpha.mkv");
+        let output = directory.join("alpha-edited.mkv");
+        std::fs::write(&output, b"edited media").unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        app.dialog = Some(Dialog::Processing);
+        result_tx
+            .send(EditEvent::Finished {
+                path: source,
+                outcome: EditOutcome::Completed {
+                    output_path: output,
+                },
+            })
+            .unwrap();
+
+        // Act
+        app.receive_edit_results(&result_rx);
+
+        // Assert
+        assert_that!(app.selected_file().unwrap().display_name.as_str())
+            .is_equal_to("alpha-edited.mkv");
+        assert_that!(app.notice.as_deref().unwrap()).contains("alpha-edited.mkv");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_stream_details_should_open_one_layer_and_back_should_return_to_tracks() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_stream_details();
+        let opened_layer = app.layer;
+        let went_back = app.back();
+
+        // Assert
+        assert_that!(opened_layer).is_equal_to(Layer::StreamDetails);
+        assert_that!(went_back).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancelling_processing_should_close_one_layer_and_preserve_staged_edits() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
+        ])));
+        let directory = app.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.deleted_streams.insert(2);
+        app.edit_cancel = Some(cancelled.clone());
+        app.dialog = Some(Dialog::Processing);
+
+        // Act
+        app.cancel_edit();
+
+        // Assert
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.deleted_streams).contains(2);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
