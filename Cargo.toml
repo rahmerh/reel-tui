@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal media inspector powered by ffprobe"
 license = "MIT"
+repository = "https://github.com/rahmerh/reel-tui"
 
 [[bin]]
 name = "reel"

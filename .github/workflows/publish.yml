@@ -1,0 +1,146 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+run-name: Publish ${{ github.ref_name }} to crates.io
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tagged commit is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Tag ${GITHUB_REF_NAME} does not point to a commit reachable from main." >&2
+            exit 1
+          fi
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set package version from tag
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          version = os.environ["RELEASE_VERSION"]
+          semver = re.compile(
+              r"^(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)"
+              r"(?:-(?:"
+              r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*"
+              r"))?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          if not semver.fullmatch(version):
+              raise SystemExit(
+                  f"Tag {version!r} is not an exact SemVer version such as 0.2.0"
+              )
+
+          manifest_path = Path("Cargo.toml")
+          manifest = manifest_path.read_text()
+          manifest, manifest_updates = re.subn(
+              r'(?m)^(version\s*=\s*")[^"]+("\s*)$',
+              rf'\g<1>{version}\g<2>',
+              manifest,
+              count=1,
+          )
+          if manifest_updates != 1:
+              raise SystemExit("Could not update the package version in Cargo.toml")
+          manifest_path.write_text(manifest)
+
+          lock_path = Path("Cargo.lock")
+          lock = lock_path.read_text()
+          lock, lock_updates = re.subn(
+              r'(\[\[package\]\]\nname = "reel-tui"\nversion = ")[^"]+("\n)',
+              rf'\g<1>{version}\g<2>',
+              lock,
+              count=1,
+          )
+          if lock_updates != 1:
+              raise SystemExit("Could not update the reel-tui version in Cargo.lock")
+          lock_path.write_text(lock)
+
+          metadata = json.loads(
+              subprocess.check_output(
+                  [
+                      "cargo",
+                      "metadata",
+                      "--locked",
+                      "--no-deps",
+                      "--format-version",
+                      "1",
+                  ],
+                  text=True,
+              )
+          )
+          package = next(
+              item for item in metadata["packages"] if item["name"] == "reel-tui"
+          )
+          if package["version"] != version:
+              raise SystemExit(
+                  f"Cargo resolved version {package['version']}, expected {version}"
+              )
+          PY
+
+          git diff --check
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify crates.io package
+        run: cargo publish --dry-run --locked --allow-dirty
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "The CARGO_REGISTRY_TOKEN repository secret is not configured." >&2
+            exit 1
+          fi
+          cargo publish --locked --allow-dirty
