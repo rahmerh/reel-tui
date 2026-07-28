@@ -154,6 +154,7 @@ pub struct App {
     pub layer: Layer,
     pub selected_stream: usize,
     pub stream_order: Vec<u64>,
+    moved_streams: BTreeSet<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
@@ -202,6 +203,7 @@ impl App {
             layer: Layer::Files,
             selected_stream: 0,
             stream_order: Vec::new(),
+            moved_streams: BTreeSet::new(),
             deleted_streams: BTreeSet::new(),
             default_streams: BTreeSet::new(),
             video_settings: BTreeMap::new(),
@@ -730,6 +732,21 @@ impl App {
             return;
         }
         self.stream_order.swap(current_position, target);
+        self.moved_streams.insert(index);
+        self.moved_streams = self
+            .moved_streams
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                stream_position_changed(
+                    &self.original_stream_order,
+                    &self.stream_order,
+                    &self.deleted_streams,
+                    self.media_info(),
+                    *candidate,
+                )
+            })
+            .collect();
         self.selected_stream = self
             .track_rows()
             .iter()
@@ -1674,6 +1691,7 @@ impl App {
             .collect::<BTreeSet<_>>();
         self.stream_order = order.clone();
         self.original_stream_order = order;
+        self.moved_streams.clear();
         self.default_streams = defaults.clone();
         self.original_default_streams = defaults;
         self.deleted_streams.clear();
@@ -1686,6 +1704,7 @@ impl App {
     fn clear_track_edits(&mut self) {
         self.stream_order.clear();
         self.original_stream_order.clear();
+        self.moved_streams.clear();
         self.deleted_streams.clear();
         self.default_streams.clear();
         self.original_default_streams.clear();
@@ -1696,14 +1715,26 @@ impl App {
     }
 
     pub fn changed_streams(&self) -> BTreeSet<u64> {
-        let mut changed = changed_streams(
+        let mut changed = self
+            .moved_streams
+            .iter()
+            .copied()
+            .filter(|index| {
+                stream_position_changed(
+                    &self.original_stream_order,
+                    &self.stream_order,
+                    &self.deleted_streams,
+                    self.media_info(),
+                    *index,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        changed.extend(changed_default_streams(
             &self.original_stream_order,
-            &self.stream_order,
             &self.deleted_streams,
             &self.original_default_streams,
             &self.default_streams,
-            self.media_info(),
-        );
+        ));
         changed.extend(self.video_settings.keys().copied());
         changed.extend(
             self.subtitle_changes
@@ -1760,6 +1791,7 @@ impl App {
             info,
             &self.original_stream_order,
             &self.stream_order,
+            &self.moved_streams,
             &self.deleted_streams,
             &self.original_default_streams,
             &self.default_streams,
@@ -1986,33 +2018,71 @@ fn changed_streams(
             }
         }
     }
-    for index in original_order
+    changed.extend(changed_default_streams(
+        original_order,
+        deleted,
+        original_defaults,
+        staged_defaults,
+    ));
+    changed
+}
+
+fn changed_default_streams(
+    original_order: &[u64],
+    deleted: &BTreeSet<u64>,
+    original_defaults: &BTreeSet<u64>,
+    staged_defaults: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    original_order
         .iter()
         .filter(|index| !deleted.contains(index))
-    {
-        if original_defaults.contains(index) != staged_defaults.contains(index) {
-            changed.insert(*index);
-        }
-    }
-    changed
+        .filter(|index| original_defaults.contains(index) != staged_defaults.contains(index))
+        .copied()
+        .collect()
+}
+
+fn stream_position_changed(
+    original_order: &[u64],
+    staged_order: &[u64],
+    deleted: &BTreeSet<u64>,
+    info: Option<&MediaInfo>,
+    index: u64,
+) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    let Some(group) = stream_by_index(info, index).map(stream_group) else {
+        return false;
+    };
+    let original = effective_group_order(info, original_order, deleted, group);
+    let staged = effective_group_order(info, staged_order, deleted, group);
+    original.iter().position(|candidate| *candidate == index)
+        != staged.iter().position(|candidate| *candidate == index)
 }
 
 fn edit_summary(
     info: &MediaInfo,
     original_order: &[u64],
     staged_order: &[u64],
+    moved_streams: &BTreeSet<u64>,
     deleted: &BTreeSet<u64>,
     original_defaults: &BTreeSet<u64>,
     staged_defaults: &BTreeSet<u64>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for group in ["video", "audio", "subtitle", "other"] {
-        let original = effective_group_order(info, original_order, deleted, group);
-        let staged = effective_group_order(info, staged_order, deleted, group);
-        let moved = staged
+        let moved = moved_streams
             .iter()
-            .enumerate()
-            .filter(|(position, index)| original.get(*position) != Some(*index))
+            .filter(|index| {
+                stream_by_index(info, **index).is_some_and(|stream| stream_group(stream) == group)
+                    && stream_position_changed(
+                        original_order,
+                        staged_order,
+                        deleted,
+                        Some(info),
+                        **index,
+                    )
+            })
             .count();
         if moved > 0 {
             lines.push(format!(
@@ -2243,6 +2313,7 @@ mod tests {
             &info,
             &[0, 1, 3, 2],
             &[0, 3, 1, 2],
+            &BTreeSet::from([3]),
             &BTreeSet::from([2]),
             &BTreeSet::from([1]),
             &BTreeSet::from([3]),
@@ -2250,7 +2321,7 @@ mod tests {
 
         // Assert
         assert_that!(lines).contains_exactly_in_given_order([
-            "Moving 2 audio tracks".to_string(),
+            "Moving 1 audio track".to_string(),
             "Deleting 1 subtitle track".to_string(),
             "Changing the default audio track".to_string(),
         ]);
@@ -2276,7 +2347,33 @@ mod tests {
         // Assert
         assert_that!(&app.stream_order).contains_exactly_in_given_order([0, 2, 1, 3]);
         assert_that!(app.selected_stream).is_equal_to(2);
-        assert_that!(app.changed_streams()).is_equal_to(BTreeSet::from([1, 2]));
+        assert_that!(app.changed_streams()).is_equal_to(BTreeSet::from([1]));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn move_selected_stream_should_only_mark_the_explicitly_moved_track_when_crossing_multiple_tracks()
+     {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "disposition": {"default": 0}},
+            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}},
+            {"index": 3, "codec_type": "subtitle", "disposition": {"default": 0}}
+        ]));
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        app.selected_stream = 1;
+
+        // Act
+        app.move_selected_stream(1);
+        app.move_selected_stream(1);
+
+        // Assert
+        assert_that!(&app.stream_order).contains_exactly_in_given_order([0, 2, 3, 1]);
+        assert_that!(app.changed_streams()).is_equal_to(BTreeSet::from([1]));
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2443,6 +2540,11 @@ mod tests {
             {"index": 0, "codec_type": "video", "codec_name": "h264"},
             {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
         ])));
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["subrip".to_string()]),
+            ..ToolCapabilities::default()
+        };
         app.selected_stream = 1;
         app.open_track_settings();
 

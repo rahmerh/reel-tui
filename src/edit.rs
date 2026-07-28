@@ -2196,6 +2196,16 @@ mod tests {
     #[test]
     fn apply_edits_should_convert_embedded_subtitle_in_copy_and_export_with_copy_stem() {
         // Arrange
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-subtitle-convert-{}-{}",
             std::process::id(),
@@ -2284,6 +2294,16 @@ mod tests {
     #[test]
     fn apply_edits_should_export_original_codec_when_only_export_is_checked() {
         // Arrange
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-subtitle-export-{}-{}",
             std::process::id(),
@@ -2373,6 +2393,16 @@ mod tests {
     #[test]
     fn apply_edits_should_replace_matching_text_sidecar_after_validation() {
         // Arrange
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-sidecar-convert-{}-{}",
             std::process::id(),
