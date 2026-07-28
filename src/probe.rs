@@ -40,14 +40,8 @@ pub struct MediaInfo {
 
 impl MediaInfo {
     pub(crate) fn from_json(value: Value) -> Result<Self, String> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| "ffprobe returned an invalid JSON document".to_string())?;
-        let format = object_map(object.get("format"));
-        let streams = object_array(object.get("streams"));
-        let chapters = object_array(object.get("chapters"));
-
-        let has_video = streams.iter().any(|stream| {
+        let info = Self::from_json_unchecked(value)?;
+        let has_video = info.streams.iter().any(|stream| {
             stream.get("codec_type").and_then(Value::as_str) == Some("video")
                 && !is_attached_picture(stream)
         });
@@ -55,13 +49,55 @@ impl MediaInfo {
         if !has_video {
             return Err("No video stream found".to_string());
         }
+        Ok(info)
+    }
 
+    pub(crate) fn from_json_unchecked(value: Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "ffprobe returned an invalid JSON document".to_string())?;
+        let format = object_map(object.get("format"));
+        let streams = object_array(object.get("streams"));
+        let chapters = object_array(object.get("chapters"));
         Ok(Self {
             format,
             streams,
             chapters,
         })
     }
+}
+
+pub(crate) fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-of",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "-show_chapters",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "ffprobe was not found in PATH. Install FFmpeg to inspect media.".to_string()
+            } else {
+                format!("Could not start ffprobe: {error}")
+            }
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "ffprobe could not recognize this subtitle output".to_string()
+        } else {
+            detail
+        });
+    }
+    let value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Could not parse ffprobe output: {error}"))?;
+    MediaInfo::from_json_unchecked(value)
 }
 
 fn object_map(value: Option<&Value>) -> BTreeMap<String, Value> {

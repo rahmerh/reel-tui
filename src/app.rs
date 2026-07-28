@@ -19,6 +19,10 @@ use crate::{
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
+    subtitle::{
+        FormatChoice, SidecarEntry, SubtitleChange, SubtitleFormat, SubtitleSource,
+        ToolCapabilities, partition_sidecars, path_extension, stream_language,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -33,9 +37,40 @@ pub enum Layer {
 pub enum Dialog {
     Keybindings,
     VideoSettings,
+    SubtitleSettings,
     ConfirmSave,
     Processing,
     Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrackRef {
+    Embedded(u64),
+    Sidecar(usize),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SubtitleSettingsField {
+    #[default]
+    Action,
+    Codec,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SubtitleAction {
+    #[default]
+    ConvertInContainer,
+    ExportSidecar,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubtitleSettingsPopup {
+    pub source: SubtitleSource,
+    pub source_format: SubtitleFormat,
+    pub action: SubtitleAction,
+    pub field: SubtitleSettingsField,
+    pub dropdown_open: bool,
+    pub codec_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,6 +101,13 @@ pub struct ResolutionChoice {
     pub value: VideoResolution,
     pub label: String,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoCodecChoice {
+    pub value: VideoCodec,
+    pub label: String,
+    pub current: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -108,12 +150,17 @@ pub struct App {
     pub default_streams: BTreeSet<u64>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub video_settings_popup: Option<VideoSettingsPopup>,
+    pub sidecars: Vec<SidecarEntry>,
+    pub subtitle_changes: BTreeMap<SubtitleSource, SubtitleChange>,
+    pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
+    pub subtitle_capabilities: ToolCapabilities,
     pub save_destination: SaveDestination,
     pub save_dialog_field: SaveDialogField,
     pub dialog: Option<Dialog>,
     pub notice: Option<String>,
     pub edit_error: Option<String>,
     pub edit_progress: Option<f64>,
+    pub edit_progress_label: Option<String>,
     pub edit_started: Option<Instant>,
     pub scan_error: Option<String>,
     request_tx: Sender<ProbeRequest>,
@@ -124,6 +171,7 @@ pub struct App {
     cache: HashMap<CacheKey, ProbeOutcome>,
     original_stream_order: Vec<u64>,
     original_default_streams: BTreeSet<u64>,
+    sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
 }
 
 impl App {
@@ -149,12 +197,17 @@ impl App {
             default_streams: BTreeSet::new(),
             video_settings: BTreeMap::new(),
             video_settings_popup: None,
+            sidecars: Vec::new(),
+            subtitle_changes: BTreeMap::new(),
+            subtitle_settings_popup: None,
+            subtitle_capabilities: ToolCapabilities::detect_cached(),
             save_destination: SaveDestination::ReplaceOriginal,
             save_dialog_field: SaveDialogField::Start,
             dialog: None,
             notice: None,
             edit_error: None,
             edit_progress: None,
+            edit_progress_label: None,
             edit_started: None,
             scan_error: None,
             request_tx,
@@ -165,6 +218,7 @@ impl App {
             cache: HashMap::new(),
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
+            sidecars_by_media: HashMap::new(),
         };
         let snapshot = match scan_directory(&app.directory) {
             Ok(files) => DirectorySnapshot::Files(files),
@@ -194,9 +248,15 @@ impl App {
     }
 
     fn reconcile_files(&mut self, files: Vec<FileEntry>) {
+        let (files, sidecars_by_media) = partition_sidecars(files);
         let old_selection = self.list_state.selected();
         let old_file = self.selected_file().cloned();
         let old_path = old_file.as_ref().map(|file| file.path.clone());
+        let old_sidecars = old_path
+            .as_ref()
+            .and_then(|path| self.sidecars_by_media.get(path))
+            .cloned()
+            .unwrap_or_default();
         let selected_position = old_path
             .as_ref()
             .and_then(|path| files.iter().position(|file| &file.path == path));
@@ -207,15 +267,30 @@ impl App {
         let was_processing = self.dialog == Some(Dialog::Processing);
 
         self.files = files;
+        self.sidecars_by_media = sidecars_by_media;
         self.cache
             .retain(|key, _| self.files.iter().any(|file| key.matches_file(file)));
 
         if let Some(position) = selected_position {
             self.list_state.select(Some(position));
+            self.sidecars = old_path
+                .as_ref()
+                .and_then(|path| self.sidecars_by_media.get(path))
+                .cloned()
+                .unwrap_or_default();
+            let sidecars_changed = old_sidecars != self.sidecars;
             if selected_changed && !was_processing {
                 self.clear_edit_state();
                 self.notice = Some("Selected file changed; reloaded latest metadata.".to_string());
                 self.queue_probe();
+            } else if sidecars_changed && !was_processing {
+                self.subtitle_changes.clear();
+                self.subtitle_settings_popup = None;
+                self.selected_stream = self
+                    .selected_stream
+                    .min(self.stream_count().saturating_sub(1));
+                self.notice =
+                    Some("Matching subtitle sidecars changed; reloaded them.".to_string());
             }
             return;
         }
@@ -226,6 +301,11 @@ impl App {
                 .min(self.files.len().saturating_sub(1))
         });
         self.list_state.select(selection);
+        self.sidecars = self
+            .selected_file()
+            .and_then(|file| self.sidecars_by_media.get(&file.path))
+            .cloned()
+            .unwrap_or_default();
 
         if selected_removed {
             if let Some(cancelled) = self.edit_cancel.take() {
@@ -328,6 +408,11 @@ impl App {
         if self.list_state.selected() != Some(index) {
             self.clear_edit_state();
             self.list_state.select(Some(index));
+            self.sidecars = self
+                .selected_file()
+                .and_then(|file| self.sidecars_by_media.get(&file.path))
+                .cloned()
+                .unwrap_or_default();
             self.queue_probe();
         }
     }
@@ -401,9 +486,15 @@ impl App {
                 continue;
             }
             match event {
-                EditEvent::Progress(progress) => self.edit_progress = progress,
+                EditEvent::Progress { progress, label } => {
+                    self.edit_progress = progress;
+                    self.edit_progress_label = Some(label);
+                }
                 EditEvent::Finished { path, outcome } => match outcome {
-                    EditOutcome::Completed { output_path } => {
+                    EditOutcome::Completed {
+                        output_path,
+                        media_changed,
+                    } => {
                         if let Ok(files) = scan_directory(&self.directory) {
                             self.reconcile_files(files);
                         }
@@ -417,8 +508,11 @@ impl App {
                         self.dialog = None;
                         self.edit_error = None;
                         self.edit_progress = None;
+                        self.edit_progress_label = None;
                         self.edit_started = None;
-                        self.notice = Some(if output_path == path {
+                        self.notice = Some(if !media_changed {
+                            "Subtitle changes saved.".to_string()
+                        } else if output_path == path {
                             "Media edits saved.".to_string()
                         } else {
                             format!(
@@ -453,6 +547,7 @@ impl App {
                         self.dialog = Some(Dialog::Error);
                         self.edit_error = Some(error);
                         self.edit_progress = None;
+                        self.edit_progress_label = None;
                         self.edit_started = None;
                     }
                 },
@@ -505,19 +600,57 @@ impl App {
     }
 
     pub fn stream_count(&self) -> usize {
-        self.stream_order.len()
+        if self.media_info().is_some() {
+            self.track_rows().len()
+        } else {
+            self.stream_order.len() + self.sidecars.len()
+        }
+    }
+
+    pub fn track_rows(&self) -> Vec<TrackRef> {
+        let Some(info) = self.media_info() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(self.stream_order.len() + self.sidecars.len());
+        for kind in ["video", "audio", "subtitle"] {
+            rows.extend(self.stream_order.iter().filter_map(|index| {
+                stream_by_index(info, *index)
+                    .filter(|stream| stream_kind(stream) == Some(kind))
+                    .map(|_| TrackRef::Embedded(*index))
+            }));
+            if kind == "subtitle" {
+                rows.extend((0..self.sidecars.len()).map(TrackRef::Sidecar));
+            }
+        }
+        rows.extend(self.stream_order.iter().filter_map(|index| {
+            stream_by_index(info, *index)
+                .filter(|stream| {
+                    !matches!(stream_kind(stream), Some("video" | "audio" | "subtitle"))
+                })
+                .map(|_| TrackRef::Embedded(*index))
+        }));
+        rows
+    }
+
+    pub fn selected_track(&self) -> Option<TrackRef> {
+        self.track_rows().get(self.selected_stream).cloned()
     }
 
     pub fn selected_stream_info(
         &self,
     ) -> Option<&std::collections::BTreeMap<String, serde_json::Value>> {
         let info = self.media_info()?;
-        let index = self.stream_order.get(self.selected_stream)?;
-        stream_by_index(info, *index)
+        let TrackRef::Embedded(index) = self.selected_track()? else {
+            return None;
+        };
+        stream_by_index(info, index)
     }
 
     pub fn selected_stream_index(&self) -> Option<u64> {
-        self.selected_stream_info().and_then(stream_index)
+        match self.selected_track()? {
+            TrackRef::Embedded(index) => Some(index),
+            TrackRef::Sidecar(_) => None,
+        }
     }
 
     pub fn toggle_delete_selected_stream(&mut self) {
@@ -525,7 +658,7 @@ impl App {
             return;
         }
         let Some(index) = self.selected_stream_index() else {
-            self.show_error("This track has no usable stream index.");
+            self.notice = Some("Sidecar subtitles are converted rather than deleted here.".into());
             return;
         };
         if self.deleted_streams.remove(&index) {
@@ -535,6 +668,8 @@ impl App {
 
         self.deleted_streams.insert(index);
         self.video_settings.remove(&index);
+        self.subtitle_changes
+            .remove(&SubtitleSource::Embedded(index));
         self.notice = None;
         self.selected_stream =
             (self.selected_stream + 1).min(self.stream_count().saturating_sub(1));
@@ -551,14 +686,21 @@ impl App {
             self.notice = Some("Unmark this track for deletion before moving it.".to_string());
             return;
         }
-        let Some(target) = self.selected_stream.checked_add_signed(direction) else {
+        let Some(current_position) = self
+            .stream_order
+            .iter()
+            .position(|candidate| *candidate == index)
+        else {
+            return;
+        };
+        let Some(target) = current_position.checked_add_signed(direction) else {
             return;
         };
         if target >= self.stream_order.len() {
             return;
         }
         let same_group = self.media_info().is_some_and(|info| {
-            let current = stream_by_index(info, self.stream_order[self.selected_stream]);
+            let current = stream_by_index(info, self.stream_order[current_position]);
             let target_stream = stream_by_index(info, self.stream_order[target]);
             current
                 .zip(target_stream)
@@ -567,8 +709,12 @@ impl App {
         if !same_group {
             return;
         }
-        self.stream_order.swap(self.selected_stream, target);
-        self.selected_stream = target;
+        self.stream_order.swap(current_position, target);
+        self.selected_stream = self
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(index))
+            .unwrap_or(self.selected_stream);
         self.notice = None;
     }
 
@@ -577,6 +723,8 @@ impl App {
             return;
         }
         let Some(index) = self.selected_stream_index() else {
+            self.notice =
+                Some("External subtitle files do not have a container default flag.".into());
             return;
         };
         if self.deleted_streams.contains(&index) {
@@ -634,14 +782,15 @@ impl App {
         }
 
         let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        let codecs = self.video_codec_choices(index);
         let resolutions = self.resolution_choices(index);
         self.video_settings_popup = Some(VideoSettingsPopup {
             stream_index: index,
             field: VideoSettingsField::Codec,
             dropdown_open: false,
-            codec_cursor: VideoCodec::OPTIONS
+            codec_cursor: codecs
                 .iter()
-                .position(|codec| *codec == settings.codec)
+                .position(|choice| choice.value == settings.codec)
                 .unwrap_or(0),
             resolution_cursor: resolutions
                 .iter()
@@ -655,6 +804,357 @@ impl App {
         });
         self.notice = None;
         self.dialog = Some(Dialog::VideoSettings);
+    }
+
+    pub fn open_track_settings(&mut self) {
+        match self.selected_track() {
+            Some(TrackRef::Embedded(index))
+                if self
+                    .selected_stream_info()
+                    .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+            {
+                self.open_subtitle_settings(SubtitleSource::Embedded(index));
+            }
+            Some(TrackRef::Sidecar(index)) => {
+                if let Some(sidecar) = self.sidecars.get(index) {
+                    self.open_subtitle_settings(SubtitleSource::Sidecar(sidecar.path.clone()));
+                }
+            }
+            _ => self.open_video_settings(),
+        }
+    }
+
+    fn open_subtitle_settings(&mut self, source: SubtitleSource) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        if let SubtitleSource::Embedded(index) = source
+            && self.deleted_streams.contains(&index)
+        {
+            self.notice =
+                Some("Unmark this subtitle track for deletion before converting it.".into());
+            return;
+        }
+        let source_format = match &source {
+            SubtitleSource::Embedded(index) => self
+                .media_info()
+                .and_then(|info| stream_by_index(info, *index))
+                .and_then(|stream| stream.get("codec_name"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(SubtitleFormat::from_codec),
+            SubtitleSource::Sidecar(path) => self
+                .sidecars
+                .iter()
+                .find(|sidecar| &sidecar.path == path)
+                .map(|sidecar| sidecar.format),
+        };
+        let Some(source_format) = source_format else {
+            self.notice =
+                Some("This subtitle format is not supported for conversion yet.".to_string());
+            return;
+        };
+        let change = self
+            .subtitle_changes
+            .get(&source)
+            .cloned()
+            .unwrap_or(SubtitleChange {
+                source: source.clone(),
+                source_format,
+                embedded_target: None,
+                export_target: None,
+                ocr_language: None,
+            });
+        let sidecar = matches!(source, SubtitleSource::Sidecar(_));
+        let action = if !sidecar && change.export_target.is_some() {
+            SubtitleAction::ExportSidecar
+        } else {
+            SubtitleAction::ConvertInContainer
+        };
+        let codec_choices = self.subtitle_choices(&source, source_format, action);
+        let selected_codec = |choice: &FormatChoice| {
+            if action == SubtitleAction::ExportSidecar {
+                change.export_target == Some(choice.format)
+            } else {
+                choice.value == change.embedded_target
+            }
+        };
+        self.subtitle_settings_popup = Some(SubtitleSettingsPopup {
+            source,
+            source_format,
+            action,
+            field: if sidecar {
+                SubtitleSettingsField::Codec
+            } else {
+                SubtitleSettingsField::Action
+            },
+            dropdown_open: false,
+            codec_cursor: codec_choices.iter().position(selected_codec).unwrap_or(0),
+        });
+        self.notice = None;
+        self.dialog = Some(Dialog::SubtitleSettings);
+    }
+
+    pub fn subtitle_choices(
+        &self,
+        source: &SubtitleSource,
+        source_format: SubtitleFormat,
+        action: SubtitleAction,
+    ) -> Vec<FormatChoice> {
+        let sidecar = matches!(source, SubtitleSource::Sidecar(_));
+        let exporting = sidecar || action == SubtitleAction::ExportSidecar;
+        self.subtitle_capabilities.format_choices(
+            source_format,
+            (!exporting)
+                .then(|| {
+                    self.selected_file()
+                        .and_then(|file| path_extension(&file.path))
+                })
+                .flatten(),
+            exporting,
+            !sidecar && action == SubtitleAction::ExportSidecar,
+        )
+    }
+
+    fn automatic_ocr_language(&self, source: &SubtitleSource) -> Option<String> {
+        let preferred = match source {
+            SubtitleSource::Embedded(index) => self
+                .media_info()
+                .and_then(|info| stream_by_index(info, *index))
+                .map(stream_language),
+            SubtitleSource::Sidecar(path) => self
+                .sidecars
+                .iter()
+                .find(|sidecar| &sidecar.path == path)
+                .map(|sidecar| sidecar.language.clone()),
+        }
+        .unwrap_or_default();
+        let base = preferred.split('-').next().unwrap_or_default();
+        let iso_three = match base {
+            "en" => Some("eng"),
+            "nl" => Some("nld"),
+            "de" => Some("deu"),
+            "fr" => Some("fra"),
+            "es" => Some("spa"),
+            "it" => Some("ita"),
+            "pt" => Some("por"),
+            "ja" => Some("jpn"),
+            "ko" => Some("kor"),
+            _ => None,
+        };
+        [Some(preferred.as_str()), Some(base), iso_three]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                self.subtitle_capabilities
+                    .tesseract_languages
+                    .iter()
+                    .find(|language| language.eq_ignore_ascii_case(candidate))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.subtitle_capabilities
+                    .tesseract_languages
+                    .iter()
+                    .find(|language| language.as_str() == "eng")
+                    .cloned()
+            })
+            .or_else(|| {
+                self.subtitle_capabilities
+                    .tesseract_languages
+                    .first()
+                    .cloned()
+            })
+    }
+
+    pub fn move_subtitle_settings_cursor(&mut self, direction: isize) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        if !popup.dropdown_open {
+            let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
+            let popup = self.subtitle_settings_popup.as_mut().unwrap();
+            popup.field = match (popup.field, direction.is_positive(), sidecar) {
+                (SubtitleSettingsField::Action, true, false) => SubtitleSettingsField::Codec,
+                (SubtitleSettingsField::Codec, false, false) => SubtitleSettingsField::Action,
+                (field, _, _) => field,
+            };
+            return;
+        }
+        let source = popup.source.clone();
+        let source_format = popup.source_format;
+        let action = popup.action;
+        let field = popup.field;
+        match field {
+            SubtitleSettingsField::Action => {}
+            SubtitleSettingsField::Codec => {
+                let choices = self.subtitle_choices(&source, source_format, action);
+                let popup = self.subtitle_settings_popup.as_mut().unwrap();
+                let cursor = &mut popup.codec_cursor;
+                *cursor = move_cursor(*cursor, choices.len(), direction, |position| {
+                    choices[position].enabled
+                });
+            }
+        }
+    }
+
+    pub fn activate_subtitle_settings(&mut self) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        if !popup.dropdown_open {
+            if popup.field == SubtitleSettingsField::Action {
+                let action = match popup.action {
+                    SubtitleAction::ConvertInContainer => SubtitleAction::ExportSidecar,
+                    SubtitleAction::ExportSidecar => SubtitleAction::ConvertInContainer,
+                };
+                self.select_subtitle_action(action);
+                return;
+            }
+            self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = true;
+            return;
+        }
+        let source = popup.source.clone();
+        let source_format = popup.source_format;
+        let action = popup.action;
+        let field = popup.field;
+        let codec_cursor = popup.codec_cursor;
+        let mut change = self
+            .subtitle_changes
+            .get(&source)
+            .cloned()
+            .unwrap_or(SubtitleChange {
+                source: source.clone(),
+                source_format,
+                embedded_target: None,
+                export_target: None,
+                ocr_language: None,
+            });
+        match field {
+            SubtitleSettingsField::Action => return,
+            SubtitleSettingsField::Codec => {
+                let choices = self.subtitle_choices(&source, source_format, action);
+                let Some(choice) = choices.get(codec_cursor).filter(|choice| choice.enabled) else {
+                    return;
+                };
+                if action == SubtitleAction::ExportSidecar {
+                    change.embedded_target = None;
+                    change.export_target = Some(choice.format);
+                } else {
+                    change.embedded_target = choice.value;
+                    change.export_target = None;
+                }
+            }
+        }
+        change.ocr_language = change
+            .needs_ocr()
+            .then(|| self.automatic_ocr_language(&source))
+            .flatten();
+        if change.has_effect() {
+            self.subtitle_changes.insert(source, change);
+        } else {
+            self.subtitle_changes.remove(&source);
+        }
+        self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = false;
+    }
+
+    pub fn choose_subtitle_action(&mut self, direction: isize) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        if popup.dropdown_open
+            || popup.field != SubtitleSettingsField::Action
+            || matches!(popup.source, SubtitleSource::Sidecar(_))
+            || direction == 0
+        {
+            return;
+        }
+        self.select_subtitle_action(if direction.is_positive() {
+            SubtitleAction::ExportSidecar
+        } else {
+            SubtitleAction::ConvertInContainer
+        });
+    }
+
+    fn select_subtitle_action(&mut self, selected_action: SubtitleAction) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        if popup.action == selected_action {
+            return;
+        }
+        let source = popup.source.clone();
+        let source_format = popup.source_format;
+        let mut change = self
+            .subtitle_changes
+            .get(&source)
+            .cloned()
+            .unwrap_or(SubtitleChange {
+                source: source.clone(),
+                source_format,
+                embedded_target: None,
+                export_target: None,
+                ocr_language: None,
+            });
+        if selected_action == SubtitleAction::ExportSidecar {
+            let choices = self.subtitle_choices(&source, source_format, selected_action);
+            let Some((cursor, choice)) = choices
+                .iter()
+                .enumerate()
+                .find(|(_, choice)| choice.current && choice.enabled)
+                .or_else(|| {
+                    choices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, choice)| choice.enabled)
+                })
+            else {
+                self.notice =
+                    Some("No sidecar subtitle codec is available with tools in PATH.".into());
+                return;
+            };
+            change.embedded_target = None;
+            change.export_target = Some(choice.format);
+            self.subtitle_settings_popup.as_mut().unwrap().codec_cursor = cursor;
+        } else {
+            change.embedded_target = None;
+            change.export_target = None;
+            let choices = self.subtitle_choices(&source, source_format, selected_action);
+            self.subtitle_settings_popup.as_mut().unwrap().codec_cursor = choices
+                .iter()
+                .position(|choice| choice.current)
+                .unwrap_or(0);
+        }
+        change.ocr_language = change
+            .needs_ocr()
+            .then(|| self.automatic_ocr_language(&source))
+            .flatten();
+        if change.has_effect() {
+            self.subtitle_changes.insert(source, change);
+        } else {
+            self.subtitle_changes.remove(&source);
+        }
+        let popup = self.subtitle_settings_popup.as_mut().unwrap();
+        popup.action = selected_action;
+        popup.dropdown_open = false;
+        self.notice = None;
+    }
+
+    pub fn escape_subtitle_settings(&mut self) {
+        if self
+            .subtitle_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.dropdown_open)
+        {
+            self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = false;
+            return;
+        }
+        self.subtitle_settings_popup = None;
+        self.dialog = None;
+    }
+
+    pub fn close_subtitle_settings(&mut self) {
+        self.subtitle_settings_popup = None;
+        self.dialog = None;
     }
 
     pub fn move_video_settings_cursor(&mut self, direction: isize) {
@@ -673,13 +1173,10 @@ impl App {
 
         match popup.field {
             VideoSettingsField::Codec => {
+                let choices = self.video_codec_choices(popup.stream_index);
                 let popup = self.video_settings_popup.as_mut().unwrap();
-                popup.codec_cursor = move_cursor(
-                    popup.codec_cursor,
-                    VideoCodec::OPTIONS.len(),
-                    direction,
-                    |_| true,
-                );
+                popup.codec_cursor =
+                    move_cursor(popup.codec_cursor, choices.len(), direction, |_| true);
             }
             VideoSettingsField::Resolution => {
                 let choices = self.resolution_choices(popup.stream_index);
@@ -709,7 +1206,13 @@ impl App {
         let resolution_cursor = popup.resolution_cursor;
         let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
         match field {
-            VideoSettingsField::Codec => settings.codec = VideoCodec::OPTIONS[codec_cursor],
+            VideoSettingsField::Codec => {
+                let choices = self.video_codec_choices(index);
+                let Some(choice) = choices.get(codec_cursor) else {
+                    return;
+                };
+                settings.codec = choice.value;
+            }
             VideoSettingsField::Resolution => {
                 let choices = self.resolution_choices(index);
                 let Some(choice) = choices
@@ -744,14 +1247,17 @@ impl App {
                     .position(|choice| choice.value == settings.resolution)
                     .unwrap_or(0)
             });
+            let codec_cursor = (field == VideoSettingsField::Codec).then(|| {
+                self.video_codec_choices(index)
+                    .iter()
+                    .position(|choice| choice.value == settings.codec)
+                    .unwrap_or(0)
+            });
             let popup = self.video_settings_popup.as_mut().unwrap();
             popup.dropdown_open = false;
             match field {
                 VideoSettingsField::Codec => {
-                    popup.codec_cursor = VideoCodec::OPTIONS
-                        .iter()
-                        .position(|codec| *codec == settings.codec)
-                        .unwrap_or(0);
+                    popup.codec_cursor = codec_cursor.unwrap_or(0);
                 }
                 VideoSettingsField::Resolution => {
                     popup.resolution_cursor = resolution_cursor.unwrap_or(0);
@@ -820,6 +1326,38 @@ impl App {
         choices
     }
 
+    pub fn video_codec_choices(&self, index: u64) -> Vec<VideoCodecChoice> {
+        let source_name = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))
+            .and_then(|stream| stream.get("codec_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let source_codec = match source_name {
+            "h264" => Some(VideoCodec::H264),
+            "hevc" => Some(VideoCodec::Hevc),
+            "av1" => Some(VideoCodec::Av1),
+            _ => None,
+        };
+        let mut choices = Vec::with_capacity(VideoCodec::TARGETS.len() + 1);
+        if source_codec.is_none() {
+            choices.push(VideoCodecChoice {
+                value: VideoCodec::Original,
+                label: source_name.to_uppercase(),
+                current: true,
+            });
+        }
+        choices.extend(VideoCodec::TARGETS.into_iter().map(|codec| {
+            let current = source_codec == Some(codec);
+            VideoCodecChoice {
+                value: if current { VideoCodec::Original } else { codec },
+                label: codec.label().to_string(),
+                current,
+            }
+        }));
+        choices
+    }
+
     fn settings_change_stream(&self, index: u64, settings: VideoSettings) -> bool {
         if settings.resolution != VideoResolution::Original {
             return true;
@@ -874,6 +1412,10 @@ impl App {
         if self.dialog != Some(Dialog::ConfirmSave) || direction == 0 {
             return;
         }
+        if !self.media_will_change() {
+            self.save_dialog_field = SaveDialogField::Start;
+            return;
+        }
         self.save_dialog_field = match (self.save_dialog_field, direction.is_positive()) {
             (SaveDialogField::Destination, true) => SaveDialogField::Start,
             (SaveDialogField::Start, false) => SaveDialogField::Destination,
@@ -883,6 +1425,7 @@ impl App {
 
     pub fn choose_save_destination(&mut self, direction: isize) {
         if self.dialog != Some(Dialog::ConfirmSave)
+            || !self.media_will_change()
             || self.save_dialog_field != SaveDialogField::Destination
             || direction == 0
         {
@@ -901,6 +1444,10 @@ impl App {
         }
         match self.save_dialog_field {
             SaveDialogField::Destination => {
+                if !self.media_will_change() {
+                    self.save_dialog_field = SaveDialogField::Start;
+                    return;
+                }
                 self.save_destination = match self.save_destination {
                     SaveDestination::ReplaceOriginal => SaveDestination::CreateCopy,
                     SaveDestination::CreateCopy => SaveDestination::ReplaceOriginal,
@@ -937,6 +1484,8 @@ impl App {
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
             video_settings: self.video_settings.clone(),
+            subtitle_changes: self.subtitle_changes.values().cloned().collect(),
+            sidecars: self.sidecars.clone(),
             cancelled: cancelled.clone(),
         };
         match self.edit_tx.send(request) {
@@ -944,6 +1493,7 @@ impl App {
                 self.dialog = Some(Dialog::Processing);
                 self.edit_error = None;
                 self.edit_progress = None;
+                self.edit_progress_label = None;
                 self.edit_started = Some(Instant::now());
                 self.edit_cancel = Some(cancelled);
             }
@@ -964,6 +1514,7 @@ impl App {
         self.dialog = None;
         self.edit_error = None;
         self.edit_progress = None;
+        self.edit_progress_label = None;
         self.edit_started = None;
         self.notice = Some("Media edit cancelled.".to_string());
         self.layer = Layer::Streams;
@@ -976,6 +1527,7 @@ impl App {
         self.dialog = None;
         self.edit_error = None;
         self.edit_progress = None;
+        self.edit_progress_label = None;
         self.edit_started = None;
         self.edit_cancel = None;
     }
@@ -1037,6 +1589,7 @@ impl App {
         self.notice = None;
         self.edit_error = None;
         self.edit_progress = None;
+        self.edit_progress_label = None;
         self.edit_started = None;
     }
 
@@ -1062,6 +1615,8 @@ impl App {
         self.deleted_streams.clear();
         self.video_settings.clear();
         self.video_settings_popup = None;
+        self.subtitle_changes.clear();
+        self.subtitle_settings_popup = None;
     }
 
     fn clear_track_edits(&mut self) {
@@ -1072,6 +1627,8 @@ impl App {
         self.original_default_streams.clear();
         self.video_settings.clear();
         self.video_settings_popup = None;
+        self.subtitle_changes.clear();
+        self.subtitle_settings_popup = None;
     }
 
     pub fn changed_streams(&self) -> BTreeSet<u64> {
@@ -1084,11 +1641,51 @@ impl App {
             self.media_info(),
         );
         changed.extend(self.video_settings.keys().copied());
+        changed.extend(
+            self.subtitle_changes
+                .keys()
+                .filter_map(|source| match source {
+                    SubtitleSource::Embedded(index) => Some(*index),
+                    SubtitleSource::Sidecar(_) => None,
+                }),
+        );
         changed
     }
 
     pub fn has_track_edits(&self) -> bool {
-        !self.deleted_streams.is_empty() || !self.changed_streams().is_empty()
+        !self.deleted_streams.is_empty()
+            || !changed_streams(
+                &self.original_stream_order,
+                &self.stream_order,
+                &self.deleted_streams,
+                &self.original_default_streams,
+                &self.default_streams,
+                self.media_info(),
+            )
+            .is_empty()
+            || !self.video_settings.is_empty()
+            || self
+                .subtitle_changes
+                .values()
+                .any(SubtitleChange::has_effect)
+    }
+
+    pub fn media_will_change(&self) -> bool {
+        !self.deleted_streams.is_empty()
+            || !changed_streams(
+                &self.original_stream_order,
+                &self.stream_order,
+                &self.deleted_streams,
+                &self.original_default_streams,
+                &self.default_streams,
+                self.media_info(),
+            )
+            .is_empty()
+            || !self.video_settings.is_empty()
+            || self
+                .subtitle_changes
+                .values()
+                .any(SubtitleChange::changes_media)
     }
 
     pub fn save_summary(&self) -> Vec<String> {
@@ -1121,6 +1718,29 @@ impl App {
                 }
                 _ => format!("Encoding video track #{index} as {codec} at {resolution}"),
             });
+        }
+        for change in self.subtitle_changes.values() {
+            let source = match &change.source {
+                SubtitleSource::Embedded(index) => format!("subtitle track #{index}"),
+                SubtitleSource::Sidecar(path) => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("subtitle sidecar")
+                    .to_string(),
+            };
+            if let Some(target) = change.embedded_target {
+                lines.push(match change.source {
+                    SubtitleSource::Embedded(_) => {
+                        format!("Converting {source} in the media to {}", target.label())
+                    }
+                    SubtitleSource::Sidecar(_) => {
+                        format!("Converting {source} to {}", target.label())
+                    }
+                });
+            }
+            if let Some(target) = change.export_target {
+                lines.push(format!("Exporting {source} as {}", target.label()));
+            }
         }
         lines
     }
@@ -1739,7 +2359,6 @@ mod tests {
         let directory = app.directory.clone();
         app.open_video_settings();
         app.activate_video_settings();
-        app.move_video_settings_cursor(1);
         app.activate_video_settings();
 
         // Act
@@ -1751,6 +2370,81 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selecting_export_sidecar_should_stage_the_source_codec_without_a_media_change() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+        ])));
+        app.selected_stream = 1;
+        app.open_track_settings();
+
+        // Act
+        app.choose_subtitle_action(1);
+
+        // Assert
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(1))
+            .unwrap();
+        assert_that!(change.embedded_target).is_none();
+        assert_that!(change.export_target).contains(SubtitleFormat::SubRip);
+        assert_that!(app.media_will_change()).is_false();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().action)
+            .is_equal_to(SubtitleAction::ExportSidecar);
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().dropdown_open).is_false();
+    }
+
+    #[test]
+    fn subtitle_only_save_dialog_should_keep_start_selected() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+        ])));
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: Some(SubtitleFormat::SubRip),
+                ocr_language: None,
+            },
+        );
+        app.request_save();
+
+        // Act
+        app.move_save_dialog_cursor(-1);
+        app.choose_save_destination(1);
+
+        // Assert
+        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Start);
+        assert_that!(app.save_destination).is_equal_to(SaveDestination::ReplaceOriginal);
+    }
+
+    #[test]
+    fn automatic_ocr_language_should_prefer_the_subtitle_track_language() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {
+                "index": 1,
+                "codec_type": "subtitle",
+                "codec_name": "hdmv_pgs_subtitle",
+                "tags": {"language": "nld"}
+            }
+        ])));
+        app.subtitle_capabilities.tesseract_languages = vec!["eng".to_string(), "nld".to_string()];
+
+        // Act
+        let language = app.automatic_ocr_language(&SubtitleSource::Embedded(1));
+
+        // Assert
+        assert_that!(language.as_deref()).contains("nld");
     }
 
     #[test]
@@ -1786,7 +2480,6 @@ mod tests {
         app.open_video_settings();
         app.activate_video_settings();
         app.move_video_settings_cursor(1);
-        app.move_video_settings_cursor(1);
 
         // Act
         app.activate_video_settings();
@@ -1795,6 +2488,65 @@ mod tests {
         assert_that!(app.video_settings.get(&0).map(|settings| settings.codec))
             .contains(VideoCodec::Hevc);
         assert_that!(app.changed_streams()).contains(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn video_codec_choices_should_show_the_source_codec_once_without_original() {
+        // Arrange
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.video_codec_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order(["H.264", "HEVC / H.265", "AV1"]);
+        assert_that!(choices.iter().filter(|choice| choice.current).count()).is_equal_to(1);
+        assert_that!(choices[0].current).is_true();
+        assert_that!(choices[0].value).is_equal_to(VideoCodec::Original);
+        assert_that!(
+            choices
+                .iter()
+                .any(|choice| choice.label.contains("Original"))
+        )
+        .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn video_codec_choices_should_add_an_unknown_source_without_duplicating_targets() {
+        // Arrange
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "ffv1", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.video_codec_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order(["FFV1", "H.264", "HEVC / H.265", "AV1"]);
+        assert_that!(choices[0].current).is_true();
+        assert_that!(choices[0].value).is_equal_to(VideoCodec::Original);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2006,6 +2758,7 @@ mod tests {
                 path: source,
                 outcome: EditOutcome::Completed {
                     output_path: output,
+                    media_changed: true,
                 },
             })
             .unwrap();

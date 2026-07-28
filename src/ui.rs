@@ -10,9 +10,13 @@ use ratatui::{
 use serde_json::Value;
 
 use crate::{
-    app::{App, Dialog, Layer, SaveDialogField, VideoSettingsField},
-    edit::{SaveDestination, VideoCodec, stream_index},
+    app::{
+        App, Dialog, Layer, SaveDialogField, SubtitleAction,
+        SubtitleSettingsField, TrackRef, VideoSettingsField,
+    },
+    edit::{SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
+    subtitle::{SidecarEntry, SubtitleSource},
 };
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -92,13 +96,19 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         match &app.outcome {
             Some(ProbeOutcome::Video(info)) => {
                 let changed = app.changed_streams();
+                let rows = app.track_rows();
                 let (text, selected_line) = media_text(
                     info,
                     (app.layer != Layer::Files).then_some(app.selected_stream),
-                    &app.stream_order,
-                    &app.deleted_streams,
-                    &app.default_streams,
-                    &changed,
+                    MediaTextState {
+                        order: &app.stream_order,
+                        rows: &rows,
+                        sidecars: &app.sidecars,
+                        deleted: &app.deleted_streams,
+                        defaults: &app.default_streams,
+                        changed: &changed,
+                        subtitle_changes: &app.subtitle_changes,
+                    },
                 );
                 if app.layer == Layer::Streams
                     && let Some(selected_line) = selected_line
@@ -171,11 +181,17 @@ fn message(heading: &str, detail: &str, color: Color) -> Text<'static> {
 fn media_text(
     info: &MediaInfo,
     selected: Option<usize>,
-    order: &[u64],
-    deleted: &std::collections::BTreeSet<u64>,
-    defaults: &std::collections::BTreeSet<u64>,
-    changed: &std::collections::BTreeSet<u64>,
+    state: MediaTextState<'_>,
 ) -> (Text<'static>, Option<usize>) {
+    let MediaTextState {
+        order,
+        rows,
+        sidecars,
+        deleted,
+        defaults,
+        changed,
+        subtitle_changes,
+    } = state;
     let mut lines = Vec::new();
     let mut selected_line = None;
     section(&mut lines, "Overview");
@@ -190,17 +206,27 @@ fn media_text(
     for (heading, kind) in groups {
         let streams: Vec<_> = order
             .iter()
-            .enumerate()
-            .filter_map(|(selection_index, index)| {
+            .filter_map(|index| {
                 let stream = info
                     .streams
                     .iter()
                     .find(|stream| stream_index(stream) == Some(*index))?;
+                let selection_index = rows
+                    .iter()
+                    .position(|row| *row == TrackRef::Embedded(*index))?;
                 (string(stream, "codec_type") == Some(kind)).then_some((selection_index, stream))
             })
             .collect();
-        if !streams.is_empty() {
-            section(&mut lines, &format!("{heading} ({})", streams.len()));
+        let sidecar_count = if kind == "subtitle" {
+            sidecars.len()
+        } else {
+            0
+        };
+        if !streams.is_empty() || sidecar_count > 0 {
+            section(
+                &mut lines,
+                &format!("{heading} ({})", streams.len() + sidecar_count),
+            );
             for (selection_index, stream) in streams {
                 if selected == Some(selection_index) {
                     selected_line = Some(lines.len());
@@ -214,17 +240,36 @@ fn media_text(
                     stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                 ));
             }
+            if kind == "subtitle" {
+                for (sidecar_index, sidecar) in sidecars.iter().enumerate() {
+                    let selection_index = rows
+                        .iter()
+                        .position(|row| *row == TrackRef::Sidecar(sidecar_index))
+                        .unwrap_or(0);
+                    if selected == Some(selection_index) {
+                        selected_line = Some(lines.len());
+                    }
+                    lines.push(sidecar_line(
+                        sidecar,
+                        selected == Some(selection_index),
+                        subtitle_changes
+                            .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                    ));
+                }
+            }
         }
     }
 
     let other: Vec<_> = order
         .iter()
-        .enumerate()
-        .filter_map(|(selection_index, index)| {
+        .filter_map(|index| {
             let stream = info
                 .streams
                 .iter()
                 .find(|stream| stream_index(stream) == Some(*index))?;
+            let selection_index = rows
+                .iter()
+                .position(|row| *row == TrackRef::Embedded(*index))?;
             (!matches!(
                 string(stream, "codec_type"),
                 Some("video" | "audio" | "subtitle")
@@ -260,6 +305,46 @@ fn media_text(
     }
 
     (Text::from(lines), selected_line)
+}
+
+struct MediaTextState<'a> {
+    order: &'a [u64],
+    rows: &'a [TrackRef],
+    sidecars: &'a [SidecarEntry],
+    deleted: &'a std::collections::BTreeSet<u64>,
+    defaults: &'a std::collections::BTreeSet<u64>,
+    changed: &'a std::collections::BTreeSet<u64>,
+    subtitle_changes: &'a std::collections::BTreeMap<
+        crate::subtitle::SubtitleSource,
+        crate::subtitle::SubtitleChange,
+    >,
+}
+
+fn sidecar_line(sidecar: &SidecarEntry, selected: bool, changed: bool) -> Line<'static> {
+    let marker = if selected { "›" } else { " " };
+    let changed = if changed { "  ✎" } else { "" };
+    let mut flags = vec!["external".to_string()];
+    if sidecar.forced {
+        flags.push("forced".to_string());
+    }
+    if sidecar.cc {
+        flags.push("cc".to_string());
+    }
+    Line::from(format!(
+        "{marker}    {}  ·  {}  ·  {}  [{}]{changed}",
+        sidecar.format.label(),
+        sidecar.language.to_ascii_uppercase(),
+        sidecar.display_name,
+        flags.join(", ")
+    ))
+    .style(if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    })
 }
 
 fn section(lines: &mut Vec<Line<'static>>, name: &str) {
@@ -394,6 +479,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_video_settings_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::SubtitleSettings {
+        render_subtitle_settings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::Processing {
         render_progress_dialog(frame, app);
         return;
@@ -403,8 +492,11 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         return;
     }
     let (title, body, color) = match dialog {
-        Dialog::Keybindings | Dialog::VideoSettings | Dialog::ConfirmSave => unreachable!(),
         Dialog::Processing => unreachable!(),
+        Dialog::Keybindings
+        | Dialog::VideoSettings
+        | Dialog::SubtitleSettings
+        | Dialog::ConfirmSave => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -437,31 +529,33 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
     lines.extend(summary.into_iter().map(Line::from));
     lines.push(Line::from(""));
 
-    let destination_focused = app.save_dialog_field == SaveDialogField::Destination;
-    lines.push(Line::from(vec![
-        Span::styled(
-            if destination_focused {
-                "› Output  "
-            } else {
-                "  Output  "
-            },
-            Style::default().add_modifier(if destination_focused {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-        ),
-        save_option(
-            " Replace original ",
-            app.save_destination == SaveDestination::ReplaceOriginal,
-        ),
-        Span::raw("  "),
-        save_option(
-            " Create a copy ",
-            app.save_destination == SaveDestination::CreateCopy,
-        ),
-    ]));
-    lines.push(Line::from(""));
+    if app.media_will_change() {
+        let destination_focused = app.save_dialog_field == SaveDialogField::Destination;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if destination_focused {
+                    "› Output  "
+                } else {
+                    "  Output  "
+                },
+                Style::default().add_modifier(if destination_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            save_option(
+                " Replace original ",
+                app.save_destination == SaveDestination::ReplaceOriginal,
+            ),
+            Span::raw("  "),
+            save_option(
+                " Create a copy ",
+                app.save_destination == SaveDestination::CreateCopy,
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
 
     let start_focused = app.save_dialog_field == SaveDialogField::Start;
     lines.push(
@@ -489,7 +583,11 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
-                    .title(" Save media edits "),
+                    .title(if app.media_will_change() {
+                        " Save media edits "
+                    } else {
+                        " Save subtitle changes "
+                    }),
             )
             .wrap(Wrap { trim: false }),
         area,
@@ -545,7 +643,11 @@ fn keybindings_text() -> Text<'static> {
         "Move track down / up within its type",
     );
     keybinding(&mut lines, "a", "Make track the default for its type");
-    keybinding(&mut lines, "Enter", "Edit video codec and resolution");
+    keybinding(
+        &mut lines,
+        "Enter",
+        "Edit video settings or convert/export subtitles",
+    );
     keybinding(&mut lines, "i", "Open full ffprobe stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
@@ -590,11 +692,13 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
 
     if let Some(progress) = app.edit_progress {
         let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u16;
-        let action = if app.video_settings.is_empty() {
-            "Remuxing with ffmpeg…"
-        } else {
-            "Transcoding with ffmpeg…"
-        };
+        let action = app.edit_progress_label.as_deref().unwrap_or({
+            if app.video_settings.is_empty() {
+                "Remuxing with ffmpeg…"
+            } else {
+                "Transcoding with ffmpeg…"
+            }
+        });
         frame.render_widget(Paragraph::new(action).centered(), rows[0]);
         frame.render_widget(
             Gauge::default()
@@ -617,11 +721,13 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
             Paragraph::new(format!(
                 "{}  {}",
                 SPINNER[tick % SPINNER.len()],
-                if app.video_settings.is_empty() {
-                    "Remuxing with ffmpeg…"
-                } else {
-                    "Transcoding with ffmpeg…"
-                }
+                app.edit_progress_label.as_deref().unwrap_or({
+                    if app.video_settings.is_empty() {
+                        "Remuxing with ffmpeg…"
+                    } else {
+                        "Transcoding with ffmpeg…"
+                    }
+                })
             ))
             .centered()
             .style(Style::default().fg(Color::Cyan).bold()),
@@ -639,15 +745,12 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
         .get(&popup.stream_index)
         .copied()
         .unwrap_or_default();
-    let stream = app.selected_stream_info();
-    let source_codec = stream
-        .and_then(|stream| string(stream, "codec_name"))
-        .unwrap_or("unknown")
-        .to_uppercase();
-    let codec_label = match settings.codec {
-        VideoCodec::Original => format!("Original ({source_codec})"),
-        codec => codec.label().to_string(),
-    };
+    let codec_choices = app.video_codec_choices(popup.stream_index);
+    let codec_label = codec_choices
+        .iter()
+        .find(|choice| choice.value == settings.codec)
+        .map(|choice| choice.label.as_str())
+        .unwrap_or("Unknown");
     let resolution_choices = app.resolution_choices(popup.stream_index);
     let resolution_label = resolution_choices
         .iter()
@@ -658,7 +761,7 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let mut lines = vec![
         setting_line(
             "Codec",
-            &codec_label,
+            codec_label,
             popup.field == VideoSettingsField::Codec,
         ),
         setting_line(
@@ -671,17 +774,14 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
         match popup.field {
             VideoSettingsField::Codec => {
-                for (position, codec) in VideoCodec::OPTIONS.iter().enumerate() {
-                    let label = if *codec == VideoCodec::Original {
-                        format!("Original ({source_codec})")
-                    } else {
-                        codec.label().to_string()
-                    };
-                    lines.push(dropdown_line(
-                        &label,
+                for (position, choice) in codec_choices.iter().enumerate() {
+                    lines.push(subtitle_codec_line(
+                        &choice.label,
                         position == popup.codec_cursor,
-                        *codec == settings.codec,
+                        settings.codec != crate::edit::VideoCodec::Original
+                            && choice.value == settings.codec,
                         true,
+                        choice.current,
                     ));
                 }
             }
@@ -712,6 +812,107 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.subtitle_settings_popup.as_ref() else {
+        return;
+    };
+    let change = app.subtitle_changes.get(&popup.source);
+    let codec_choices = app.subtitle_choices(&popup.source, popup.source_format, popup.action);
+    let codec_selected = |choice: &crate::subtitle::FormatChoice| {
+        if popup.action == SubtitleAction::ExportSidecar {
+            change.and_then(|change| change.export_target) == Some(choice.format)
+        } else {
+            change.and_then(|change| change.embedded_target) == choice.value
+        }
+    };
+    let codec_staged = |choice: &crate::subtitle::FormatChoice| {
+        if popup.action == SubtitleAction::ExportSidecar {
+            change.and_then(|change| change.export_target) == Some(choice.format)
+        } else {
+            change.and_then(|change| change.embedded_target).is_some()
+                && change.and_then(|change| change.embedded_target) == choice.value
+        }
+    };
+    let codec_label = codec_choices
+        .iter()
+        .find(|choice| codec_selected(choice))
+        .map(|choice| choice.label.as_str())
+        .unwrap_or_else(|| popup.source_format.label());
+    let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
+    let mut lines = Vec::new();
+    if !sidecar {
+        lines.push(subtitle_action_line(
+            popup.action,
+            popup.field == SubtitleSettingsField::Action,
+        ));
+    }
+    lines.push(setting_line(
+        "Codec",
+        codec_label,
+        popup.field == SubtitleSettingsField::Codec,
+    ));
+
+    if popup.dropdown_open {
+        lines.push(Line::from(""));
+        match popup.field {
+            SubtitleSettingsField::Action => {}
+            SubtitleSettingsField::Codec => {
+                for (position, choice) in codec_choices.iter().enumerate() {
+                    let label = match &choice.reason {
+                        Some(reason) => format!("{} — {reason}", choice.label),
+                        None => choice.label.clone(),
+                    };
+                    lines.push(subtitle_codec_line(
+                        &label,
+                        position == popup.codec_cursor,
+                        codec_staged(choice),
+                        choice.enabled,
+                        choice.current,
+                    ));
+                }
+            }
+        }
+    }
+    let title = match &popup.source {
+        SubtitleSource::Embedded(index) => format!(" Subtitle track #{index} "),
+        SubtitleSource::Sidecar(path) => format!(
+            " {} ",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Subtitle sidecar")
+        ),
+    };
+    let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+    let area = centered_fixed(frame.area(), 76, height.max(8));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn subtitle_action_line(action: SubtitleAction, focused: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "Action      ",
+            Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
+        ),
+        save_option(
+            " Convert in container ",
+            action == SubtitleAction::ConvertInContainer,
+        ),
+        Span::raw("  "),
+        save_option(" Export sidecar ", action == SubtitleAction::ExportSidecar),
+    ])
+}
+
 fn setting_line(label: &str, value: &str, selected: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -727,6 +928,39 @@ fn setting_line(label: &str, value: &str, selected: bool) -> Line<'static> {
             },
         ),
     ])
+}
+
+fn subtitle_codec_line(
+    label: &str,
+    cursor: bool,
+    staged: bool,
+    enabled: bool,
+    current: bool,
+) -> Line<'static> {
+    let background = cursor.then_some(Color::Cyan);
+    let mut label_style = if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else if staged {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    if let Some(background) = background {
+        label_style = label_style.bg(background).add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![Span::styled(format!("    {label}"), label_style)];
+    if current {
+        let mut original_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        if let Some(background) = background {
+            original_style = original_style.bg(background);
+        }
+        spans.push(Span::styled(" (original)", original_style));
+    }
+    Line::from(spans)
 }
 
 fn dropdown_line(label: &str, cursor: bool, selected: bool, enabled: bool) -> Line<'static> {
@@ -1255,5 +1489,64 @@ mod tests {
 
         // Assert
         assert_that!(help).does_not_contain("Refresh");
+    }
+
+    #[test]
+    fn subtitle_codec_line_should_distinguish_original_staged_and_available_codecs() {
+        // Act
+        let original = subtitle_codec_line("SubRip / SRT", false, false, true, true);
+        let staged = subtitle_codec_line("ASS", false, true, true, false);
+        let available = subtitle_codec_line("WebVTT", false, false, true, false);
+        let staged_original = subtitle_codec_line("SubRip / SRT", false, true, true, true);
+        let staged_cursor = subtitle_codec_line("ASS", true, true, true, false);
+
+        // Assert
+        assert_that!(original.to_string())
+            .contains("(original)")
+            .does_not_contain("●");
+        assert_eq!(original.spans[0].style.fg, Some(Color::White));
+        assert_eq!(original.spans[1].style.fg, Some(Color::DarkGray));
+        assert!(
+            original.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert_eq!(staged.spans[0].style.fg, Some(Color::Yellow));
+        assert!(
+            staged.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert_eq!(available.spans[0].style.fg, Some(Color::White));
+        assert_eq!(staged_original.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(staged_original.spans[1].style.fg, Some(Color::DarkGray));
+        assert_eq!(staged_cursor.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(staged_cursor.spans[0].style.bg, Some(Color::Cyan));
+        assert!(
+            staged_cursor.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn subtitle_action_line_should_use_save_dialog_button_styling_without_an_orb() {
+        // Act
+        let line = subtitle_action_line(SubtitleAction::ConvertInContainer, true);
+
+        // Assert
+        assert_that!(line.to_string())
+            .contains("Convert in container")
+            .contains("Export sidecar")
+            .does_not_contain("›")
+            .does_not_contain("●");
+        assert!(line.to_string().starts_with("Action"));
+        assert_eq!(line.spans[1].style.fg, Some(Color::White));
+        assert_eq!(line.spans[1].style.bg, Some(Color::Cyan));
+        assert_eq!(line.spans[3].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[3].style.bg, None);
     }
 }

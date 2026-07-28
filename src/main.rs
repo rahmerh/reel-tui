@@ -2,6 +2,7 @@ mod app;
 mod edit;
 mod files;
 mod probe;
+mod subtitle;
 mod ui;
 
 use std::time::{Duration, Instant};
@@ -103,6 +104,30 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                     app.request_save();
                 }
                 _ if is_back_key(key) => app.escape_video_settings(),
+                _ => {}
+            }
+        }
+        Some(Dialog::SubtitleSettings) => {
+            input.reset_sequence();
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                    app.move_subtitle_settings_cursor(1)
+                }
+                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                    app.move_subtitle_settings_cursor(-1)
+                }
+                (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                    app.choose_subtitle_action(-1)
+                }
+                (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                    app.choose_subtitle_action(1)
+                }
+                (KeyCode::Enter, _) => app.activate_subtitle_settings(),
+                (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                    app.close_subtitle_settings();
+                    app.request_save();
+                }
+                _ if is_back_key(key) => app.escape_subtitle_settings(),
                 _ => {}
             }
         }
@@ -225,7 +250,7 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         }
         (KeyCode::Enter, _) if app.layer == Layer::Streams => {
             input.reset_sequence();
-            app.open_video_settings();
+            app.open_track_settings();
         }
         (KeyCode::Enter, _) if app.layer == Layer::Files => {
             input.reset_sequence();
@@ -320,6 +345,7 @@ mod tests {
             (Layer::StreamDetails, None),
             (Layer::Streams, Some(Dialog::Keybindings)),
             (Layer::Streams, Some(Dialog::VideoSettings)),
+            (Layer::Streams, Some(Dialog::SubtitleSettings)),
             (Layer::Streams, Some(Dialog::ConfirmSave)),
             (Layer::Streams, Some(Dialog::Processing)),
             (Layer::Streams, Some(Dialog::Error)),
