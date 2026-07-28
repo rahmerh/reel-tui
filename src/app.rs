@@ -40,7 +40,15 @@ pub enum Dialog {
     SubtitleSettings,
     ConfirmSave,
     Processing,
+    ConfirmCancel,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CancelEditChoice {
+    #[default]
+    KeepProcessing,
+    CancelProcessing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +170,7 @@ pub struct App {
     pub edit_progress: Option<f64>,
     pub edit_progress_label: Option<String>,
     pub edit_started: Option<Instant>,
+    pub cancel_edit_choice: CancelEditChoice,
     pub scan_error: Option<String>,
     request_tx: Sender<ProbeRequest>,
     edit_tx: Sender<EditRequest>,
@@ -209,6 +218,7 @@ impl App {
             edit_progress: None,
             edit_progress_label: None,
             edit_started: None,
+            cancel_edit_choice: CancelEditChoice::KeepProcessing,
             scan_error: None,
             request_tx,
             edit_tx,
@@ -264,7 +274,10 @@ impl App {
             .zip(old_file.as_ref())
             .is_some_and(|(index, old)| files[index].fingerprint != old.fingerprint);
         let selected_removed = old_path.is_some() && selected_position.is_none();
-        let was_processing = self.dialog == Some(Dialog::Processing);
+        let was_processing = matches!(
+            self.dialog,
+            Some(Dialog::Processing | Dialog::ConfirmCancel)
+        );
 
         self.files = files;
         self.sidecars_by_media = sidecars_by_media;
@@ -482,7 +495,10 @@ impl App {
 
     pub fn receive_edit_results(&mut self, receiver: &Receiver<EditEvent>) {
         while let Ok(event) = receiver.try_recv() {
-            if self.dialog != Some(Dialog::Processing) {
+            if !matches!(
+                self.dialog,
+                Some(Dialog::Processing | Dialog::ConfirmCancel)
+            ) {
                 continue;
             }
             match event {
@@ -510,6 +526,7 @@ impl App {
                         self.edit_progress = None;
                         self.edit_progress_label = None;
                         self.edit_started = None;
+                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                         self.notice = Some(if !media_changed {
                             "Subtitle changes saved.".to_string()
                         } else if output_path == path {
@@ -530,9 +547,11 @@ impl App {
                     }
                     EditOutcome::Cancelled => {
                         self.edit_cancel = None;
+                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                     }
                     EditOutcome::SourceChanged(error) => {
                         self.edit_cancel = None;
+                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                         let snapshot = match scan_directory(&self.directory) {
                             Ok(files) => DirectorySnapshot::Files(files),
                             Err(error) => DirectorySnapshot::Error(error.to_string()),
@@ -544,6 +563,7 @@ impl App {
                     }
                     EditOutcome::Failed(error) => {
                         self.edit_cancel = None;
+                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                         self.dialog = Some(Dialog::Error);
                         self.edit_error = Some(error);
                         self.edit_progress = None;
@@ -1495,6 +1515,7 @@ impl App {
                 self.edit_progress = None;
                 self.edit_progress_label = None;
                 self.edit_started = Some(Instant::now());
+                self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                 self.edit_cancel = Some(cancelled);
             }
             Err(error) => {
@@ -1505,7 +1526,10 @@ impl App {
     }
 
     pub fn cancel_edit(&mut self) {
-        if self.dialog != Some(Dialog::Processing) {
+        if !matches!(
+            self.dialog,
+            Some(Dialog::Processing | Dialog::ConfirmCancel)
+        ) {
             return;
         }
         if let Some(cancelled) = self.edit_cancel.take() {
@@ -1516,12 +1540,52 @@ impl App {
         self.edit_progress = None;
         self.edit_progress_label = None;
         self.edit_started = None;
+        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
         self.notice = Some("Media edit cancelled.".to_string());
         self.layer = Layer::Streams;
     }
 
+    pub fn request_cancel_edit(&mut self) {
+        if self.dialog != Some(Dialog::Processing) {
+            return;
+        }
+        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
+        self.dialog = Some(Dialog::ConfirmCancel);
+    }
+
+    pub fn choose_cancel_edit(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmCancel) || direction == 0 {
+            return;
+        }
+        self.cancel_edit_choice = if direction.is_positive() {
+            CancelEditChoice::CancelProcessing
+        } else {
+            CancelEditChoice::KeepProcessing
+        };
+    }
+
+    pub fn activate_cancel_edit(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmCancel) {
+            return;
+        }
+        match self.cancel_edit_choice {
+            CancelEditChoice::KeepProcessing => self.dismiss_cancel_edit(),
+            CancelEditChoice::CancelProcessing => self.cancel_edit(),
+        }
+    }
+
+    pub fn dismiss_cancel_edit(&mut self) {
+        if self.dialog == Some(Dialog::ConfirmCancel) {
+            self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
+            self.dialog = Some(Dialog::Processing);
+        }
+    }
+
     pub fn dismiss_dialog(&mut self) {
-        if self.dialog == Some(Dialog::Processing) {
+        if matches!(
+            self.dialog,
+            Some(Dialog::Processing | Dialog::ConfirmCancel)
+        ) {
             return;
         }
         self.dialog = None;
@@ -2776,6 +2840,32 @@ mod tests {
     }
 
     #[test]
+    fn processing_updates_should_continue_while_cancel_confirmation_is_open() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        app.dialog = Some(Dialog::ConfirmCancel);
+        result_tx
+            .send(EditEvent::Progress {
+                progress: Some(0.5),
+                label: "Transcoding with ffmpeg…".to_string(),
+            })
+            .unwrap();
+
+        // Act
+        app.receive_edit_results(&result_rx);
+
+        // Assert
+        assert_that!(app.dialog).contains(Dialog::ConfirmCancel);
+        assert_that!(app.edit_progress).contains(0.5);
+        assert_that!(app.edit_progress_label.as_deref()).contains("Transcoding with ffmpeg…");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn open_stream_details_should_open_one_layer_and_back_should_return_to_tracks() {
         // Arrange
         let mut app = test_app(media(serde_json::json!([
@@ -2819,6 +2909,61 @@ mod tests {
         assert_that!(app.dialog).is_none();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
         assert_that!(app.deleted_streams).contains(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn request_cancel_edit_should_require_confirmation_before_signalling_the_worker() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ])));
+        let directory = app.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.edit_cancel = Some(cancelled.clone());
+        app.dialog = Some(Dialog::Processing);
+
+        // Act
+        app.request_cancel_edit();
+
+        // Assert
+        assert_that!(app.dialog).contains(Dialog::ConfirmCancel);
+        assert_that!(app.cancel_edit_choice).is_equal_to(CancelEditChoice::KeepProcessing);
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
+
+        // Act
+        app.choose_cancel_edit(1);
+        app.activate_cancel_edit();
+
+        // Assert
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dismiss_cancel_edit_should_return_to_processing_without_signalling_the_worker() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ])));
+        let directory = app.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.edit_cancel = Some(cancelled.clone());
+        app.dialog = Some(Dialog::ConfirmCancel);
+        app.cancel_edit_choice = CancelEditChoice::CancelProcessing;
+
+        // Act
+        app.dismiss_cancel_edit();
+
+        // Assert
+        assert_that!(app.dialog).contains(Dialog::Processing);
+        assert_that!(app.cancel_edit_choice).is_equal_to(CancelEditChoice::KeepProcessing);
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

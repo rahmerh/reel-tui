@@ -80,13 +80,27 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
     match app.dialog {
         Some(Dialog::Processing) => {
             input.reset_sequence();
-            if is_back_key(key)
-                || matches!(
-                    (key.code, key.modifiers),
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                )
-            {
+            if is_back_key(key) {
+                app.request_cancel_edit();
+            } else if matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ) {
                 app.cancel_edit();
+            }
+        }
+        Some(Dialog::ConfirmCancel) => {
+            input.reset_sequence();
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                    app.choose_cancel_edit(-1)
+                }
+                (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                    app.choose_cancel_edit(1)
+                }
+                (KeyCode::Enter, _) => app.activate_cancel_edit(),
+                _ if is_back_key(key) => app.dismiss_cancel_edit(),
+                _ => {}
             }
         }
         Some(Dialog::VideoSettings) => {
@@ -348,6 +362,7 @@ mod tests {
             (Layer::Streams, Some(Dialog::SubtitleSettings)),
             (Layer::Streams, Some(Dialog::ConfirmSave)),
             (Layer::Streams, Some(Dialog::Processing)),
+            (Layer::Streams, Some(Dialog::ConfirmCancel)),
             (Layer::Streams, Some(Dialog::Error)),
         ];
 
@@ -355,6 +370,25 @@ mod tests {
             let escape = exit_result(layer, dialog, KeyCode::Esc);
             let q = exit_result(layer, dialog, KeyCode::Char('q'));
             assert_eq!(escape, q, "Esc/q mismatch in {layer:?} with {dialog:?}");
+        }
+    }
+
+    #[test]
+    fn escape_and_q_should_open_then_dismiss_processing_cancellation_confirmation() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (mut app, directory) = test_app();
+            app.layer = Layer::Streams;
+            app.dialog = Some(Dialog::Processing);
+            let mut input = InputState::default();
+
+            handle_key(&mut app, &mut input, key(code));
+            assert_eq!(app.dialog, Some(Dialog::ConfirmCancel));
+
+            handle_key(&mut app, &mut input, key(code));
+            assert_eq!(app.dialog, Some(Dialog::Processing));
+
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 

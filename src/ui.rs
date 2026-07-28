@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::{
     app::{
-        App, Dialog, Layer, SaveDialogField, SubtitleAction,
+        App, CancelEditChoice, Dialog, Layer, SaveDialogField, SubtitleAction,
         SubtitleSettingsField, TrackRef, VideoSettingsField,
     },
     edit::{SaveDestination, stream_index},
@@ -487,16 +487,21 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_progress_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::ConfirmCancel {
+        render_progress_dialog(frame, app);
+        render_cancel_edit_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::ConfirmSave {
         render_save_dialog(frame, app);
         return;
     }
     let (title, body, color) = match dialog {
-        Dialog::Processing => unreachable!(),
         Dialog::Keybindings
         | Dialog::VideoSettings
         | Dialog::SubtitleSettings
         | Dialog::ConfirmSave => unreachable!(),
+        Dialog::Processing | Dialog::ConfirmCancel => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -514,6 +519,38 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(color))
                     .title(title),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_cancel_edit_dialog(frame: &mut Frame, app: &App) {
+    let lines = vec![
+        Line::from("Are you sure you want to cancel the current operation?").centered(),
+        Line::from(""),
+        Line::from(vec![
+            save_option(
+                " Keep processing ",
+                app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
+            ),
+            Span::raw("  "),
+            save_option(
+                " Cancel processing ",
+                app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
+            ),
+        ])
+        .centered(),
+    ];
+    let area = centered_fixed(frame.area(), 64, 7);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Confirm cancellation "),
             )
             .wrap(Wrap { trim: false }),
         area,
