@@ -933,7 +933,7 @@ fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
 }
 
 fn render_progress_dialog(frame: &mut Frame, app: &App) {
-    let area = centered_fixed(frame.area(), 64, 7);
+    let area = centered_fixed(frame.area(), 64, 9);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -946,54 +946,54 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .margin(1)
     .split(inner);
 
-    if let Some(progress) = app.edit_progress {
-        let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u16;
-        let action = app.edit_progress_label.as_deref().unwrap_or({
-            if app.video_settings.is_empty() {
-                "Remuxing with ffmpeg…"
-            } else {
-                "Transcoding with ffmpeg…"
-            }
-        });
-        frame.render_widget(Paragraph::new(action).centered(), rows[0]);
-        frame.render_widget(
-            Gauge::default()
-                .gauge_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .percent(percent)
-                .label(format!("{percent}%")),
-            rows[2],
-        );
-    } else {
-        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let tick = app
-            .edit_started
-            .map_or(0, |started| (started.elapsed().as_millis() / 80) as usize);
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{}  {}",
-                SPINNER[tick % SPINNER.len()],
-                app.edit_progress_label.as_deref().unwrap_or({
-                    if app.video_settings.is_empty() {
-                        "Remuxing with ffmpeg…"
-                    } else {
-                        "Transcoding with ffmpeg…"
-                    }
-                })
-            ))
+    frame.render_widget(
+        Paragraph::new("Processing...")
             .centered()
             .style(Style::default().fg(Color::Cyan).bold()),
-            rows[1],
-        );
-    }
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(processing_info_line(app.processing_description())).centered(),
+        rows[2],
+    );
+
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let tick = app
+        .edit_started
+        .map_or(0, |started| (started.elapsed().as_millis() / 80) as usize);
+    let percent = app
+        .edit_progress
+        .map(|progress| (progress.clamp(0.0, 1.0) * 100.0).round() as u16);
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .percent(percent.unwrap_or(0))
+            .label(percent.map_or_else(
+                || SPINNER[tick % SPINNER.len()].to_string(),
+                |value| format!("{value}%"),
+            )),
+        rows[4],
+    );
+}
+
+fn processing_info_line(description: String) -> Line<'static> {
+    Line::styled(
+        description,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )
 }
 
 fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
@@ -1747,6 +1747,20 @@ mod tests {
 
         // Assert
         assert_that!(result).is_equal_to("short".to_string());
+    }
+
+    #[test]
+    fn processing_info_line_should_render_as_quiet_italic_text() {
+        // Arrange
+        let description = "Converting MKV to MP4".to_string();
+
+        // Act
+        let line = processing_info_line(description);
+
+        // Assert
+        assert_that!(line.to_string()).is_equal_to("Converting MKV to MP4".to_string());
+        assert_eq!(line.style.fg, Some(Color::DarkGray));
+        assert!(line.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]

@@ -2394,6 +2394,65 @@ impl App {
                 .any(SubtitleChange::changes_media)
     }
 
+    pub fn processing_description(&self) -> String {
+        let mut descriptions = Vec::new();
+
+        if let Some(target) = self.container_target {
+            descriptions.push(match self.source_container() {
+                Some(source) => {
+                    format!("Converting {} to {}", source.label(), target.label())
+                }
+                None => format!("Converting container to {}", target.label()),
+            });
+        }
+
+        let exported_subtitles = self
+            .subtitle_changes
+            .values()
+            .filter(|change| change.export_target.is_some())
+            .count();
+        if exported_subtitles > 0 {
+            descriptions.push(format!(
+                "Exporting {exported_subtitles} subtitle{}",
+                if exported_subtitles == 1 { "" } else { "s" }
+            ));
+        }
+
+        if descriptions.len() < 2 && !self.video_settings.is_empty() {
+            descriptions.push(format!(
+                "Transcoding {} video track{}",
+                self.video_settings.len(),
+                if self.video_settings.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+
+        let converted_subtitles = self
+            .subtitle_changes
+            .values()
+            .filter(|change| {
+                change
+                    .embedded_target
+                    .is_some_and(|target| target != change.source_format)
+            })
+            .count();
+        if descriptions.len() < 2 && exported_subtitles == 0 && converted_subtitles > 0 {
+            descriptions.push(format!(
+                "Converting {converted_subtitles} subtitle{}",
+                if converted_subtitles == 1 { "" } else { "s" }
+            ));
+        }
+
+        if descriptions.is_empty() {
+            "Remuxing media".to_string()
+        } else {
+            descriptions.join(" · ")
+        }
+    }
+
     pub fn save_summary(&self) -> Vec<String> {
         let Some(info) = self.media_info() else {
             return Vec::new();
@@ -2891,6 +2950,87 @@ mod tests {
 
         // Assert
         assert_that!(result).is_equal_to(0);
+    }
+
+    #[test]
+    fn processing_description_should_describe_container_conversion_and_subtitle_exports() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        app.container_target = Some(ContainerFormat::Mp4);
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(2),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: Some(SubtitleFormat::SubRip),
+                ocr_language: None,
+            },
+        );
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(3),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(3),
+                source_format: SubtitleFormat::Ass,
+                embedded_target: None,
+                export_target: Some(SubtitleFormat::Ass),
+                ocr_language: None,
+            },
+        );
+
+        // Act
+        let description = app.processing_description();
+
+        // Assert
+        assert_that!(description)
+            .is_equal_to("Converting MKV to MP4 · Exporting 2 subtitles".to_string());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn processing_description_should_singularize_one_subtitle_export() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(2),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: Some(SubtitleFormat::SubRip),
+                ocr_language: None,
+            },
+        );
+
+        // Act
+        let description = app.processing_description();
+
+        // Assert
+        assert_that!(description).is_equal_to("Exporting 1 subtitle".to_string());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn processing_description_should_describe_a_plain_remux() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(1);
+
+        // Act
+        let description = app.processing_description();
+
+        // Assert
+        assert_that!(description).is_equal_to("Remuxing media".to_string());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
