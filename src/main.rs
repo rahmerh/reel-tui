@@ -269,7 +269,13 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         }
         (KeyCode::Char('h'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
-            app.back();
+            if !app.move_subtitle_column(-1) {
+                app.back();
+            }
+        }
+        (KeyCode::Char('l'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
+            input.reset_sequence();
+            app.move_subtitle_column(1);
         }
         (KeyCode::Char('l'), KeyModifiers::NONE) if app.layer == Layer::Files => {
             input.reset_sequence();
@@ -327,6 +333,7 @@ mod tests {
         edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
         files::{FileEntry, FileFingerprint},
         probe::{MediaInfo, ProbeOutcome, ProbeRequest},
+        subtitle::{SidecarEntry, SubtitleFormat},
     };
 
     fn test_app() -> (App, PathBuf) {
@@ -454,6 +461,55 @@ mod tests {
         );
 
         assert_eq!(app.layer, Layer::Files);
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn h_and_l_should_switch_between_wide_subtitle_columns_before_leaving() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1];
+        app.sidecars.push(SidecarEntry {
+            path: directory.join("movie.eng.srt"),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        });
+        app.layer = Layer::Streams;
+        app.selected_stream = 2;
+        app.set_subtitle_columns_side_by_side(true);
+        let mut input = InputState::default();
+
+        // Act / Assert
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_eq!(app.selected_stream, 3);
+        assert_eq!(app.layer, Layer::Streams);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_eq!(app.selected_stream, 2);
+        assert_eq!(app.layer, Layer::Streams);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_eq!(app.layer, Layer::Files);
+
+        // Cleanup
         drop(app);
         fs::remove_dir_all(directory).unwrap();
     }

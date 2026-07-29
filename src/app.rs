@@ -16,7 +16,7 @@ use crate::{
     edit::{
         ContainerFormat, CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
         SaveDestination, VideoCodec, VideoResolution, VideoSettings, container_conflict_streams,
-        container_conflicts, stream_index, validate_edit,
+        container_conflicts, imported_subtitle_conflicts, stream_index, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -65,6 +65,7 @@ pub enum SubtitleSettingsField {
     #[default]
     Codec,
     Export,
+    Import,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +294,7 @@ pub struct App {
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub video_settings_popup: Option<VideoSettingsPopup>,
     pub sidecars: Vec<SidecarEntry>,
+    pub subtitle_columns_side_by_side: bool,
     pub subtitle_changes: BTreeMap<SubtitleSource, SubtitleChange>,
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
@@ -344,6 +346,7 @@ impl App {
             video_settings: BTreeMap::new(),
             video_settings_popup: None,
             sidecars: Vec::new(),
+            subtitle_columns_side_by_side: false,
             subtitle_changes: BTreeMap::new(),
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
@@ -497,6 +500,9 @@ impl App {
     pub fn select_next(&mut self) {
         self.notice = None;
         if self.layer == Layer::Streams {
+            if self.move_within_subtitle_column(1, 1, false) {
+                return;
+            }
             let count = self.stream_count();
             if count > 0 {
                 self.selected_stream = (self.selected_stream + 1).min(count - 1);
@@ -521,6 +527,9 @@ impl App {
     pub fn select_previous(&mut self) {
         self.notice = None;
         if self.layer == Layer::Streams {
+            if self.move_within_subtitle_column(-1, 1, false) {
+                return;
+            }
             self.selected_stream = self.selected_stream.saturating_sub(1);
             return;
         }
@@ -558,6 +567,25 @@ impl App {
             return;
         }
         if self.layer == Layer::Streams {
+            if self.subtitle_columns_side_by_side {
+                let rows = self.track_rows();
+                let column = match self.selected_track() {
+                    Some(TrackRef::Embedded(index))
+                        if self
+                            .media_info()
+                            .and_then(|info| stream_by_index(info, index))
+                            .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+                    {
+                        self.embedded_subtitle_positions(&rows)
+                    }
+                    Some(TrackRef::Sidecar(_)) => self.sidecar_positions(&rows),
+                    _ => Vec::new(),
+                };
+                if let Some(last) = column.last() {
+                    self.selected_stream = *last;
+                    return;
+                }
+            }
             self.selected_stream = self.stream_count().saturating_sub(1);
             return;
         }
@@ -778,6 +806,137 @@ impl App {
         } else {
             self.stream_order.len() + self.sidecars.len()
         }
+    }
+
+    pub fn set_subtitle_columns_side_by_side(&mut self, side_by_side: bool) {
+        self.subtitle_columns_side_by_side = side_by_side;
+    }
+
+    pub fn move_subtitle_column(&mut self, direction: isize) -> bool {
+        if self.layer != Layer::Streams
+            || self.dialog.is_some()
+            || !self.subtitle_columns_side_by_side
+            || direction == 0
+        {
+            return false;
+        }
+        let rows = self.track_rows();
+        let embedded = self.embedded_subtitle_positions(&rows);
+        let external = self.sidecar_positions(&rows);
+        if embedded.is_empty() || external.is_empty() {
+            return false;
+        }
+        let (source, target) = match self.selected_track() {
+            Some(TrackRef::Embedded(index))
+                if direction.is_positive()
+                    && self
+                        .media_info()
+                        .and_then(|info| stream_by_index(info, index))
+                        .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+            {
+                (&embedded, &external)
+            }
+            Some(TrackRef::Sidecar(_)) if direction.is_negative() => (&external, &embedded),
+            _ => return false,
+        };
+        let row = source
+            .iter()
+            .position(|position| *position == self.selected_stream)
+            .unwrap_or(0);
+        self.selected_stream = target[row.min(target.len() - 1)];
+        self.notice = None;
+        true
+    }
+
+    fn embedded_subtitle_positions(&self, rows: &[TrackRef]) -> Vec<usize> {
+        let Some(info) = self.media_info() else {
+            return Vec::new();
+        };
+        rows.iter()
+            .enumerate()
+            .filter_map(|(position, row)| match row {
+                TrackRef::Embedded(index)
+                    if stream_by_index(info, *index)
+                        .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+                {
+                    Some(position)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sidecar_positions(&self, rows: &[TrackRef]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter_map(|(position, row)| matches!(row, TrackRef::Sidecar(_)).then_some(position))
+            .collect()
+    }
+
+    fn move_within_subtitle_column(
+        &mut self,
+        direction: isize,
+        amount: usize,
+        clamp_within_column: bool,
+    ) -> bool {
+        if self.layer != Layer::Streams || !self.subtitle_columns_side_by_side || direction == 0 {
+            return false;
+        }
+        let rows = self.track_rows();
+        let embedded = self.embedded_subtitle_positions(&rows);
+        let external = self.sidecar_positions(&rows);
+        let column = match self.selected_track() {
+            Some(TrackRef::Embedded(index))
+                if self
+                    .media_info()
+                    .and_then(|info| stream_by_index(info, index))
+                    .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+            {
+                &embedded
+            }
+            Some(TrackRef::Sidecar(_)) => &external,
+            _ => return false,
+        };
+        let Some(row) = column
+            .iter()
+            .position(|position| *position == self.selected_stream)
+        else {
+            return false;
+        };
+        let target_row = if direction.is_positive() {
+            row.saturating_add(amount).min(column.len() - 1)
+        } else {
+            row.saturating_sub(amount)
+        };
+        if target_row != row || clamp_within_column {
+            self.selected_stream = column[target_row];
+            return true;
+        }
+
+        let first_subtitle = embedded
+            .first()
+            .into_iter()
+            .chain(external.first())
+            .copied()
+            .min()
+            .unwrap_or(self.selected_stream);
+        let last_subtitle = embedded
+            .last()
+            .into_iter()
+            .chain(external.last())
+            .copied()
+            .max()
+            .unwrap_or(self.selected_stream);
+        self.selected_stream = if direction.is_positive() {
+            if last_subtitle + 1 < rows.len() {
+                last_subtitle + 1
+            } else {
+                self.selected_stream
+            }
+        } else {
+            first_subtitle.saturating_sub(1)
+        };
+        true
     }
 
     pub fn track_rows(&self) -> Vec<TrackRef> {
@@ -1007,13 +1166,34 @@ impl App {
             &subtitle_changes,
             target,
         ));
+        conflicts.extend(imported_subtitle_conflicts(
+            &subtitle_changes,
+            &self.sidecars,
+            target,
+        ));
         conflicts
     }
 
     pub fn selected_container_conflicts(&self) -> Vec<String> {
-        self.container_target
-            .map(|target| self.container_conflicts_for(target))
-            .unwrap_or_default()
+        if let Some(target) = self.container_target {
+            return self.container_conflicts_for(target);
+        }
+        let Some(target) = self.source_container() else {
+            return if self
+                .subtitle_changes
+                .values()
+                .any(|change| change.import_into_media)
+            {
+                vec![
+                    "The current container is unknown; choose a container before importing subtitles."
+                        .to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+        };
+        let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
+        imported_subtitle_conflicts(&subtitle_changes, &self.sidecars, target)
     }
 
     pub fn selected_container_conflict_streams(&self) -> BTreeSet<u64> {
@@ -1205,6 +1385,7 @@ impl App {
                 source_format,
                 embedded_target: None,
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             });
         let codec_choices = self.subtitle_choices(&source, source_format);
@@ -1228,9 +1409,14 @@ impl App {
         source_format: SubtitleFormat,
     ) -> Vec<FormatChoice> {
         let sidecar = matches!(source, SubtitleSource::Sidecar(_));
+        let importing = sidecar
+            && self
+                .subtitle_changes
+                .get(source)
+                .is_some_and(|change| change.import_into_media);
         let mut choices = self.subtitle_capabilities.format_choices(
             source_format,
-            (!sidecar)
+            (!sidecar || importing)
                 .then(|| {
                     self.container_target
                         .map(ContainerFormat::extension)
@@ -1240,7 +1426,7 @@ impl App {
                         })
                 })
                 .flatten(),
-            sidecar,
+            sidecar && !importing,
             false,
         );
         if !sidecar && self.subtitle_export_enabled(source) {
@@ -1296,6 +1482,7 @@ impl App {
                 source_format,
                 embedded_target: None,
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             });
         if change.export_target.is_some() {
@@ -1334,6 +1521,7 @@ impl App {
                 source_format,
                 embedded_target: None,
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             })
     }
@@ -1350,12 +1538,59 @@ impl App {
         sidecar: bool,
     ) -> SubtitleSettingsField {
         if sidecar {
-            return SubtitleSettingsField::Codec;
+            return match (field, direction.is_positive()) {
+                (SubtitleSettingsField::Codec, true) => SubtitleSettingsField::Import,
+                (SubtitleSettingsField::Import, false) => SubtitleSettingsField::Codec,
+                (field, _) => field,
+            };
         }
         match (field, direction.is_positive()) {
             (SubtitleSettingsField::Codec, true) => SubtitleSettingsField::Export,
             (SubtitleSettingsField::Export, false) => SubtitleSettingsField::Codec,
             (field, _) => field,
+        }
+    }
+
+    fn toggle_subtitle_import(&mut self) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        let source = popup.source.clone();
+        if !matches!(source, SubtitleSource::Sidecar(_)) {
+            return;
+        }
+        let source_format = popup.source_format;
+        let mut change = self.subtitle_change(&source, source_format);
+        change.import_into_media = !change.import_into_media;
+        if !change.import_into_media
+            && let Some(target) = change.embedded_target
+        {
+            let external_choices =
+                self.subtitle_capabilities
+                    .format_choices(source_format, None, true, false);
+            if external_choices
+                .iter()
+                .find(|choice| choice.format == target)
+                .is_none_or(|choice| !choice.enabled)
+            {
+                change.embedded_target = None;
+                self.notice = Some(format!(
+                    "{} is only available inside a media container; Codec was reset.",
+                    target.label()
+                ));
+            }
+        }
+        self.store_subtitle_change(source.clone(), change);
+        let choices = self.subtitle_choices(&source, source_format);
+        let selected_target = self
+            .subtitle_changes
+            .get(&source)
+            .and_then(|change| change.embedded_target);
+        if let Some(popup) = self.subtitle_settings_popup.as_mut() {
+            popup.codec_cursor = choices
+                .iter()
+                .position(|choice| choice.value == selected_target)
+                .unwrap_or(0);
         }
     }
 
@@ -1435,9 +1670,16 @@ impl App {
             return;
         };
         if !popup.dropdown_open {
-            if popup.field == SubtitleSettingsField::Export {
-                self.toggle_subtitle_export();
-                return;
+            match popup.field {
+                SubtitleSettingsField::Export => {
+                    self.toggle_subtitle_export();
+                    return;
+                }
+                SubtitleSettingsField::Import => {
+                    self.toggle_subtitle_import();
+                    return;
+                }
+                SubtitleSettingsField::Codec => {}
             }
             self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = true;
             return;
@@ -2259,6 +2501,9 @@ impl App {
                 }
             }
             Layer::Streams => {
+                if self.move_within_subtitle_column(1, 10, true) {
+                    return;
+                }
                 let count = self.stream_count();
                 if count > 0 {
                     self.selected_stream = self.selected_stream.saturating_add(10).min(count - 1);
@@ -2278,6 +2523,9 @@ impl App {
                 }
             }
             Layer::Streams => {
+                if self.move_within_subtitle_column(-1, 10, true) {
+                    return;
+                }
                 self.selected_stream = self.selected_stream.saturating_sub(10);
             }
             Layer::StreamDetails => self.scroll_details_up(10),
@@ -2434,6 +2682,18 @@ impl App {
             });
         }
 
+        let imported_subtitles = self
+            .subtitle_changes
+            .values()
+            .filter(|change| change.import_into_media)
+            .count();
+        if imported_subtitles > 0 {
+            descriptions.push(format!(
+                "Importing {imported_subtitles} subtitle{}",
+                if imported_subtitles == 1 { "" } else { "s" }
+            ));
+        }
+
         let exported_subtitles = self
             .subtitle_changes
             .values()
@@ -2467,7 +2727,11 @@ impl App {
                     .is_some_and(|target| target != change.source_format)
             })
             .count();
-        if descriptions.len() < 2 && exported_subtitles == 0 && converted_subtitles > 0 {
+        if descriptions.len() < 2
+            && imported_subtitles == 0
+            && exported_subtitles == 0
+            && converted_subtitles > 0
+        {
             descriptions.push(format!(
                 "Converting {converted_subtitles} subtitle{}",
                 if converted_subtitles == 1 { "" } else { "s" }
@@ -2550,6 +2814,14 @@ impl App {
                     .unwrap_or("subtitle sidecar")
                     .to_string(),
             };
+            if change.import_into_media {
+                let target = change.embedded_target.unwrap_or(change.source_format);
+                lines.push(format!(
+                    "Importing {source} as {} and removing the sidecar",
+                    target.label()
+                ));
+                continue;
+            }
             if let Some(target) = change.embedded_target {
                 lines.push(match change.source {
                     SubtitleSource::Embedded(_) => {
@@ -2930,6 +3202,24 @@ mod tests {
         app.layer = Layer::Streams;
     }
 
+    fn test_sidecar(app: &App, name: &str, language: &str) -> SidecarEntry {
+        SidecarEntry {
+            path: app.directory.join(name),
+            companion: None,
+            display_name: name.to_string(),
+            format: SubtitleFormat::SubRip,
+            language: language.to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        }
+    }
+
     #[test]
     fn scroll_forward_should_add_amount_when_result_is_below_maximum() {
         // Arrange
@@ -3011,6 +3301,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
                 export_target: Some(SubtitleFormat::SubRip),
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -3021,6 +3312,7 @@ mod tests {
                 source_format: SubtitleFormat::Ass,
                 embedded_target: None,
                 export_target: Some(SubtitleFormat::Ass),
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -3048,6 +3340,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
                 export_target: Some(SubtitleFormat::SubRip),
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -3091,6 +3384,186 @@ mod tests {
 
         // Assert
         assert_that!(description).is_equal_to("Changing the default subtitle track".to_string());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn side_by_side_subtitles_should_use_columns_for_navigation() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "subtitle"},
+                {"index": 3, "codec_type": "subtitle"},
+                {"index": 4, "codec_type": "attachment"}
+            ]),
+        );
+        app.sidecars = vec![
+            test_sidecar(&app, "movie.eng.srt", "eng"),
+            test_sidecar(&app, "movie.nld.srt", "nld"),
+        ];
+        app.set_subtitle_columns_side_by_side(true);
+        app.selected_stream = 3;
+
+        // Act / Assert
+        app.select_last();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(3));
+        app.selected_stream = 3;
+        assert_that!(app.move_subtitle_column(1)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+        app.select_last();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(1));
+        app.selected_stream = 5;
+        app.scroll_down();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(1));
+        app.scroll_up();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+        app.select_next();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(1));
+        assert_that!(app.move_subtitle_column(-1)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(3));
+        app.select_next();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(4));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wide_subtitle_navigation_should_not_cross_columns_at_the_bottom() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "subtitle"},
+                {"index": 2, "codec_type": "subtitle"}
+            ]),
+        );
+        app.sidecars = vec![
+            test_sidecar(&app, "movie.eng.srt", "eng"),
+            test_sidecar(&app, "movie.nld.srt", "nld"),
+        ];
+        app.set_subtitle_columns_side_by_side(true);
+        app.selected_stream = 3;
+
+        // Act
+        app.select_next();
+
+        // Assert
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(2));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stacked_subtitles_should_follow_the_linear_track_order() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "subtitle"},
+                {"index": 2, "codec_type": "subtitle"}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.eng.srt", "eng")];
+        app.set_subtitle_columns_side_by_side(false);
+        app.selected_stream = 3;
+
+        // Act
+        app.select_next();
+
+        // Assert
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+        assert_that!(app.move_subtitle_column(1)).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn toggling_sidecar_import_should_stage_a_descriptive_media_edit() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let sidecar = test_sidecar(&app, "movie.eng.srt", "eng");
+        let source = SubtitleSource::Sidecar(sidecar.path.clone());
+        app.sidecars.push(sidecar);
+        app.selected_stream = 4;
+        app.open_track_settings();
+        app.move_subtitle_settings_cursor(1);
+
+        // Act
+        app.activate_subtitle_settings();
+
+        // Assert
+        let change = app.subtitle_changes.get(&source).unwrap();
+        assert_that!(change.import_into_media).is_true();
+        assert_that!(change.embedded_target).is_none();
+        assert_that!(app.media_will_change()).is_true();
+        assert_that!(app.processing_description()).is_equal_to("Importing 1 subtitle".to_string());
+        assert_that!(app.save_summary()).contains(
+            "Importing movie.eng.srt as SubRip / SRT and removing the sidecar".to_string(),
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn imported_subtitle_should_block_an_incompatible_container_until_converted() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"}
+            ]),
+        );
+        let sidecar = test_sidecar(&app, "movie.eng.srt", "eng");
+        let source = SubtitleSource::Sidecar(sidecar.path.clone());
+        app.sidecars.push(sidecar);
+        app.container_target = Some(ContainerFormat::Mp4);
+        app.subtitle_changes.insert(
+            source.clone(),
+            SubtitleChange {
+                source: source.clone(),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: true,
+                ocr_language: None,
+            },
+        );
+
+        // Act
+        let incompatible = app.selected_container_conflicts();
+        app.subtitle_changes
+            .get_mut(&source)
+            .unwrap()
+            .embedded_target = Some(SubtitleFormat::MovText);
+        let compatible = app.selected_container_conflicts();
+
+        // Assert
+        assert_that!(incompatible).contains(
+            "MP4 can't import SubRip / SRT subtitle movie.eng.srt. Convert it to MOV Text."
+                .to_string(),
+        );
+        assert_that!(compatible).is_empty();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -4032,6 +4505,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -4071,6 +4545,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -4190,6 +4665,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
                 export_target: None,
+                import_into_media: false,
                 ocr_language: None,
             },
         );
@@ -4268,6 +4744,7 @@ mod tests {
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
                 export_target: Some(SubtitleFormat::SubRip),
+                import_into_media: false,
                 ocr_language: None,
             },
         );

@@ -137,6 +137,7 @@ pub struct SubtitleChange {
     pub source_format: SubtitleFormat,
     pub embedded_target: Option<SubtitleFormat>,
     pub export_target: Option<SubtitleFormat>,
+    pub import_into_media: bool,
     pub ocr_language: Option<String>,
 }
 
@@ -148,19 +149,26 @@ impl SubtitleChange {
     }
 
     pub fn changes_media(&self) -> bool {
-        matches!(self.source, SubtitleSource::Embedded(_))
-            && (self.removes_from_media()
-                || self
-                    .embedded_target
-                    .is_some_and(|target| target != self.source_format))
+        match self.source {
+            SubtitleSource::Embedded(_) => {
+                self.removes_from_media()
+                    || self
+                        .embedded_target
+                        .is_some_and(|target| target != self.source_format)
+            }
+            SubtitleSource::Sidecar(_) => self.import_into_media,
+        }
     }
 
     pub fn has_effect(&self) -> bool {
         match self.source {
             SubtitleSource::Embedded(_) => self.changes_media() || self.export_target.is_some(),
-            SubtitleSource::Sidecar(_) => self
-                .embedded_target
-                .is_some_and(|target| target != self.source_format),
+            SubtitleSource::Sidecar(_) => {
+                self.import_into_media
+                    || self
+                        .embedded_target
+                        .is_some_and(|target| target != self.source_format)
+            }
         }
     }
 

@@ -287,7 +287,16 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
     std::thread::spawn(move || {
         while let Ok(request) = request_rx.recv() {
             let progress_tx = result_tx.clone();
-            if !request.subtitle_changes.is_empty() {
+            if request
+                .subtitle_changes
+                .iter()
+                .any(|change| change.import_into_media)
+            {
+                let _ = progress_tx.send(EditEvent::Progress {
+                    progress: None,
+                    label: "Preparing subtitle import…".to_string(),
+                });
+            } else if !request.subtitle_changes.is_empty() {
                 let _ = progress_tx.send(EditEvent::Progress {
                     progress: None,
                     label: "Converting subtitles…".to_string(),
@@ -506,6 +515,45 @@ pub(crate) fn container_conflict_streams(
     container_conflict_entries(info, stream_order, video_settings, subtitle_changes, target)
         .into_iter()
         .map(|(index, _)| index)
+        .collect()
+}
+
+pub(crate) fn imported_subtitle_conflicts(
+    changes: &[SubtitleChange],
+    sidecars: &[SidecarEntry],
+    target: ContainerFormat,
+) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|change| change.import_into_media)
+        .filter_map(|change| {
+            let SubtitleSource::Sidecar(path) = &change.source else {
+                return None;
+            };
+            let sidecar = sidecars.iter().find(|sidecar| &sidecar.path == path)?;
+            let format = change.embedded_target.unwrap_or(change.source_format);
+            if target.supports_codec("subtitle", format.ffmpeg_codec(), false) {
+                return None;
+            }
+            let targets = SubtitleFormat::COMMON_TARGETS
+                .into_iter()
+                .filter(|candidate| {
+                    target.supports_codec("subtitle", candidate.ffmpeg_codec(), false)
+                })
+                .map(SubtitleFormat::label)
+                .collect::<Vec<_>>();
+            let resolution = if targets.is_empty() {
+                "Choose another container.".to_string()
+            } else {
+                format!("Convert it to {}.", targets.join(" or "))
+            };
+            Some(format!(
+                "{} can't import {} subtitle {}. {resolution}",
+                target.label(),
+                format.label(),
+                sidecar.display_name
+            ))
+        })
         .collect()
 }
 
@@ -736,20 +784,37 @@ fn apply_edits(
             })
         })
         .collect::<Vec<_>>();
-    if let Some(container) = target_container {
-        let conflicts = container_conflicts(
-            &source_info,
-            &output_stream_order,
-            video_settings,
+    let effective_container = target_container.or_else(|| ContainerFormat::from_path(path));
+    if let Some(container) = effective_container {
+        let mut conflicts = if target_container.is_some() {
+            container_conflicts(
+                &source_info,
+                &output_stream_order,
+                video_settings,
+                subtitle_changes,
+                container,
+            )
+        } else {
+            Vec::new()
+        };
+        conflicts.extend(imported_subtitle_conflicts(
             subtitle_changes,
+            sidecars,
             container,
-        );
+        ));
         if !conflicts.is_empty() {
             return Err(EditError::Failed(format!(
                 "The selected container is incompatible:\n{}",
                 conflicts.join("\n")
             )));
         }
+    } else if subtitle_changes
+        .iter()
+        .any(|change| change.import_into_media)
+    {
+        return Err(EditError::Failed(
+            "Choose a supported container before importing subtitles.".to_string(),
+        ));
     }
     let duration = media_duration(&source_info);
     let container_changed = target_container
@@ -824,6 +889,7 @@ fn apply_edits(
             default_streams,
             video_settings,
             replacements: &prepared.replacements,
+            imports: &prepared.imports,
             container: target_container,
             duration,
             cancelled,
@@ -846,7 +912,7 @@ fn apply_edits(
         validate_output_container(&output_info, &temporary, container)
             .map_err(EditError::Failed)?;
     }
-    let expected_count = output_stream_order.len();
+    let expected_count = output_stream_order.len() + prepared.imports.len();
     if output_info.streams.len() != expected_count {
         return Err(EditError::Failed(format!(
             "The remuxed file has {} tracks; expected {expected_count}.",
@@ -860,6 +926,7 @@ fn apply_edits(
         default_streams,
         video_settings,
         &prepared.replacements,
+        &prepared.imports,
     )
     .map_err(EditError::Failed)?;
     validate_subtitle_sources(&source_info, subtitle_changes, sidecars).map_err(|_| {
@@ -967,6 +1034,15 @@ struct SubtitleReplacement {
 }
 
 #[derive(Clone, Debug)]
+struct SubtitleImport {
+    target: SubtitleFormat,
+    path: PathBuf,
+    language: String,
+    forced: bool,
+    cc: bool,
+}
+
+#[derive(Clone, Debug)]
 struct Publication {
     staged: Vec<(PathBuf, PathBuf)>,
     remove: Vec<PathBuf>,
@@ -975,6 +1051,7 @@ struct Publication {
 #[derive(Debug, Default)]
 struct PreparedSubtitles {
     replacements: Vec<SubtitleReplacement>,
+    imports: Vec<SubtitleImport>,
     publications: Vec<Publication>,
 }
 
@@ -1067,13 +1144,42 @@ fn prepare_subtitle_changes(
                 }
             }
             SubtitleSource::Sidecar(path) => {
-                let target = change
-                    .embedded_target
-                    .expect("sidecar changes have a conversion target");
                 let sidecar = sidecars
                     .iter()
                     .find(|sidecar| &sidecar.path == path)
                     .expect("subtitle sources are validated before preparation");
+                if change.import_into_media {
+                    let target = change.embedded_target.unwrap_or(change.source_format);
+                    let staged = workspace.join(format!("import-{job}.{}", target.extension()));
+                    if target == change.source_format {
+                        copy_subtitle_artifact(path, &staged, target)?;
+                    } else {
+                        convert_subtitle(
+                            ConversionInput::File(path),
+                            change,
+                            target,
+                            &staged,
+                            resolution,
+                        )?;
+                    }
+                    let input = subtitle_input_path(&staged, target);
+                    validate_subtitle_output(&input, target)?;
+                    prepared.imports.push(SubtitleImport {
+                        target,
+                        path: input,
+                        language: sidecar.language.clone(),
+                        forced: sidecar.forced,
+                        cc: sidecar.cc,
+                    });
+                    prepared.publications.push(Publication {
+                        staged: Vec::new(),
+                        remove: sidecar.source_paths().cloned().collect(),
+                    });
+                    continue;
+                }
+                let target = change
+                    .embedded_target
+                    .expect("sidecar changes have a conversion target");
                 let base_filename = sidecar_filename(
                     media_stem,
                     &sidecar.language,
@@ -1105,6 +1211,14 @@ fn prepare_subtitle_changes(
         }
     }
     Ok(prepared)
+}
+
+fn subtitle_input_path(path: &Path, format: SubtitleFormat) -> PathBuf {
+    if format == SubtitleFormat::VobSub {
+        path.with_extension("idx")
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn sidecar_conversion_destination(
@@ -1181,6 +1295,7 @@ fn convert_subtitle(
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
             export_target: None,
+            import_into_media: false,
             ocr_language: None,
         };
         return convert_subtitle(
@@ -1722,6 +1837,54 @@ fn media_info(path: &Path) -> Result<MediaInfo, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputTrack {
+    Existing(u64),
+    Imported(usize),
+}
+
+fn output_track_plan(
+    source: &MediaInfo,
+    stream_order: &[u64],
+    import_count: usize,
+) -> Vec<OutputTrack> {
+    let insert_at = stream_order
+        .iter()
+        .rposition(|index| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(*index))
+                .is_some_and(|stream| stream_kind(stream) == Some("subtitle"))
+        })
+        .map(|position| position + 1)
+        .unwrap_or_else(|| {
+            stream_order
+                .iter()
+                .position(|index| {
+                    source
+                        .streams
+                        .iter()
+                        .find(|stream| stream_index(stream) == Some(*index))
+                        .is_some_and(|stream| {
+                            !matches!(stream_kind(stream), Some("video" | "audio"))
+                        })
+                })
+                .unwrap_or(stream_order.len())
+        });
+    let mut tracks = Vec::with_capacity(stream_order.len() + import_count);
+    for (position, index) in stream_order.iter().enumerate() {
+        if position == insert_at {
+            tracks.extend((0..import_count).map(OutputTrack::Imported));
+        }
+        tracks.push(OutputTrack::Existing(*index));
+    }
+    if insert_at == stream_order.len() {
+        tracks.extend((0..import_count).map(OutputTrack::Imported));
+    }
+    tracks
+}
+
 fn validate_result(
     source: &MediaInfo,
     output: &MediaInfo,
@@ -1729,6 +1892,7 @@ fn validate_result(
     default_streams: &BTreeSet<u64>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_replacements: &[SubtitleReplacement],
+    subtitle_imports: &[SubtitleImport],
 ) -> Result<(), String> {
     let has_video = output
         .streams
@@ -1737,14 +1901,16 @@ fn validate_result(
     if !has_video {
         return Err("The remuxed file has no playable video track.".to_string());
     }
-    let expected_kinds = stream_order
+    let output_tracks = output_track_plan(source, stream_order, subtitle_imports.len());
+    let expected_kinds = output_tracks
         .iter()
-        .filter_map(|index| {
-            source
+        .filter_map(|track| match track {
+            OutputTrack::Existing(index) => source
                 .streams
                 .iter()
                 .find(|stream| stream_index(stream) == Some(*index))
-                .and_then(stream_kind)
+                .and_then(stream_kind),
+            OutputTrack::Imported(_) => Some("subtitle"),
         })
         .collect::<Vec<_>>();
     let output_kinds = output
@@ -1756,20 +1922,43 @@ fn validate_result(
         return Err("The remuxed tracks are not in the requested order.".to_string());
     }
     for (position, stream) in output.streams.iter().enumerate() {
-        let expected = stream_order
-            .get(position)
-            .is_some_and(|index| default_streams.contains(index));
+        let Some(track) = output_tracks.get(position) else {
+            return Err("The remuxed file has an unexpected extra track.".to_string());
+        };
+        let expected = match track {
+            OutputTrack::Existing(index) => default_streams.contains(index),
+            OutputTrack::Imported(_) => false,
+        };
         if is_default(stream) != expected {
             return Err(format!(
                 "The remuxed track at position {position} has the wrong default flag."
             ));
         }
-        let Some(source_index) = stream_order.get(position) else {
-            continue;
+        let source_index = match track {
+            OutputTrack::Existing(index) => *index,
+            OutputTrack::Imported(import_index) => {
+                let import = &subtitle_imports[*import_index];
+                if stream.get("codec_name").and_then(Value::as_str)
+                    != Some(import.target.ffmpeg_codec())
+                {
+                    return Err(format!(
+                        "The imported subtitle track at position {position} has the wrong codec."
+                    ));
+                }
+                if stream_language(stream) != import.language
+                    || stream_forced(stream) != import.forced
+                    || stream_cc(stream) != import.cc
+                {
+                    return Err(format!(
+                        "The imported subtitle track at position {position} has the wrong metadata."
+                    ));
+                }
+                continue;
+            }
         };
         if let Some(replacement) = subtitle_replacements
             .iter()
-            .find(|replacement| replacement.source_index == *source_index)
+            .find(|replacement| replacement.source_index == source_index)
         {
             if stream.get("codec_name").and_then(Value::as_str)
                 != Some(replacement.target.ffmpeg_codec())
@@ -1780,13 +1969,13 @@ fn validate_result(
             }
             continue;
         }
-        let Some(settings) = video_settings.get(source_index) else {
+        let Some(settings) = video_settings.get(&source_index) else {
             continue;
         };
         let source_stream = source
             .streams
             .iter()
-            .find(|candidate| stream_index(candidate) == Some(*source_index));
+            .find(|candidate| stream_index(candidate) == Some(source_index));
         if source_stream.is_some_and(|stream| !requires_transcode(stream, *settings)) {
             continue;
         }
@@ -1860,6 +2049,7 @@ struct FfmpegPlan<'a> {
     default_streams: &'a BTreeSet<u64>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     replacements: &'a [SubtitleReplacement],
+    imports: &'a [SubtitleImport],
     container: Option<ContainerFormat>,
     duration: Option<f64>,
     cancelled: &'a AtomicBool,
@@ -1885,15 +2075,27 @@ fn run_ffmpeg(
     for replacement in plan.replacements {
         command.arg("-i").arg(&replacement.path);
     }
-    for index in plan.stream_order {
-        if let Some(replacement_index) = plan
-            .replacements
-            .iter()
-            .position(|replacement| replacement.source_index == *index)
-        {
-            command.args(["-map", &format!("{}:0", replacement_index + 1)]);
-        } else {
-            command.args(["-map", &format!("0:{index}")]);
+    for import in plan.imports {
+        command.arg("-i").arg(&import.path);
+    }
+    let output_tracks = output_track_plan(plan.source_info, plan.stream_order, plan.imports.len());
+    for track in &output_tracks {
+        match track {
+            OutputTrack::Existing(index) => {
+                if let Some(replacement_index) = plan
+                    .replacements
+                    .iter()
+                    .position(|replacement| replacement.source_index == *index)
+                {
+                    command.args(["-map", &format!("{}:0", replacement_index + 1)]);
+                } else {
+                    command.args(["-map", &format!("0:{index}")]);
+                }
+            }
+            OutputTrack::Imported(import_index) => {
+                let input_index = 1 + plan.replacements.len() + import_index;
+                command.args(["-map", &format!("{input_index}:0")]);
+            }
         }
     }
     command.args(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]);
@@ -1937,47 +2139,71 @@ fn run_ffmpeg(
         }
         video_output_index += 1;
     }
-    for (output_index, source_index) in plan.stream_order.iter().enumerate() {
-        let replacement = plan
-            .replacements
-            .iter()
-            .any(|replacement| replacement.source_index == *source_index);
-        let source_stream = plan
-            .source_info
-            .streams
-            .iter()
-            .find(|stream| stream_index(stream) == Some(*source_index));
-        if replacement {
-            if let Some(stream) = source_stream {
+    for (output_index, track) in output_tracks.iter().enumerate() {
+        match track {
+            OutputTrack::Existing(source_index) => {
+                let replacement = plan
+                    .replacements
+                    .iter()
+                    .any(|replacement| replacement.source_index == *source_index);
+                let source_stream = plan
+                    .source_info
+                    .streams
+                    .iter()
+                    .find(|stream| stream_index(stream) == Some(*source_index));
+                if replacement {
+                    if let Some(stream) = source_stream {
+                        command
+                            .arg(format!("-metadata:s:{output_index}"))
+                            .arg(format!("language={}", stream_language(stream)));
+                    }
+                    let mut disposition = Vec::new();
+                    if plan.default_streams.contains(source_index) {
+                        disposition.push("default");
+                    }
+                    if source_stream.is_some_and(stream_forced) {
+                        disposition.push("forced");
+                    }
+                    if source_stream.is_some_and(stream_cc) {
+                        disposition.push("hearing_impaired");
+                    }
+                    command.arg(format!("-disposition:{output_index}")).arg(
+                        if disposition.is_empty() {
+                            "0".to_string()
+                        } else {
+                            disposition.join("+")
+                        },
+                    );
+                } else {
+                    command.arg(format!("-disposition:{output_index}")).arg(
+                        if plan.default_streams.contains(source_index) {
+                            "+default"
+                        } else {
+                            "-default"
+                        },
+                    );
+                }
+            }
+            OutputTrack::Imported(import_index) => {
+                let import = &plan.imports[*import_index];
                 command
                     .arg(format!("-metadata:s:{output_index}"))
-                    .arg(format!("language={}", stream_language(stream)));
+                    .arg(format!("language={}", import.language));
+                let mut disposition = Vec::new();
+                if import.forced {
+                    disposition.push("forced");
+                }
+                if import.cc {
+                    disposition.push("hearing_impaired");
+                }
+                command.arg(format!("-disposition:{output_index}")).arg(
+                    if disposition.is_empty() {
+                        "0".to_string()
+                    } else {
+                        disposition.join("+")
+                    },
+                );
             }
-            let mut disposition = Vec::new();
-            if plan.default_streams.contains(source_index) {
-                disposition.push("default");
-            }
-            if source_stream.is_some_and(stream_forced) {
-                disposition.push("forced");
-            }
-            if source_stream.is_some_and(stream_cc) {
-                disposition.push("hearing_impaired");
-            }
-            command
-                .arg(format!("-disposition:{output_index}"))
-                .arg(if disposition.is_empty() {
-                    "0".to_string()
-                } else {
-                    disposition.join("+")
-                });
-        } else {
-            command.arg(format!("-disposition:{output_index}")).arg(
-                if plan.default_streams.contains(source_index) {
-                    "+default"
-                } else {
-                    "-default"
-                },
-            );
         }
     }
     if let Some(container) = plan.container {
@@ -2267,6 +2493,7 @@ mod tests {
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
             export_target: None,
+            import_into_media: false,
             ocr_language: None,
         }];
 
@@ -2296,6 +2523,7 @@ mod tests {
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
             export_target: Some(SubtitleFormat::SubRip),
+            import_into_media: false,
             ocr_language: None,
         }];
 
@@ -2310,6 +2538,98 @@ mod tests {
 
         // Assert
         assert_that!(conflicts).is_empty();
+    }
+
+    #[test]
+    fn imported_subtitle_conflicts_should_clear_after_a_compatible_conversion() {
+        // Arrange
+        let path = PathBuf::from("/videos/movie.eng.srt");
+        let sidecars = [SidecarEntry {
+            path: path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        }];
+        let mut changes = [SubtitleChange {
+            source: SubtitleSource::Sidecar(path),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: true,
+            ocr_language: None,
+        }];
+
+        // Act
+        let incompatible = imported_subtitle_conflicts(&changes, &sidecars, ContainerFormat::Mp4);
+        changes[0].embedded_target = Some(SubtitleFormat::MovText);
+        let compatible = imported_subtitle_conflicts(&changes, &sidecars, ContainerFormat::Mp4);
+
+        // Assert
+        assert_that!(incompatible).contains(
+            "MP4 can't import SubRip / SRT subtitle movie.eng.srt. Convert it to MOV Text."
+                .to_string(),
+        );
+        assert_that!(compatible).is_empty();
+    }
+
+    #[test]
+    fn output_track_plan_should_insert_imports_after_embedded_subtitles() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"},
+            {"index": 3, "codec_type": "attachment"}
+        ]));
+
+        // Act
+        let tracks = output_track_plan(&info, &[0, 1, 2, 3], 2);
+
+        // Assert
+        assert_eq!(
+            tracks,
+            vec![
+                OutputTrack::Existing(0),
+                OutputTrack::Existing(1),
+                OutputTrack::Existing(2),
+                OutputTrack::Imported(0),
+                OutputTrack::Imported(1),
+                OutputTrack::Existing(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_track_plan_should_put_imports_after_audio_without_embedded_subtitles() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "attachment"}
+        ]));
+
+        // Act
+        let tracks = output_track_plan(&info, &[0, 1, 2], 1);
+
+        // Assert
+        assert_eq!(
+            tracks,
+            vec![
+                OutputTrack::Existing(0),
+                OutputTrack::Existing(1),
+                OutputTrack::Imported(0),
+                OutputTrack::Existing(2),
+            ]
+        );
     }
 
     #[test]
@@ -3113,6 +3433,7 @@ mod tests {
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
             export_target: Some(SubtitleFormat::Ass),
+            import_into_media: false,
             ocr_language: None,
         }];
 
@@ -3212,6 +3533,7 @@ mod tests {
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
             export_target: Some(SubtitleFormat::SubRip),
+            import_into_media: false,
             ocr_language: None,
         }];
 
@@ -3246,6 +3568,283 @@ mod tests {
         assert_that!(media.streams[0]["codec_name"].as_str()).contains("mpeg4");
         assert_that!(exported.exists()).is_true();
         assert_that!(fs::read_to_string(exported).unwrap()).contains("Original codec");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_import_sidecars_after_embedded_subtitles_and_remove_the_sources() {
+        // Arrange
+        if !Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-sidecar-import-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let embedded_path = directory.join("embedded.srt");
+        let english_path = directory.join("movie.eng.forced.cc.srt");
+        let dutch_path = directory.join("movie.nld.srt");
+        fs::write(
+            &embedded_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nEmbedded subtitle\n",
+        )
+        .unwrap();
+        fs::write(
+            &english_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nEnglish external\n",
+        )
+        .unwrap();
+        fs::write(
+            &dutch_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nDutch external\n",
+        )
+        .unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x240:d=1",
+                "-i",
+            ])
+            .arg(&embedded_path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:0",
+                "-c:v",
+                "ffv1",
+                "-c:s",
+                "subrip",
+                "-metadata:s:s:0",
+                "language=fra",
+                "-disposition:v:0",
+                "default",
+                "-disposition:s:0",
+                "default",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        let sidecars = [
+            SidecarEntry {
+                path: english_path.clone(),
+                companion: None,
+                display_name: "movie.eng.forced.cc.srt".to_string(),
+                format: SubtitleFormat::SubRip,
+                language: "eng".to_string(),
+                forced: true,
+                cc: true,
+                number: None,
+                fingerprint: FileFingerprint::for_path(&english_path).unwrap(),
+                companion_fingerprint: None,
+            },
+            SidecarEntry {
+                path: dutch_path.clone(),
+                companion: None,
+                display_name: "movie.nld.srt".to_string(),
+                format: SubtitleFormat::SubRip,
+                language: "nld".to_string(),
+                forced: false,
+                cc: false,
+                number: None,
+                fingerprint: FileFingerprint::for_path(&dutch_path).unwrap(),
+                companion_fingerprint: None,
+            },
+        ];
+        let changes = sidecars
+            .iter()
+            .map(|sidecar| SubtitleChange {
+                source: SubtitleSource::Sidecar(sidecar.path.clone()),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: true,
+                ocr_language: None,
+            })
+            .collect::<Vec<_>>();
+
+        // Act
+        let result = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::CreateCopy,
+                container: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0, 1]),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &changes,
+                sidecars: &sidecars,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let output = media_info(&result.output_path).unwrap();
+
+        // Assert
+        assert_that!(source.exists()).is_true();
+        assert_that!(english_path.exists()).is_false();
+        assert_that!(dutch_path.exists()).is_false();
+        assert_that!(result.media_changed).is_true();
+        assert_that!(result.output_path.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("movie-reel-edit.mkv");
+        assert_eq!(
+            output
+                .streams
+                .iter()
+                .filter_map(stream_kind)
+                .collect::<Vec<_>>(),
+            vec!["video", "subtitle", "subtitle", "subtitle"]
+        );
+        assert_that!(stream_language(&output.streams[1])).is_equal_to("fra".to_string());
+        assert_that!(stream_language(&output.streams[2])).is_equal_to("eng".to_string());
+        assert_that!(stream_language(&output.streams[3])).is_equal_to("nld".to_string());
+        assert_that!(is_default(&output.streams[2])).is_false();
+        assert_that!(is_default(&output.streams[3])).is_false();
+        assert_that!(stream_forced(&output.streams[2])).is_true();
+        assert_that!(stream_cc(&output.streams[2])).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_or_cancelled_sidecar_import_should_leave_media_and_sidecar_untouched() {
+        // Arrange
+        if !Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cancelled-sidecar-import-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let sidecar_path = directory.join("movie.eng.srt");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:d=1",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        fs::write(
+            &sidecar_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nExternal subtitle\n",
+        )
+        .unwrap();
+        let source_before = fs::read(&source).unwrap();
+        let sidecar_before = fs::read(&sidecar_path).unwrap();
+        let sidecar = SidecarEntry {
+            path: sidecar_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&sidecar_path).unwrap(),
+            companion_fingerprint: None,
+        };
+        let changes = [SubtitleChange {
+            source: SubtitleSource::Sidecar(sidecar_path.clone()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: true,
+            ocr_language: None,
+        }];
+
+        // Act
+        let incompatible = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: Some(ContainerFormat::Mp4),
+            },
+            TrackEdits {
+                stream_order: &[0],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0]),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &changes,
+                sidecars: std::slice::from_ref(&sidecar),
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        let cancelled = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+            },
+            TrackEdits {
+                stream_order: &[0],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0]),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &changes,
+                sidecars: &[sidecar],
+            },
+            &AtomicBool::new(true),
+            |_| {},
+        );
+
+        // Assert
+        assert_that!(matches!(
+            incompatible,
+            Err(EditError::Failed(ref error)) if error.contains(
+                "MP4 can't import SubRip / SRT subtitle movie.eng.srt"
+            )
+        ))
+        .is_true();
+        assert_that!(matches!(cancelled, Err(EditError::Cancelled))).is_true();
+        assert_that!(fs::read(&source).unwrap()).is_equal_to(source_before);
+        assert_that!(fs::read(&sidecar_path).unwrap()).is_equal_to(sidecar_before);
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -3313,6 +3912,7 @@ mod tests {
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
             export_target: None,
+            import_into_media: false,
             ocr_language: None,
         }];
         let source_before = fs::read(&source).unwrap();
@@ -3430,6 +4030,7 @@ mod tests {
             source_format: SubtitleFormat::Ass,
             embedded_target: Some(SubtitleFormat::SubRip),
             export_target: None,
+            import_into_media: false,
             ocr_language: None,
         }];
         let sidecars = [existing_sidecar, ass_sidecar];

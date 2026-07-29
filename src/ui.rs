@@ -20,9 +20,13 @@ use crate::{
     subtitle::{SidecarEntry, SubtitleFormat, SubtitleSource, stream_cc, stream_forced},
 };
 
+const MIN_SUBTITLE_COLUMN_WIDTH: u16 = 38;
+const SUBTITLE_COLUMN_GUTTER: u16 = 2;
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < 50 || area.height < 10 {
+        app.set_subtitle_columns_side_by_side(false);
         frame.render_widget(
             Paragraph::new("Terminal too small\nResize to at least 50×10")
                 .centered()
@@ -113,6 +117,19 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|file| file.display_name.as_str())
         .unwrap_or("Details");
     let title = format!(" {filename} ");
+    let embedded_subtitles = app.media_info().map_or(0, |info| {
+        info.streams
+            .iter()
+            .filter(|stream| string(stream, "codec_type") == Some("subtitle"))
+            .count()
+    });
+    let subtitle_content_width = area.width.saturating_sub(2);
+    let subtitle_columns_side_by_side = subtitle_columns_fit(
+        subtitle_content_width,
+        embedded_subtitles,
+        app.sidecars.len(),
+    );
+    app.set_subtitle_columns_side_by_side(subtitle_columns_side_by_side);
 
     let text = if let Some(error) = &app.scan_error {
         message("Could not read directory", error, Color::Red)
@@ -146,6 +163,10 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         container_target: app.container_target,
                         container_conflicts: container_conflicts.len(),
                         conflicting_streams: &conflicting_streams,
+                        subtitle_columns_side_by_side,
+                        subtitle_column_width: usize::from(
+                            subtitle_content_width.saturating_sub(SUBTITLE_COLUMN_GUTTER) / 2,
+                        ),
                     },
                 );
                 if app.layer == Layer::Streams
@@ -177,6 +198,15 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
             .scroll((app.details_scroll, 0)),
         area,
     );
+}
+
+fn subtitle_columns_fit(content_width: u16, embedded: usize, external: usize) -> bool {
+    embedded > 0
+        && external > 0
+        && content_width
+            >= MIN_SUBTITLE_COLUMN_WIDTH
+                .saturating_mul(2)
+                .saturating_add(SUBTITLE_COLUMN_GUTTER)
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -233,6 +263,8 @@ fn media_text(
         container_target,
         container_conflicts,
         conflicting_streams,
+        subtitle_columns_side_by_side,
+        subtitle_column_width,
     } = state;
     let mut lines = Vec::new();
     let mut selected_line = None;
@@ -252,13 +284,7 @@ fn media_text(
         selected == Some(container_index),
     ));
 
-    let groups = [
-        ("Video", "video"),
-        ("Audio", "audio"),
-        ("Subtitles", "subtitle"),
-    ];
-
-    for (heading, kind) in groups {
+    for (heading, kind) in [("Video", "video"), ("Audio", "audio")] {
         let streams: Vec<_> = order
             .iter()
             .filter_map(|index| {
@@ -272,16 +298,8 @@ fn media_text(
                 (string(stream, "codec_type") == Some(kind)).then_some((selection_index, stream))
             })
             .collect();
-        let sidecar_count = if kind == "subtitle" {
-            sidecars.len()
-        } else {
-            0
-        };
-        if !streams.is_empty() || sidecar_count > 0 {
-            section(
-                &mut lines,
-                &format!("{heading} ({})", streams.len() + sidecar_count),
-            );
+        if !streams.is_empty() {
+            section(&mut lines, &format!("{heading} ({})", streams.len()));
             for (selection_index, stream) in streams {
                 if selected == Some(selection_index) {
                     selected_line = Some(lines.len());
@@ -296,22 +314,122 @@ fn media_text(
                     stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                 ));
             }
-            if kind == "subtitle" {
-                for (sidecar_index, sidecar) in sidecars.iter().enumerate() {
-                    let selection_index = rows
-                        .iter()
-                        .position(|row| *row == TrackRef::Sidecar(sidecar_index))
-                        .unwrap_or(0);
-                    if selected == Some(selection_index) {
+        }
+    }
+
+    let embedded_subtitles = order
+        .iter()
+        .filter_map(|index| {
+            let stream = info
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(*index))?;
+            let selection_index = rows
+                .iter()
+                .position(|row| *row == TrackRef::Embedded(*index))?;
+            (string(stream, "codec_type") == Some("subtitle")).then_some((selection_index, stream))
+        })
+        .collect::<Vec<_>>();
+    let external_subtitles = sidecars
+        .iter()
+        .enumerate()
+        .map(|(sidecar_index, sidecar)| {
+            let selection_index = rows
+                .iter()
+                .position(|row| *row == TrackRef::Sidecar(sidecar_index))
+                .unwrap_or(0);
+            (selection_index, sidecar)
+        })
+        .collect::<Vec<_>>();
+
+    if subtitle_columns_side_by_side {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(subtitle_columns_line(
+            Line::styled(
+                format!("Embedded subtitles ({})", embedded_subtitles.len()),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Line::styled(
+                format!("External subtitles ({})", external_subtitles.len()),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            subtitle_column_width,
+        ));
+        let count = embedded_subtitles.len().max(external_subtitles.len());
+        for row in 0..count {
+            let left = embedded_subtitles
+                .get(row)
+                .map(|(selection_index, stream)| {
+                    if selected == Some(*selection_index) {
                         selected_line = Some(lines.len());
                     }
-                    lines.push(sidecar_line(
+                    stream_line(
+                        stream,
+                        *selection_index,
+                        selected == Some(*selection_index),
+                        stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                        stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                        stream_index(stream)
+                            .is_some_and(|index| conflicting_streams.contains(&index)),
+                        stream_index(stream).is_some_and(|index| defaults.contains(&index)),
+                    )
+                });
+            let right = external_subtitles
+                .get(row)
+                .map(|(selection_index, sidecar)| {
+                    if selected == Some(*selection_index) {
+                        selected_line = Some(lines.len());
+                    }
+                    sidecar_line(
                         sidecar,
-                        selected == Some(selection_index),
+                        selected == Some(*selection_index),
                         subtitle_changes
                             .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
-                    ));
+                    )
+                });
+            lines.push(subtitle_optional_columns_line(
+                left,
+                right,
+                subtitle_column_width,
+            ));
+        }
+    } else {
+        if !embedded_subtitles.is_empty() {
+            section(
+                &mut lines,
+                &format!("Embedded subtitles ({})", embedded_subtitles.len()),
+            );
+            for (selection_index, stream) in embedded_subtitles {
+                if selected == Some(selection_index) {
+                    selected_line = Some(lines.len());
                 }
+                lines.push(stream_line(
+                    stream,
+                    selection_index,
+                    selected == Some(selection_index),
+                    stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                    stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                    stream_index(stream).is_some_and(|index| conflicting_streams.contains(&index)),
+                    stream_index(stream).is_some_and(|index| defaults.contains(&index)),
+                ));
+            }
+        }
+        if !external_subtitles.is_empty() {
+            section(
+                &mut lines,
+                &format!("External subtitles ({})", external_subtitles.len()),
+            );
+            for (selection_index, sidecar) in external_subtitles {
+                if selected == Some(selection_index) {
+                    selected_line = Some(lines.len());
+                }
+                lines.push(sidecar_line(
+                    sidecar,
+                    selected == Some(selection_index),
+                    subtitle_changes.contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                ));
             }
         }
     }
@@ -379,6 +497,8 @@ struct MediaTextState<'a> {
     container_target: Option<crate::edit::ContainerFormat>,
     container_conflicts: usize,
     conflicting_streams: &'a std::collections::BTreeSet<u64>,
+    subtitle_columns_side_by_side: bool,
+    subtitle_column_width: usize,
 }
 
 fn sidecar_line(sidecar: &SidecarEntry, selected: bool, changed: bool) -> Line<'static> {
@@ -399,6 +519,40 @@ fn sidecar_line(sidecar: &SidecarEntry, selected: bool, changed: bool) -> Line<'
     } else {
         Style::default()
     })
+}
+
+fn subtitle_columns_line(
+    left: Line<'static>,
+    right: Line<'static>,
+    column_width: usize,
+) -> Line<'static> {
+    subtitle_optional_columns_line(Some(left), Some(right), column_width)
+}
+
+fn subtitle_optional_columns_line(
+    left: Option<Line<'static>>,
+    right: Option<Line<'static>>,
+    column_width: usize,
+) -> Line<'static> {
+    let column = |line: Option<Line<'static>>, pad: bool| {
+        let (content, style) = line.map_or_else(
+            || (String::new(), Style::default()),
+            |line| (truncate(&line.to_string(), column_width), line.style),
+        );
+        Span::styled(
+            if pad {
+                format!("{content:<column_width$}")
+            } else {
+                content
+            },
+            style,
+        )
+    };
+    Line::from(vec![
+        column(left, true),
+        Span::raw("  "),
+        column(right, false),
+    ])
 }
 
 fn section(lines: &mut Vec<Line<'static>>, name: &str) {
@@ -1216,6 +1370,7 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| popup.source_format.label());
     let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
     let exporting = change.is_some_and(|change| change.export_target.is_some());
+    let importing = change.is_some_and(|change| change.import_into_media);
     let mut lines = vec![setting_line(
         "Codec",
         codec_label,
@@ -1226,6 +1381,11 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         lines.push(subtitle_export_line(
             exporting,
             popup.field == SubtitleSettingsField::Export,
+        ));
+    } else {
+        lines.push(subtitle_import_line(
+            importing,
+            popup.field == SubtitleSettingsField::Import,
         ));
     }
 
@@ -1247,7 +1407,7 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                     ));
                 }
             }
-            SubtitleSettingsField::Export => {}
+            SubtitleSettingsField::Export | SubtitleSettingsField::Import => {}
         }
     }
     let title = match &popup.source {
@@ -1277,9 +1437,17 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
 }
 
 fn subtitle_export_line(checked: bool, focused: bool) -> Line<'static> {
+    subtitle_checkbox_line("Export", checked, focused)
+}
+
+fn subtitle_import_line(checked: bool, focused: bool) -> Line<'static> {
+    subtitle_checkbox_line("Import", checked, focused)
+}
+
+fn subtitle_checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            "Export      ",
+            format!("{label:<12}"),
             Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(if checked { "[x]" } else { "[ ]" }, {
@@ -2288,6 +2456,47 @@ mod tests {
 
         // Assert
         assert_that!(result).is_equal_to("short".to_string());
+    }
+
+    #[test]
+    fn subtitle_columns_should_only_share_a_row_when_both_fit() {
+        // Act / Assert
+        assert_that!(subtitle_columns_fit(77, 2, 2)).is_false();
+        assert_that!(subtitle_columns_fit(78, 2, 2)).is_true();
+        assert_that!(subtitle_columns_fit(120, 0, 2)).is_false();
+        assert_that!(subtitle_columns_fit(120, 2, 0)).is_false();
+    }
+
+    #[test]
+    fn subtitle_columns_should_truncate_each_side_independently() {
+        // Act
+        let line = subtitle_columns_line(
+            Line::styled(
+                "A very long embedded subtitle",
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::styled(
+                "A very long external subtitle",
+                Style::default().fg(Color::Cyan),
+            ),
+            12,
+        );
+
+        // Assert
+        assert_that!(line.to_string()).is_equal_to("…ed subtitle  …al subtitle".to_string());
+        assert_that!(line.spans[0].style.fg).contains(Color::Yellow);
+        assert_that!(line.spans[2].style.fg).contains(Color::Cyan);
+    }
+
+    #[test]
+    fn subtitle_import_line_should_show_checked_and_focused_state() {
+        // Act
+        let line = subtitle_import_line(true, true);
+
+        // Assert
+        assert_that!(line.to_string()).is_equal_to("Import      [x]".to_string());
+        assert_that!(line.spans[0].style.fg).contains(Color::Cyan);
+        assert_that!(line.spans[1].style.bg).contains(Color::Cyan);
     }
 
     #[test]
