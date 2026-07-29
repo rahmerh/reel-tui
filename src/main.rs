@@ -231,11 +231,11 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.show_keybindings();
         }
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) if app.layer == Layer::StreamDetails => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             input.reset_sequence();
             app.scroll_down();
         }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) if app.layer == Layer::StreamDetails => {
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             input.reset_sequence();
             app.scroll_up();
         }
@@ -262,6 +262,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.open_stream_details();
+        }
+        (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::StreamDetails => {
+            input.reset_sequence();
+            app.back();
         }
         (KeyCode::Char('h'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
@@ -321,6 +325,7 @@ mod tests {
             VideoSettingsPopup,
         },
         edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
+        files::{FileEntry, FileFingerprint},
         probe::{MediaInfo, ProbeOutcome, ProbeRequest},
     };
 
@@ -489,6 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn i_should_close_video_information_when_it_is_already_open() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.layer = Layer::Streams;
+        app.stream_order = vec![0];
+        app.selected_stream = 1;
+        app.open_stream_details();
+
+        // Act
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('i')),
+        );
+
+        // Assert
+        assert_eq!(app.layer, Layer::Streams);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn escape_and_q_should_both_close_a_video_settings_dropdown_one_level() {
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
             let (mut app, directory) = test_app();
@@ -644,6 +681,40 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(app.details_scroll, 30);
 
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_list_should_support_ctrl_d_and_ctrl_u_ten_item_jumps() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.files = (0..25)
+            .map(|index| FileEntry {
+                path: directory.join(format!("{index:02}.mkv")),
+                display_name: format!("{index:02}.mkv"),
+                fingerprint: FileFingerprint {
+                    length: 0,
+                    modified: None,
+                },
+            })
+            .collect();
+        app.list_state.select(Some(5));
+        let mut input = InputState::default();
+
+        // Act and assert
+        handle_key(&mut app, &mut input, ctrl('d'));
+        assert_eq!(app.list_state.selected(), Some(15));
+        handle_key(&mut app, &mut input, ctrl('d'));
+        assert_eq!(app.list_state.selected(), Some(24));
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(app.list_state.selected(), Some(14));
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(app.list_state.selected(), Some(4));
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(app.list_state.selected(), Some(0));
+
+        // Cleanup
         drop(app);
         fs::remove_dir_all(directory).unwrap();
     }

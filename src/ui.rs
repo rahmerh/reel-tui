@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
+use isolang::Language;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -16,7 +17,7 @@ use crate::{
     },
     edit::{ContainerFormat, SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
-    subtitle::{SidecarEntry, SubtitleSource, stream_cc, stream_forced},
+    subtitle::{SidecarEntry, SubtitleFormat, SubtitleSource, stream_cc, stream_forced},
 };
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -904,11 +905,7 @@ fn keybindings_text() -> Text<'static> {
         "Enter",
         "Edit container, video, or subtitle settings",
     );
-    keybinding(
-        &mut lines,
-        "i",
-        "Open full ffprobe container or stream information",
-    );
+    keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
     keybinding(&mut lines, "Ctrl-c", "Cancel processing");
@@ -1347,11 +1344,15 @@ fn dropdown_line(
 }
 
 fn render_details_popup(frame: &mut Frame, app: &mut App) {
-    let Some((text, title)) = details_popup_content(app) else {
+    let Some((text, title, compact)) = details_popup_content(app) else {
         return;
     };
-    let area = popup_area(frame.area(), 90, 86);
     let text = padded_popup_text(text);
+    let area = if compact {
+        content_popup_area(frame.area(), &text, &title)
+    } else {
+        popup_area(frame.area(), 90, 86)
+    };
     app.set_details_max_scroll(max_scroll(&text, area));
 
     frame.render_widget(Clear, area);
@@ -1369,7 +1370,7 @@ fn render_details_popup(frame: &mut Frame, app: &mut App) {
     );
 }
 
-fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
+fn details_popup_content(app: &App) -> Option<(Text<'static>, String, bool)> {
     let info = app.media_info()?;
     match app.selected_track()? {
         TrackRef::Container => {
@@ -1381,6 +1382,7 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
                     file.fingerprint.length,
                 )),
                 " Container information ".to_string(),
+                true,
             ))
         }
         TrackRef::Embedded(index) => {
@@ -1388,14 +1390,526 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
                 .streams
                 .iter()
                 .find(|stream| stream_index(stream) == Some(index))?;
-            let index = number_string(stream, "index").unwrap_or_else(|| index.to_string());
+            let default = app.default_streams.contains(&index);
+            let index_label = number_string(stream, "index").unwrap_or_else(|| index.to_string());
             let kind = string(stream, "codec_type").unwrap_or("unknown");
+            if kind == "video" {
+                return Some((
+                    Text::from(video_information_lines(stream, default)),
+                    format!(" Video #{index_label} "),
+                    true,
+                ));
+            }
+            if kind == "audio" {
+                return Some((
+                    Text::from(audio_information_lines(stream, default)),
+                    format!(" Audio #{index_label} "),
+                    true,
+                ));
+            }
+            if kind == "subtitle" {
+                return Some((
+                    Text::from(embedded_subtitle_information_lines(stream, default)),
+                    format!(" Subtitle #{index_label} "),
+                    true,
+                ));
+            }
             let mut lines = Vec::new();
             append_map(&mut lines, stream, 0);
-            Some((Text::from(lines), format!(" Stream #{index} · {kind} ")))
+            Some((
+                Text::from(lines),
+                format!(" Stream #{index_label} · {kind} "),
+                false,
+            ))
         }
-        TrackRef::Sidecar(_) => None,
+        TrackRef::Sidecar(index) => {
+            let sidecar = app.sidecars.get(index)?;
+            Some((
+                Text::from(sidecar_subtitle_information_lines(sidecar)),
+                " External subtitle ".to_string(),
+                true,
+            ))
+        }
     }
+}
+
+fn video_information_lines(stream: &BTreeMap<String, Value>, default: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let title = tag(stream, "title")
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("Not provided");
+    append_information_group(&mut lines, vec![field_line(0, "Title", title)]);
+
+    let mut language_and_role = Vec::new();
+    if let Some(language) = tag(stream, "language").and_then(language_name) {
+        language_and_role.push(field_line(0, "Language", &language));
+    }
+    let roles = video_roles(stream, default);
+    if !roles.is_empty() {
+        language_and_role.push(field_line(0, "Role", &roles.join(" · ")));
+    }
+    append_information_group(&mut lines, language_and_role);
+
+    let mut technical = vec![field_line(0, "Format", &video_format_description(stream))];
+    if let Some(resolution) = video_resolution_description(stream) {
+        technical.push(field_line(0, "Resolution", &resolution));
+    }
+    if let Some(frame_rate) = string(stream, "avg_frame_rate")
+        .or_else(|| string(stream, "r_frame_rate"))
+        .and_then(format_frame_rate)
+    {
+        technical.push(field_line(0, "Frame rate", &format!("{frame_rate} fps")));
+    }
+
+    let mut picture = Vec::new();
+    if let Some(range) = video_dynamic_range(stream) {
+        picture.push(range);
+    }
+    if let Some(depth) = video_bit_depth(stream) {
+        picture.push(format!("{depth}-bit"));
+    }
+    if let Some(scan) = video_scan_type(stream) {
+        picture.push(scan.to_string());
+    }
+    if !picture.is_empty() {
+        technical.push(field_line(0, "Picture", &picture.join(" · ")));
+    }
+
+    if let Some(bit_rate) = number_string(stream, "bit_rate").and_then(parse_number) {
+        technical.push(field_line(0, "Bitrate", &format_bitrate(bit_rate)));
+    }
+    append_information_group(&mut lines, technical);
+
+    lines
+}
+
+fn video_format_description(stream: &BTreeMap<String, Value>) -> String {
+    match string(stream, "codec_name").unwrap_or("unknown") {
+        "h264" => "H.264 (AVC)".to_string(),
+        "hevc" => "HEVC (H.265)".to_string(),
+        "av1" => "AV1".to_string(),
+        "vp9" => "VP9".to_string(),
+        "vp8" => "VP8".to_string(),
+        "mpeg4" => "MPEG-4 Visual".to_string(),
+        "mpeg2video" => "MPEG-2 Video".to_string(),
+        "prores" => "Apple ProRes".to_string(),
+        "mjpeg" => "Motion JPEG".to_string(),
+        "unknown" => "Unknown".to_string(),
+        codec => codec.to_ascii_uppercase(),
+    }
+}
+
+fn video_resolution_description(stream: &BTreeMap<String, Value>) -> Option<String> {
+    let width = number_string(stream, "width")?.parse::<u64>().ok()?;
+    let height = number_string(stream, "height")?.parse::<u64>().ok()?;
+    let mut parts = vec![format!("{width}×{height}")];
+    if let Some(aspect_ratio) = string(stream, "display_aspect_ratio")
+        .filter(|aspect_ratio| !matches!(*aspect_ratio, "0:1" | "N/A"))
+    {
+        parts.push(aspect_ratio.to_string());
+    }
+    if let Some(tier) = match height {
+        4320 => Some("8K"),
+        2160 => Some("4K"),
+        1440 => Some("1440p"),
+        1080 => Some("1080p"),
+        720 => Some("720p"),
+        576 => Some("576p"),
+        480 => Some("480p"),
+        _ => None,
+    } {
+        parts.push(tier.to_string());
+    }
+    Some(parts.join(" · "))
+}
+
+fn video_dynamic_range(stream: &BTreeMap<String, Value>) -> Option<String> {
+    match string(stream, "color_transfer")? {
+        "smpte2084" => Some("HDR10".to_string()),
+        "arib-std-b67" => Some("HLG HDR".to_string()),
+        "bt709" | "gamma22" | "gamma28" | "smpte170m" | "bt470bg" => Some("SDR".to_string()),
+        _ => None,
+    }
+}
+
+fn video_bit_depth(stream: &BTreeMap<String, Value>) -> Option<u8> {
+    if let Some(depth) = number_string(stream, "bits_per_raw_sample")
+        .and_then(|depth| depth.parse::<u8>().ok())
+        .filter(|depth| *depth > 0)
+    {
+        return Some(depth);
+    }
+    let pixel_format = string(stream, "pix_fmt")?;
+    for (marker, depth) in [
+        ("p016", 16),
+        ("p014", 14),
+        ("p012", 12),
+        ("p010", 10),
+        ("p16", 16),
+        ("p14", 14),
+        ("p12", 12),
+        ("p10", 10),
+        ("p9", 9),
+    ] {
+        if pixel_format.contains(marker) {
+            return Some(depth);
+        }
+    }
+    matches!(
+        pixel_format,
+        "yuv420p"
+            | "yuv422p"
+            | "yuv444p"
+            | "yuvj420p"
+            | "yuvj422p"
+            | "yuvj444p"
+            | "nv12"
+            | "nv21"
+            | "rgb24"
+            | "bgr24"
+            | "rgba"
+            | "bgra"
+            | "gray"
+    )
+    .then_some(8)
+}
+
+fn video_scan_type(stream: &BTreeMap<String, Value>) -> Option<&'static str> {
+    match string(stream, "field_order")? {
+        "progressive" => Some("Progressive"),
+        "tt" | "bb" | "tb" | "bt" => Some("Interlaced"),
+        _ => None,
+    }
+}
+
+fn video_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
+    let mut roles = disposition_flags(stream, default)
+        .into_iter()
+        .map(|role| title_case(role.trim_matches(['[', ']'])))
+        .collect::<Vec<_>>();
+    if disposition_enabled(stream, "original") {
+        roles.push("Original".to_string());
+    }
+    if crate::probe::is_attached_picture(stream) {
+        roles.push("Cover art".to_string());
+    }
+    roles
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            let mut characters = word.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + characters.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn language_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let normalized = value.to_ascii_lowercase();
+    let code = normalized
+        .split_once(['-', '_'])
+        .map_or(normalized.as_str(), |(language, _)| language);
+    if matches!(code, "" | "und") {
+        return None;
+    }
+    let canonical_code = match code {
+        "alb" => "sqi",
+        "arm" => "hye",
+        "baq" => "eus",
+        "bur" => "mya",
+        "chi" => "zho",
+        "cze" => "ces",
+        "dut" => "nld",
+        "fre" => "fra",
+        "geo" => "kat",
+        "ger" => "deu",
+        "gre" => "ell",
+        "ice" => "isl",
+        "mac" => "mkd",
+        "mao" => "mri",
+        "may" => "msa",
+        "per" => "fas",
+        "rum" => "ron",
+        "slo" => "slk",
+        "tib" => "bod",
+        "wel" => "cym",
+        _ => code,
+    };
+    if let Ok(language) = canonical_code.parse::<Language>() {
+        return Some(language.to_name().to_string());
+    }
+    if code.len() <= 3
+        && code
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        return Some(format!("Unknown language ({})", code.to_ascii_uppercase()));
+    }
+    Some(value.to_string())
+}
+
+fn audio_information_lines(stream: &BTreeMap<String, Value>, default: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let title = tag(stream, "title")
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("Not provided");
+    append_information_group(&mut lines, vec![field_line(0, "Title", title)]);
+
+    let mut language_and_role = Vec::new();
+    if let Some(language) = tag(stream, "language").and_then(language_name) {
+        language_and_role.push(field_line(0, "Language", &language));
+    }
+    let roles = audio_roles(stream, default);
+    if !roles.is_empty() {
+        language_and_role.push(field_line(0, "Role", &roles.join(" · ")));
+    }
+    append_information_group(&mut lines, language_and_role);
+
+    let mut technical = vec![field_line(0, "Format", &audio_format_description(stream))];
+    if let Some(channels) = audio_channel_description(stream) {
+        technical.push(field_line(0, "Channels", &channels));
+    }
+    if let Some(bit_rate) = number_string(stream, "bit_rate").and_then(parse_number) {
+        technical.push(field_line(0, "Bitrate", &format_bitrate(bit_rate)));
+    }
+    if let Some(sample_rate) = number_string(stream, "sample_rate").and_then(parse_number) {
+        technical.push(field_line(
+            0,
+            "Sample rate",
+            &format_sample_rate(sample_rate),
+        ));
+    }
+    append_information_group(&mut lines, technical);
+
+    lines
+}
+
+fn audio_format_description(stream: &BTreeMap<String, Value>) -> String {
+    let codec = string(stream, "codec_name").unwrap_or("unknown");
+    match codec {
+        "aac" => "AAC".to_string(),
+        "ac3" => "Dolby Digital (AC-3)".to_string(),
+        "eac3" => "Dolby Digital Plus (E-AC-3)".to_string(),
+        "truehd" => "Dolby TrueHD".to_string(),
+        "dts" => match string(stream, "profile") {
+            Some("DTS-HD MA") => "DTS-HD Master Audio".to_string(),
+            Some("DTS-HD HRA") => "DTS-HD High Resolution Audio".to_string(),
+            _ => "DTS".to_string(),
+        },
+        "opus" => "Opus".to_string(),
+        "vorbis" => "Vorbis".to_string(),
+        "flac" => "FLAC · Lossless".to_string(),
+        "alac" => "ALAC · Lossless".to_string(),
+        "mp3" => "MP3".to_string(),
+        "unknown" => "Unknown".to_string(),
+        codec if codec.starts_with("pcm_") => "PCM · Uncompressed".to_string(),
+        codec => codec.to_ascii_uppercase(),
+    }
+}
+
+fn audio_channel_description(stream: &BTreeMap<String, Value>) -> Option<String> {
+    if let Some(layout) = string(stream, "channel_layout") {
+        let base = layout.split_once('(').map_or(layout, |(base, _)| base);
+        let description = match base {
+            "mono" => Some("Mono".to_string()),
+            "stereo" => Some("Stereo".to_string()),
+            "quad" => Some("Quadraphonic".to_string()),
+            value
+                if value
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.') =>
+            {
+                Some(format!("{value} surround"))
+            }
+            _ => None,
+        };
+        if description.is_some() {
+            return description;
+        }
+    }
+
+    match number_string(stream, "channels")?.parse::<u64>().ok()? {
+        1 => Some("Mono".to_string()),
+        2 => Some("Stereo".to_string()),
+        channels => Some(format!("{channels} channels")),
+    }
+}
+
+fn audio_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
+    let mut roles = Vec::new();
+    if default {
+        roles.push("Default".to_string());
+    }
+    for (key, label) in [
+        ("forced", "Forced"),
+        ("hearing_impaired", "Hearing impaired"),
+        ("visual_impaired", "Audio description"),
+        ("comment", "Commentary"),
+        ("dub", "Dubbed"),
+        ("original", "Original"),
+    ] {
+        if disposition_enabled(stream, key) {
+            roles.push(label.to_string());
+        }
+    }
+    roles
+}
+
+fn embedded_subtitle_information_lines(
+    stream: &BTreeMap<String, Value>,
+    default: bool,
+) -> Vec<Line<'static>> {
+    let codec = string(stream, "codec_name").unwrap_or("unknown");
+    let format = SubtitleFormat::from_codec(codec);
+    let mut lines = Vec::new();
+
+    let title = tag(stream, "title")
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("Not provided");
+    append_information_group(&mut lines, vec![field_line(0, "Title", title)]);
+
+    let mut language_and_role = Vec::new();
+    if let Some(language) = tag(stream, "language")
+        .and_then(|language| subtitle_language_description(language, stream_cc(stream)))
+    {
+        language_and_role.push(field_line(0, "Language", &language));
+    }
+    let roles = embedded_subtitle_roles(stream, default);
+    if !roles.is_empty() {
+        language_and_role.push(field_line(0, "Role", &roles.join(" · ")));
+    }
+    append_information_group(&mut lines, language_and_role);
+
+    let mut format_and_type = vec![field_line(
+        0,
+        "Format",
+        &subtitle_information_format(format, codec),
+    )];
+    if let Some(format) = format {
+        format_and_type.push(field_line(
+            0,
+            "Type",
+            if format.is_text() {
+                "Text-based"
+            } else {
+                "Image-based"
+            },
+        ));
+    }
+    append_information_group(&mut lines, format_and_type);
+
+    lines
+}
+
+fn sidecar_subtitle_information_lines(sidecar: &SidecarEntry) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    append_information_group(
+        &mut lines,
+        vec![field_line(0, "File", &sidecar.display_name)],
+    );
+
+    let mut language_and_role = Vec::new();
+    if let Some(language) = subtitle_language_description(&sidecar.language, sidecar.cc) {
+        language_and_role.push(field_line(0, "Language", &language));
+    }
+    let mut roles = Vec::new();
+    if sidecar.forced {
+        roles.push("Forced");
+    }
+    if sidecar.cc {
+        roles.push("Closed captions");
+    }
+    if !roles.is_empty() {
+        language_and_role.push(field_line(0, "Role", &roles.join(" · ")));
+    }
+    append_information_group(&mut lines, language_and_role);
+
+    append_information_group(
+        &mut lines,
+        vec![
+            field_line(
+                0,
+                "Format",
+                &subtitle_information_format(Some(sidecar.format), sidecar.format.ffmpeg_codec()),
+            ),
+            field_line(
+                0,
+                "Type",
+                if sidecar.format.is_text() {
+                    "Text-based"
+                } else {
+                    "Image-based"
+                },
+            ),
+        ],
+    );
+    lines
+}
+
+fn append_information_group(lines: &mut Vec<Line<'static>>, group: Vec<Line<'static>>) {
+    if group.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(group);
+}
+
+fn subtitle_information_format(format: Option<SubtitleFormat>, codec: &str) -> String {
+    match format {
+        Some(SubtitleFormat::SubRip) => "SubRip (SRT)".to_string(),
+        Some(format) => format.label().to_string(),
+        None => match codec {
+            "eia_608" => "CEA-608 Closed Captions".to_string(),
+            "eia_708" => "CEA-708 Closed Captions".to_string(),
+            "unknown" => "Unknown".to_string(),
+            codec => codec.to_ascii_uppercase(),
+        },
+    }
+}
+
+fn subtitle_language_description(value: &str, cc: bool) -> Option<String> {
+    let language = language_name(value)?;
+    Some(if cc {
+        format!("{language} · CC")
+    } else {
+        language
+    })
+}
+
+fn embedded_subtitle_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
+    let mut roles = Vec::new();
+    if default {
+        roles.push("Default".to_string());
+    }
+    if stream_forced(stream) {
+        roles.push("Forced".to_string());
+    }
+    if disposition_enabled(stream, "hearing_impaired") {
+        roles.push("SDH".to_string());
+    } else if stream_cc(stream) {
+        roles.push("Closed captions".to_string());
+    }
+    if disposition_enabled(stream, "original") {
+        roles.push("Original".to_string());
+    }
+    roles
+}
+
+fn disposition_enabled(stream: &BTreeMap<String, Value>, key: &str) -> bool {
+    stream
+        .get("disposition")
+        .and_then(Value::as_object)
+        .and_then(|disposition| disposition.get(key))
+        .and_then(Value::as_i64)
+        == Some(1)
 }
 
 fn container_information_lines(
@@ -1416,13 +1930,23 @@ fn container_information_lines(
         .unwrap_or_else(|| "Unknown".to_string());
     let format = container_format_description(info, path);
 
-    vec![
-        field_line(0, "File name", &file_name),
-        field_line(0, "Path", &path.to_string_lossy()),
-        field_line(0, "Size", &format_bytes(size)),
-        field_line(0, "Duration", &duration),
-        field_line(0, "Format", &format),
-    ]
+    let mut lines = Vec::new();
+    append_information_group(
+        &mut lines,
+        vec![
+            field_line(0, "File name", &file_name),
+            field_line(0, "Path", &path.to_string_lossy()),
+        ],
+    );
+    append_information_group(
+        &mut lines,
+        vec![
+            field_line(0, "Duration", &duration),
+            field_line(0, "Size", &format_bytes(size)),
+        ],
+    );
+    append_information_group(&mut lines, vec![field_line(0, "Format", &format)]);
+    lines
 }
 
 fn container_format_description(info: &MediaInfo, path: &Path) -> String {
@@ -1530,6 +2054,19 @@ fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
+fn content_popup_area(area: Rect, text: &Text<'_>, title: &str) -> Rect {
+    let content_width = text.lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = content_width
+        .saturating_add(4)
+        .max(title.chars().count().saturating_add(4));
+    let height = text.lines.len().saturating_add(2);
+    centered_fixed(
+        area,
+        u16::try_from(width).unwrap_or(u16::MAX),
+        u16::try_from(height).unwrap_or(u16::MAX),
+    )
+}
+
 fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(1);
     let height = height.min(area.height.saturating_sub(2)).max(1);
@@ -1612,14 +2149,13 @@ fn disposition_flags(
     stream: &std::collections::BTreeMap<String, Value>,
     default: bool,
 ) -> Vec<String> {
-    const FLAGS: [(&str, &str); 7] = [
+    const FLAGS: [(&str, &str); 6] = [
         ("default", "default"),
         ("forced", "forced"),
         ("hearing_impaired", "hearing impaired"),
         ("visual_impaired", "visual impaired"),
         ("comment", "commentary"),
         ("dub", "dub"),
-        ("original", "original"),
     ];
 
     let disposition = stream.get("disposition").and_then(Value::as_object);
@@ -1678,7 +2214,12 @@ fn format_bitrate(bits: f64) -> String {
 
 fn format_sample_rate(hertz: f64) -> String {
     if hertz >= 1000.0 {
-        format!("{:.1} kHz", hertz / 1000.0)
+        let kilohertz = hertz / 1000.0;
+        if (kilohertz - kilohertz.round()).abs() < 0.01 {
+            format!("{kilohertz:.0} kHz")
+        } else {
+            format!("{kilohertz:.1} kHz")
+        }
     } else {
         format!("{hertz:.0} Hz")
     }
@@ -1860,7 +2401,7 @@ mod tests {
                 "sample_rate": "48000",
                 "channel_layout": "5.1",
                 "tags": {"language": "eng", "title": "Main"},
-                "disposition": {"default": 1}
+                "disposition": {"default": 1, "original": 1}
             }),
         )
         .unwrap();
@@ -1874,7 +2415,8 @@ mod tests {
             .contains("OPUS")
             .contains("5.1")
             .contains("ENG")
-            .contains("[default]");
+            .contains("[default]")
+            .does_not_contain("[original]");
     }
 
     #[test]
@@ -2118,10 +2660,382 @@ mod tests {
         assert_that!(text).contains_exactly_in_given_order([
             "File name: movie.mkv",
             "Path: /videos/movie.mkv",
-            "Size: 1.5 MiB",
+            "",
             "Duration: 01:02:03",
+            "Size: 1.5 MiB",
+            "",
             "Format: MKV (Matroska / WebM)",
         ]);
+    }
+
+    #[test]
+    fn video_information_lines_should_replace_raw_fields_with_a_friendly_summary() {
+        // Arrange
+        let stream = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "h264",
+            "profile": "High",
+            "width": 1920,
+            "height": 1080,
+            "display_aspect_ratio": "16:9",
+            "avg_frame_rate": "24000/1001",
+            "pix_fmt": "yuv420p10le",
+            "color_transfer": "smpte2084",
+            "field_order": "progressive",
+            "bit_rate": "4200000",
+            "time_base": "1/24000",
+            "start_pts": 0,
+            "codec_tag_string": "avc1",
+            "disposition": {
+                "default": 1,
+                "comment": 1,
+                "original": 1
+            },
+            "tags": {
+                "title": "Main feature",
+                "language": "eng"
+            }
+        }))
+        .unwrap();
+
+        // Act
+        let text = video_information_lines(&stream, true)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let rendered = text.join("\n");
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "Title: Main feature".to_string(),
+            "".to_string(),
+            "Language: English".to_string(),
+            "Role: Default · Commentary · Original".to_string(),
+            "".to_string(),
+            "Format: H.264 (AVC)".to_string(),
+            "Resolution: 1920×1080 · 16:9 · 1080p".to_string(),
+            "Frame rate: 23.98 fps".to_string(),
+            "Picture: HDR10 · 10-bit · Progressive".to_string(),
+            "Bitrate: 4.2 Mb/s".to_string(),
+        ]);
+        assert_that!(rendered)
+            .does_not_contain("time_base")
+            .does_not_contain("start_pts")
+            .does_not_contain("codec_tag")
+            .does_not_contain("profile");
+    }
+
+    #[test]
+    fn video_information_lines_should_omit_unavailable_optional_information() {
+        // Arrange
+        let stream = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "hevc",
+            "width": 1280,
+            "height": 720
+        }))
+        .unwrap();
+
+        // Act
+        let text = video_information_lines(&stream, false)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "Title: Not provided".to_string(),
+            "".to_string(),
+            "Format: HEVC (H.265)".to_string(),
+            "Resolution: 1280×720 · 720p".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn audio_information_lines_should_translate_codec_channels_and_roles() {
+        // Arrange
+        let stream = serde_json::from_value(serde_json::json!({
+            "index": 1,
+            "codec_type": "audio",
+            "codec_name": "eac3",
+            "channels": 6,
+            "channel_layout": "5.1(side)",
+            "sample_rate": "48000",
+            "bit_rate": "640000",
+            "time_base": "1/48000",
+            "disposition": {
+                "default": 1,
+                "comment": 1,
+                "original": 1
+            },
+            "tags": {
+                "language": "eng",
+                "title": "English surround"
+            }
+        }))
+        .unwrap();
+
+        // Act
+        let text = audio_information_lines(&stream, true)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let rendered = text.join("\n");
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "Title: English surround".to_string(),
+            "".to_string(),
+            "Language: English".to_string(),
+            "Role: Default · Commentary · Original".to_string(),
+            "".to_string(),
+            "Format: Dolby Digital Plus (E-AC-3)".to_string(),
+            "Channels: 5.1 surround".to_string(),
+            "Bitrate: 640 kb/s".to_string(),
+            "Sample rate: 48 kHz".to_string(),
+        ]);
+        assert_that!(rendered).does_not_contain("time_base");
+    }
+
+    #[test]
+    fn subtitle_information_lines_should_explain_embedded_text_subtitles() {
+        // Arrange
+        let stream = serde_json::from_value(serde_json::json!({
+            "index": 2,
+            "codec_type": "subtitle",
+            "codec_name": "subrip",
+            "time_base": "1/1000",
+            "disposition": {
+                "default": 1,
+                "forced": 1,
+                "hearing_impaired": 1,
+                "original": 1
+            },
+            "tags": {
+                "language": "eng",
+                "title": "English SDH"
+            }
+        }))
+        .unwrap();
+
+        // Act
+        let text = embedded_subtitle_information_lines(&stream, true)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let rendered = text.join("\n");
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "Title: English SDH".to_string(),
+            "".to_string(),
+            "Language: English · CC".to_string(),
+            "Role: Default · Forced · SDH · Original".to_string(),
+            "".to_string(),
+            "Format: SubRip (SRT)".to_string(),
+            "Type: Text-based".to_string(),
+        ]);
+        assert_that!(rendered)
+            .does_not_contain("time_base")
+            .does_not_contain("Source:");
+    }
+
+    #[test]
+    fn subtitle_language_description_should_append_cc_only_for_captions() {
+        // Act
+        let captions = subtitle_language_description("eng", true);
+        let subtitles = subtitle_language_description("eng", false);
+
+        // Assert
+        assert_that!(captions.as_deref()).contains("English · CC");
+        assert_that!(subtitles.as_deref()).contains("English");
+    }
+
+    #[test]
+    fn language_name_should_translate_iso_codes_instead_of_showing_abbreviations() {
+        // Assert
+        assert_that!(language_name("ARA").as_deref()).contains("Arabic");
+        assert_that!(language_name("est").as_deref()).contains("Estonian");
+        assert_that!(language_name("fre").as_deref()).contains("French");
+        assert_that!(language_name("en-US").as_deref()).contains("English");
+        assert_that!(language_name("qaa").as_deref()).contains("Unknown language (QAA)");
+    }
+
+    #[test]
+    fn sidecar_information_lines_should_group_file_language_role_and_format() {
+        // Arrange
+        let sidecar = SidecarEntry {
+            path: std::path::PathBuf::from("movie.nld.forced.cc.sup"),
+            companion: None,
+            display_name: "movie.nld.forced.cc.sup".to_string(),
+            format: SubtitleFormat::Pgs,
+            language: "nld".to_string(),
+            forced: true,
+            cc: true,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        };
+
+        // Act
+        let text = sidecar_subtitle_information_lines(&sidecar)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "File: movie.nld.forced.cc.sup".to_string(),
+            "".to_string(),
+            "Language: Dutch · CC".to_string(),
+            "Role: Forced · Closed captions".to_string(),
+            "".to_string(),
+            "Format: PGS / SUP".to_string(),
+            "Type: Image-based".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn stream_details_popup_should_show_friendly_video_audio_and_subtitle_information() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-video-details-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{
+                    "index": 0,
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "time_base": "1/24000",
+                    "disposition": {"default": 1}
+                }, {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "ac3",
+                    "channels": 2,
+                    "tags": {"language": "nld"},
+                    "time_base": "1/48000"
+                }, {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "hdmv_pgs_subtitle",
+                    "tags": {"language": "eng"},
+                    "time_base": "1/1000"
+                }]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1, 2];
+        app.default_streams.insert(0);
+        app.sidecars.push(SidecarEntry {
+            path: directory.join("movie.nld.srt"),
+            companion: None,
+            display_name: "movie.nld.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "nld".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        });
+        app.layer = Layer::Streams;
+        app.selected_stream = 1;
+        app.open_stream_details();
+
+        // Act
+        app.selected_stream = 0;
+        let (container, container_title, container_compact) = details_popup_content(&app).unwrap();
+        app.selected_stream = 1;
+        let (video, video_title, video_compact) = details_popup_content(&app).unwrap();
+        app.selected_stream = 2;
+        let (audio, audio_title, audio_compact) = details_popup_content(&app).unwrap();
+        app.selected_stream = 3;
+        let (subtitle, subtitle_title, subtitle_compact) = details_popup_content(&app).unwrap();
+        app.selected_stream = 4;
+        let (external, external_title, external_compact) = details_popup_content(&app).unwrap();
+
+        // Assert
+        assert_that!(container_title).is_equal_to(" Container information ".to_string());
+        assert_that!(container_compact).is_true();
+        assert_that!(container.to_string())
+            .contains("File name: movie.mkv")
+            .contains("Format: MKV");
+        assert_that!(video_title).is_equal_to(" Video #0 ".to_string());
+        assert_that!(video_compact).is_true();
+        assert_that!(video.to_string())
+            .contains("Format: H.264 (AVC)")
+            .contains("Resolution: 1920×1080 · 1080p")
+            .does_not_contain("time_base");
+        assert_that!(audio_title).is_equal_to(" Audio #1 ".to_string());
+        assert_that!(audio_compact).is_true();
+        assert_that!(audio.to_string())
+            .contains("Format: Dolby Digital (AC-3)")
+            .contains("Channels: Stereo")
+            .contains("Language: Dutch")
+            .does_not_contain("time_base");
+        assert_that!(subtitle_title).is_equal_to(" Subtitle #2 ".to_string());
+        assert_that!(subtitle_compact).is_true();
+        assert_that!(subtitle.to_string())
+            .contains("Title: Not provided")
+            .contains("Format: PGS / SUP")
+            .contains("Type: Image-based")
+            .does_not_contain("Source:")
+            .does_not_contain("time_base");
+        assert_that!(external_title).is_equal_to(" External subtitle ".to_string());
+        assert_that!(external_compact).is_true();
+        assert_that!(external.to_string())
+            .contains("Format: SubRip (SRT)")
+            .contains("Language: Dutch")
+            .does_not_contain("Source:")
+            .contains("File: movie.nld.srt");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn content_popup_area_should_fit_short_information_instead_of_using_most_of_the_screen() {
+        // Arrange
+        let terminal = Rect::new(0, 0, 120, 40);
+        let text = padded_popup_text(Text::from(vec![
+            Line::from("Title: English SDH"),
+            Line::from(""),
+            Line::from("Language: English · CC"),
+            Line::from("Role: Default · SDH"),
+            Line::from(""),
+            Line::from("Format: SubRip (SRT)"),
+            Line::from("Type: Text-based"),
+        ]));
+
+        // Act
+        let area = content_popup_area(terminal, &text, " Subtitle #2 ");
+
+        // Assert
+        assert_that!(area.width).is_less_than(60);
+        assert_that!(area.height).is_equal_to(11);
     }
 
     #[test]
@@ -2140,9 +3054,10 @@ mod tests {
 
         // Act
         let lines = container_information_lines(&info, Path::new("/videos/movie.mp4"), 0);
+        let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
 
         // Assert
-        assert_that!(lines[4].to_string()).is_equal_to("Format: MP4 (QuickTime / MOV)".to_string());
+        assert_that!(text).contains("Format: MP4 (QuickTime / MOV)".to_string());
     }
 
     #[test]

@@ -739,7 +739,8 @@ impl App {
         let details_available = match self.selected_track() {
             Some(TrackRef::Container) => self.media_info().is_some(),
             Some(TrackRef::Embedded(_)) => self.selected_stream_info().is_some(),
-            Some(TrackRef::Sidecar(_)) | None => false,
+            Some(TrackRef::Sidecar(index)) => self.sidecars.get(index).is_some(),
+            None => false,
         };
         if self.dialog.is_none() && self.layer == Layer::Streams && details_available {
             self.layer = Layer::StreamDetails;
@@ -2249,11 +2250,38 @@ impl App {
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_details_down(10);
+        self.notice = None;
+        match self.layer {
+            Layer::Files => {
+                if !self.files.is_empty() {
+                    let current = self.list_state.selected().unwrap_or(0);
+                    self.select(current.saturating_add(10).min(self.files.len() - 1));
+                }
+            }
+            Layer::Streams => {
+                let count = self.stream_count();
+                if count > 0 {
+                    self.selected_stream = self.selected_stream.saturating_add(10).min(count - 1);
+                }
+            }
+            Layer::StreamDetails => self.scroll_details_down(10),
+        }
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_details_up(10);
+        self.notice = None;
+        match self.layer {
+            Layer::Files => {
+                if !self.files.is_empty() {
+                    let current = self.list_state.selected().unwrap_or(0);
+                    self.select(current.saturating_sub(10));
+                }
+            }
+            Layer::Streams => {
+                self.selected_stream = self.selected_stream.saturating_sub(10);
+            }
+            Layer::StreamDetails => self.scroll_details_up(10),
+        }
     }
 
     fn scroll_details_down(&mut self, amount: u16) {
@@ -2444,6 +2472,24 @@ impl App {
                 "Converting {converted_subtitles} subtitle{}",
                 if converted_subtitles == 1 { "" } else { "s" }
             ));
+        }
+
+        if descriptions.len() < 2
+            && let Some(info) = self.media_info()
+        {
+            descriptions.extend(
+                edit_summary(
+                    info,
+                    &self.original_stream_order,
+                    &self.stream_order,
+                    &self.moved_streams,
+                    &self.deleted_streams,
+                    &self.original_default_streams,
+                    &self.default_streams,
+                )
+                .into_iter()
+                .take(2 - descriptions.len()),
+            );
         }
 
         if descriptions.is_empty() {
@@ -3017,7 +3063,7 @@ mod tests {
     }
 
     #[test]
-    fn processing_description_should_describe_a_plain_remux() {
+    fn processing_description_should_describe_a_deleted_track() {
         // Arrange
         let mut app = test_file_app(&["alpha.mkv"]);
         let directory = app.directory.clone();
@@ -3027,7 +3073,24 @@ mod tests {
         let description = app.processing_description();
 
         // Assert
-        assert_that!(description).is_equal_to("Remuxing media".to_string());
+        assert_that!(description).is_equal_to("Deleting 1 audio track".to_string());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn processing_description_should_describe_a_default_subtitle_change() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        app.default_streams.insert(2);
+
+        // Act
+        let description = app.processing_description();
+
+        // Assert
+        assert_that!(description).is_equal_to("Changing the default subtitle track".to_string());
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -4702,6 +4765,41 @@ mod tests {
         assert_that!(app.layer).is_equal_to(Layer::StreamDetails);
         assert_that!(app.details_scroll).is_equal_to(0);
         assert_that!(app.details_max_scroll).is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_stream_details_should_open_for_an_external_subtitle() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ])));
+        let directory = app.directory.clone();
+        app.sidecars.push(SidecarEntry {
+            path: directory.join("movie.eng.srt"),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        });
+        app.selected_stream = 2;
+
+        // Act
+        app.open_stream_details();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::StreamDetails);
+        assert_that!(app.details_scroll).is_equal_to(0);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

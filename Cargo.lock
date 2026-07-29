@@ -531,6 +531,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "isolang"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe50d48c77760c55188549098b9a7f6e37ae980c586a24693d6b01c3b2010c3c"
+dependencies = [
+ "phf",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1131,6 +1140,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "isolang",
  "kernal",
  "notify",
  "ratatui",
