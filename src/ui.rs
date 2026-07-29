@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use ratatui::{
     Frame,
@@ -11,12 +11,12 @@ use serde_json::Value;
 
 use crate::{
     app::{
-        App, CancelEditChoice, Dialog, Layer, SaveDialogField, SubtitleAction,
-        SubtitleSettingsField, TrackRef, VideoSettingsField,
+        App, CancelEditChoice, ContainerChoice, CustomResolutionField, Dialog, Layer,
+        SaveDialogField, SubtitleSettingsField, TrackRef, VideoSettingsField, VideoSettingsMode,
     },
-    edit::{SaveDestination, stream_index},
+    edit::{ContainerFormat, SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
-    subtitle::{SidecarEntry, SubtitleSource},
+    subtitle::{SidecarEntry, SubtitleSource, stream_cc, stream_forced},
 };
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_details(frame, app, columns[1]);
     render_footer(frame, app, rows[1]);
     if app.layer == Layer::StreamDetails {
-        render_stream_popup(frame, app);
+        render_details_popup(frame, app);
     }
     if let Some(dialog) = app.dialog {
         render_dialog(frame, app, dialog);
@@ -52,10 +52,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.layer == Layer::Files;
     let items: Vec<_> = app
         .files
         .iter()
-        .map(|file| ListItem::new(file.display_name.clone()))
+        .map(|file| {
+            ListItem::new(file_tree_lines(
+                &file.display_name,
+                app.sidecars_for_media(&file.path)
+                    .iter()
+                    .map(|sidecar| sidecar.display_name.as_str()),
+            ))
+        })
         .collect();
     let title = format!(" Files ({}) ", app.files.len());
     let list = List::new(items)
@@ -65,14 +73,37 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
                 .border_style(focus_border(app.layer == Layer::Files))
                 .title(title),
         )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
+        .highlight_style(if focused {
+            focused_style(false)
+        } else {
+            Style::default().fg(Color::White).bold()
+        })
+        .highlight_symbol(if focused { "› " } else { "  " });
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+fn file_tree_lines<'a>(
+    display_name: &str,
+    sidecar_names: impl IntoIterator<Item = &'a str>,
+) -> Vec<Line<'static>> {
+    let sidecar_names = sidecar_names.into_iter().collect::<Vec<_>>();
+    let mut lines = Vec::with_capacity(sidecar_names.len() + 1);
+    lines.push(Line::from(display_name.to_string()));
+    let last = sidecar_names.len().saturating_sub(1);
+    lines.extend(sidecar_names.into_iter().enumerate().map(|(index, name)| {
+        Line::from(vec![
+            Span::styled(
+                if index == last {
+                    "  └── "
+                } else {
+                    "  ├── "
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(name.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    }));
+    lines
 }
 
 fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -97,6 +128,8 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
             Some(ProbeOutcome::Video(info)) => {
                 let changed = app.changed_streams();
                 let rows = app.track_rows();
+                let container_conflicts = app.selected_container_conflicts();
+                let conflicting_streams = app.selected_container_conflict_streams();
                 let (text, selected_line) = media_text(
                     info,
                     (app.layer != Layer::Files).then_some(app.selected_stream),
@@ -108,6 +141,10 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         defaults: &app.default_streams,
                         changed: &changed,
                         subtitle_changes: &app.subtitle_changes,
+                        source_container: app.source_container(),
+                        container_target: app.container_target,
+                        container_conflicts: container_conflicts.len(),
+                        conflicting_streams: &conflicting_streams,
                     },
                 );
                 if app.layer == Layer::Streams
@@ -191,11 +228,28 @@ fn media_text(
         defaults,
         changed,
         subtitle_changes,
+        source_container,
+        container_target,
+        container_conflicts,
+        conflicting_streams,
     } = state;
     let mut lines = Vec::new();
     let mut selected_line = None;
-    section(&mut lines, "Overview");
-    lines.push(Line::from(format_overview(info)));
+    section(&mut lines, "Container");
+    let container_index = rows
+        .iter()
+        .position(|row| *row == TrackRef::Container)
+        .unwrap_or(0);
+    if selected == Some(container_index) {
+        selected_line = Some(lines.len());
+    }
+    lines.push(container_line(
+        info,
+        source_container,
+        container_target,
+        container_conflicts,
+        selected == Some(container_index),
+    ));
 
     let groups = [
         ("Video", "video"),
@@ -237,6 +291,7 @@ fn media_text(
                     selected == Some(selection_index),
                     stream_index(stream).is_some_and(|index| deleted.contains(&index)),
                     stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                    stream_index(stream).is_some_and(|index| conflicting_streams.contains(&index)),
                     stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                 ));
             }
@@ -289,6 +344,7 @@ fn media_text(
                 selected == Some(selection_index),
                 stream_index(stream).is_some_and(|index| deleted.contains(&index)),
                 stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                stream_index(stream).is_some_and(|index| conflicting_streams.contains(&index)),
                 stream_index(stream).is_some_and(|index| defaults.contains(&index)),
             ));
         }
@@ -318,30 +374,27 @@ struct MediaTextState<'a> {
         crate::subtitle::SubtitleSource,
         crate::subtitle::SubtitleChange,
     >,
+    source_container: Option<crate::edit::ContainerFormat>,
+    container_target: Option<crate::edit::ContainerFormat>,
+    container_conflicts: usize,
+    conflicting_streams: &'a std::collections::BTreeSet<u64>,
 }
 
 fn sidecar_line(sidecar: &SidecarEntry, selected: bool, changed: bool) -> Line<'static> {
     let marker = if selected { "›" } else { " " };
-    let changed = if changed { "  ✎" } else { "" };
-    let mut flags = vec!["external".to_string()];
-    if sidecar.forced {
-        flags.push("forced".to_string());
-    }
-    if sidecar.cc {
-        flags.push("cc".to_string());
-    }
-    Line::from(format!(
-        "{marker}    {}  ·  {}  ·  {}  [{}]{changed}",
+    let changed_marker = if changed { "  ✎" } else { "" };
+    let details = subtitle_overview_details(
         sidecar.format.label(),
-        sidecar.language.to_ascii_uppercase(),
-        sidecar.display_name,
-        flags.join(", ")
-    ))
-    .style(if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        crate::subtitle::normalized_language(&sidecar.language),
+        false,
+        sidecar.forced,
+        sidecar.cc,
+        true,
+    );
+    Line::from(format!("{marker}     {details}{changed_marker}",)).style(if selected {
+        focused_style(changed)
+    } else if changed {
+        changed_style()
     } else {
         Style::default()
     })
@@ -357,13 +410,27 @@ fn section(lines: &mut Vec<Line<'static>>, name: &str) {
     ));
 }
 
-fn format_overview(info: &MediaInfo) -> String {
-    let mut parts = Vec::new();
-    if let Some(format) =
-        string(&info.format, "format_long_name").or_else(|| string(&info.format, "format_name"))
-    {
-        parts.push(format.to_string());
-    }
+fn container_line(
+    info: &MediaInfo,
+    source_container: Option<crate::edit::ContainerFormat>,
+    target: Option<crate::edit::ContainerFormat>,
+    conflicts: usize,
+    selected: bool,
+) -> Line<'static> {
+    let source = source_container.map_or_else(
+        || {
+            string(&info.format, "format_long_name")
+                .or_else(|| string(&info.format, "format_name"))
+                .unwrap_or("Unknown container")
+                .to_string()
+        },
+        |container| container.label().to_string(),
+    );
+    let format = target.map_or_else(
+        || source.clone(),
+        |target| format!("{source} → {}", target.label()),
+    );
+    let mut parts = vec![format];
     if let Some(duration) = number_string(&info.format, "duration").and_then(parse_number) {
         parts.push(format_duration(duration));
     }
@@ -373,7 +440,23 @@ fn format_overview(info: &MediaInfo) -> String {
     if let Some(bit_rate) = number_string(&info.format, "bit_rate").and_then(parse_number) {
         parts.push(format_bitrate(bit_rate));
     }
-    parts.join("  ·  ")
+    if conflicts > 0 {
+        parts.push(format!(
+            "⚠ {conflicts} compatibility conflict{}",
+            if conflicts == 1 { "" } else { "s" }
+        ));
+    }
+    let marker = if selected { "›" } else { " " };
+    let changed = target.is_some();
+    Line::from(format!("{marker}    {}", parts.join("  ·  "))).style(if selected {
+        focused_style(changed)
+    } else if conflicts > 0 {
+        warning_style(changed)
+    } else if changed {
+        changed_style()
+    } else {
+        Style::default()
+    })
 }
 
 fn stream_line(
@@ -382,12 +465,25 @@ fn stream_line(
     selected: bool,
     deleted: bool,
     changed: bool,
+    conflict: bool,
     default: bool,
 ) -> Line<'static> {
     let index = number_string(stream, "index").unwrap_or_else(|| fallback_index.to_string());
     let kind = string(stream, "codec_type").unwrap_or("unknown");
     let codec = string(stream, "codec_name").unwrap_or("unknown");
-    let mut details = vec![codec.to_uppercase()];
+    let subtitle = kind == "subtitle";
+    let mut details = if subtitle {
+        vec![subtitle_overview_details(
+            &subtitle_format_label(codec),
+            crate::subtitle::normalized_language(tag(stream, "language").unwrap_or("und")),
+            default,
+            stream_forced(stream),
+            stream_cc(stream),
+            false,
+        )]
+    } else {
+        vec![codec.to_uppercase()]
+    };
 
     match kind {
         "video" => {
@@ -422,57 +518,107 @@ fn stream_line(
         }
     }
 
-    if let Some(language) = tag(stream, "language")
-        && language != "und"
-    {
-        details.push(language.to_uppercase());
+    if !subtitle {
+        if let Some(language) = tag(stream, "language")
+            && language != "und"
+        {
+            details.push(language.to_uppercase());
+        }
+        if let Some(title) = tag(stream, "title") {
+            details.push(title.to_string());
+        }
+        details.extend(disposition_flags(stream, default));
     }
-    if let Some(title) = tag(stream, "title") {
-        details.push(title.to_string());
-    }
-    details.extend(disposition_flags(stream, default));
 
+    let semantic_span_style = if selected {
+        Style::default()
+    } else if deleted {
+        Style::default().fg(Color::Red).bold()
+    } else if conflict {
+        warning_style(false).bold()
+    } else if changed {
+        changed_style().bold()
+    } else {
+        Style::default()
+    };
+    let index_style = if selected {
+        Style::default()
+    } else if deleted {
+        Style::default().fg(Color::Red)
+    } else if conflict {
+        warning_style(false)
+    } else if changed {
+        changed_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let line = Line::from(vec![
         if deleted {
-            Span::styled("× ", Style::default().fg(Color::Red).bold())
+            Span::styled("× ", semantic_span_style)
+        } else if conflict {
+            Span::styled("⚠ ", semantic_span_style)
         } else if changed {
-            Span::styled("~ ", Style::default().fg(Color::Yellow).bold())
+            Span::styled("~ ", semantic_span_style)
         } else {
             Span::raw("  ")
         },
-        Span::styled(
-            format!("#{index:<2} "),
-            Style::default().fg(if deleted {
-                Color::Red
-            } else if changed {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }),
-        ),
-        Span::raw(details.join("  ·  ")),
+        Span::styled(format!("#{index:<2} "), index_style),
+        Span::raw(details.join(if subtitle { " - " } else { "  ·  " })),
     ]);
     if selected {
-        line.style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        line.style(focused_style(changed && !deleted))
     } else {
         line.style(if deleted {
             Style::default().fg(Color::Red)
+        } else if conflict {
+            warning_style(changed)
         } else if changed {
-            Style::default().fg(Color::Yellow)
+            changed_style()
         } else {
             Style::default()
         })
     }
 }
 
+fn subtitle_format_label(codec: &str) -> String {
+    crate::subtitle::SubtitleFormat::from_codec(codec).map_or_else(
+        || codec.to_ascii_uppercase(),
+        |format| format.label().to_string(),
+    )
+}
+
+fn subtitle_overview_details(
+    format: &str,
+    language: &str,
+    default: bool,
+    forced: bool,
+    cc: bool,
+    external: bool,
+) -> String {
+    let language = language.to_ascii_uppercase();
+    let mut parts = vec![format!("{format:<12}"), language];
+    if default {
+        parts.push("[Default]".to_string());
+    }
+    if forced {
+        parts.push("[Forced]".to_string());
+    }
+    if cc {
+        parts.push("[CC]".to_string());
+    }
+    if external {
+        parts.push("[External]".to_string());
+    }
+    parts.join(" · ")
+}
+
 fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
     if dialog == Dialog::Keybindings {
         render_keybindings_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::ContainerSettings {
+        render_container_settings_dialog(frame, app);
         return;
     }
     if dialog == Dialog::VideoSettings {
@@ -498,6 +644,7 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
     }
     let (title, body, color) = match dialog {
         Dialog::Keybindings
+        | Dialog::ContainerSettings
         | Dialog::VideoSettings
         | Dialog::SubtitleSettings
         | Dialog::ConfirmSave => unreachable!(),
@@ -511,9 +658,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         ),
     };
     let area = centered_fixed(frame.area(), 64, 9);
+    let text = padded_popup_text(Text::from(body));
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(body)
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -525,27 +673,74 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
     );
 }
 
+fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.container_settings_popup.as_ref() else {
+        return;
+    };
+    let choices = app.container_choices();
+    let mut lines = Vec::new();
+    for (position, choice) in choices.iter().enumerate() {
+        lines.push(container_choice_line(choice, position == popup.cursor));
+    }
+    let text = padded_popup_text(Text::from(lines));
+    let height = (text.lines.len() as u16 + 2)
+        .max(8)
+        .min(frame.area().height.saturating_sub(2));
+    let area = centered_fixed(frame.area(), 88, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Container format "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn container_choice_line(choice: &ContainerChoice, cursor: bool) -> Line<'static> {
+    let changed = choice.staged && !choice.current;
+    let mut line = subtitle_codec_line(&choice.label, cursor, changed, true, choice.current);
+    if let Some(warning) = choice.warning() {
+        let target_prefix = format!("{} ", choice.label);
+        let warning = warning.strip_prefix(&target_prefix).unwrap_or(&warning);
+        line.spans.push(Span::styled(
+            format!("  ⚠ {warning}"),
+            if cursor {
+                focused_style(false)
+            } else {
+                warning_style(changed)
+            },
+        ));
+    }
+    line
+}
+
 fn render_cancel_edit_dialog(frame: &mut Frame, app: &App) {
     let lines = vec![
         Line::from("Are you sure you want to cancel the current operation?").centered(),
         Line::from(""),
         Line::from(vec![
-            save_option(
+            action_option(
                 " Keep processing ",
                 app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
             ),
             Span::raw("  "),
-            save_option(
+            action_option(
                 " Cancel processing ",
                 app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
             ),
         ])
         .centered(),
     ];
+    let text = padded_popup_text(Text::from(lines));
     let area = centered_fixed(frame.area(), 64, 7);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -581,12 +776,12 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
                     Modifier::empty()
                 }),
             ),
-            save_option(
+            destination_option(
                 " Replace original ",
                 app.save_destination == SaveDestination::ReplaceOriginal,
             ),
             Span::raw("  "),
-            save_option(
+            destination_option(
                 " Create a copy ",
                 app.save_destination == SaveDestination::CreateCopy,
             ),
@@ -603,7 +798,7 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
                 "          START       "
             },
             if start_focused {
-                Style::default().fg(Color::White).bg(Color::Cyan).bold()
+                focused_style(false)
             } else {
                 Style::default().fg(Color::White).bold()
             },
@@ -611,11 +806,12 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
         .centered(),
     );
 
-    let height = (lines.len() as u16 + 2).max(10);
-    let area = centered_fixed(frame.area(), 68, height);
+    let text = padded_popup_text(Text::from(lines));
+    let area = save_dialog_area(frame.area(), &text.lines);
+    let scroll = max_scroll(&text, area);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -626,25 +822,48 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
                         " Save subtitle changes "
                     }),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         area,
     );
 }
 
-fn save_option(label: &'static str, selected: bool) -> Span<'static> {
+fn save_dialog_area(frame_area: Rect, lines: &[Line<'_>]) -> Rect {
+    let width = 68.min(frame_area.width.saturating_sub(2)).max(1);
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let rendered_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let height = rendered_lines.saturating_add(2).min(u16::MAX as usize) as u16;
+    centered_fixed(frame_area, width, height.max(10))
+}
+
+fn action_option(label: &'static str, focused: bool) -> Span<'static> {
     Span::styled(
         label,
-        if selected {
-            Style::default().fg(Color::White).bg(Color::Cyan).bold()
+        if focused {
+            focused_style(false)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::White)
+        },
+    )
+}
+
+fn destination_option(label: &'static str, chosen: bool) -> Span<'static> {
+    Span::styled(
+        label,
+        if chosen {
+            focused_style(false)
+        } else {
+            Style::default().fg(Color::White)
         },
     )
 }
 
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
     let area = popup_area(frame.area(), 80, 80);
-    let text = keybindings_text();
+    let text = padded_popup_text(keybindings_text());
     app.set_keybindings_max_scroll(max_scroll(&text, area));
 
     frame.render_widget(Clear, area);
@@ -683,9 +902,13 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "Enter",
-        "Edit video settings or convert/export subtitles",
+        "Edit container, video, or subtitle settings",
     );
-    keybinding(&mut lines, "i", "Open full ffprobe stream information");
+    keybinding(
+        &mut lines,
+        "i",
+        "Open full ffprobe container or stream information",
+    );
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
     keybinding(&mut lines, "Ctrl-c", "Cancel processing");
@@ -777,6 +1000,10 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.video_settings_popup.as_ref() else {
         return;
     };
+    if popup.mode == VideoSettingsMode::CustomResolution {
+        render_custom_resolution_dialog(frame, app);
+        return;
+    }
     let settings = app
         .video_settings
         .get(&popup.stream_index)
@@ -791,55 +1018,64 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let resolution_choices = app.resolution_choices(popup.stream_index);
     let resolution_label = resolution_choices
         .iter()
-        .find(|choice| choice.value == settings.resolution)
+        .find(|choice| choice.selected(settings.resolution))
         .map(|choice| choice.label.clone())
-        .unwrap_or_else(|| settings.resolution.label().to_string());
+        .unwrap_or_else(|| settings.resolution.label());
 
     let mut lines = vec![
         setting_line(
             "Codec",
             codec_label,
             popup.field == VideoSettingsField::Codec,
+            settings.codec != crate::edit::VideoCodec::Original,
         ),
         setting_line(
             "Resolution",
             &resolution_label,
             popup.field == VideoSettingsField::Resolution,
+            settings.resolution != crate::edit::VideoResolution::Original,
         ),
     ];
-    if popup.dropdown_open {
+    if popup.mode == VideoSettingsMode::Dropdown {
         lines.push(Line::from(""));
         match popup.field {
             VideoSettingsField::Codec => {
                 for (position, choice) in codec_choices.iter().enumerate() {
+                    let label = match &choice.reason {
+                        Some(reason) => format!("{} — {reason}", choice.label),
+                        None => choice.label.clone(),
+                    };
                     lines.push(subtitle_codec_line(
-                        &choice.label,
+                        &label,
                         position == popup.codec_cursor,
                         settings.codec != crate::edit::VideoCodec::Original
                             && choice.value == settings.codec,
-                        true,
+                        choice.enabled,
                         choice.current,
                     ));
                 }
             }
             VideoSettingsField::Resolution => {
                 for (position, choice) in resolution_choices.iter().enumerate() {
+                    let selected = choice.selected(settings.resolution);
                     lines.push(dropdown_line(
                         &choice.label,
                         position == popup.resolution_cursor,
-                        choice.value == settings.resolution,
+                        selected,
                         choice.enabled,
+                        settings.resolution != crate::edit::VideoResolution::Original && selected,
                     ));
                 }
             }
         }
     }
 
-    let height = (lines.len() as u16 + 4).max(7);
+    let text = padded_popup_text(Text::from(lines));
+    let height = (text.lines.len() as u16 + 2).max(7);
     let area = centered_fixed(frame.area(), 58, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
+        Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
@@ -849,26 +1085,132 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.video_settings_popup.as_ref() else {
+        return;
+    };
+    let Some(draft) = popup.custom_resolution.as_ref() else {
+        return;
+    };
+    let source = app
+        .video_source_dimensions(popup.stream_index)
+        .map(|(width, height)| format!("Original: {width}×{height}"))
+        .unwrap_or_else(|| "Original resolution unavailable".to_string());
+    let source_dimensions = app.video_source_dimensions(popup.stream_index);
+    let width_changed =
+        source_dimensions.is_some_and(|(width, _)| draft.width.parse::<u64>().ok() != Some(width));
+    let height_changed = source_dimensions
+        .is_some_and(|(_, height)| draft.height.parse::<u64>().ok() != Some(height));
+    let mut lines = vec![
+        Line::styled(source, Style::default().fg(Color::DarkGray)),
+        Line::from(""),
+    ];
+    lines.push(custom_input_line(
+        "Width",
+        &draft.width,
+        draft.field == CustomResolutionField::Width,
+        width_changed,
+    ));
+    lines.push(Line::from(""));
+    lines.push(custom_input_line(
+        "Height",
+        &draft.height,
+        draft.field == CustomResolutionField::Height,
+        height_changed,
+    ));
+    lines.push(Line::from(""));
+    if let Some(error) = app.custom_resolution_error() {
+        lines.push(Line::styled(error, Style::default().fg(Color::Red)));
+        lines.push(Line::from(""));
+    }
+    lines.extend(custom_scaling_lines(draft));
+
+    let text = padded_popup_text(Text::from(lines));
+    let height = (text.lines.len() as u16 + 2).max(10);
+    let area = centered_fixed(frame.area(), 58, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(format!(
+                        " Video track #{} custom resolution ",
+                        popup.stream_index
+                    )),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+const CUSTOM_INPUT_WIDTH: usize = 16;
+
+fn custom_input_line(label: &str, value: &str, focused: bool, changed: bool) -> Line<'static> {
+    let input_style = if changed {
+        changed_style()
+    } else {
+        Style::default().fg(Color::White)
+    }
+    .bg(Color::Rgb(32, 32, 32));
+    let cursor = if focused { "▏" } else { "" };
+    let prefix = format!(" {value}");
+    let padding = " ".repeat(
+        CUSTOM_INPUT_WIDTH
+            .saturating_sub(prefix.chars().count())
+            .saturating_sub(cursor.chars().count()),
+    );
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<12}"),
+            Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
+        ),
+        Span::styled(prefix, input_style),
+        Span::styled(
+            cursor.to_string(),
+            input_style.fg(if focused { Color::Cyan } else { Color::White }),
+        ),
+        Span::styled(padding, input_style),
+    ])
+}
+
+fn custom_scaling_lines(draft: &crate::app::CustomResolutionDraft) -> Vec<Line<'static>> {
+    let focused = draft.field == CustomResolutionField::Scaling;
+    let changed = draft.scaling != crate::edit::CustomScaling::FitPad;
+    let mut lines = vec![setting_line(
+        "Scaling",
+        draft.scaling.label(),
+        focused,
+        changed,
+    )];
+    if draft.scaling_dropdown_open {
+        lines.push(Line::from(""));
+        for (position, scaling) in crate::edit::CustomScaling::OPTIONS.iter().enumerate() {
+            lines.push(dropdown_line(
+                scaling.label(),
+                position == draft.scaling_cursor,
+                *scaling == draft.scaling,
+                true,
+                changed && *scaling == draft.scaling,
+            ));
+        }
+    }
+    lines
+}
+
 fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.subtitle_settings_popup.as_ref() else {
         return;
     };
     let change = app.subtitle_changes.get(&popup.source);
-    let codec_choices = app.subtitle_choices(&popup.source, popup.source_format, popup.action);
+    let codec_choices = app.subtitle_choices(&popup.source, popup.source_format);
     let codec_selected = |choice: &crate::subtitle::FormatChoice| {
-        if popup.action == SubtitleAction::ExportSidecar {
-            change.and_then(|change| change.export_target) == Some(choice.format)
-        } else {
-            change.and_then(|change| change.embedded_target) == choice.value
-        }
+        change.and_then(|change| change.embedded_target) == choice.value
     };
     let codec_staged = |choice: &crate::subtitle::FormatChoice| {
-        if popup.action == SubtitleAction::ExportSidecar {
-            change.and_then(|change| change.export_target) == Some(choice.format)
-        } else {
-            change.and_then(|change| change.embedded_target).is_some()
-                && change.and_then(|change| change.embedded_target) == choice.value
-        }
+        change.and_then(|change| change.embedded_target).is_some()
+            && change.and_then(|change| change.embedded_target) == choice.value
     };
     let codec_label = codec_choices
         .iter()
@@ -876,23 +1218,23 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         .map(|choice| choice.label.as_str())
         .unwrap_or_else(|| popup.source_format.label());
     let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
-    let mut lines = Vec::new();
-    if !sidecar {
-        lines.push(subtitle_action_line(
-            popup.action,
-            popup.field == SubtitleSettingsField::Action,
-        ));
-    }
-    lines.push(setting_line(
+    let exporting = change.is_some_and(|change| change.export_target.is_some());
+    let mut lines = vec![setting_line(
         "Codec",
         codec_label,
         popup.field == SubtitleSettingsField::Codec,
-    ));
+        change.is_some_and(|change| change.embedded_target.is_some()),
+    )];
+    if !sidecar {
+        lines.push(subtitle_export_line(
+            exporting,
+            popup.field == SubtitleSettingsField::Export,
+        ));
+    }
 
     if popup.dropdown_open {
         lines.push(Line::from(""));
         match popup.field {
-            SubtitleSettingsField::Action => {}
             SubtitleSettingsField::Codec => {
                 for (position, choice) in codec_choices.iter().enumerate() {
                     let label = match &choice.reason {
@@ -908,6 +1250,7 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                     ));
                 }
             }
+            SubtitleSettingsField::Export => {}
         }
     }
     let title = match &popup.source {
@@ -919,11 +1262,12 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                 .unwrap_or("Subtitle sidecar")
         ),
     };
-    let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+    let text = padded_popup_text(Text::from(lines));
+    let height = (text.lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
     let area = centered_fixed(frame.area(), 76, height.max(8));
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -935,35 +1279,38 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn subtitle_action_line(action: SubtitleAction, focused: bool) -> Line<'static> {
+fn subtitle_export_line(checked: bool, focused: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            "Action      ",
+            "Export      ",
             Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
         ),
-        save_option(
-            " Convert in container ",
-            action == SubtitleAction::ConvertInContainer,
-        ),
-        Span::raw("  "),
-        save_option(" Export sidecar ", action == SubtitleAction::ExportSidecar),
+        Span::styled(if checked { "[x]" } else { "[ ]" }, {
+            if focused {
+                focused_style(checked)
+            } else if checked {
+                changed_style()
+            } else {
+                Style::default().fg(Color::White)
+            }
+        }),
     ])
 }
 
-fn setting_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+fn setting_line(label: &str, value: &str, selected: bool, changed: bool) -> Line<'static> {
+    let value_style = if selected {
+        focused_style(changed)
+    } else if changed {
+        changed_style()
+    } else {
+        Style::default()
+    };
     Line::from(vec![
         Span::styled(
             format!("{label:<12}"),
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
-        Span::styled(
-            format!("[ {value} ]"),
-            if selected {
-                Style::default().fg(Color::Yellow).bold()
-            } else {
-                Style::default()
-            },
-        ),
+        Span::styled(format!("[ {value} ]"), value_style),
     ])
 }
 
@@ -974,61 +1321,37 @@ fn subtitle_codec_line(
     enabled: bool,
     current: bool,
 ) -> Line<'static> {
-    let background = cursor.then_some(Color::Cyan);
-    let mut label_style = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else if staged {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::ITALIC)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    if let Some(background) = background {
-        label_style = label_style.bg(background).add_modifier(Modifier::BOLD);
-    }
+    let label_style = choice_style(cursor, staged, enabled);
     let mut spans = vec![Span::styled(format!("    {label}"), label_style)];
     if current {
-        let mut original_style = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC);
-        if let Some(background) = background {
-            original_style = original_style.bg(background);
-        }
+        let original_style = if cursor {
+            focused_style(false).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         spans.push(Span::styled(" (original)", original_style));
     }
     Line::from(spans)
 }
 
-fn dropdown_line(label: &str, cursor: bool, selected: bool, enabled: bool) -> Line<'static> {
-    let marker = if selected { "●" } else { " " };
+fn dropdown_line(
+    label: &str,
+    cursor: bool,
+    selected: bool,
+    enabled: bool,
+    staged: bool,
+) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
     let line = Line::from(format!("  {marker} {label}"));
-    if !enabled {
-        line.style(Style::default().fg(Color::DarkGray))
-    } else if cursor {
-        line.style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        line
-    }
+    line.style(choice_style(cursor, staged, enabled))
 }
 
-fn render_stream_popup(frame: &mut Frame, app: &mut App) {
-    let Some(stream) = app.selected_stream_info() else {
+fn render_details_popup(frame: &mut Frame, app: &mut App) {
+    let Some((text, title)) = details_popup_content(app) else {
         return;
     };
     let area = popup_area(frame.area(), 90, 86);
-    let index = number_string(stream, "index").unwrap_or_else(|| "?".to_string());
-    let kind = string(stream, "codec_type")
-        .unwrap_or("unknown")
-        .to_string();
-    let mut lines = Vec::new();
-    append_map(&mut lines, stream, 0);
-    let text = Text::from(lines);
+    let text = padded_popup_text(text);
     app.set_details_max_scroll(max_scroll(&text, area));
 
     frame.render_widget(Clear, area);
@@ -1038,12 +1361,97 @@ fn render_stream_popup(frame: &mut Frame, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(format!(" Stream #{index} · {kind} ")),
+                    .title(title),
             )
             .wrap(Wrap { trim: false })
             .scroll((app.details_scroll, 0)),
         area,
     );
+}
+
+fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
+    let info = app.media_info()?;
+    match app.selected_track()? {
+        TrackRef::Container => {
+            let file = app.selected_file()?;
+            Some((
+                Text::from(container_information_lines(
+                    info,
+                    &file.path,
+                    file.fingerprint.length,
+                )),
+                " Container information ".to_string(),
+            ))
+        }
+        TrackRef::Embedded(index) => {
+            let stream = info
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(index))?;
+            let index = number_string(stream, "index").unwrap_or_else(|| index.to_string());
+            let kind = string(stream, "codec_type").unwrap_or("unknown");
+            let mut lines = Vec::new();
+            append_map(&mut lines, stream, 0);
+            Some((Text::from(lines), format!(" Stream #{index} · {kind} ")))
+        }
+        TrackRef::Sidecar(_) => None,
+    }
+}
+
+fn container_information_lines(
+    info: &MediaInfo,
+    path: &Path,
+    fallback_size: u64,
+) -> Vec<Line<'static>> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let size = number_string(&info.format, "size")
+        .and_then(parse_number)
+        .unwrap_or(fallback_size as f64);
+    let duration = number_string(&info.format, "duration")
+        .and_then(parse_number)
+        .map(format_duration_24h)
+        .unwrap_or_else(|| "Unknown".to_string());
+    let format = container_format_description(info, path);
+
+    vec![
+        field_line(0, "File name", &file_name),
+        field_line(0, "Path", &path.to_string_lossy()),
+        field_line(0, "Size", &format_bytes(size)),
+        field_line(0, "Duration", &duration),
+        field_line(0, "Format", &format),
+    ]
+}
+
+fn container_format_description(info: &MediaInfo, path: &Path) -> String {
+    let probed_name =
+        string(&info.format, "format_long_name").or_else(|| string(&info.format, "format_name"));
+    match (ContainerFormat::from_path(path), probed_name) {
+        (Some(container), Some(probed_name))
+            if !probed_name.eq_ignore_ascii_case(container.label()) =>
+        {
+            format!("{} ({probed_name})", container.label())
+        }
+        (Some(container), _) => container.label().to_string(),
+        (None, Some(probed_name)) => probed_name.to_string(),
+        (None, None) => "Unknown".to_string(),
+    }
+}
+
+fn format_duration_24h(seconds: f64) -> String {
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn padded_popup_text(mut text: Text<'static>) -> Text<'static> {
+    text.lines.insert(0, Line::from(""));
+    text.lines.push(Line::from(""));
+    text
 }
 
 fn max_scroll(text: &Text<'_>, area: Rect) -> u16 {
@@ -1138,6 +1546,45 @@ fn focus_border(focused: bool) -> Style {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default()
+    }
+}
+
+fn focused_style(changed: bool) -> Style {
+    let style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    if changed {
+        style.add_modifier(Modifier::ITALIC)
+    } else {
+        style
+    }
+}
+
+fn changed_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::ITALIC)
+}
+
+fn warning_style(changed: bool) -> Style {
+    let style = Style::default().fg(Color::Yellow);
+    if changed {
+        style.add_modifier(Modifier::ITALIC)
+    } else {
+        style
+    }
+}
+
+fn choice_style(cursor: bool, changed: bool, enabled: bool) -> Style {
+    if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else if cursor {
+        focused_style(changed)
+    } else if changed {
+        changed_style()
+    } else {
+        Style::default().fg(Color::White)
     }
 }
 
@@ -1339,6 +1786,44 @@ mod tests {
     }
 
     #[test]
+    fn container_line_should_show_staged_format_metadata_and_conflicts() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "duration": "3723",
+                "size": "1572864",
+                "bit_rate": "4200000"
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+
+        // Act
+        let line = container_line(
+            &info,
+            Some(crate::edit::ContainerFormat::Matroska),
+            Some(crate::edit::ContainerFormat::Mp4),
+            1,
+            true,
+        );
+
+        // Assert
+        assert_that!(line.to_string())
+            .contains("MKV → MP4")
+            .contains("1:02:03")
+            .contains("1.5 MiB")
+            .contains("4.2 Mb/s")
+            .contains("1 compatibility conflict");
+        assert_eq!(line.style.fg, Some(Color::White));
+        assert_eq!(line.style.bg, Some(Color::Cyan));
+        assert!(line.style.add_modifier.contains(Modifier::BOLD));
+        assert!(line.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
     fn format_frame_rate_should_format_decimal_rate_when_input_is_fractional() {
         // Arrange
         let rate = "30000/1001";
@@ -1367,15 +1852,292 @@ mod tests {
         .unwrap();
 
         // Act
-        let line = stream_line(&stream, 0, false, false, false, true).to_string();
+        let line = stream_line(&stream, 0, false, false, false, false, true).to_string();
 
         // Assert
-        assert_that!(line)
+        assert_that!(&line)
             .contains("#2")
             .contains("OPUS")
             .contains("5.1")
             .contains("ENG")
             .contains("[default]");
+    }
+
+    #[test]
+    fn stream_line_should_warn_before_an_incompatible_track() {
+        // Arrange
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip"
+            }),
+        )
+        .unwrap();
+
+        // Act
+        let line = stream_line(&stream, 0, false, false, false, true, false);
+
+        // Assert
+        assert_that!(line.to_string()).starts_with("⚠ #2");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(line.style.fg, Some(Color::Yellow));
+        assert!(!line.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn stream_line_should_format_embedded_subtitle_with_metadata_tags() {
+        // Arrange
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip",
+                "tags": {"language": "eng", "title": "English"},
+                "disposition": {"default": 1, "forced": 1, "hearing_impaired": 1}
+            }),
+        )
+        .unwrap();
+
+        // Act
+        let line = stream_line(&stream, 0, false, false, false, false, true).to_string();
+
+        // Assert
+        assert_that!(&line)
+            .contains("#2")
+            .ends_with("SubRip / SRT · ENG · [Default] · [Forced] · [CC]")
+            .does_not_contain("English")
+            .does_not_contain("[default]")
+            .does_not_contain("[forced]");
+        assert_eq!(line.find("SubRip / SRT"), Some(6));
+    }
+
+    #[test]
+    fn stream_line_should_show_und_when_embedded_subtitle_has_no_language() {
+        // Arrange
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "ass"
+            }),
+        )
+        .unwrap();
+
+        // Act
+        let line = stream_line(&stream, 0, false, false, false, false, false).to_string();
+
+        // Assert
+        assert_that!(line).ends_with("ASS          · UND");
+    }
+
+    #[test]
+    fn stream_line_should_preserve_changed_state_when_the_track_is_focused() {
+        // Arrange
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip"
+            }),
+        )
+        .unwrap();
+
+        // Act
+        let changed = stream_line(&stream, 0, false, false, true, false, false);
+        let focused = stream_line(&stream, 0, true, false, true, false, false);
+
+        // Assert
+        assert_eq!(changed.style.fg, Some(Color::Yellow));
+        assert!(changed.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(focused.style.fg, Some(Color::White));
+        assert_eq!(focused.style.bg, Some(Color::Cyan));
+        assert!(focused.style.add_modifier.contains(Modifier::ITALIC));
+        assert_that!(focused.to_string()).starts_with("~ #2");
+    }
+
+    #[test]
+    fn stream_line_should_keep_deletion_red_when_the_track_is_not_focused() {
+        // Arrange
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip"
+            }),
+        )
+        .unwrap();
+
+        // Act
+        let line = stream_line(&stream, 0, false, true, false, false, false);
+
+        // Assert
+        assert_that!(line.to_string()).starts_with("× #2");
+        assert_eq!(line.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn file_tree_lines_should_nest_related_sidecars_below_the_media_file() {
+        // Arrange
+        let sidecars = ["movie.eng.srt", "movie.nld.forced.ass"];
+
+        // Act
+        let lines = file_tree_lines("movie.mkv", sidecars);
+        let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let text = text.iter().map(String::as_str).collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "movie.mkv",
+            "  ├── movie.eng.srt",
+            "  └── movie.nld.forced.ass",
+        ]);
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(lines[2].spans[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn sidecar_line_should_preserve_changed_state_when_the_sidecar_is_focused() {
+        // Arrange
+        let sidecar = SidecarEntry {
+            path: std::path::PathBuf::from("movie.eng.srt"),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: crate::subtitle::SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: true,
+            cc: true,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        };
+
+        // Act
+        let changed = sidecar_line(&sidecar, false, true);
+        let focused = sidecar_line(&sidecar, true, true);
+
+        // Assert
+        assert_eq!(changed.style.fg, Some(Color::Yellow));
+        assert!(changed.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(focused.style.fg, Some(Color::White));
+        assert_eq!(focused.style.bg, Some(Color::Cyan));
+        assert!(focused.style.add_modifier.contains(Modifier::ITALIC));
+        assert_that!(focused.to_string())
+            .contains("SubRip / SRT · ENG · [Forced] · [CC] · [External]")
+            .contains("✎")
+            .does_not_contain("movie.eng.srt")
+            .does_not_contain(" - ");
+        assert_that!(focused.to_string()).starts_with("›     SubRip / SRT");
+    }
+
+    #[test]
+    fn subtitle_overview_details_should_keep_format_language_and_external_in_columns() {
+        // Act
+        let short_format = subtitle_overview_details("ASS", "nld", false, false, false, false);
+        let tagged = subtitle_overview_details("ASS", "nld", true, true, true, false);
+        let external = subtitle_overview_details("ASS", "nld", false, false, false, true);
+
+        // Assert
+        assert_that!(short_format).is_equal_to("ASS          · NLD".to_string());
+        assert_that!(tagged)
+            .is_equal_to("ASS          · NLD · [Default] · [Forced] · [CC]".to_string());
+        assert_that!(external).is_equal_to("ASS          · NLD · [External]".to_string());
+    }
+
+    #[test]
+    fn save_dialog_area_should_grow_for_wrapped_change_lines() {
+        // Arrange
+        let lines = (0..9)
+            .map(|_| Line::from("A change summary that occupies more than one rendered line because it is deliberately longer than the dialog content width"))
+            .collect::<Vec<_>>();
+
+        // Act
+        let area = save_dialog_area(Rect::new(0, 0, 100, 40), &lines);
+
+        // Assert
+        assert_that!(area.width).is_equal_to(68);
+        assert_that!(area.height).is_equal_to(20);
+    }
+
+    #[test]
+    fn padded_popup_text_should_add_one_empty_line_before_and_after_content() {
+        // Arrange
+        let text = Text::from(vec![Line::from("first"), Line::from("last")]);
+
+        // Act
+        let padded = padded_popup_text(text);
+        let lines = padded.lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(lines.first().unwrap().as_str()).is_equal_to("");
+        assert_that!(lines.last().unwrap().as_str()).is_equal_to("");
+        assert_that!(lines[1].as_str()).is_equal_to("first");
+        assert_that!(lines[2].as_str()).is_equal_to("last");
+    }
+
+    #[test]
+    fn container_information_lines_should_include_only_curated_human_readable_fields() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "format_long_name": "Matroska / WebM",
+                "duration": "3723.0",
+                "size": "1572864",
+                "bit_rate": "4200000"
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+
+        // Act
+        let lines = container_information_lines(&info, Path::new("/videos/movie.mkv"), 0);
+        let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let text = text.iter().map(String::as_str).collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(text).contains_exactly_in_given_order([
+            "File name: movie.mkv",
+            "Path: /videos/movie.mkv",
+            "Size: 1.5 MiB",
+            "Duration: 01:02:03",
+            "Format: MKV (Matroska / WebM)",
+        ]);
+    }
+
+    #[test]
+    fn container_information_lines_should_identify_mp4_despite_quicktime_family_name() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                "format_long_name": "QuickTime / MOV"
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+
+        // Act
+        let lines = container_information_lines(&info, Path::new("/videos/movie.mp4"), 0);
+
+        // Assert
+        assert_that!(lines[4].to_string()).is_equal_to("Format: MP4 (QuickTime / MOV)".to_string());
+    }
+
+    #[test]
+    fn format_duration_24h_should_include_zero_padded_hours_for_short_media() {
+        // Act
+        let duration = format_duration_24h(60.0);
+
+        // Assert
+        assert_that!(duration).is_equal_to("00:01:00".to_string());
     }
 
     #[test]
@@ -1529,6 +2291,33 @@ mod tests {
     }
 
     #[test]
+    fn container_choice_line_should_place_warning_beside_the_format() {
+        // Arrange
+        let choice = ContainerChoice {
+            value: Some(crate::edit::ContainerFormat::Mp4),
+            label: "MP4".to_string(),
+            current: false,
+            staged: false,
+            conflicts: vec![
+                "MP4 can't contain SUBRIP subtitle track #2.".to_string(),
+                "MP4 can't contain SUBRIP subtitle track #3.".to_string(),
+                "MP4 can't contain ASS subtitle track #4.".to_string(),
+            ],
+        };
+
+        // Act
+        let line = container_choice_line(&choice, false);
+        let focused = container_choice_line(&choice, true);
+
+        // Assert
+        assert_that!(line.to_string())
+            .contains("MP4  ⚠ can't contain SubRip/SRT or ASS subtitles.");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(focused.spans[1].style.fg, Some(Color::White));
+        assert_eq!(focused.spans[1].style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
     fn subtitle_codec_line_should_distinguish_original_staged_and_available_codecs() {
         // Act
         let original = subtitle_codec_line("SubRip / SRT", false, false, true, true);
@@ -1544,7 +2333,7 @@ mod tests {
         assert_eq!(original.spans[0].style.fg, Some(Color::White));
         assert_eq!(original.spans[1].style.fg, Some(Color::DarkGray));
         assert!(
-            original.spans[1]
+            !original.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::ITALIC)
@@ -1559,7 +2348,7 @@ mod tests {
         assert_eq!(available.spans[0].style.fg, Some(Color::White));
         assert_eq!(staged_original.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(staged_original.spans[1].style.fg, Some(Color::DarkGray));
-        assert_eq!(staged_cursor.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(staged_cursor.spans[0].style.fg, Some(Color::White));
         assert_eq!(staged_cursor.spans[0].style.bg, Some(Color::Cyan));
         assert!(
             staged_cursor.spans[0]
@@ -1570,20 +2359,203 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_action_line_should_use_save_dialog_button_styling_without_an_orb() {
+    fn subtitle_export_line_should_render_an_independent_checkbox() {
         // Act
-        let line = subtitle_action_line(SubtitleAction::ConvertInContainer, true);
+        let unchecked = subtitle_export_line(false, true);
+        let checked = subtitle_export_line(true, false);
+
+        // Assert
+        assert_that!(unchecked.to_string())
+            .contains("Export      [ ]")
+            .does_not_contain("Export sidecar");
+        assert_that!(checked.to_string())
+            .contains("Export      [x]")
+            .does_not_contain("Export sidecar");
+        assert!(unchecked.to_string().starts_with("Export"));
+        assert_eq!(unchecked.spans[1].style.fg, Some(Color::White));
+        assert_eq!(unchecked.spans[1].style.bg, Some(Color::Cyan));
+        assert_eq!(checked.spans[1].style.fg, Some(Color::Yellow));
+        assert!(
+            checked.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            !unchecked.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn setting_line_should_italicize_only_a_changed_value() {
+        // Act
+        let unchanged = setting_line("Codec", "SubRip / SRT", false, false);
+        let changed = setting_line("Codec", "ASS", false, true);
+        let focused_changed = setting_line("Codec", "ASS", true, true);
+
+        // Assert
+        assert!(
+            !unchanged.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            changed.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert_eq!(changed.spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(focused_changed.spans[1].style.fg, Some(Color::White));
+        assert_eq!(focused_changed.spans[1].style.bg, Some(Color::Cyan));
+        assert!(
+            focused_changed.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn custom_input_should_use_a_flat_dark_surface_and_cursor() {
+        // Act
+        let line = custom_input_line("Width", "1280", true, false);
 
         // Assert
         assert_that!(line.to_string())
-            .contains("Convert in container")
-            .contains("Export sidecar")
-            .does_not_contain("›")
+            .contains("1280")
+            .contains("▏")
+            .does_not_contain("╭")
+            .does_not_contain("╰");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[1].style.bg, Some(Color::Rgb(32, 32, 32)));
+    }
+
+    #[test]
+    fn custom_input_should_mark_a_changed_value_yellow_and_italic() {
+        // Act
+        let line = custom_input_line("Width", "1280", false, true);
+
+        // Assert
+        assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(line.spans[1].style.bg, Some(Color::Rgb(32, 32, 32)));
+    }
+
+    #[test]
+    fn custom_scaling_should_offer_only_exact_output_options() {
+        // Arrange
+        let draft = crate::app::CustomResolutionDraft {
+            width: "1280".to_string(),
+            height: "720".to_string(),
+            scaling: crate::edit::CustomScaling::FitPad,
+            field: CustomResolutionField::Scaling,
+            scaling_cursor: 1,
+            scaling_dropdown_open: true,
+        };
+
+        // Act
+        let lines = custom_scaling_lines(&draft);
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Assert
+        assert_that!(text.as_str())
+            .contains("Fit & pad")
+            .contains("Stretch")
+            .does_not_contain("Fit inside");
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[3].style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn custom_scaling_should_mark_a_nondefault_value_as_changed() {
+        // Arrange
+        let draft = crate::app::CustomResolutionDraft {
+            width: "1280".to_string(),
+            height: "720".to_string(),
+            scaling: crate::edit::CustomScaling::Stretch,
+            field: CustomResolutionField::Width,
+            scaling_cursor: 1,
+            scaling_dropdown_open: false,
+        };
+
+        // Act
+        let lines = custom_scaling_lines(&draft);
+
+        // Assert
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Yellow));
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn dropdown_line_should_mark_the_selected_value_with_a_greater_than_sign() {
+        // Act
+        let selected = dropdown_line("1920×1080 / 16:9", false, true, true, false);
+        let available = dropdown_line("1280×720 / 16:9", false, false, true, false);
+
+        // Assert
+        assert_that!(selected.to_string())
+            .starts_with("  > 1920×1080 / 16:9")
             .does_not_contain("●");
-        assert!(line.to_string().starts_with("Action"));
-        assert_eq!(line.spans[1].style.fg, Some(Color::White));
-        assert_eq!(line.spans[1].style.bg, Some(Color::Cyan));
-        assert_eq!(line.spans[3].style.fg, Some(Color::DarkGray));
-        assert_eq!(line.spans[3].style.bg, None);
+        assert_that!(available.to_string())
+            .starts_with("    1280×720 / 16:9")
+            .does_not_contain("●");
+    }
+
+    #[test]
+    fn choice_style_should_distinguish_available_changed_focused_and_disabled_choices() {
+        // Act
+        let available = choice_style(false, false, true);
+        let changed = choice_style(false, true, true);
+        let focused_changed = choice_style(true, true, true);
+        let disabled = choice_style(false, false, false);
+
+        // Assert
+        assert_eq!(available.fg, Some(Color::White));
+        assert_eq!(changed.fg, Some(Color::Yellow));
+        assert!(changed.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(focused_changed.fg, Some(Color::White));
+        assert_eq!(focused_changed.bg, Some(Color::Cyan));
+        assert!(focused_changed.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(disabled.fg, Some(Color::DarkGray));
+        assert_eq!(disabled.bg, None);
+    }
+
+    #[test]
+    fn destination_option_should_keep_the_chosen_destination_as_a_full_cyan_block() {
+        // Act
+        let chosen = destination_option(" Replace original ", true);
+        let available = destination_option(" Create a copy ", false);
+
+        // Assert
+        assert_that!(chosen.content.as_ref()).is_equal_to(" Replace original ");
+        assert_eq!(chosen.style.fg, Some(Color::White));
+        assert_eq!(chosen.style.bg, Some(Color::Cyan));
+        assert!(chosen.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(available.style.fg, Some(Color::White));
+        assert_eq!(available.style.bg, None);
+    }
+
+    #[test]
+    fn action_option_should_keep_an_unfocused_action_available() {
+        // Act
+        let action = action_option(" Keep processing ", false);
+
+        // Assert
+        assert_eq!(action.style.fg, Some(Color::White));
+        assert_eq!(action.style.bg, None);
     }
 }

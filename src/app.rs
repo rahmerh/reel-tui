@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,8 +14,9 @@ use ratatui::widgets::ListState;
 
 use crate::{
     edit::{
-        EditEvent, EditOutcome, EditRequest, SaveDestination, VideoCodec, VideoResolution,
-        VideoSettings, stream_index, validate_edit,
+        ContainerFormat, CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
+        SaveDestination, VideoCodec, VideoResolution, VideoSettings, container_conflict_streams,
+        container_conflicts, stream_index, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -36,6 +37,7 @@ pub enum Layer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialog {
     Keybindings,
+    ContainerSettings,
     VideoSettings,
     SubtitleSettings,
     ConfirmSave,
@@ -53,6 +55,7 @@ pub enum CancelEditChoice {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrackRef {
+    Container,
     Embedded(u64),
     Sidecar(usize),
 }
@@ -60,22 +63,14 @@ pub enum TrackRef {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SubtitleSettingsField {
     #[default]
-    Action,
     Codec,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SubtitleAction {
-    #[default]
-    ConvertInContainer,
-    ExportSidecar,
+    Export,
 }
 
 #[derive(Clone, Debug)]
 pub struct SubtitleSettingsPopup {
     pub source: SubtitleSource,
     pub source_format: SubtitleFormat,
-    pub action: SubtitleAction,
     pub field: SubtitleSettingsField,
     pub dropdown_open: bool,
     pub codec_cursor: usize,
@@ -99,16 +94,152 @@ pub enum SaveDialogField {
 pub struct VideoSettingsPopup {
     pub stream_index: u64,
     pub field: VideoSettingsField,
-    pub dropdown_open: bool,
+    pub mode: VideoSettingsMode,
     pub codec_cursor: usize,
     pub resolution_cursor: usize,
+    pub custom_resolution: Option<CustomResolutionDraft>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoSettingsMode {
+    #[default]
+    Summary,
+    Dropdown,
+    CustomResolution,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CustomResolutionField {
+    #[default]
+    Width,
+    Height,
+    Scaling,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomResolutionDraft {
+    pub width: String,
+    pub height: String,
+    pub scaling: CustomScaling,
+    pub field: CustomResolutionField,
+    pub scaling_cursor: usize,
+    pub scaling_dropdown_open: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContainerSettingsPopup {
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerChoice {
+    pub value: Option<ContainerFormat>,
+    pub label: String,
+    pub current: bool,
+    pub staged: bool,
+    pub conflicts: Vec<String>,
+}
+
+impl ContainerChoice {
+    pub fn warning(&self) -> Option<String> {
+        if self.conflicts.is_empty() {
+            return None;
+        }
+        if self
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("FFmpeg is not available"))
+        {
+            return Some("Can't convert: FFmpeg is not available.".to_string());
+        }
+        if self
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("muxer"))
+        {
+            return Some("Can't convert: FFmpeg does not support this container.".to_string());
+        }
+
+        let incompatibilities = [
+            ("video", "video"),
+            ("audio", "audio"),
+            ("subtitle", "subtitles"),
+            ("attachment", "attachments"),
+        ]
+        .into_iter()
+        .filter_map(|(kind, label)| {
+            let prefix = format!("{} can't contain ", self.label);
+            let marker = format!(" {kind} track #");
+            let mut codecs = Vec::new();
+            for conflict in &self.conflicts {
+                let Some(codec) = conflict
+                    .strip_prefix(&prefix)
+                    .and_then(|details| details.split_once(&marker))
+                    .map(|(codec, _)| warning_codec_label(codec))
+                else {
+                    continue;
+                };
+                if !codecs.contains(&codec) {
+                    codecs.push(codec);
+                }
+            }
+            (!codecs.is_empty()).then(|| format!("{} {label}", codecs.join(" or ")))
+        })
+        .collect::<Vec<_>>();
+        if incompatibilities.is_empty() {
+            Some(format!("{} can't contain one or more tracks.", self.label))
+        } else {
+            Some(format!(
+                "{} can't contain {}.",
+                self.label,
+                incompatibilities.join(" or ")
+            ))
+        }
+    }
+}
+
+fn warning_codec_label(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "subrip" => "SubRip/SRT".to_string(),
+        "ass" | "ssa" => "ASS".to_string(),
+        "webvtt" => "WebVTT".to_string(),
+        "mov_text" => "MOV Text".to_string(),
+        "hdmv_pgs_subtitle" => "PGS".to_string(),
+        "dvd_subtitle" => "VobSub".to_string(),
+        "h264" => "H.264".to_string(),
+        "hevc" => "HEVC/H.265".to_string(),
+        "av1" => "AV1".to_string(),
+        "vp8" => "VP8".to_string(),
+        "vp9" => "VP9".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionChoice {
-    pub value: VideoResolution,
+    pub value: ResolutionChoiceValue,
     pub label: String,
     pub enabled: bool,
+    pub current: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionChoiceValue {
+    Resolution(VideoResolution),
+    Custom,
+}
+
+impl ResolutionChoice {
+    pub fn selected(&self, resolution: VideoResolution) -> bool {
+        match (self.value, resolution) {
+            (_, VideoResolution::Original) => self.current,
+            (ResolutionChoiceValue::Resolution(choice_resolution), selected_resolution) => {
+                choice_resolution == selected_resolution
+            }
+            (ResolutionChoiceValue::Custom, VideoResolution::Custom(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +247,8 @@ pub struct VideoCodecChoice {
     pub value: VideoCodec,
     pub label: String,
     pub current: bool,
+    pub enabled: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -163,6 +296,8 @@ pub struct App {
     pub subtitle_changes: BTreeMap<SubtitleSource, SubtitleChange>,
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
+    pub container_target: Option<ContainerFormat>,
+    pub container_settings_popup: Option<ContainerSettingsPopup>,
     pub save_destination: SaveDestination,
     pub save_dialog_field: SaveDialogField,
     pub dialog: Option<Dialog>,
@@ -212,6 +347,8 @@ impl App {
             subtitle_changes: BTreeMap::new(),
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
+            container_target: None,
+            container_settings_popup: None,
             save_destination: SaveDestination::ReplaceOriginal,
             save_dialog_field: SaveDialogField::Start,
             dialog: None,
@@ -280,6 +417,9 @@ impl App {
             self.dialog,
             Some(Dialog::Processing | Dialog::ConfirmCancel)
         );
+        if selected_removed && was_processing {
+            return;
+        }
 
         self.files = files;
         self.sidecars_by_media = sidecars_by_media;
@@ -345,6 +485,13 @@ impl App {
         self.list_state
             .selected()
             .and_then(|index| self.files.get(index))
+    }
+
+    pub fn sidecars_for_media(&self, path: &Path) -> &[SidecarEntry] {
+        self.sidecars_by_media
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn select_next(&mut self) {
@@ -513,6 +660,8 @@ impl App {
                         output_path,
                         media_changed,
                     } => {
+                        self.edit_cancel = None;
+                        self.dialog = None;
                         if let Ok(files) = scan_directory(&self.directory) {
                             self.reconcile_files(files);
                         }
@@ -521,9 +670,7 @@ impl App {
                         {
                             self.list_state.select(Some(index));
                         }
-                        self.edit_cancel = None;
                         self.clear_track_edits();
-                        self.dialog = None;
                         self.edit_error = None;
                         self.edit_progress = None;
                         self.edit_progress_label = None;
@@ -553,6 +700,7 @@ impl App {
                     }
                     EditOutcome::SourceChanged(error) => {
                         self.edit_cancel = None;
+                        self.dialog = None;
                         self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
                         let snapshot = match scan_directory(&self.directory) {
                             Ok(files) => DirectorySnapshot::Files(files),
@@ -588,10 +736,12 @@ impl App {
     }
 
     pub fn open_stream_details(&mut self) {
-        if self.dialog.is_none()
-            && self.layer == Layer::Streams
-            && self.selected_stream_info().is_some()
-        {
+        let details_available = match self.selected_track() {
+            Some(TrackRef::Container) => self.media_info().is_some(),
+            Some(TrackRef::Embedded(_)) => self.selected_stream_info().is_some(),
+            Some(TrackRef::Sidecar(_)) | None => false,
+        };
+        if self.dialog.is_none() && self.layer == Layer::Streams && details_available {
             self.layer = Layer::StreamDetails;
             self.details_scroll = 0;
             self.details_max_scroll = 0;
@@ -633,7 +783,8 @@ impl App {
         let Some(info) = self.media_info() else {
             return Vec::new();
         };
-        let mut rows = Vec::with_capacity(self.stream_order.len() + self.sidecars.len());
+        let mut rows = Vec::with_capacity(self.stream_order.len() + self.sidecars.len() + 1);
+        rows.push(TrackRef::Container);
         for kind in ["video", "audio", "subtitle"] {
             rows.extend(self.stream_order.iter().filter_map(|index| {
                 stream_by_index(info, *index)
@@ -670,6 +821,7 @@ impl App {
 
     pub fn selected_stream_index(&self) -> Option<u64> {
         match self.selected_track()? {
+            TrackRef::Container => None,
             TrackRef::Embedded(index) => Some(index),
             TrackRef::Sidecar(_) => None,
         }
@@ -677,6 +829,10 @@ impl App {
 
     pub fn toggle_delete_selected_stream(&mut self) {
         if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        if self.selected_track() == Some(TrackRef::Container) {
+            self.notice = Some("The container can be changed, but not deleted.".into());
             return;
         }
         let Some(index) = self.selected_stream_index() else {
@@ -759,6 +915,10 @@ impl App {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
         }
+        if self.selected_track() == Some(TrackRef::Container) {
+            self.notice = Some("Default flags apply to tracks, not the container.".into());
+            return;
+        }
         let Some(index) = self.selected_stream_index() else {
             self.notice =
                 Some("External subtitle files do not have a container default flag.".into());
@@ -798,6 +958,154 @@ impl App {
         self.notice = None;
     }
 
+    pub fn source_container(&self) -> Option<ContainerFormat> {
+        self.selected_file()
+            .and_then(|file| ContainerFormat::from_path(&file.path))
+    }
+
+    pub fn effective_container(&self) -> Option<ContainerFormat> {
+        self.container_target.or_else(|| self.source_container())
+    }
+
+    fn original_container_label(&self) -> String {
+        let name = self
+            .media_info()
+            .and_then(|info| {
+                info.format
+                    .get("format_long_name")
+                    .or_else(|| info.format.get("format_name"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown container");
+        format!("Original ({name})")
+    }
+
+    pub fn container_conflicts_for(&self, target: ContainerFormat) -> Vec<String> {
+        let mut conflicts = Vec::new();
+        if !self.subtitle_capabilities.ffmpeg {
+            conflicts.push("FFmpeg is not available in PATH.".to_string());
+        } else if !self
+            .subtitle_capabilities
+            .ffmpeg_muxers
+            .contains(target.muxer())
+        {
+            conflicts.push(format!(
+                "The installed FFmpeg build does not provide the {} muxer.",
+                target.label()
+            ));
+        }
+        let Some(info) = self.media_info() else {
+            return conflicts;
+        };
+        let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
+        let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
+        conflicts.extend(container_conflicts(
+            info,
+            &stream_order,
+            &self.video_settings,
+            &subtitle_changes,
+            target,
+        ));
+        conflicts
+    }
+
+    pub fn selected_container_conflicts(&self) -> Vec<String> {
+        self.container_target
+            .map(|target| self.container_conflicts_for(target))
+            .unwrap_or_default()
+    }
+
+    pub fn selected_container_conflict_streams(&self) -> BTreeSet<u64> {
+        let (Some(target), Some(info)) = (self.container_target, self.media_info()) else {
+            return BTreeSet::new();
+        };
+        let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
+        let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
+        container_conflict_streams(
+            info,
+            &stream_order,
+            &self.video_settings,
+            &subtitle_changes,
+            target,
+        )
+    }
+
+    pub fn container_choices(&self) -> Vec<ContainerChoice> {
+        let source = self.source_container();
+        let mut choices = Vec::new();
+        if source.is_none() {
+            choices.push(ContainerChoice {
+                value: None,
+                label: self.original_container_label(),
+                current: true,
+                staged: self.container_target.is_none(),
+                conflicts: Vec::new(),
+            });
+        }
+        choices.extend(ContainerFormat::TARGETS.into_iter().map(|format| {
+            let current = source == Some(format);
+            let value = (!current).then_some(format);
+            ContainerChoice {
+                value,
+                label: format.label().to_string(),
+                current,
+                staged: if current {
+                    self.container_target.is_none()
+                } else {
+                    self.container_target == Some(format)
+                },
+                conflicts: if current {
+                    Vec::new()
+                } else {
+                    self.container_conflicts_for(format)
+                },
+            }
+        }));
+        choices
+    }
+
+    pub fn open_container_settings(&mut self) {
+        if self.layer != Layer::Streams
+            || self.dialog.is_some()
+            || self.selected_track() != Some(TrackRef::Container)
+        {
+            return;
+        }
+        let choices = self.container_choices();
+        let cursor = choices.iter().position(|choice| choice.staged).unwrap_or(0);
+        self.container_settings_popup = Some(ContainerSettingsPopup { cursor });
+        self.notice = None;
+        self.dialog = Some(Dialog::ContainerSettings);
+    }
+
+    pub fn move_container_settings_cursor(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ContainerSettings) || direction == 0 {
+            return;
+        }
+        let length = self.container_choices().len();
+        let popup = self.container_settings_popup.as_mut().unwrap();
+        popup.cursor = move_cursor(popup.cursor, length, direction, |_| true);
+    }
+
+    pub fn activate_container_settings(&mut self) {
+        if self.dialog != Some(Dialog::ContainerSettings) {
+            return;
+        }
+        let cursor = self.container_settings_popup.as_ref().unwrap().cursor;
+        let Some(choice) = self.container_choices().get(cursor).cloned() else {
+            return;
+        };
+        self.container_target = choice.value;
+        self.notice = choice.warning();
+        self.container_settings_popup = None;
+        self.dialog = None;
+    }
+
+    pub fn close_container_settings(&mut self) {
+        self.container_settings_popup = None;
+        self.dialog = None;
+    }
+
     pub fn open_video_settings(&mut self) {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
@@ -824,20 +1132,16 @@ impl App {
         self.video_settings_popup = Some(VideoSettingsPopup {
             stream_index: index,
             field: VideoSettingsField::Codec,
-            dropdown_open: false,
+            mode: VideoSettingsMode::Summary,
             codec_cursor: codecs
                 .iter()
                 .position(|choice| choice.value == settings.codec)
                 .unwrap_or(0),
             resolution_cursor: resolutions
                 .iter()
-                .position(|choice| choice.value == settings.resolution)
-                .unwrap_or_else(|| {
-                    resolutions
-                        .iter()
-                        .position(|choice| choice.value == VideoResolution::Original)
-                        .unwrap_or(0)
-                }),
+                .position(|choice| choice.selected(settings.resolution))
+                .unwrap_or(0),
+            custom_resolution: None,
         });
         self.notice = None;
         self.dialog = Some(Dialog::VideoSettings);
@@ -845,6 +1149,7 @@ impl App {
 
     pub fn open_track_settings(&mut self) {
         match self.selected_track() {
+            Some(TrackRef::Container) => self.open_container_settings(),
             Some(TrackRef::Embedded(index))
                 if self
                     .selected_stream_info()
@@ -901,31 +1206,16 @@ impl App {
                 export_target: None,
                 ocr_language: None,
             });
-        let sidecar = matches!(source, SubtitleSource::Sidecar(_));
-        let action = if !sidecar && change.export_target.is_some() {
-            SubtitleAction::ExportSidecar
-        } else {
-            SubtitleAction::ConvertInContainer
-        };
-        let codec_choices = self.subtitle_choices(&source, source_format, action);
-        let selected_codec = |choice: &FormatChoice| {
-            if action == SubtitleAction::ExportSidecar {
-                change.export_target == Some(choice.format)
-            } else {
-                choice.value == change.embedded_target
-            }
-        };
+        let codec_choices = self.subtitle_choices(&source, source_format);
         self.subtitle_settings_popup = Some(SubtitleSettingsPopup {
             source,
             source_format,
-            action,
-            field: if sidecar {
-                SubtitleSettingsField::Codec
-            } else {
-                SubtitleSettingsField::Action
-            },
+            field: SubtitleSettingsField::Codec,
             dropdown_open: false,
-            codec_cursor: codec_choices.iter().position(selected_codec).unwrap_or(0),
+            codec_cursor: codec_choices
+                .iter()
+                .position(|choice| choice.value == change.embedded_target)
+                .unwrap_or(0),
         });
         self.notice = None;
         self.dialog = Some(Dialog::SubtitleSettings);
@@ -935,21 +1225,137 @@ impl App {
         &self,
         source: &SubtitleSource,
         source_format: SubtitleFormat,
-        action: SubtitleAction,
     ) -> Vec<FormatChoice> {
         let sidecar = matches!(source, SubtitleSource::Sidecar(_));
-        let exporting = sidecar || action == SubtitleAction::ExportSidecar;
-        self.subtitle_capabilities.format_choices(
+        let mut choices = self.subtitle_capabilities.format_choices(
             source_format,
-            (!exporting)
+            (!sidecar)
                 .then(|| {
-                    self.selected_file()
-                        .and_then(|file| path_extension(&file.path))
+                    self.container_target
+                        .map(ContainerFormat::extension)
+                        .or_else(|| {
+                            self.selected_file()
+                                .and_then(|file| path_extension(&file.path))
+                        })
                 })
                 .flatten(),
-            exporting,
-            !sidecar && action == SubtitleAction::ExportSidecar,
-        )
+            sidecar,
+            false,
+        );
+        if !sidecar && self.subtitle_export_enabled(source) {
+            let export_choices = self.subtitle_export_choices(source_format);
+            for choice in &mut choices {
+                let export_choice = export_choices
+                    .iter()
+                    .find(|export| export.format == choice.format);
+                if let Some(reason) = export_choice
+                    .filter(|export| !export.enabled)
+                    .and_then(|export| export.reason.as_deref())
+                {
+                    choice.enabled = false;
+                    choice.reason = Some(format!("Cannot export: {reason}"));
+                }
+            }
+        }
+        choices
+    }
+
+    fn subtitle_export_choices(&self, source_format: SubtitleFormat) -> Vec<FormatChoice> {
+        self.subtitle_capabilities
+            .format_choices(source_format, None, true, true)
+    }
+
+    fn store_subtitle_change(&mut self, source: SubtitleSource, mut change: SubtitleChange) {
+        change.ocr_language = change
+            .needs_ocr()
+            .then(|| self.automatic_ocr_language(&source))
+            .flatten();
+        if change.has_effect() {
+            self.subtitle_changes.insert(source, change);
+        } else {
+            self.subtitle_changes.remove(&source);
+        }
+    }
+
+    fn toggle_subtitle_export(&mut self) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        let source = popup.source.clone();
+        let source_format = popup.source_format;
+        if matches!(source, SubtitleSource::Sidecar(_)) {
+            return;
+        }
+        let mut change = self
+            .subtitle_changes
+            .get(&source)
+            .cloned()
+            .unwrap_or(SubtitleChange {
+                source: source.clone(),
+                source_format,
+                embedded_target: None,
+                export_target: None,
+                ocr_language: None,
+            });
+        if change.export_target.is_some() {
+            change.export_target = None;
+        } else {
+            let preferred = change.embedded_target.unwrap_or(source_format);
+            let choices = self.subtitle_export_choices(source_format);
+            let Some(choice) = choices
+                .iter()
+                .find(|choice| choice.format == preferred && choice.enabled)
+            else {
+                let reason = choices
+                    .iter()
+                    .find(|choice| choice.format == preferred)
+                    .and_then(|choice| choice.reason.as_deref())
+                    .unwrap_or("the selected codec cannot be written as a sidecar");
+                self.notice = Some(format!("Cannot export {}: {reason}.", preferred.label()));
+                return;
+            };
+            change.export_target = Some(choice.format);
+        }
+        self.store_subtitle_change(source, change);
+        self.notice = None;
+    }
+
+    fn subtitle_change(
+        &self,
+        source: &SubtitleSource,
+        source_format: SubtitleFormat,
+    ) -> SubtitleChange {
+        self.subtitle_changes
+            .get(source)
+            .cloned()
+            .unwrap_or(SubtitleChange {
+                source: source.clone(),
+                source_format,
+                embedded_target: None,
+                export_target: None,
+                ocr_language: None,
+            })
+    }
+
+    fn subtitle_export_enabled(&self, source: &SubtitleSource) -> bool {
+        self.subtitle_changes
+            .get(source)
+            .is_some_and(|change| change.export_target.is_some())
+    }
+
+    fn subtitle_field_after_move(
+        field: SubtitleSettingsField,
+        direction: isize,
+        sidecar: bool,
+    ) -> SubtitleSettingsField {
+        if sidecar {
+            return SubtitleSettingsField::Codec;
+        }
+        match (field, direction.is_positive()) {
+            (SubtitleSettingsField::Codec, true) => SubtitleSettingsField::Export,
+            (SubtitleSettingsField::Export, false) => SubtitleSettingsField::Codec,
+            (field, _) => field,
+        }
     }
 
     fn automatic_ocr_language(&self, source: &SubtitleSource) -> Option<String> {
@@ -1010,28 +1416,17 @@ impl App {
         if !popup.dropdown_open {
             let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
             let popup = self.subtitle_settings_popup.as_mut().unwrap();
-            popup.field = match (popup.field, direction.is_positive(), sidecar) {
-                (SubtitleSettingsField::Action, true, false) => SubtitleSettingsField::Codec,
-                (SubtitleSettingsField::Codec, false, false) => SubtitleSettingsField::Action,
-                (field, _, _) => field,
-            };
+            popup.field = Self::subtitle_field_after_move(popup.field, direction, sidecar);
             return;
         }
         let source = popup.source.clone();
         let source_format = popup.source_format;
-        let action = popup.action;
-        let field = popup.field;
-        match field {
-            SubtitleSettingsField::Action => {}
-            SubtitleSettingsField::Codec => {
-                let choices = self.subtitle_choices(&source, source_format, action);
-                let popup = self.subtitle_settings_popup.as_mut().unwrap();
-                let cursor = &mut popup.codec_cursor;
-                *cursor = move_cursor(*cursor, choices.len(), direction, |position| {
-                    choices[position].enabled
-                });
-            }
-        }
+        let choices = self.subtitle_choices(&source, source_format);
+        let popup = self.subtitle_settings_popup.as_mut().unwrap();
+        popup.codec_cursor =
+            move_cursor(popup.codec_cursor, choices.len(), direction, |position| {
+                choices[position].enabled
+            });
     }
 
     pub fn activate_subtitle_settings(&mut self) {
@@ -1039,12 +1434,8 @@ impl App {
             return;
         };
         if !popup.dropdown_open {
-            if popup.field == SubtitleSettingsField::Action {
-                let action = match popup.action {
-                    SubtitleAction::ConvertInContainer => SubtitleAction::ExportSidecar,
-                    SubtitleAction::ExportSidecar => SubtitleAction::ConvertInContainer,
-                };
-                self.select_subtitle_action(action);
+            if popup.field == SubtitleSettingsField::Export {
+                self.toggle_subtitle_export();
                 return;
             }
             self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = true;
@@ -1052,128 +1443,24 @@ impl App {
         }
         let source = popup.source.clone();
         let source_format = popup.source_format;
-        let action = popup.action;
-        let field = popup.field;
-        let codec_cursor = popup.codec_cursor;
-        let mut change = self
-            .subtitle_changes
-            .get(&source)
-            .cloned()
-            .unwrap_or(SubtitleChange {
-                source: source.clone(),
-                source_format,
-                embedded_target: None,
-                export_target: None,
-                ocr_language: None,
-            });
-        match field {
-            SubtitleSettingsField::Action => return,
-            SubtitleSettingsField::Codec => {
-                let choices = self.subtitle_choices(&source, source_format, action);
-                let Some(choice) = choices.get(codec_cursor).filter(|choice| choice.enabled) else {
-                    return;
-                };
-                if action == SubtitleAction::ExportSidecar {
-                    change.embedded_target = None;
-                    change.export_target = Some(choice.format);
-                } else {
-                    change.embedded_target = choice.value;
-                    change.export_target = None;
-                }
-            }
+        if popup.field != SubtitleSettingsField::Codec {
+            return;
         }
-        change.ocr_language = change
-            .needs_ocr()
-            .then(|| self.automatic_ocr_language(&source))
-            .flatten();
-        if change.has_effect() {
-            self.subtitle_changes.insert(source, change);
-        } else {
-            self.subtitle_changes.remove(&source);
-        }
-        self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = false;
-    }
-
-    pub fn choose_subtitle_action(&mut self, direction: isize) {
-        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+        let choices = self.subtitle_choices(&source, source_format);
+        let Some(choice) = choices
+            .get(popup.codec_cursor)
+            .filter(|choice| choice.enabled)
+        else {
             return;
         };
-        if popup.dropdown_open
-            || popup.field != SubtitleSettingsField::Action
-            || matches!(popup.source, SubtitleSource::Sidecar(_))
-            || direction == 0
-        {
-            return;
-        }
-        self.select_subtitle_action(if direction.is_positive() {
-            SubtitleAction::ExportSidecar
-        } else {
-            SubtitleAction::ConvertInContainer
-        });
-    }
-
-    fn select_subtitle_action(&mut self, selected_action: SubtitleAction) {
-        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
-            return;
-        };
-        if popup.action == selected_action {
-            return;
-        }
-        let source = popup.source.clone();
-        let source_format = popup.source_format;
-        let mut change = self
-            .subtitle_changes
-            .get(&source)
-            .cloned()
-            .unwrap_or(SubtitleChange {
-                source: source.clone(),
-                source_format,
-                embedded_target: None,
-                export_target: None,
-                ocr_language: None,
-            });
-        if selected_action == SubtitleAction::ExportSidecar {
-            let choices = self.subtitle_choices(&source, source_format, selected_action);
-            let Some((cursor, choice)) = choices
-                .iter()
-                .enumerate()
-                .find(|(_, choice)| choice.current && choice.enabled)
-                .or_else(|| {
-                    choices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, choice)| choice.enabled)
-                })
-            else {
-                self.notice =
-                    Some("No sidecar subtitle codec is available with tools in PATH.".into());
-                return;
-            };
-            change.embedded_target = None;
+        let mut change = self.subtitle_change(&source, source_format);
+        let exporting = change.export_target.is_some();
+        change.embedded_target = choice.value;
+        if exporting {
             change.export_target = Some(choice.format);
-            self.subtitle_settings_popup.as_mut().unwrap().codec_cursor = cursor;
-        } else {
-            change.embedded_target = None;
-            change.export_target = None;
-            let choices = self.subtitle_choices(&source, source_format, selected_action);
-            self.subtitle_settings_popup.as_mut().unwrap().codec_cursor = choices
-                .iter()
-                .position(|choice| choice.current)
-                .unwrap_or(0);
         }
-        change.ocr_language = change
-            .needs_ocr()
-            .then(|| self.automatic_ocr_language(&source))
-            .flatten();
-        if change.has_effect() {
-            self.subtitle_changes.insert(source, change);
-        } else {
-            self.subtitle_changes.remove(&source);
-        }
-        let popup = self.subtitle_settings_popup.as_mut().unwrap();
-        popup.action = selected_action;
-        popup.dropdown_open = false;
-        self.notice = None;
+        self.store_subtitle_change(source, change);
+        self.subtitle_settings_popup.as_mut().unwrap().dropdown_open = false;
     }
 
     pub fn escape_subtitle_settings(&mut self) {
@@ -1198,32 +1485,59 @@ impl App {
         let Some(popup) = self.video_settings_popup.as_ref() else {
             return;
         };
-        if !popup.dropdown_open {
-            let popup = self.video_settings_popup.as_mut().unwrap();
-            popup.field = match (popup.field, direction.is_positive()) {
-                (VideoSettingsField::Codec, true) => VideoSettingsField::Resolution,
-                (VideoSettingsField::Resolution, false) => VideoSettingsField::Codec,
-                (field, _) => field,
-            };
-            return;
-        }
-
-        match popup.field {
-            VideoSettingsField::Codec => {
-                let choices = self.video_codec_choices(popup.stream_index);
+        match popup.mode {
+            VideoSettingsMode::Summary => {
                 let popup = self.video_settings_popup.as_mut().unwrap();
-                popup.codec_cursor =
-                    move_cursor(popup.codec_cursor, choices.len(), direction, |_| true);
+                popup.field = match (popup.field, direction.is_positive()) {
+                    (VideoSettingsField::Codec, true) => VideoSettingsField::Resolution,
+                    (VideoSettingsField::Resolution, false) => VideoSettingsField::Codec,
+                    (field, _) => field,
+                };
             }
-            VideoSettingsField::Resolution => {
-                let choices = self.resolution_choices(popup.stream_index);
-                let popup = self.video_settings_popup.as_mut().unwrap();
-                popup.resolution_cursor = move_cursor(
-                    popup.resolution_cursor,
-                    choices.len(),
-                    direction,
-                    |position| choices[position].enabled,
-                );
+            VideoSettingsMode::Dropdown => match popup.field {
+                VideoSettingsField::Codec => {
+                    let choices = self.video_codec_choices(popup.stream_index);
+                    let popup = self.video_settings_popup.as_mut().unwrap();
+                    popup.codec_cursor =
+                        move_cursor(popup.codec_cursor, choices.len(), direction, |position| {
+                            choices[position].enabled
+                        });
+                }
+                VideoSettingsField::Resolution => {
+                    let choices = self.resolution_choices(popup.stream_index);
+                    let popup = self.video_settings_popup.as_mut().unwrap();
+                    popup.resolution_cursor = move_cursor(
+                        popup.resolution_cursor,
+                        choices.len(),
+                        direction,
+                        |position| choices[position].enabled,
+                    );
+                }
+            },
+            VideoSettingsMode::CustomResolution => {
+                let Some(draft) = self
+                    .video_settings_popup
+                    .as_mut()
+                    .and_then(|popup| popup.custom_resolution.as_mut())
+                else {
+                    return;
+                };
+                if draft.scaling_dropdown_open {
+                    draft.scaling_cursor = move_cursor(
+                        draft.scaling_cursor,
+                        CustomScaling::OPTIONS.len(),
+                        direction,
+                        |_| true,
+                    );
+                    return;
+                }
+                draft.field = match (draft.field, direction.is_positive()) {
+                    (CustomResolutionField::Width, true) => CustomResolutionField::Height,
+                    (CustomResolutionField::Height, true) => CustomResolutionField::Scaling,
+                    (CustomResolutionField::Scaling, false) => CustomResolutionField::Height,
+                    (CustomResolutionField::Height, false) => CustomResolutionField::Width,
+                    (field, _) => field,
+                };
             }
         }
     }
@@ -1232,9 +1546,16 @@ impl App {
         let Some(popup) = self.video_settings_popup.as_ref() else {
             return;
         };
-        if !popup.dropdown_open {
-            self.video_settings_popup.as_mut().unwrap().dropdown_open = true;
-            return;
+        match popup.mode {
+            VideoSettingsMode::Summary => {
+                self.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::Dropdown;
+                return;
+            }
+            VideoSettingsMode::CustomResolution => {
+                self.activate_custom_resolution();
+                return;
+            }
+            VideoSettingsMode::Dropdown => {}
         }
 
         let index = popup.stream_index;
@@ -1245,7 +1566,7 @@ impl App {
         match field {
             VideoSettingsField::Codec => {
                 let choices = self.video_codec_choices(index);
-                let Some(choice) = choices.get(codec_cursor) else {
+                let Some(choice) = choices.get(codec_cursor).filter(|choice| choice.enabled) else {
                     return;
                 };
                 settings.codec = choice.value;
@@ -1258,7 +1579,41 @@ impl App {
                 else {
                     return;
                 };
-                settings.resolution = choice.value;
+                match choice.value {
+                    ResolutionChoiceValue::Resolution(value) => settings.resolution = value,
+                    ResolutionChoiceValue::Custom => {
+                        let source_dimensions = self.video_source_dimensions(index);
+                        let custom = match settings.resolution {
+                            VideoResolution::Custom(custom) => Some(custom),
+                            _ => None,
+                        };
+                        let popup = self.video_settings_popup.as_mut().unwrap();
+                        popup.custom_resolution = Some(CustomResolutionDraft {
+                            width: custom
+                                .map(|custom| custom.width.to_string())
+                                .or_else(|| source_dimensions.map(|(width, _)| width.to_string()))
+                                .unwrap_or_default(),
+                            height: custom
+                                .map(|custom| custom.height.to_string())
+                                .or_else(|| source_dimensions.map(|(_, height)| height.to_string()))
+                                .unwrap_or_default(),
+                            scaling: custom
+                                .map(|custom| custom.scaling)
+                                .unwrap_or(CustomScaling::FitPad),
+                            field: CustomResolutionField::Width,
+                            scaling_cursor: custom
+                                .and_then(|custom| {
+                                    CustomScaling::OPTIONS
+                                        .iter()
+                                        .position(|scaling| *scaling == custom.scaling)
+                                })
+                                .unwrap_or(0),
+                            scaling_dropdown_open: false,
+                        });
+                        popup.mode = VideoSettingsMode::CustomResolution;
+                        return;
+                    }
+                }
             }
         }
         if self.settings_change_stream(index, settings) {
@@ -1266,7 +1621,7 @@ impl App {
         } else {
             self.video_settings.remove(&index);
         }
-        self.video_settings_popup.as_mut().unwrap().dropdown_open = false;
+        self.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::Summary;
     }
 
     pub fn escape_video_settings(&mut self) {
@@ -1274,33 +1629,57 @@ impl App {
             self.dialog = None;
             return;
         };
-        if popup.dropdown_open {
-            let index = popup.stream_index;
-            let field = popup.field;
-            let settings = self.video_settings.get(&index).copied().unwrap_or_default();
-            let resolution_cursor = (field == VideoSettingsField::Resolution).then(|| {
-                self.resolution_choices(index)
-                    .iter()
-                    .position(|choice| choice.value == settings.resolution)
-                    .unwrap_or(0)
-            });
-            let codec_cursor = (field == VideoSettingsField::Codec).then(|| {
-                self.video_codec_choices(index)
-                    .iter()
-                    .position(|choice| choice.value == settings.codec)
-                    .unwrap_or(0)
-            });
-            let popup = self.video_settings_popup.as_mut().unwrap();
-            popup.dropdown_open = false;
-            match field {
-                VideoSettingsField::Codec => {
-                    popup.codec_cursor = codec_cursor.unwrap_or(0);
+        match popup.mode {
+            VideoSettingsMode::CustomResolution => {
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                if popup
+                    .custom_resolution
+                    .as_ref()
+                    .is_some_and(|draft| draft.scaling_dropdown_open)
+                {
+                    let draft = popup.custom_resolution.as_mut().unwrap();
+                    draft.scaling_dropdown_open = false;
+                    draft.scaling_cursor = CustomScaling::OPTIONS
+                        .iter()
+                        .position(|scaling| *scaling == draft.scaling)
+                        .unwrap_or(0);
+                    return;
                 }
-                VideoSettingsField::Resolution => {
-                    popup.resolution_cursor = resolution_cursor.unwrap_or(0);
-                }
+                self.stage_custom_resolution();
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.custom_resolution = None;
+                popup.mode = VideoSettingsMode::Dropdown;
+                return;
             }
-            return;
+            VideoSettingsMode::Dropdown => {
+                let index = popup.stream_index;
+                let field = popup.field;
+                let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+                let resolution_cursor = (field == VideoSettingsField::Resolution).then(|| {
+                    self.resolution_choices(index)
+                        .iter()
+                        .position(|choice| choice.selected(settings.resolution))
+                        .unwrap_or(0)
+                });
+                let codec_cursor = (field == VideoSettingsField::Codec).then(|| {
+                    self.video_codec_choices(index)
+                        .iter()
+                        .position(|choice| choice.value == settings.codec)
+                        .unwrap_or(0)
+                });
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.mode = VideoSettingsMode::Summary;
+                match field {
+                    VideoSettingsField::Codec => {
+                        popup.codec_cursor = codec_cursor.unwrap_or(0);
+                    }
+                    VideoSettingsField::Resolution => {
+                        popup.resolution_cursor = resolution_cursor.unwrap_or(0);
+                    }
+                }
+                return;
+            }
+            VideoSettingsMode::Summary => {}
         }
         self.video_settings_popup = None;
         self.dialog = None;
@@ -1311,55 +1690,249 @@ impl App {
         self.dialog = None;
     }
 
+    pub fn save_from_video_settings(&mut self) {
+        let custom_open = self
+            .video_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == VideoSettingsMode::CustomResolution);
+        if custom_open {
+            self.commit_scaling_dropdown();
+            if !self.apply_custom_resolution() {
+                return;
+            }
+        }
+        self.close_video_settings();
+        self.request_save();
+    }
+
+    pub fn input_custom_resolution_digit(&mut self, digit: char) {
+        if !digit.is_ascii_digit() {
+            return;
+        }
+        let Some(draft) = self
+            .video_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
+            .and_then(|popup| popup.custom_resolution.as_mut())
+            .filter(|draft| !draft.scaling_dropdown_open)
+        else {
+            return;
+        };
+        let value = match draft.field {
+            CustomResolutionField::Width => &mut draft.width,
+            CustomResolutionField::Height => &mut draft.height,
+            CustomResolutionField::Scaling => return,
+        };
+        if value.len() < 20 {
+            value.push(digit);
+        }
+    }
+
+    pub fn backspace_custom_resolution(&mut self) {
+        let Some(draft) = self
+            .video_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
+            .and_then(|popup| popup.custom_resolution.as_mut())
+            .filter(|draft| !draft.scaling_dropdown_open)
+        else {
+            return;
+        };
+        match draft.field {
+            CustomResolutionField::Width => {
+                draft.width.pop();
+            }
+            CustomResolutionField::Height => {
+                draft.height.pop();
+            }
+            CustomResolutionField::Scaling => {}
+        }
+    }
+
+    fn activate_custom_resolution(&mut self) {
+        let Some(draft) = self
+            .video_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
+            .and_then(|popup| popup.custom_resolution.as_mut())
+        else {
+            return;
+        };
+        if draft.scaling_dropdown_open {
+            self.commit_scaling_dropdown();
+            self.stage_custom_resolution();
+            return;
+        }
+        match draft.field {
+            CustomResolutionField::Width => draft.field = CustomResolutionField::Height,
+            CustomResolutionField::Height => draft.field = CustomResolutionField::Scaling,
+            CustomResolutionField::Scaling => {
+                draft.scaling_cursor = CustomScaling::OPTIONS
+                    .iter()
+                    .position(|scaling| *scaling == draft.scaling)
+                    .unwrap_or(0);
+                draft.scaling_dropdown_open = true;
+            }
+        }
+    }
+
+    fn commit_scaling_dropdown(&mut self) {
+        let Some(draft) = self
+            .video_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
+            .and_then(|popup| popup.custom_resolution.as_mut())
+            .filter(|draft| draft.scaling_dropdown_open)
+        else {
+            return;
+        };
+        if let Some(scaling) = CustomScaling::OPTIONS.get(draft.scaling_cursor) {
+            draft.scaling = *scaling;
+        }
+        draft.scaling_dropdown_open = false;
+    }
+
+    pub fn custom_resolution_error(&self) -> Option<String> {
+        self.custom_resolution_from_draft().err()
+    }
+
+    fn apply_custom_resolution(&mut self) -> bool {
+        if !self.stage_custom_resolution() {
+            return false;
+        }
+        let popup = self.video_settings_popup.as_mut().unwrap();
+        popup.custom_resolution = None;
+        popup.mode = VideoSettingsMode::Summary;
+        true
+    }
+
+    fn stage_custom_resolution(&mut self) -> bool {
+        let Ok(resolution) = self.custom_resolution_from_draft() else {
+            return false;
+        };
+        let Some(index) = self
+            .video_settings_popup
+            .as_ref()
+            .map(|popup| popup.stream_index)
+        else {
+            return false;
+        };
+        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        settings.resolution = resolution;
+        if self.settings_change_stream(index, settings) {
+            self.video_settings.insert(index, settings);
+        } else {
+            self.video_settings.remove(&index);
+        }
+        true
+    }
+
+    fn custom_resolution_from_draft(&self) -> Result<VideoResolution, String> {
+        let popup = self
+            .video_settings_popup
+            .as_ref()
+            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
+            .ok_or_else(|| "Custom resolution is not being edited.".to_string())?;
+        let draft = popup
+            .custom_resolution
+            .as_ref()
+            .ok_or_else(|| "Enter both width and height.".to_string())?;
+        if draft.width.is_empty() || draft.height.is_empty() {
+            return Err("Enter both width and height.".to_string());
+        }
+        let width = draft
+            .width
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Width and height must be positive whole numbers.".to_string())?;
+        let height = draft
+            .height
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Width and height must be positive whole numbers.".to_string())?;
+        if width % 2 != 0 || height % 2 != 0 {
+            return Err("Width and height must be even.".to_string());
+        }
+        let Some((source_width, source_height)) = self.video_source_dimensions(popup.stream_index)
+        else {
+            return Err(
+                "The source resolution is unavailable; custom scaling cannot be applied."
+                    .to_string(),
+            );
+        };
+        if width > source_width || height > source_height {
+            return Err("Upscaling isn't possible yet.".to_string());
+        }
+        if width == source_width && height == source_height {
+            return Ok(VideoResolution::Original);
+        }
+        Ok(VideoResolution::Custom(CustomResolution {
+            width,
+            height,
+            scaling: draft.scaling,
+        }))
+    }
+
+    pub fn video_source_dimensions(&self, index: u64) -> Option<(u64, u64)> {
+        let stream = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))?;
+        stream_number(stream, "width").zip(stream_number(stream, "height"))
+    }
+
     pub fn resolution_choices(&self, index: u64) -> Vec<ResolutionChoice> {
         let stream = self
             .media_info()
             .and_then(|info| stream_by_index(info, index));
         let width = stream.and_then(|stream| stream_number(stream, "width"));
         let height = stream.and_then(|stream| stream_number(stream, "height"));
-        let original_label = match (width, height) {
-            (Some(width), Some(height)) => format!("Original ({width}×{height})"),
-            _ => "Original".to_string(),
-        };
-        let original = ResolutionChoice {
-            value: VideoResolution::Original,
-            label: original_label,
-            enabled: true,
-        };
-        let Some(source_height) = height else {
-            return std::iter::once(original)
-                .chain(
-                    VideoResolution::PRESETS
-                        .into_iter()
-                        .map(|value| ResolutionChoice {
-                            label: value.label().to_string(),
-                            value,
-                            enabled: false,
-                        }),
-                )
-                .collect();
+        let source_dimensions = width.zip(height);
+        let source_preset = source_dimensions.and_then(|dimensions| {
+            VideoResolution::PRESETS
+                .into_iter()
+                .find(|preset| preset.dimensions() == Some(dimensions))
+        });
+        let staged_custom =
+            self.video_settings
+                .get(&index)
+                .and_then(|settings| match settings.resolution {
+                    VideoResolution::Custom(custom) => Some(custom),
+                    _ => None,
+                });
+        let custom_is_current = source_preset.is_none() && source_dimensions.is_some();
+        let custom = ResolutionChoice {
+            value: ResolutionChoiceValue::Custom,
+            label: staged_custom
+                .map(|custom| format!("Custom ({}×{})", custom.width, custom.height))
+                .or_else(|| {
+                    custom_is_current
+                        .then(|| format!("Custom ({}×{})", width.unwrap(), height.unwrap()))
+                })
+                .unwrap_or_else(|| "Custom…".to_string()),
+            enabled: width.is_some() && height.is_some(),
+            current: custom_is_current,
         };
 
-        let mut choices = Vec::new();
-        let mut inserted_original = false;
+        let mut choices = Vec::with_capacity(VideoResolution::PRESETS.len() + 1);
         for value in VideoResolution::PRESETS {
-            let preset_height = value.height().unwrap();
-            if !inserted_original && source_height >= preset_height {
-                choices.push(original.clone());
-                inserted_original = true;
-                if source_height == preset_height {
-                    continue;
-                }
-            }
+            let (preset_width, preset_height) = value.dimensions().unwrap();
+            let current = source_preset == Some(value);
             choices.push(ResolutionChoice {
-                label: value.label().to_string(),
-                value,
-                enabled: preset_height < source_height,
+                label: value.label(),
+                value: ResolutionChoiceValue::Resolution(if current {
+                    VideoResolution::Original
+                } else {
+                    value
+                }),
+                enabled: source_dimensions.is_some_and(|(source_width, source_height)| {
+                    preset_width <= source_width && preset_height <= source_height
+                }),
+                current,
             });
         }
-        if !inserted_original {
-            choices.push(original);
-        }
+        choices.push(custom);
         choices
     }
 
@@ -1378,18 +1951,41 @@ impl App {
         };
         let mut choices = Vec::with_capacity(VideoCodec::TARGETS.len() + 1);
         if source_codec.is_none() {
+            let enabled = self
+                .effective_container()
+                .is_none_or(|container| container.supports_codec("video", source_name, false));
             choices.push(VideoCodecChoice {
                 value: VideoCodec::Original,
                 label: source_name.to_uppercase(),
                 current: true,
+                enabled,
+                reason: (!enabled).then(|| {
+                    format!(
+                        "{} cannot contain {} video",
+                        self.effective_container().unwrap().label(),
+                        source_name.to_uppercase()
+                    )
+                }),
             });
         }
         choices.extend(VideoCodec::TARGETS.into_iter().map(|codec| {
             let current = source_codec == Some(codec);
+            let codec_name = codec.codec_name().unwrap();
+            let enabled = self
+                .effective_container()
+                .is_none_or(|container| container.supports_codec("video", codec_name, false));
             VideoCodecChoice {
                 value: if current { VideoCodec::Original } else { codec },
                 label: codec.label().to_string(),
                 current,
+                enabled,
+                reason: (!enabled).then(|| {
+                    format!(
+                        "{} cannot contain {} video",
+                        self.effective_container().unwrap().label(),
+                        codec.label()
+                    )
+                }),
             }
         }));
         choices
@@ -1417,7 +2013,7 @@ impl App {
             return;
         }
         if !self.has_track_edits() {
-            self.notice = Some("No track changes to save.".to_string());
+            self.notice = Some("No media changes to save.".to_string());
             return;
         }
         let Some(info) = self.media_info() else {
@@ -1437,6 +2033,14 @@ impl App {
             &self.video_settings,
         ) {
             self.show_error(error);
+            return;
+        }
+        let conflicts = self.selected_container_conflicts();
+        if !conflicts.is_empty() {
+            self.show_error(format!(
+                "Resolve the container compatibility issues before saving:\n{}",
+                conflicts.join("\n")
+            ));
             return;
         }
         self.notice = None;
@@ -1517,6 +2121,7 @@ impl App {
         let request = EditRequest {
             path,
             destination: self.save_destination,
+            container: self.container_target,
             stream_order,
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
@@ -1699,6 +2304,8 @@ impl App {
         self.video_settings_popup = None;
         self.subtitle_changes.clear();
         self.subtitle_settings_popup = None;
+        self.container_target = None;
+        self.container_settings_popup = None;
     }
 
     fn clear_track_edits(&mut self) {
@@ -1712,6 +2319,8 @@ impl App {
         self.video_settings_popup = None;
         self.subtitle_changes.clear();
         self.subtitle_settings_popup = None;
+        self.container_target = None;
+        self.container_settings_popup = None;
     }
 
     pub fn changed_streams(&self) -> BTreeSet<u64> {
@@ -1748,7 +2357,8 @@ impl App {
     }
 
     pub fn has_track_edits(&self) -> bool {
-        !self.deleted_streams.is_empty()
+        self.container_target.is_some()
+            || !self.deleted_streams.is_empty()
             || !changed_streams(
                 &self.original_stream_order,
                 &self.stream_order,
@@ -1766,7 +2376,8 @@ impl App {
     }
 
     pub fn media_will_change(&self) -> bool {
-        !self.deleted_streams.is_empty()
+        self.container_target.is_some()
+            || !self.deleted_streams.is_empty()
             || !changed_streams(
                 &self.original_stream_order,
                 &self.stream_order,
@@ -1796,6 +2407,16 @@ impl App {
             &self.original_default_streams,
             &self.default_streams,
         );
+        if let Some(target) = self.container_target {
+            let source = self
+                .source_container()
+                .map(ContainerFormat::label)
+                .unwrap_or("original");
+            lines.insert(
+                0,
+                format!("Changing container from {source} to {}", target.label()),
+            );
+        }
         for (index, settings) in &self.video_settings {
             let codec = match settings.codec {
                 VideoCodec::Original => self
@@ -1835,7 +2456,14 @@ impl App {
                 });
             }
             if let Some(target) = change.export_target {
-                lines.push(format!("Exporting {source} as {}", target.label()));
+                lines.push(if change.removes_from_media() {
+                    format!(
+                        "Exporting {source} as {} and removing it from the media",
+                        target.label()
+                    )
+                } else {
+                    format!("Exporting {source} as {}", target.label())
+                });
             }
         }
         lines
@@ -2190,6 +2818,13 @@ mod tests {
         app
     }
 
+    fn set_media(app: &mut App, streams: serde_json::Value) {
+        app.outcome = Some(ProbeOutcome::Video(media(streams)));
+        app.loading = false;
+        app.reset_track_edits();
+        app.layer = Layer::Streams;
+    }
+
     #[test]
     fn scroll_forward_should_add_amount_when_result_is_below_maximum() {
         // Arrange
@@ -2339,14 +2974,14 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 1;
+        app.selected_stream = 2;
 
         // Act
         app.move_selected_stream(1);
 
         // Assert
         assert_that!(&app.stream_order).contains_exactly_in_given_order([0, 2, 1, 3]);
-        assert_that!(app.selected_stream).is_equal_to(2);
+        assert_that!(app.selected_stream).is_equal_to(3);
         assert_that!(app.changed_streams()).is_equal_to(BTreeSet::from([1]));
 
         // Cleanup
@@ -2365,7 +3000,7 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 1;
+        app.selected_stream = 2;
 
         // Act
         app.move_selected_stream(1);
@@ -2390,7 +3025,7 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 1;
+        app.selected_stream = 2;
         app.move_selected_stream(1);
 
         // Act
@@ -2415,7 +3050,7 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 2;
+        app.selected_stream = 3;
 
         // Act
         app.set_selected_stream_default();
@@ -2438,7 +3073,7 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 2;
+        app.selected_stream = 3;
 
         // Act
         app.toggle_delete_selected_stream();
@@ -2460,9 +3095,9 @@ mod tests {
         ]));
         let mut app = test_app(info);
         let directory = app.directory.clone();
-        app.selected_stream = 2;
+        app.selected_stream = 3;
         app.toggle_delete_selected_stream();
-        app.selected_stream = 2;
+        app.selected_stream = 3;
 
         // Act
         app.move_selected_stream(-1);
@@ -2475,7 +3110,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_choices_should_show_higher_presets_disabled_and_original_in_size_order() {
+    fn resolution_choices_should_use_preset_label_for_standard_source_resolution() {
         // Arrange
         let app = test_app(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
@@ -2493,11 +3128,13 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .contains_exactly_in_given_order([
-            "2160p",
-            "1440p",
-            "Original (1920×1080)",
-            "720p",
-            "480p",
+            "3840×2160 / 16:9",
+            "2560×1440 / 16:9",
+            "1920×1080 / 16:9",
+            "1920×960 / 2:1",
+            "1280×720 / 16:9",
+            "854×480 / 16:9",
+            "Custom…",
         ]);
         assert_that!(
             choices
@@ -2505,7 +3142,553 @@ mod tests {
                 .map(|choice| choice.enabled)
                 .collect::<Vec<_>>()
         )
-        .contains_exactly_in_given_order([false, false, true, true, true]);
+        .contains_exactly_in_given_order([false, false, true, true, true, true, true]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.selected(VideoResolution::Original))
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, true, false, false, false, false]);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_mark_nonstandard_source_resolution_as_custom() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 800}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.resolution_choices(0);
+        app.selected_stream = 1;
+        app.open_video_settings();
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([
+            "3840×2160 / 16:9",
+            "2560×1440 / 16:9",
+            "1920×1080 / 16:9",
+            "1920×960 / 2:1",
+            "1280×720 / 16:9",
+            "854×480 / 16:9",
+            "Custom (1920×800)",
+        ]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.enabled)
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, false, false, true, true, true]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.selected(VideoResolution::Original))
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, false, false, false, false, true]);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().resolution_cursor)
+            .is_equal_to(choices.len() - 1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_recognize_a_1920_by_960_source_as_an_exact_preset() {
+        // Arrange
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 960}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.resolution_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([
+            "3840×2160 / 16:9",
+            "2560×1440 / 16:9",
+            "1920×1080 / 16:9",
+            "1920×960 / 2:1",
+            "1280×720 / 16:9",
+            "854×480 / 16:9",
+            "Custom…",
+        ]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.selected(VideoResolution::Original))
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, false, true, false, false, false]);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_keep_a_same_height_wrong_width_source_custom() {
+        // Arrange
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1440, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.resolution_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.enabled)
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, false, false, true, true, true]);
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.selected(VideoResolution::Original))
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([false, false, false, false, false, false, true]);
+        assert_that!(choices.last().unwrap().label.as_str()).is_equal_to("Custom (1440×1080)");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_keep_one_custom_row_when_custom_dimensions_are_staged() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                resolution: VideoResolution::Custom(CustomResolution {
+                    width: 1280,
+                    height: 720,
+                    scaling: CustomScaling::Stretch,
+                }),
+                ..VideoSettings::default()
+            },
+        );
+
+        // Act
+        let choices = app.resolution_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>()
+        )
+        .contains_exactly_in_given_order([
+            "3840×2160 / 16:9",
+            "2560×1440 / 16:9",
+            "1920×1080 / 16:9",
+            "1920×960 / 2:1",
+            "1280×720 / 16:9",
+            "854×480 / 16:9",
+            "Custom (1280×720)",
+        ]);
+        assert_that!(
+            choices
+                .iter()
+                .filter(|choice| matches!(choice.value, ResolutionChoiceValue::Custom))
+                .count()
+        )
+        .is_equal_to(1);
+        assert_that!(
+            choices
+                .last()
+                .unwrap()
+                .selected(VideoResolution::Custom(CustomResolution {
+                    width: 1280,
+                    height: 720,
+                    scaling: CustomScaling::Stretch,
+                }))
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn open_custom_resolution_editor(app: &mut App) {
+        app.selected_stream = 1;
+        app.open_video_settings();
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+        let custom_cursor = app.resolution_choices(0).len() - 1;
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = custom_cursor;
+        app.activate_video_settings();
+    }
+
+    fn clear_custom_resolution_inputs(app: &mut App) {
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.width.clear();
+        draft.height.clear();
+    }
+
+    #[test]
+    fn custom_resolution_should_prefill_the_source_dimensions() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        open_custom_resolution_editor(&mut app);
+
+        // Assert
+        let draft = app
+            .video_settings_popup
+            .as_ref()
+            .unwrap()
+            .custom_resolution
+            .as_ref()
+            .unwrap();
+        assert_that!(draft.width.as_str()).is_equal_to("1920");
+        assert_that!(draft.height.as_str()).is_equal_to("1080");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn valid_custom_resolution_should_stage_dimensions_and_scaling_mode() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        clear_custom_resolution_inputs(&mut app);
+        for digit in "1280".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+        app.move_video_settings_cursor(1);
+        for digit in "720".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+        app.move_video_settings_cursor(1);
+
+        // Act
+        app.activate_video_settings();
+
+        // Assert
+        assert_that!(
+            app.video_settings
+                .get(&0)
+                .map(|settings| settings.resolution)
+        )
+        .contains(VideoResolution::Custom(CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::Stretch,
+        }));
+        let popup = app.video_settings_popup.as_ref().unwrap();
+        assert_that!(popup.mode).is_equal_to(VideoSettingsMode::CustomResolution);
+        assert_that!(
+            popup
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .scaling_dropdown_open
+        )
+        .is_false();
+
+        // Act: back out normally after staging
+        app.escape_video_settings();
+
+        // Assert
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::Dropdown);
+        assert_that!(
+            app.video_settings
+                .get(&0)
+                .map(|settings| settings.resolution)
+        )
+        .contains(VideoResolution::Custom(CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::Stretch,
+        }));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn escape_video_settings_should_stage_a_valid_custom_resolution_and_enable_save() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.width = "1280".to_string();
+        draft.height = "720".to_string();
+
+        // Act
+        app.escape_video_settings();
+        let staged = app
+            .video_settings
+            .get(&0)
+            .map(|settings| settings.resolution);
+        app.save_from_video_settings();
+
+        // Assert
+        assert_that!(staged).contains(VideoResolution::Custom(CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::FitPad,
+        }));
+        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn escape_video_settings_should_discard_an_invalid_draft_and_preserve_staged_resolution() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        let staged = CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::FitPad,
+        };
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                resolution: VideoResolution::Custom(staged),
+                ..VideoSettings::default()
+            },
+        );
+        open_custom_resolution_editor(&mut app);
+        app.video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap()
+            .width = "1279".to_string();
+
+        // Act
+        app.escape_video_settings();
+
+        // Assert
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::Dropdown);
+        assert_that!(
+            app.video_settings
+                .get(&0)
+                .map(|settings| settings.resolution)
+        )
+        .contains(VideoResolution::Custom(staged));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn escape_should_close_scaling_dropdown_before_leaving_custom_editor() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        app.move_video_settings_cursor(1);
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+
+        // Act
+        app.escape_video_settings();
+
+        // Assert
+        let popup = app.video_settings_popup.as_ref().unwrap();
+        assert_that!(popup.mode).is_equal_to(VideoSettingsMode::CustomResolution);
+        assert_that!(
+            popup
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .scaling_dropdown_open
+        )
+        .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn upscaled_custom_resolution_should_remain_in_editor_and_block_save() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        clear_custom_resolution_inputs(&mut app);
+        for digit in "1922".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+        app.move_video_settings_cursor(1);
+        for digit in "720".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+
+        // Act
+        let error = app.custom_resolution_error();
+        app.save_from_video_settings();
+
+        // Assert
+        assert_that!(error.as_deref()).contains("Upscaling isn't possible yet.");
+        assert_that!(app.dialog).contains(Dialog::VideoSettings);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::CustomResolution);
+        assert_that!(app.video_settings).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn odd_custom_resolution_should_show_validation_and_not_apply() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        clear_custom_resolution_inputs(&mut app);
+        for digit in "1279".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+        app.move_video_settings_cursor(1);
+        for digit in "720".chars() {
+            app.input_custom_resolution_digit(digit);
+        }
+
+        // Act
+        app.activate_video_settings();
+
+        // Assert
+        assert_that!(app.custom_resolution_error().as_deref())
+            .contains("Width and height must be even.");
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::CustomResolution);
+        assert_that!(app.video_settings).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_resolution_should_validate_incomplete_zero_overflow_and_height_upscale() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        let cases = [
+            ("", "", "Enter both width and height."),
+            (
+                "0",
+                "720",
+                "Width and height must be positive whole numbers.",
+            ),
+            (
+                "18446744073709551616",
+                "720",
+                "Width and height must be positive whole numbers.",
+            ),
+            ("1280", "1082", "Upscaling isn't possible yet."),
+        ];
+
+        for (width, height, expected) in cases {
+            let draft = app
+                .video_settings_popup
+                .as_mut()
+                .unwrap()
+                .custom_resolution
+                .as_mut()
+                .unwrap();
+            draft.width = width.to_string();
+            draft.height = height.to_string();
+
+            // Act / Assert
+            assert_that!(app.custom_resolution_error().as_deref()).contains(expected);
+        }
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_resolution_matching_source_should_normalize_to_original() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        app.move_video_settings_cursor(1);
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+
+        // Act
+        app.activate_video_settings();
+
+        // Assert
+        assert_that!(app.video_settings).is_empty();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::CustomResolution);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2534,22 +3717,239 @@ mod tests {
     }
 
     #[test]
-    fn selecting_export_sidecar_should_stage_the_source_codec_without_a_media_change() {
+    fn container_should_be_the_first_track_row_and_open_its_selector() {
         // Arrange
-        let mut app = test_app(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "h264"},
-            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
-        ])));
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+
+        // Act
+        let rows = app.track_rows();
+        app.open_track_settings();
+
+        // Assert
+        assert_that!(rows.first()).contains(&TrackRef::Container);
+        assert_that!(app.dialog).contains(Dialog::ContainerSettings);
+        assert_that!(&app.container_settings_popup).is_some();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_warning_should_group_multiple_conflicts_by_track_type() {
+        // Arrange
+        let choice = ContainerChoice {
+            value: Some(ContainerFormat::Mp4),
+            label: "MP4".to_string(),
+            current: false,
+            staged: false,
+            conflicts: vec![
+                "MP4 can't contain SUBRIP subtitle track #2.".to_string(),
+                "MP4 can't contain SUBRIP subtitle track #3.".to_string(),
+                "MP4 can't contain ASS subtitle track #4.".to_string(),
+            ],
+        };
+
+        // Act
+        let warning = choice.warning();
+
+        // Assert
+        assert_that!(warning.as_deref()).contains("MP4 can't contain SubRip/SRT or ASS subtitles.");
+    }
+
+    #[test]
+    fn selecting_mp4_should_stage_the_container_and_default_to_replacing_the_original() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_muxers: BTreeSet::from(["mp4".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        app.open_container_settings();
+        app.move_container_settings_cursor(1);
+
+        // Act
+        app.activate_container_settings();
+        app.request_save();
+
+        // Assert
+        assert_that!(app.container_target).contains(ContainerFormat::Mp4);
+        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+        assert_that!(app.save_destination).is_equal_to(SaveDestination::ReplaceOriginal);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_subtitle_should_block_save_until_it_is_converted_for_mp4() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["mov_text".to_string()]),
+            ffmpeg_muxers: BTreeSet::from(["mp4".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        app.container_target = Some(ContainerFormat::Mp4);
+
+        // Act: unresolved conflict
+        app.request_save();
+        let error = app.edit_error.clone().unwrap();
+
+        // Assert: the reason is actionable
+        assert_that!(app.dialog).contains(Dialog::Error);
+        assert_that!(error.as_str()).contains("track #2");
+        assert_that!(error.as_str()).contains("MOV Text");
+
+        // Act: stage the compatible subtitle conversion and retry
+        app.dismiss_dialog();
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(2),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::MovText),
+                export_target: None,
+                ocr_language: None,
+            },
+        );
+        app.request_save();
+
+        // Assert
+        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+        assert_that!(app.selected_container_conflicts()).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selected_container_conflict_streams_should_only_include_unresolved_surviving_tracks() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "ass"}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::Mp4);
+        app.deleted_streams.insert(3);
+
+        // Act
+        let unresolved = app.selected_container_conflict_streams();
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(2),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::MovText),
+                export_target: None,
+                ocr_language: None,
+            },
+        );
+        let resolved = app.selected_container_conflict_streams();
+
+        // Assert
+        assert_that!(unresolved).contains_exactly_in_any_order([2]);
+        assert_that!(resolved).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn webm_target_should_only_enable_compatible_video_codec_choices() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::WebM);
+
+        // Act
+        let choices = app.video_codec_choices(0);
+
+        // Assert
+        assert_that!(
+            choices
+                .iter()
+                .find(|choice| choice.label == "H.264")
+                .unwrap()
+                .enabled
+        )
+        .is_false();
+        assert_that!(
+            choices
+                .iter()
+                .find(|choice| choice.label == "HEVC / H.265")
+                .unwrap()
+                .enabled
+        )
+        .is_false();
+        assert_that!(
+            choices
+                .iter()
+                .find(|choice| choice.label == "AV1")
+                .unwrap()
+                .enabled
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn toggling_export_should_stage_the_source_codec_and_remove_the_embedded_track() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+            ]),
+        );
         app.subtitle_capabilities = ToolCapabilities {
             ffmpeg: true,
             ffmpeg_encoders: BTreeSet::from(["subrip".to_string()]),
             ..ToolCapabilities::default()
         };
-        app.selected_stream = 1;
+        app.selected_stream = 2;
         app.open_track_settings();
 
         // Act
-        app.choose_subtitle_action(1);
+        app.move_subtitle_settings_cursor(1);
+        app.activate_subtitle_settings();
 
         // Assert
         let change = app
@@ -2558,14 +3958,101 @@ mod tests {
             .unwrap();
         assert_that!(change.embedded_target).is_none();
         assert_that!(change.export_target).contains(SubtitleFormat::SubRip);
-        assert_that!(app.media_will_change()).is_false();
-        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().action)
-            .is_equal_to(SubtitleAction::ExportSidecar);
+        assert_that!(app.media_will_change()).is_true();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(SubtitleSettingsField::Export);
         assert_that!(app.subtitle_settings_popup.as_ref().unwrap().dropdown_open).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn subtitle_only_save_dialog_should_keep_start_selected() {
+    fn toggling_export_should_preserve_a_staged_embedded_conversion() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+        ])));
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "ass".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        app.subtitle_changes.insert(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::Ass),
+                export_target: None,
+                ocr_language: None,
+            },
+        );
+        app.selected_stream = 2;
+        app.open_track_settings();
+        app.move_subtitle_settings_cursor(1);
+
+        // Act
+        app.activate_subtitle_settings();
+
+        // Assert
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(1))
+            .unwrap();
+        assert_that!(change.embedded_target).contains(SubtitleFormat::Ass);
+        assert_that!(change.export_target).contains(SubtitleFormat::Ass);
+        assert_that!(change.removes_from_media()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selecting_codec_should_update_container_and_sidecar_when_export_is_checked() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "ass".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        app.selected_stream = 2;
+        app.open_track_settings();
+        app.move_subtitle_settings_cursor(1);
+        app.activate_subtitle_settings();
+        app.move_subtitle_settings_cursor(-1);
+        app.activate_subtitle_settings();
+        app.move_subtitle_settings_cursor(1);
+
+        // Act
+        app.activate_subtitle_settings();
+
+        // Assert
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(1))
+            .unwrap();
+        assert_that!(change.embedded_target).contains(SubtitleFormat::Ass);
+        assert_that!(change.export_target).contains(SubtitleFormat::Ass);
+        assert_that!(change.removes_from_media()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_export_save_dialog_should_allow_selecting_a_copy_destination() {
         // Arrange
         let mut app = test_app(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264"},
@@ -2588,8 +4075,8 @@ mod tests {
         app.choose_save_destination(1);
 
         // Assert
-        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Start);
-        assert_that!(app.save_destination).is_equal_to(SaveDestination::ReplaceOriginal);
+        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Destination);
+        assert_that!(app.save_destination).is_equal_to(SaveDestination::CreateCopy);
     }
 
     #[test]
@@ -2620,6 +4107,7 @@ mod tests {
             {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
         ])));
         let directory = app.directory.clone();
+        app.selected_stream = 1;
         app.open_video_settings();
         app.move_video_settings_cursor(1);
         app.activate_video_settings();
@@ -2643,6 +4131,7 @@ mod tests {
             {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
         ])));
         let directory = app.directory.clone();
+        app.selected_stream = 1;
         app.open_video_settings();
         app.activate_video_settings();
         app.move_video_settings_cursor(1);
@@ -2741,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_update_should_cancel_processing_when_selected_file_is_deleted() {
+    fn directory_update_should_defer_selected_removal_until_the_worker_finishes() {
         // Arrange
         let mut app = test_file_app(&["alpha.mkv", "beta.mkv"]);
         let directory = app.directory.clone();
@@ -2749,18 +4238,32 @@ mod tests {
         app.edit_cancel = Some(cancelled.clone());
         app.dialog = Some(Dialog::Processing);
         std::fs::remove_file(directory.join("alpha.mkv")).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
 
-        // Act
+        // Act: the watcher reports the source removal before the worker result
         app.apply_directory_snapshot(DirectorySnapshot::Files(
             scan_directory(&directory).unwrap(),
         ));
 
+        // Assert: keep ownership with the worker to allow cross-extension replacement
+        assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
+        assert_that!(app.dialog).contains(Dialog::Processing);
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
+
+        // Act: the worker confirms that an external removal changed the source
+        result_tx
+            .send(EditEvent::Finished {
+                path: directory.join("alpha.mkv"),
+                outcome: EditOutcome::SourceChanged("Source file was removed.".to_string()),
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+
         // Assert
-        assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
         assert_that!(app.dialog).is_none();
         assert_that!(app.layer).is_equal_to(Layer::Files);
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
-        assert_that!(app.notice.as_deref().unwrap()).contains("cancelled");
+        assert_that!(app.notice.as_deref().unwrap()).contains("removed");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2884,17 +4387,24 @@ mod tests {
         let (edit_tx, edit_rx) = std::sync::mpsc::channel::<EditRequest>();
         let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
         app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
-            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
-            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 0}}
         ]))));
         app.loading = false;
         app.reset_track_edits();
         app.layer = Layer::Streams;
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_muxers: BTreeSet::from(["mp4".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        app.container_target = Some(ContainerFormat::Mp4);
         app.deleted_streams.insert(2);
         app.request_save();
         app.move_save_dialog_cursor(-1);
-        app.activate_save_dialog();
+        app.choose_save_destination(-1);
+        app.choose_save_destination(1);
         app.move_save_dialog_cursor(1);
 
         // Act
@@ -2903,6 +4413,7 @@ mod tests {
 
         // Assert
         assert_that!(request.destination).is_equal_to(SaveDestination::CreateCopy);
+        assert_that!(request.container).contains(ContainerFormat::Mp4);
         assert_that!(app.dialog).contains(Dialog::Processing);
 
         // Cleanup
@@ -2942,6 +4453,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_cross_extension_replacement_should_win_over_watcher_removal() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        let source = directory.join("alpha.mkv");
+        let output = directory.join("alpha.mp4");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        app.dialog = Some(Dialog::Processing);
+        std::fs::write(&output, b"edited media").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Act
+        result_tx
+            .send(EditEvent::Finished {
+                path: source,
+                outcome: EditOutcome::Completed {
+                    output_path: output,
+                    media_changed: true,
+                },
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+
+        // Assert
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mp4");
+        assert_that!(app.notice.as_deref().unwrap()).contains("alpha.mp4");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn processing_updates_should_continue_while_cancel_confirmation_is_open() {
         // Arrange
         let mut app = test_file_app(&["alpha.mkv"]);
@@ -2974,6 +4521,7 @@ mod tests {
             {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
         ])));
         let directory = app.directory.clone();
+        app.selected_stream = 1;
 
         // Act
         app.open_stream_details();
@@ -2984,6 +4532,36 @@ mod tests {
         assert_that!(opened_layer).is_equal_to(Layer::StreamDetails);
         assert_that!(went_back).is_true();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_stream_details_should_open_when_the_container_is_selected() {
+        // Arrange
+        let mut app = test_app(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {
+                    "format_name": "matroska,webm",
+                    "duration": "60.0"
+                },
+                "streams": [
+                    {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+                ]
+            }))
+            .unwrap(),
+        );
+        let directory = app.directory.clone();
+        app.selected_stream = 0;
+
+        // Act
+        app.open_stream_details();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::StreamDetails);
+        assert_that!(app.details_scroll).is_equal_to(0);
+        assert_that!(app.details_max_scroll).is_equal_to(0);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

@@ -103,20 +103,35 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 _ => {}
             }
         }
+        Some(Dialog::ContainerSettings) => {
+            input.reset_sequence();
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                    app.move_container_settings_cursor(1)
+                }
+                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                    app.move_container_settings_cursor(-1)
+                }
+                (KeyCode::Enter, _) => app.activate_container_settings(),
+                _ if is_back_key(key) => app.close_container_settings(),
+                _ => {}
+            }
+        }
         Some(Dialog::VideoSettings) => {
             input.reset_sequence();
             match (key.code, key.modifiers) {
+                (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.save_from_video_settings(),
                 (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
                     app.move_video_settings_cursor(1)
                 }
                 (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
                     app.move_video_settings_cursor(-1)
                 }
-                (KeyCode::Enter, _) => app.activate_video_settings(),
-                (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                    app.close_video_settings();
-                    app.request_save();
+                (KeyCode::Char(digit), KeyModifiers::NONE) if digit.is_ascii_digit() => {
+                    app.input_custom_resolution_digit(digit)
                 }
+                (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_custom_resolution(),
+                (KeyCode::Enter, _) => app.activate_video_settings(),
                 _ if is_back_key(key) => app.escape_video_settings(),
                 _ => {}
             }
@@ -130,13 +145,7 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
                     app.move_subtitle_settings_cursor(-1)
                 }
-                (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
-                    app.choose_subtitle_action(-1)
-                }
-                (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
-                    app.choose_subtitle_action(1)
-                }
-                (KeyCode::Enter, _) => app.activate_subtitle_settings(),
+                (KeyCode::Enter | KeyCode::Char(' '), _) => app.activate_subtitle_settings(),
                 (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                     app.close_subtitle_settings();
                     app.request_save();
@@ -307,9 +316,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{VideoSettingsField, VideoSettingsPopup},
-        edit::EditRequest,
-        probe::ProbeRequest,
+        app::{
+            CustomResolutionDraft, CustomResolutionField, VideoSettingsField, VideoSettingsMode,
+            VideoSettingsPopup,
+        },
+        edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
+        probe::{MediaInfo, ProbeOutcome, ProbeRequest},
     };
 
     fn test_app() -> (App, PathBuf) {
@@ -358,6 +370,7 @@ mod tests {
             (Layer::Streams, None),
             (Layer::StreamDetails, None),
             (Layer::Streams, Some(Dialog::Keybindings)),
+            (Layer::Streams, Some(Dialog::ContainerSettings)),
             (Layer::Streams, Some(Dialog::VideoSettings)),
             (Layer::Streams, Some(Dialog::SubtitleSettings)),
             (Layer::Streams, Some(Dialog::ConfirmSave)),
@@ -441,6 +454,41 @@ mod tests {
     }
 
     #[test]
+    fn i_should_open_details_when_the_container_is_selected() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {
+                    "format_name": "matroska,webm",
+                    "duration": "60.0"
+                },
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.layer = Layer::Streams;
+        app.selected_stream = 0;
+
+        // Act
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('i')),
+        );
+
+        // Assert
+        assert_eq!(app.layer, Layer::StreamDetails);
+        assert_eq!(app.details_scroll, 0);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn escape_and_q_should_both_close_a_video_settings_dropdown_one_level() {
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
             let (mut app, directory) = test_app();
@@ -448,15 +496,131 @@ mod tests {
             app.video_settings_popup = Some(VideoSettingsPopup {
                 stream_index: 0,
                 field: VideoSettingsField::Codec,
-                dropdown_open: true,
+                mode: VideoSettingsMode::Dropdown,
                 codec_cursor: 0,
                 resolution_cursor: 0,
+                custom_resolution: None,
             });
 
             handle_key(&mut app, &mut InputState::default(), key(code));
 
             assert_eq!(app.dialog, Some(Dialog::VideoSettings));
-            assert!(!app.video_settings_popup.as_ref().unwrap().dropdown_open);
+            assert_eq!(
+                app.video_settings_popup.as_ref().unwrap().mode,
+                VideoSettingsMode::Summary
+            );
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_resolution_keys_should_edit_fields_and_select_scaling_dropdown() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.dialog = Some(Dialog::VideoSettings);
+        app.video_settings_popup = Some(VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Resolution,
+            mode: VideoSettingsMode::CustomResolution,
+            codec_cursor: 0,
+            resolution_cursor: 0,
+            custom_resolution: Some(CustomResolutionDraft {
+                width: String::new(),
+                height: String::new(),
+                scaling: CustomScaling::FitPad,
+                field: CustomResolutionField::Width,
+                scaling_cursor: 0,
+                scaling_dropdown_open: false,
+            }),
+        });
+        let mut input = InputState::default();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('1')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('2')));
+        handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('8')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert
+        let draft = app
+            .video_settings_popup
+            .as_ref()
+            .unwrap()
+            .custom_resolution
+            .as_ref()
+            .unwrap();
+        assert_eq!(draft.width, "1");
+        assert_eq!(draft.height, "8");
+        assert_eq!(draft.field, CustomResolutionField::Scaling);
+        assert_eq!(draft.scaling, CustomScaling::Stretch);
+        assert!(!draft.scaling_dropdown_open);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn escape_and_q_should_both_leave_custom_resolution_editor_one_level() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            // Arrange
+            let (mut app, directory) = test_app();
+            app.outcome = Some(ProbeOutcome::Video(
+                MediaInfo::from_json(serde_json::json!({
+                    "streams": [
+                        {
+                            "index": 0,
+                            "codec_type": "video",
+                            "codec_name": "h264",
+                            "width": 1920,
+                            "height": 1080
+                        }
+                    ]
+                }))
+                .unwrap(),
+            ));
+            app.dialog = Some(Dialog::VideoSettings);
+            app.video_settings_popup = Some(VideoSettingsPopup {
+                stream_index: 0,
+                field: VideoSettingsField::Resolution,
+                mode: VideoSettingsMode::CustomResolution,
+                codec_cursor: 0,
+                resolution_cursor: 0,
+                custom_resolution: Some(CustomResolutionDraft {
+                    width: "1280".to_string(),
+                    height: "720".to_string(),
+                    scaling: CustomScaling::FitPad,
+                    field: CustomResolutionField::Scaling,
+                    scaling_cursor: 0,
+                    scaling_dropdown_open: false,
+                }),
+            });
+
+            // Act
+            handle_key(&mut app, &mut InputState::default(), key(code));
+
+            // Assert
+            let popup = app.video_settings_popup.as_ref().unwrap();
+            assert_eq!(popup.mode, VideoSettingsMode::Dropdown);
+            assert!(popup.custom_resolution.is_none());
+            assert_eq!(
+                app.video_settings
+                    .get(&0)
+                    .map(|settings| settings.resolution),
+                Some(VideoResolution::Custom(CustomResolution {
+                    width: 1280,
+                    height: 720,
+                    scaling: CustomScaling::FitPad,
+                }))
+            );
+
+            // Cleanup
             drop(app);
             fs::remove_dir_all(directory).unwrap();
         }

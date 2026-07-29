@@ -31,6 +31,97 @@ pub enum VideoCodec {
     Av1,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ContainerFormat {
+    Matroska,
+    Mp4,
+    Mov,
+    WebM,
+}
+
+impl ContainerFormat {
+    pub const TARGETS: [Self; 4] = [Self::Matroska, Self::Mp4, Self::Mov, Self::WebM];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Matroska => "MKV",
+            Self::Mp4 => "MP4",
+            Self::Mov => "MOV",
+            Self::WebM => "WebM",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Matroska => "mkv",
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+            Self::WebM => "webm",
+        }
+    }
+
+    pub fn muxer(self) -> &'static str {
+        match self {
+            Self::Matroska => "matroska",
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+            Self::WebM => "webm",
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("mkv" | "mka" | "mks") => Some(Self::Matroska),
+            Some("mp4" | "m4v") => Some(Self::Mp4),
+            Some("mov") => Some(Self::Mov),
+            Some("webm") => Some(Self::WebM),
+            _ => None,
+        }
+    }
+
+    pub fn supports_codec(self, kind: &str, codec: &str, attached_picture: bool) -> bool {
+        if attached_picture {
+            return match self {
+                Self::Matroska => true,
+                Self::Mp4 | Self::Mov => matches!(codec, "mjpeg" | "png"),
+                Self::WebM => false,
+            };
+        }
+        match (self, kind) {
+            (Self::Matroska, "video" | "audio" | "attachment") => true,
+            (Self::Matroska, "subtitle") => matches!(
+                codec,
+                "subrip" | "ass" | "ssa" | "webvtt" | "hdmv_pgs_subtitle" | "dvd_subtitle"
+            ),
+            (Self::Mp4, "video") => {
+                matches!(codec, "h264" | "hevc" | "av1" | "mpeg4" | "mjpeg")
+            }
+            (Self::Mp4, "audio") => {
+                matches!(codec, "aac" | "alac" | "ac3" | "eac3" | "mp3" | "opus")
+            }
+            (Self::Mp4, "subtitle") => codec == "mov_text",
+            (Self::Mov, "video") => matches!(
+                codec,
+                "h264" | "hevc" | "av1" | "mpeg4" | "mjpeg" | "prores"
+            ),
+            (Self::Mov, "audio") => {
+                matches!(codec, "aac" | "alac" | "ac3" | "eac3" | "mp3" | "opus")
+                    || codec.starts_with("pcm_")
+            }
+            (Self::Mov, "subtitle") => codec == "mov_text",
+            (Self::WebM, "video") => matches!(codec, "vp8" | "vp9" | "av1"),
+            (Self::WebM, "audio") => matches!(codec, "opus" | "vorbis"),
+            (Self::WebM, "subtitle") => codec == "webvtt",
+            _ => false,
+        }
+    }
+}
+
 impl VideoCodec {
     pub const TARGETS: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
 
@@ -43,7 +134,7 @@ impl VideoCodec {
         }
     }
 
-    fn codec_name(self) -> Option<&'static str> {
+    pub(crate) fn codec_name(self) -> Option<&'static str> {
         match self {
             Self::Original => None,
             Self::H264 => Some("h264"),
@@ -54,43 +145,78 @@ impl VideoCodec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustomScaling {
+    FitPad,
+    Stretch,
+}
+
+impl CustomScaling {
+    pub const OPTIONS: [Self; 2] = [Self::FitPad, Self::Stretch];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FitPad => "Fit & pad",
+            Self::Stretch => "Stretch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomResolution {
+    pub width: u64,
+    pub height: u64,
+    pub scaling: CustomScaling,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoResolution {
     Original,
     P2160,
     P1440,
     P1080,
+    P960,
     P720,
     P480,
+    Custom(CustomResolution),
 }
 
 impl VideoResolution {
-    pub const PRESETS: [Self; 5] = [
+    pub const PRESETS: [Self; 6] = [
         Self::P2160,
         Self::P1440,
         Self::P1080,
+        Self::P960,
         Self::P720,
         Self::P480,
     ];
 
-    pub fn height(self) -> Option<u64> {
+    pub fn dimensions(self) -> Option<(u64, u64)> {
         match self {
             Self::Original => None,
-            Self::P2160 => Some(2160),
-            Self::P1440 => Some(1440),
-            Self::P1080 => Some(1080),
-            Self::P720 => Some(720),
-            Self::P480 => Some(480),
+            Self::P2160 => Some((3840, 2160)),
+            Self::P1440 => Some((2560, 1440)),
+            Self::P1080 => Some((1920, 1080)),
+            Self::P960 => Some((1920, 960)),
+            Self::P720 => Some((1280, 720)),
+            Self::P480 => Some((854, 480)),
+            Self::Custom(custom) => Some((custom.width, custom.height)),
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Original => "Original",
-            Self::P2160 => "2160p",
-            Self::P1440 => "1440p",
-            Self::P1080 => "1080p",
-            Self::P720 => "720p",
-            Self::P480 => "480p",
+            Self::Original => "Original".to_string(),
+            Self::Custom(custom) => format!(
+                "Custom ({}×{} · {})",
+                custom.width,
+                custom.height,
+                custom.scaling.label()
+            ),
+            preset => {
+                let (width, height) = preset.dimensions().unwrap();
+                let aspect_ratio = if preset == Self::P960 { "2:1" } else { "16:9" };
+                format!("{width}×{height} / {aspect_ratio}")
+            }
         }
     }
 }
@@ -121,6 +247,7 @@ impl Default for VideoSettings {
 pub struct EditRequest {
     pub path: PathBuf,
     pub destination: SaveDestination,
+    pub container: Option<ContainerFormat>,
     pub stream_order: Vec<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
@@ -170,6 +297,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
                 EditTarget {
                     source: &request.path,
                     destination: request.destination,
+                    container: request.container,
                 },
                 TrackEdits {
                     stream_order: &request.stream_order,
@@ -295,14 +423,45 @@ pub(crate) fn validate_edit(
                 "Encoding settings can only be applied to playable video tracks.".to_string(),
             );
         }
+        let source_width = stream_dimension(stream, "width");
         let source_height = stream_dimension(stream, "height");
-        if settings
-            .resolution
-            .height()
-            .zip(source_height)
-            .is_some_and(|(target, source)| target >= source)
-        {
-            return Err("The selected resolution must be lower than the original.".to_string());
+        match settings.resolution {
+            VideoResolution::Custom(custom) => {
+                if custom.width == 0
+                    || custom.height == 0
+                    || custom.width % 2 != 0
+                    || custom.height % 2 != 0
+                {
+                    return Err(
+                        "Custom width and height must be positive even numbers.".to_string()
+                    );
+                }
+                let Some((source_width, source_height)) = source_width.zip(source_height) else {
+                    return Err(
+                        "The source resolution is unavailable; custom scaling cannot be applied."
+                            .to_string(),
+                    );
+                };
+                if custom.width > source_width || custom.height > source_height {
+                    return Err("Upscaling isn't possible yet.".to_string());
+                }
+            }
+            VideoResolution::Original => {}
+            resolution => {
+                if resolution
+                    .dimensions()
+                    .zip(source_width.zip(source_height))
+                    .is_some_and(
+                        |((target_width, target_height), (source_width, source_height))| {
+                            target_width > source_width || target_height > source_height
+                        },
+                    )
+                {
+                    return Err(
+                        "The selected resolution must be lower than the original.".to_string()
+                    );
+                }
+            }
         }
         if settings.resolution != VideoResolution::Original
             && settings.codec == VideoCodec::Original
@@ -322,6 +481,140 @@ pub(crate) fn validate_edit(
         validate_deletion(info, deleted_streams)?;
     }
     Ok(())
+}
+
+pub(crate) fn container_conflicts(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &[SubtitleChange],
+    target: ContainerFormat,
+) -> Vec<String> {
+    container_conflict_entries(info, stream_order, video_settings, subtitle_changes, target)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+pub(crate) fn container_conflict_streams(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &[SubtitleChange],
+    target: ContainerFormat,
+) -> BTreeSet<u64> {
+    container_conflict_entries(info, stream_order, video_settings, subtitle_changes, target)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn container_conflict_entries(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &[SubtitleChange],
+    target: ContainerFormat,
+) -> Vec<(u64, String)> {
+    let mut conflicts = Vec::new();
+    for index in stream_order {
+        if subtitle_changes.iter().any(|change| {
+            change.source == SubtitleSource::Embedded(*index) && change.removes_from_media()
+        }) {
+            continue;
+        }
+        let Some(stream) = info
+            .streams
+            .iter()
+            .find(|stream| stream_index(stream) == Some(*index))
+        else {
+            continue;
+        };
+        let kind = stream_kind(stream).unwrap_or("other");
+        let source_codec = stream
+            .get("codec_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let codec = if kind == "video" && !is_attached_picture(stream) {
+            video_settings
+                .get(index)
+                .and_then(|settings| settings.codec.codec_name())
+                .unwrap_or(source_codec)
+        } else if kind == "subtitle" {
+            subtitle_changes
+                .iter()
+                .find_map(|change| match change.source {
+                    SubtitleSource::Embedded(source_index) if source_index == *index => {
+                        change.embedded_target.map(SubtitleFormat::ffmpeg_codec)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(source_codec)
+        } else {
+            source_codec
+        };
+        if target.supports_codec(kind, codec, is_attached_picture(stream)) {
+            continue;
+        }
+        conflicts.push((
+            *index,
+            container_conflict_message(target, *index, kind, codec),
+        ));
+    }
+    conflicts
+}
+
+fn container_conflict_message(
+    target: ContainerFormat,
+    index: u64,
+    kind: &str,
+    codec: &str,
+) -> String {
+    let codec = codec.to_ascii_uppercase();
+    let resolution = match kind {
+        "video" => {
+            let targets = VideoCodec::TARGETS
+                .into_iter()
+                .filter_map(|candidate| {
+                    let codec = candidate.codec_name()?;
+                    target
+                        .supports_codec("video", codec, false)
+                        .then_some(candidate.label())
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                "Choose another container or remove the track.".to_string()
+            } else {
+                format!("Encode it as {} or remove the track.", targets.join(" or "))
+            }
+        }
+        "subtitle" => {
+            let targets = SubtitleFormat::COMMON_TARGETS
+                .into_iter()
+                .filter(|candidate| {
+                    target.supports_codec("subtitle", candidate.ffmpeg_codec(), false)
+                })
+                .map(SubtitleFormat::label)
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                "Choose another container or remove the track.".to_string()
+            } else {
+                format!(
+                    "Convert it to {} or remove the track.",
+                    targets.join(" or ")
+                )
+            }
+        }
+        "audio" => {
+            "Audio conversion is not available; choose another container or remove the track."
+                .to_string()
+        }
+        _ => "Choose MKV or remove the track.".to_string(),
+    };
+    format!(
+        "{} can't contain {codec} {kind} track #{index}. {resolution}",
+        target.label()
+    )
 }
 
 fn validate_subtitle_sources(
@@ -400,6 +693,7 @@ fn apply_edits(
     } = edits;
     let path = target.source;
     let destination = target.destination;
+    let target_container = target.container;
     let source_metadata = fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EditError::SourceChanged(
@@ -433,14 +727,41 @@ fn apply_edits(
     .map_err(EditError::Failed)?;
     validate_subtitle_sources(&source_info, subtitle_changes, sidecars)
         .map_err(EditError::Failed)?;
+    let output_stream_order = stream_order
+        .iter()
+        .copied()
+        .filter(|index| {
+            !subtitle_changes.iter().any(|change| {
+                change.source == SubtitleSource::Embedded(*index) && change.removes_from_media()
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(container) = target_container {
+        let conflicts = container_conflicts(
+            &source_info,
+            &output_stream_order,
+            video_settings,
+            subtitle_changes,
+            container,
+        );
+        if !conflicts.is_empty() {
+            return Err(EditError::Failed(format!(
+                "The selected container is incompatible:\n{}",
+                conflicts.join("\n")
+            )));
+        }
+    }
     let duration = media_duration(&source_info);
+    let container_changed = target_container
+        .is_some_and(|container| ContainerFormat::from_path(path) != Some(container));
     let media_changed = media_changes_required(
         &source_info,
-        stream_order,
+        &output_stream_order,
         deleted_streams,
         default_streams,
         video_settings,
         subtitle_changes,
+        container_changed,
     );
     if media_changed {
         report_progress(duration.map(|_| 0.0));
@@ -486,23 +807,24 @@ fn apply_edits(
         }
         let mut publications = prepared.publications;
         resolve_export_duplicates(&mut publications, &workspace_path)?;
-        publish_transaction(None, &publications, cancelled)?;
+        publish_transaction(None, None, &publications, cancelled)?;
         return Ok(EditResult {
             output_path: path.to_path_buf(),
             media_changed: false,
         });
     }
-    let temporary = temporary_path(path).map_err(EditError::Failed)?;
+    let temporary = temporary_path(path, target_container).map_err(EditError::Failed)?;
     let mut cleanup = TempCleanup(Some(temporary.clone()));
     let output = run_ffmpeg(
         FfmpegPlan {
             source: path,
             temporary: &temporary,
             source_info: &source_info,
-            stream_order,
+            stream_order: &output_stream_order,
             default_streams,
             video_settings,
             replacements: &prepared.replacements,
+            container: target_container,
             duration,
             cancelled,
         },
@@ -520,7 +842,11 @@ fn apply_edits(
         return Err(EditError::Cancelled);
     }
     let output_info = media_info(&temporary).map_err(EditError::Failed)?;
-    let expected_count = stream_order.len();
+    if let Some(container) = target_container {
+        validate_output_container(&output_info, &temporary, container)
+            .map_err(EditError::Failed)?;
+    }
+    let expected_count = output_stream_order.len();
     if output_info.streams.len() != expected_count {
         return Err(EditError::Failed(format!(
             "The remuxed file has {} tracks; expected {expected_count}.",
@@ -530,7 +856,7 @@ fn apply_edits(
     validate_result(
         &source_info,
         &output_info,
-        stream_order,
+        &output_stream_order,
         default_streams,
         video_settings,
         &prepared.replacements,
@@ -566,16 +892,28 @@ fn apply_edits(
         SaveDestination::ReplaceOriginal => {
             let mut publications = prepared.publications.clone();
             resolve_export_duplicates(&mut publications, &workspace_path)?;
-            publish_transaction(Some((&temporary, path)), &publications, cancelled)?;
+            let replacement = replacement_path(path, target_container)?;
+            if replacement != path && replacement.exists() {
+                return Err(EditError::Failed(format!(
+                    "{} already exists; choose Create a copy or rename it.",
+                    replacement.display()
+                )));
+            }
+            publish_transaction(
+                Some((&temporary, &replacement)),
+                Some(path),
+                &publications,
+                cancelled,
+            )?;
             cleanup.0 = None;
-            path.to_path_buf()
+            replacement
         }
         SaveDestination::CreateCopy => {
-            let copy = next_copy_path(path)?;
+            let copy = next_copy_path(path, target_container)?;
             let mut publications =
                 retarget_publications_for_copy(&prepared.publications, path, &copy)?;
             resolve_export_duplicates(&mut publications, &workspace_path)?;
-            publish_transaction(Some((&temporary, &copy)), &publications, cancelled)?;
+            publish_transaction(Some((&temporary, &copy)), None, &publications, cancelled)?;
             cleanup.0 = None;
             copy
         }
@@ -600,6 +938,7 @@ fn media_changes_required(
     default_streams: &BTreeSet<u64>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &[SubtitleChange],
+    container_changed: bool,
 ) -> bool {
     let source_order = source_info
         .streams
@@ -612,7 +951,8 @@ fn media_changes_required(
         .filter(|stream| is_default(stream))
         .filter_map(stream_index)
         .collect::<BTreeSet<_>>();
-    source_order != stream_order
+    container_changed
+        || source_order != stream_order
         || !deleted_streams.is_empty()
         || source_defaults != *default_streams
         || !video_settings.is_empty()
@@ -734,26 +1074,20 @@ fn prepare_subtitle_changes(
                     .iter()
                     .find(|sidecar| &sidecar.path == path)
                     .expect("subtitle sources are validated before preparation");
-                let filename = sidecar_filename(
+                let base_filename = sidecar_filename(
                     media_stem,
                     &sidecar.language,
                     sidecar.forced,
                     sidecar.cc,
-                    sidecar.number,
+                    None,
                     target,
                 );
-                let destination = parent.join(filename);
-                if destination.exists()
-                    && !sidecar.source_paths().any(|source| source == &destination)
-                {
-                    return Err(EditError::Failed(format!(
-                        "{} already exists; no subtitle files were changed.",
-                        destination
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("The subtitle target")
-                    )));
-                }
+                let destination = sidecar_conversion_destination(
+                    &parent.join(base_filename),
+                    sidecar,
+                    target,
+                    &prepared.publications,
+                )?;
                 let staged = workspace.join(format!("sidecar-{job}.{}", target.extension()));
                 convert_subtitle(
                     ConversionInput::File(path),
@@ -771,6 +1105,48 @@ fn prepare_subtitle_changes(
         }
     }
     Ok(prepared)
+}
+
+fn sidecar_conversion_destination(
+    base: &Path,
+    sidecar: &SidecarEntry,
+    target: SubtitleFormat,
+    publications: &[Publication],
+) -> Result<PathBuf, EditError> {
+    if sidecar_destination_available(base, sidecar, target, publications) {
+        return Ok(base.to_path_buf());
+    }
+
+    let mut number = 2;
+    loop {
+        let candidate = numbered_subtitle_path(base, number)?;
+        if sidecar_destination_available(&candidate, sidecar, target, publications) {
+            return Ok(candidate);
+        }
+        number = number.checked_add(1).ok_or_else(|| {
+            EditError::Failed("Subtitle duplicate number is too large.".to_string())
+        })?;
+    }
+}
+
+fn sidecar_destination_available(
+    destination: &Path,
+    sidecar: &SidecarEntry,
+    target: SubtitleFormat,
+    publications: &[Publication],
+) -> bool {
+    std::iter::once(destination.to_path_buf())
+        .chain((target == SubtitleFormat::VobSub).then(|| destination.with_extension("idx")))
+        .all(|candidate| {
+            let replaces_source = sidecar.source_paths().any(|source| source == &candidate);
+            let reserved = publications.iter().any(|publication| {
+                publication
+                    .staged
+                    .iter()
+                    .any(|(_, published)| published == &candidate)
+            });
+            (!candidate.exists() || replaces_source) && !reserved
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -1015,6 +1391,7 @@ fn primary_video_resolution(info: &MediaInfo) -> Option<(u64, u64)> {
 struct EditTarget<'a> {
     source: &'a Path,
     destination: SaveDestination,
+    container: Option<ContainerFormat>,
 }
 
 #[derive(Clone, Copy)]
@@ -1027,9 +1404,9 @@ struct TrackEdits<'a> {
     sidecars: &'a [SidecarEntry],
 }
 
-fn next_copy_path(source: &Path) -> Result<PathBuf, EditError> {
+fn next_copy_path(source: &Path, container: Option<ContainerFormat>) -> Result<PathBuf, EditError> {
     for number in 1.. {
-        let candidate = copy_path(source, number).map_err(EditError::Failed)?;
+        let candidate = copy_path(source, number, container).map_err(EditError::Failed)?;
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -1191,6 +1568,7 @@ fn numbered_subtitle_path(path: &Path, number: usize) -> Result<PathBuf, EditErr
 
 fn publish_transaction(
     media: Option<(&Path, &Path)>,
+    removed_media: Option<&Path>,
     publications: &[Publication],
     cancelled: &AtomicBool,
 ) -> Result<(), EditError> {
@@ -1211,11 +1589,7 @@ fn publish_transaction(
         .iter()
         .flat_map(|publication| publication.remove.iter().cloned())
         .collect::<BTreeSet<_>>();
-    if let Some((_, destination)) = media
-        && destination.exists()
-    {
-        old_paths.insert(destination.to_path_buf());
-    }
+    old_paths.extend(removed_media.map(Path::to_path_buf));
     let destinations = media
         .into_iter()
         .map(|(_, destination)| destination.to_path_buf())
@@ -1290,7 +1664,11 @@ fn rollback_transaction(published: &[PathBuf], backups: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn copy_path(source: &Path, number: usize) -> Result<PathBuf, String> {
+fn copy_path(
+    source: &Path,
+    number: usize,
+    container: Option<ContainerFormat>,
+) -> Result<PathBuf, String> {
     let parent = source
         .parent()
         .ok_or_else(|| "The source file has no parent directory.".to_string())?;
@@ -1303,11 +1681,34 @@ fn copy_path(source: &Path, number: usize) -> Result<PathBuf, String> {
     } else {
         format!("-reel-edit-{number}")
     };
-    let name = match source.extension().and_then(|extension| extension.to_str()) {
+    let target_extension = container
+        .map(ContainerFormat::extension)
+        .or_else(|| source.extension().and_then(|extension| extension.to_str()));
+    let name = match target_extension {
         Some(extension) => format!("{stem}{suffix}.{extension}"),
         None => format!("{stem}{suffix}"),
     };
     Ok(parent.join(name))
+}
+
+fn replacement_path(
+    source: &Path,
+    container: Option<ContainerFormat>,
+) -> Result<PathBuf, EditError> {
+    if let Some(container) = container {
+        let parent = source.parent().ok_or_else(|| {
+            EditError::Failed("The source file has no parent directory.".to_string())
+        })?;
+        let stem = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                EditError::Failed("The source filename is not valid UTF-8.".to_string())
+            })?;
+        Ok(parent.join(format!("{stem}.{}", container.extension())))
+    } else {
+        Ok(source.to_path_buf())
+    }
 }
 
 fn source_matches_fingerprint(path: &Path, expected: FileFingerprint) -> std::io::Result<bool> {
@@ -1398,15 +1799,45 @@ fn validate_result(
                 "The encoded video track at position {position} has the wrong codec."
             ));
         }
-        if let Some(expected_height) = settings.resolution.height()
-            && stream_dimension(stream, "height") != Some(expected_height)
-        {
+        if !output_resolution_matches(stream, settings.resolution) {
             return Err(format!(
                 "The encoded video track at position {position} has the wrong resolution."
             ));
         }
     }
     Ok(())
+}
+
+fn validate_output_container(
+    output: &MediaInfo,
+    path: &Path,
+    expected: ContainerFormat,
+) -> Result<(), String> {
+    let extension_matches = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected.extension()));
+    let format_name = output
+        .format
+        .get("format_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format_matches = match expected {
+        ContainerFormat::Matroska | ContainerFormat::WebM => format_name
+            .split(',')
+            .any(|name| name == "matroska" || name == "webm"),
+        ContainerFormat::Mp4 | ContainerFormat::Mov => format_name
+            .split(',')
+            .any(|name| name == "mov" || name == "mp4"),
+    };
+    if extension_matches && format_matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "The completed file is not a valid {} container.",
+            expected.label()
+        ))
+    }
 }
 
 struct FfmpegOutput {
@@ -1429,6 +1860,7 @@ struct FfmpegPlan<'a> {
     default_streams: &'a BTreeSet<u64>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     replacements: &'a [SubtitleReplacement],
+    container: Option<ContainerFormat>,
     duration: Option<f64>,
     cancelled: &'a AtomicBool,
 }
@@ -1497,10 +1929,10 @@ fn run_ffmpeg(
                 .arg(quality)
                 .arg(format!("-preset:v:{video_output_index}"))
                 .arg(preset);
-            if let Some(height) = settings.resolution.height() {
+            if let Some(filter) = resolution_filter(settings.resolution) {
                 command
                     .arg(format!("-filter:v:{video_output_index}"))
-                    .arg(format!("scale=-2:{height}"));
+                    .arg(filter);
             }
         }
         video_output_index += 1;
@@ -1547,6 +1979,12 @@ fn run_ffmpeg(
                 },
             );
         }
+    }
+    if let Some(container) = plan.container {
+        if container == ContainerFormat::Mp4 {
+            command.args(["-movflags", "+faststart"]);
+        }
+        command.args(["-f", container.muxer()]);
     }
     command
         .arg(plan.temporary)
@@ -1611,19 +2049,25 @@ fn media_duration(info: &MediaInfo) -> Option<f64> {
         .filter(|duration| duration.is_finite() && *duration > 0.0)
 }
 
-fn temporary_path(path: &Path) -> Result<PathBuf, String> {
+fn temporary_path(path: &Path, container: Option<ContainerFormat>) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "The source file has no parent directory.".to_string())?;
-    let name = path
-        .file_name()
+    let stem = path
+        .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(|| "The source filename is not valid UTF-8.".to_string())?;
+    let extension = container
+        .map(ContainerFormat::extension)
+        .or_else(|| path.extension().and_then(|extension| extension.to_str()));
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Ok(parent.join(format!(".reel-tui-{nonce}-{name}")))
+    Ok(parent.join(match extension {
+        Some(extension) => format!(".reel-tui-{nonce}-{stem}.{extension}"),
+        None => format!(".reel-tui-{nonce}-{stem}"),
+    }))
 }
 
 fn temporary_workspace(path: &Path) -> Result<PathBuf, String> {
@@ -1693,6 +2137,46 @@ fn requires_transcode(stream: &BTreeMap<String, Value>, settings: VideoSettings)
             .is_some_and(|target| stream.get("codec_name").and_then(Value::as_str) != Some(target))
 }
 
+fn resolution_filter(resolution: VideoResolution) -> Option<String> {
+    match resolution {
+        VideoResolution::Original => None,
+        VideoResolution::Custom(custom) => {
+            let width = custom.width;
+            let height = custom.height;
+            Some(match custom.scaling {
+                CustomScaling::FitPad => format!(
+                    "scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+                ),
+                CustomScaling::Stretch => format!("scale={width}:{height},setsar=1"),
+            })
+        }
+        preset => preset.dimensions().map(|(width, height)| {
+            format!(
+                "scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+            )
+        }),
+    }
+}
+
+fn output_resolution_matches(
+    stream: &BTreeMap<String, Value>,
+    resolution: VideoResolution,
+) -> bool {
+    let width = stream_dimension(stream, "width");
+    let height = stream_dimension(stream, "height");
+    match resolution {
+        VideoResolution::Original => true,
+        VideoResolution::Custom(custom) => {
+            width == Some(custom.width) && height == Some(custom.height)
+        }
+        preset => preset
+            .dimensions()
+            .is_some_and(|(target_width, target_height)| {
+                width == Some(target_width) && height == Some(target_height)
+            }),
+    }
+}
+
 fn encoder_settings(codec: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match codec {
         "h264" => Some(("libx264", "22", "medium")),
@@ -1740,6 +2224,92 @@ mod tests {
 
     fn media(streams: Value) -> MediaInfo {
         MediaInfo::from_json(serde_json::json!({"streams": streams})).unwrap()
+    }
+
+    #[test]
+    fn container_format_should_detect_extensions_and_enforce_codec_compatibility() {
+        // Act
+        let matroska = ContainerFormat::from_path(Path::new("/videos/movie.MKV"));
+        let mp4 = ContainerFormat::from_path(Path::new("/videos/movie.m4v"));
+        let mov = ContainerFormat::from_path(Path::new("/videos/movie.mov"));
+        let webm = ContainerFormat::from_path(Path::new("/videos/movie.webm"));
+
+        // Assert
+        assert_that!(matroska).contains(ContainerFormat::Matroska);
+        assert_that!(mp4).contains(ContainerFormat::Mp4);
+        assert_that!(mov).contains(ContainerFormat::Mov);
+        assert_that!(webm).contains(ContainerFormat::WebM);
+        assert_that!(ContainerFormat::Mp4.supports_codec("video", "h264", false)).is_true();
+        assert_that!(ContainerFormat::Mp4.supports_codec("subtitle", "subrip", false)).is_false();
+        assert_that!(ContainerFormat::Mov.supports_codec("audio", "pcm_s16le", false)).is_true();
+        assert_that!(ContainerFormat::WebM.supports_codec("video", "h264", false)).is_false();
+        assert_that!(ContainerFormat::WebM.supports_codec("video", "av1", false)).is_true();
+    }
+
+    #[test]
+    fn container_conflicts_should_consider_final_order_and_staged_conversions() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            {"index": 3, "codec_type": "subtitle", "codec_name": "ass"}
+        ]));
+        let video_settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        )]);
+        let subtitle_changes = [SubtitleChange {
+            source: SubtitleSource::Embedded(2),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: Some(SubtitleFormat::MovText),
+            export_target: None,
+            ocr_language: None,
+        }];
+
+        // Act
+        let conflicts = container_conflicts(
+            &info,
+            &[0, 1, 2],
+            &video_settings,
+            &subtitle_changes,
+            ContainerFormat::Mp4,
+        );
+
+        // Assert
+        assert_that!(conflicts).is_empty();
+    }
+
+    #[test]
+    fn container_conflicts_should_ignore_an_incompatible_subtitle_staged_for_export() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+        ]));
+        let subtitle_changes = [SubtitleChange {
+            source: SubtitleSource::Embedded(2),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: Some(SubtitleFormat::SubRip),
+            ocr_language: None,
+        }];
+
+        // Act
+        let conflicts = container_conflicts(
+            &info,
+            &[0, 1, 2],
+            &BTreeMap::new(),
+            &subtitle_changes,
+            ContainerFormat::Mp4,
+        );
+
+        // Assert
+        assert_that!(conflicts).is_empty();
     }
 
     #[test]
@@ -1919,7 +2489,7 @@ mod tests {
     fn validate_edit_should_reject_resizing_an_unsupported_original_codec() {
         // Arrange
         let info = media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "ffv1", "width": 640, "height": 512}
+            {"index": 0, "codec_type": "video", "codec_name": "ffv1", "width": 1280, "height": 1024}
         ]));
         let settings = BTreeMap::from([(
             0,
@@ -1939,16 +2509,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_edit_should_reject_a_resolution_that_would_upscale() {
+    fn validate_edit_should_reject_a_preset_that_would_upscale_either_dimension() {
         // Arrange
         let info = media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 640, "height": 360}
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1000, "height": 800}
         ]));
         let settings = BTreeMap::from([(
             0,
             VideoSettings {
                 codec: VideoCodec::Original,
-                resolution: VideoResolution::P480,
+                resolution: VideoResolution::P720,
             },
         )]);
 
@@ -1958,6 +2528,127 @@ mod tests {
         // Assert
         assert_that!(result)
             .contains_error("The selected resolution must be lower than the original.".to_string());
+    }
+
+    #[test]
+    fn validate_edit_should_reject_custom_upscaling_in_either_dimension() {
+        for (width, height) in [(1922, 720), (1280, 1082)] {
+            // Arrange
+            let info = media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+            ]));
+            let settings = BTreeMap::from([(
+                0,
+                VideoSettings {
+                    codec: VideoCodec::Original,
+                    resolution: VideoResolution::Custom(CustomResolution {
+                        width,
+                        height,
+                        scaling: CustomScaling::FitPad,
+                    }),
+                },
+            )]);
+
+            // Act
+            let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+
+            // Assert
+            assert_that!(result).contains_error("Upscaling isn't possible yet.".to_string());
+        }
+    }
+
+    #[test]
+    fn validate_edit_should_reject_odd_custom_dimensions() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ]));
+        let settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Original,
+                resolution: VideoResolution::Custom(CustomResolution {
+                    width: 1279,
+                    height: 720,
+                    scaling: CustomScaling::FitPad,
+                }),
+            },
+        )]);
+
+        // Act
+        let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+
+        // Assert
+        assert_that!(result)
+            .contains_error("Custom width and height must be positive even numbers.".to_string());
+    }
+
+    #[test]
+    fn resolution_filter_should_generate_each_custom_scaling_mode() {
+        // Act
+        let preset = resolution_filter(VideoResolution::P720);
+        let fit_pad = resolution_filter(VideoResolution::Custom(CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::FitPad,
+        }));
+        let stretch = resolution_filter(VideoResolution::Custom(CustomResolution {
+            width: 1280,
+            height: 720,
+            scaling: CustomScaling::Stretch,
+        }));
+        // Assert
+        assert_that!(preset.as_deref()).contains(
+            "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+        );
+        assert_that!(fit_pad.as_deref()).contains(
+            "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+        );
+        assert_that!(stretch.as_deref()).contains("scale=1280:720,setsar=1");
+    }
+
+    #[test]
+    fn output_resolution_should_require_exact_custom_and_preset_dimensions() {
+        // Arrange
+        let exact = BTreeMap::from([
+            ("width".to_string(), Value::from(1280)),
+            ("height".to_string(), Value::from(720)),
+        ]);
+        let bounded = BTreeMap::from([
+            ("width".to_string(), Value::from(960)),
+            ("height".to_string(), Value::from(720)),
+        ]);
+
+        // Act / Assert
+        assert_that!(output_resolution_matches(
+            &exact,
+            VideoResolution::Custom(CustomResolution {
+                width: 1280,
+                height: 720,
+                scaling: CustomScaling::FitPad,
+            }),
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &exact,
+            VideoResolution::Custom(CustomResolution {
+                width: 1280,
+                height: 720,
+                scaling: CustomScaling::Stretch,
+            }),
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &bounded,
+            VideoResolution::Custom(CustomResolution {
+                width: 1280,
+                height: 720,
+                scaling: CustomScaling::FitPad,
+            }),
+        ))
+        .is_false();
+        assert_that!(output_resolution_matches(&exact, VideoResolution::P720)).is_true();
+        assert_that!(output_resolution_matches(&bounded, VideoResolution::P720)).is_false();
     }
 
     #[test]
@@ -2047,6 +2738,7 @@ mod tests {
             EditTarget {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
+                container: None,
             },
             TrackEdits {
                 stream_order: &[1, 0, 3],
@@ -2105,6 +2797,87 @@ mod tests {
     }
 
     #[test]
+    fn apply_edits_should_create_a_valid_mp4_copy_when_only_the_container_changes() {
+        // Arrange
+        if !Command::new("ffmpeg")
+            .args(["-v", "error", "-h", "encoder=aac"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-container-copy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Act
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::CreateCopy,
+                container: Some(ContainerFormat::Mp4),
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0, 1]),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let output_info = media_info(&output.output_path).unwrap();
+
+        // Assert
+        assert_that!(source.exists()).is_true();
+        assert_that!(output.output_path.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("movie-reel-edit.mp4");
+        assert_that!(output_info.format["format_name"].as_str().unwrap()).contains("mp4");
+        assert_that!(output_info.streams[0]["codec_name"].as_str()).contains("mpeg4");
+        assert_that!(output_info.streams[1]["codec_name"].as_str()).contains("aac");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn apply_edits_should_create_an_edited_copy_without_changing_the_source() {
         // Arrange
         if !Command::new("ffmpeg")
@@ -2133,7 +2906,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=640x512:r=1:d=1",
+                "color=c=black:s=1280x1024:r=1:d=1",
                 "-f",
                 "lavfi",
                 "-i",
@@ -2164,6 +2937,7 @@ mod tests {
             EditTarget {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
+                container: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -2186,8 +2960,92 @@ mod tests {
         assert_that!(source_info.streams[0]["codec_name"].as_str()).contains("ffv1");
         assert_that!(info.streams[0]["codec_name"].as_str()).contains("h264");
         assert_that!(info.streams[0]["height"].as_u64()).contains(480);
-        assert_that!(info.streams[0]["width"].as_u64()).contains(600);
+        assert_that!(info.streams[0]["width"].as_u64()).contains(854);
         assert_that!(info.streams[1]["codec_name"].as_str()).contains("pcm_s16le");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_honor_each_custom_scaling_mode() {
+        // Arrange
+        if !Command::new("ffmpeg")
+            .args(["-v", "error", "-h", "encoder=libx264"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-custom-scale-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("custom-scale.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=white:s=64x48:r=1:d=1",
+                "-c:v",
+                "libx264",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        for (scaling, expected_width, expected_height) in [
+            (CustomScaling::FitPad, 32, 18),
+            (CustomScaling::Stretch, 32, 18),
+        ] {
+            let settings = BTreeMap::from([(
+                0,
+                VideoSettings {
+                    codec: VideoCodec::Original,
+                    resolution: VideoResolution::Custom(CustomResolution {
+                        width: 32,
+                        height: 18,
+                        scaling,
+                    }),
+                },
+            )]);
+
+            // Act
+            let output = apply_edits(
+                EditTarget {
+                    source: &source,
+                    destination: SaveDestination::CreateCopy,
+                    container: None,
+                },
+                TrackEdits {
+                    stream_order: &[0],
+                    deleted_streams: &BTreeSet::new(),
+                    default_streams: &BTreeSet::new(),
+                    video_settings: &settings,
+                    subtitle_changes: &[],
+                    sidecars: &[],
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+            let info = media_info(&output.output_path).unwrap();
+
+            // Assert
+            assert_that!(info.streams[0]["width"].as_u64()).contains(expected_width);
+            assert_that!(info.streams[0]["height"].as_u64()).contains(expected_height);
+        }
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -2263,6 +3121,7 @@ mod tests {
             EditTarget {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
+                container: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -2292,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_edits_should_export_original_codec_when_only_export_is_checked() {
+    fn apply_edits_should_export_and_remove_incompatible_subtitle_during_mp4_conversion() {
         // Arrange
         if Command::new("ffmpeg")
             .arg("-version")
@@ -2338,7 +3197,7 @@ mod tests {
                 "-map",
                 "1:0",
                 "-c:v",
-                "ffv1",
+                "mpeg4",
                 "-c:s",
                 "subrip",
                 "-metadata:s:s:0",
@@ -2355,18 +3214,18 @@ mod tests {
             export_target: Some(SubtitleFormat::SubRip),
             ocr_language: None,
         }];
-        let source_before = fs::read(&source).unwrap();
 
         // Act
         let result = apply_edits(
             EditTarget {
                 source: &source,
-                destination: SaveDestination::ReplaceOriginal,
+                destination: SaveDestination::CreateCopy,
+                container: Some(ContainerFormat::Mp4),
             },
             TrackEdits {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
-                default_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 sidecars: &[],
@@ -2375,14 +3234,16 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        let media = media_info(&source).unwrap();
-        let exported = directory.join("original.eng.srt");
+        let media = media_info(&result.output_path).unwrap();
+        let exported = directory.join("original-reel-edit.eng.srt");
 
         // Assert
-        assert_that!(media.streams[1]["codec_name"].as_str()).contains("subrip");
-        assert_that!(result.media_changed).is_false();
-        assert_that!(result.output_path).is_equal_to(source.clone());
-        assert_that!(fs::read(&source).unwrap()).is_equal_to(source_before);
+        assert_that!(source.exists()).is_true();
+        assert_that!(result.media_changed).is_true();
+        assert_that!(result.output_path.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("original-reel-edit.mp4");
+        assert_that!(media.streams.len()).is_equal_to(1);
+        assert_that!(media.streams[0]["codec_name"].as_str()).contains("mpeg4");
         assert_that!(exported.exists()).is_true();
         assert_that!(fs::read_to_string(exported).unwrap()).contains("Original codec");
 
@@ -2391,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_edits_should_replace_matching_text_sidecar_after_validation() {
+    fn apply_edits_should_drop_source_number_when_converted_target_has_no_duplicate() {
         // Arrange
         if Command::new("ffmpeg")
             .arg("-version")
@@ -2413,7 +3274,7 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let source = directory.join("movie.mkv");
-        let sidecar_path = directory.join("movie.eng.srt");
+        let sidecar_path = directory.join("movie.eng.2.srt");
         let status = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -2438,12 +3299,12 @@ mod tests {
         let sidecar = SidecarEntry {
             path: sidecar_path.clone(),
             companion: None,
-            display_name: "movie.eng.srt".to_string(),
+            display_name: "movie.eng.2.srt".to_string(),
             format: SubtitleFormat::SubRip,
             language: "eng".to_string(),
             forced: false,
             cc: false,
-            number: None,
+            number: Some(2),
             fingerprint: FileFingerprint::for_path(&sidecar_path).unwrap(),
             companion_fingerprint: None,
         };
@@ -2461,6 +3322,7 @@ mod tests {
             EditTarget {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
+                container: None,
             },
             TrackEdits {
                 stream_order: &[0],
@@ -2488,6 +3350,121 @@ mod tests {
     }
 
     #[test]
+    fn apply_edits_should_number_converted_sidecar_when_matching_target_already_exists() {
+        // Arrange
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-sidecar-collision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let existing_path = directory.join("movie.eng.srt");
+        let ass_path = directory.join("movie.eng.ass");
+        let numbered_path = directory.join("movie.eng.2.srt");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x240:d=1",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        fs::write(
+            &existing_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nExisting subtitle\n",
+        )
+        .unwrap();
+        fs::write(
+            &ass_path,
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:00.80,Default,,0,0,0,,Converted subtitle\n",
+        )
+        .unwrap();
+        let existing_sidecar = SidecarEntry {
+            path: existing_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&existing_path).unwrap(),
+            companion_fingerprint: None,
+        };
+        let ass_sidecar = SidecarEntry {
+            path: ass_path.clone(),
+            companion: None,
+            display_name: "movie.eng.ass".to_string(),
+            format: SubtitleFormat::Ass,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&ass_path).unwrap(),
+            companion_fingerprint: None,
+        };
+        let changes = [SubtitleChange {
+            source: SubtitleSource::Sidecar(ass_path.clone()),
+            source_format: SubtitleFormat::Ass,
+            embedded_target: Some(SubtitleFormat::SubRip),
+            export_target: None,
+            ocr_language: None,
+        }];
+        let sidecars = [existing_sidecar, ass_sidecar];
+
+        // Act
+        let result = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+            },
+            TrackEdits {
+                stream_order: &[0],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &changes,
+                sidecars: &sidecars,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert
+        assert_that!(result.media_changed).is_false();
+        assert_that!(ass_path.exists()).is_false();
+        assert_that!(fs::read_to_string(&existing_path).unwrap()).contains("Existing subtitle");
+        assert_that!(fs::read_to_string(&numbered_path).unwrap()).contains("Converted subtitle");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn publish_copy_should_increment_the_suffix_instead_of_overwriting_a_copy() {
         // Arrange
         let directory = std::env::temp_dir().join(format!(
@@ -2507,14 +3484,113 @@ mod tests {
         fs::write(&existing, b"existing copy").unwrap();
 
         // Act
-        let output = next_copy_path(&source).unwrap();
-        publish_transaction(Some((&temporary, &output)), &[], &AtomicBool::new(false)).unwrap();
+        let output = next_copy_path(&source, None).unwrap();
+        publish_transaction(
+            Some((&temporary, &output)),
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         // Assert
         assert_that!(output.file_name().unwrap().to_str().unwrap())
             .is_equal_to("video-reel-edit-2.mkv");
         assert_that!(fs::read(&existing).unwrap()).is_equal_to(b"existing copy".to_vec());
         assert_that!(fs::read(&output).unwrap()).is_equal_to(b"new copy".to_vec());
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn copy_path_should_use_the_target_container_extension() {
+        // Arrange
+        let source = Path::new("/videos/movie.mkv");
+
+        // Act
+        let first = copy_path(source, 1, Some(ContainerFormat::Mp4)).unwrap();
+        let second = copy_path(source, 2, Some(ContainerFormat::WebM)).unwrap();
+
+        // Assert
+        assert_that!(first).is_equal_to(PathBuf::from("/videos/movie-reel-edit.mp4"));
+        assert_that!(second).is_equal_to(PathBuf::from("/videos/movie-reel-edit-2.webm"));
+    }
+
+    #[test]
+    fn cross_extension_replacement_should_publish_target_and_remove_source_transactionally() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cross-extension-replace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let staged = directory.join(".reel-tui-movie.mp4");
+        let target = directory.join("movie.mp4");
+        fs::write(&source, b"old media").unwrap();
+        fs::write(&staged, b"new media").unwrap();
+
+        // Act
+        publish_transaction(
+            Some((&staged, &target)),
+            Some(&source),
+            &[],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        // Assert
+        assert_that!(source.exists()).is_false();
+        assert_that!(staged.exists()).is_false();
+        assert_that!(fs::read(&target).unwrap()).is_equal_to(b"new media".to_vec());
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cross_extension_replacement_should_preserve_every_file_when_target_exists() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cross-extension-collision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let staged = directory.join(".reel-tui-movie.mp4");
+        let target = directory.join("movie.mp4");
+        fs::write(&source, b"old media").unwrap();
+        fs::write(&staged, b"new media").unwrap();
+        fs::write(&target, b"existing target").unwrap();
+
+        // Act
+        let result = publish_transaction(
+            Some((&staged, &target)),
+            Some(&source),
+            &[],
+            &AtomicBool::new(false),
+        );
+
+        // Assert
+        let Err(EditError::Failed(error)) = result else {
+            panic!("existing target should reject the transaction");
+        };
+        assert_that!(error).is_equal_to(format!(
+            "{} already exists; no files were changed.",
+            target.display()
+        ));
+        assert_that!(fs::read(&source).unwrap()).is_equal_to(b"old media".to_vec());
+        assert_that!(fs::read(&staged).unwrap()).is_equal_to(b"new media".to_vec());
+        assert_that!(fs::read(&target).unwrap()).is_equal_to(b"existing target".to_vec());
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -2544,7 +3620,7 @@ mod tests {
 
         // Act
         resolve_export_duplicates(&mut publications, &workspace).unwrap();
-        publish_transaction(None, &publications, &AtomicBool::new(false)).unwrap();
+        publish_transaction(None, None, &publications, &AtomicBool::new(false)).unwrap();
 
         // Assert
         assert_that!(base.exists()).is_false();
@@ -2558,12 +3634,92 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_conversion_destination_should_use_next_free_number_when_duplicates_exist() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-sidecar-next-number-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.eng.ass");
+        let base = directory.join("movie.eng.srt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&base, b"first").unwrap();
+        fs::write(directory.join("movie.eng.2.srt"), b"second").unwrap();
+        let sidecar = SidecarEntry {
+            path: source.clone(),
+            companion: None,
+            display_name: "movie.eng.ass".to_string(),
+            format: SubtitleFormat::Ass,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&source).unwrap(),
+            companion_fingerprint: None,
+        };
+
+        // Act
+        let destination =
+            sidecar_conversion_destination(&base, &sidecar, SubtitleFormat::SubRip, &[]).unwrap();
+
+        // Assert
+        assert_that!(destination).is_equal_to(directory.join("movie.eng.3.srt"));
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sidecar_conversion_destination_should_drop_source_number_when_target_has_no_duplicate() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-sidecar-drop-number-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.eng.2.srt");
+        let base = directory.join("movie.eng.ass");
+        fs::write(&source, b"source").unwrap();
+        let sidecar = SidecarEntry {
+            path: source.clone(),
+            companion: None,
+            display_name: "movie.eng.2.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: Some(2),
+            fingerprint: FileFingerprint::for_path(&source).unwrap(),
+            companion_fingerprint: None,
+        };
+
+        // Act
+        let destination =
+            sidecar_conversion_destination(&base, &sidecar, SubtitleFormat::Ass, &[]).unwrap();
+
+        // Assert
+        assert_that!(destination).is_equal_to(base);
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn copy_path_should_support_files_without_an_extension() {
         // Arrange
         let source = Path::new("/videos/movie");
 
         // Act
-        let output = copy_path(source, 1).unwrap();
+        let output = copy_path(source, 1, None).unwrap();
 
         // Assert
         assert_that!(output).is_equal_to(PathBuf::from("/videos/movie-reel-edit"));

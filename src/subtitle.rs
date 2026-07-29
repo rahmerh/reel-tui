@@ -141,11 +141,18 @@ pub struct SubtitleChange {
 }
 
 impl SubtitleChange {
+    pub fn removes_from_media(&self) -> bool {
+        matches!(self.source, SubtitleSource::Embedded(_))
+            && self.embedded_target.is_none()
+            && self.export_target.is_some()
+    }
+
     pub fn changes_media(&self) -> bool {
         matches!(self.source, SubtitleSource::Embedded(_))
-            && self
-                .embedded_target
-                .is_some_and(|target| target != self.source_format)
+            && (self.removes_from_media()
+                || self
+                    .embedded_target
+                    .is_some_and(|target| target != self.source_format))
     }
 
     pub fn has_effect(&self) -> bool {

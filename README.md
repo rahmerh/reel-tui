@@ -25,13 +25,18 @@ TODO
 ## Features
 
 - Inspect container, duration, file size, bitrate, and chapter count
+- Convert the container between MKV, MP4, MOV, and WebM while preserving
+  compatible tracks; incompatible tracks are explained and must be resolved
+  before saving
 - View video, audio, subtitle, and other tracks grouped by type
 - Reorder tracks, choose default tracks, and remove unwanted tracks
 - Apply track edits without re-encoding by remuxing with `ffmpeg`
-- Change individual video tracks to H.264, HEVC, or AV1 and downscale their resolution
-- Discover matching `movie.<language>.<format>` subtitle sidecars beneath embedded tracks
-- For embedded subtitles, choose **Convert in container** to remux to another
-  codec or **Export sidecar** to write the selected codec beside the media
+- Change individual video tracks to H.264, HEVC, or AV1 and downscale with presets
+  or an exact custom resolution using padding, stretching, or aspect-ratio fitting
+- Nest matching `movie.<language>.<format>` subtitle sidecars below their media
+  file and show them beneath embedded tracks
+- For embedded subtitles, choose a codec and independently check **Export
+  sidecar**; a changed codec is used for both the container and exported file
 - Convert sidecars between SRT, ASS, WebVTT, TTML, PGS, and VobSub when the
   required tools are available; sidecar-only changes do not remux the media
 - OCR PGS/VobSub to text with `seconv` and Tesseract, or render text subtitles
@@ -39,3 +44,5 @@ TODO
   matching installed language data, with English or the first available
   language as fallback
 - Stage and validate media and subtitle outputs before publishing them together
+- Replace the source by default after the new extension and container have been
+  validated, or save container changes as a new file
