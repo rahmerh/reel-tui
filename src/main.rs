@@ -17,11 +17,15 @@ use files::spawn_directory_monitor;
 use probe::spawn_probe_worker;
 
 fn main() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let directory_rx = spawn_directory_monitor(cwd.clone());
+    let target_dir = match std::env::args().nth(1) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::env::current_dir()?,
+    };
+    let target_dir = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
+    let directory_rx = spawn_directory_monitor(target_dir.clone());
     let (request_tx, result_rx) = spawn_probe_worker();
     let (edit_tx, edit_rx) = spawn_edit_worker();
-    let mut app = App::new(cwd, request_tx, edit_tx)?;
+    let mut app = App::new(target_dir, request_tx, edit_tx)?;
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {
