@@ -1737,7 +1737,7 @@ fn publish_transaction(
             continue;
         }
         let backup = backup_parent.join(format!("transaction-backup-{number}"));
-        if let Err(error) = fs::rename(old, &backup) {
+        if let Err(error) = move_or_copy_file(old, &backup) {
             rollback_transaction(&[], &backups);
             return Err(EditError::Failed(format!(
                 "Could not stage existing file for replacement: {error}"
@@ -1756,7 +1756,7 @@ fn publish_transaction(
                 .flat_map(|publication| publication.staged.iter().cloned()),
         );
     for (staged, destination) in staged_pairs {
-        if let Err(error) = fs::rename(&staged, &destination) {
+        if let Err(error) = move_or_copy_file(&staged, &destination) {
             rollback_transaction(&published, &backups);
             return Err(EditError::Failed(format!(
                 "Could not publish the completed edit: {error}"
@@ -1767,6 +1767,15 @@ fn publish_transaction(
     for (backup, _) in backups {
         let _ = fs::remove_file(backup);
     }
+    Ok(())
+}
+
+fn move_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dst)?;
+    let _ = fs::remove_file(src);
     Ok(())
 }
 
@@ -2276,9 +2285,15 @@ fn media_duration(info: &MediaInfo) -> Option<f64> {
 }
 
 fn temporary_path(path: &Path, container: Option<ContainerFormat>) -> Result<PathBuf, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "The source file has no parent directory.".to_string())?;
+    let parent = if crate::mount::is_network_mount(path) {
+        let scratch = std::env::temp_dir().join("reel-tui-scratch");
+        let _ = fs::create_dir_all(&scratch);
+        scratch
+    } else {
+        path.parent()
+            .ok_or_else(|| "The source file has no parent directory.".to_string())?
+            .to_path_buf()
+    };
     let stem = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -2297,9 +2312,15 @@ fn temporary_path(path: &Path, container: Option<ContainerFormat>) -> Result<Pat
 }
 
 fn temporary_workspace(path: &Path) -> Result<PathBuf, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "The source file has no parent directory.".to_string())?;
+    let parent = if crate::mount::is_network_mount(path) {
+        let scratch = std::env::temp_dir().join("reel-tui-scratch");
+        let _ = fs::create_dir_all(&scratch);
+        scratch
+    } else {
+        path.parent()
+            .ok_or_else(|| "The source file has no parent directory.".to_string())?
+            .to_path_buf()
+    };
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

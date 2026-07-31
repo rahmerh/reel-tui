@@ -11,6 +11,7 @@ use notify::{RecursiveMode, Watcher};
 
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const NETWORK_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileFingerprint {
@@ -52,12 +53,15 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
         if display_name.starts_with(".reel-tui-") {
             continue;
         }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if !metadata.is_file() {
-            continue;
-        }
         files.push(FileEntry {
             path: entry.path(),
             display_name,
@@ -87,6 +91,13 @@ pub fn spawn_directory_monitor(directory: PathBuf) -> Receiver<DirectorySnapshot
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
 
     std::thread::spawn(move || {
+        let is_network = crate::mount::is_network_mount(&directory);
+        let reconcile_interval = if is_network {
+            NETWORK_RECONCILE_INTERVAL
+        } else {
+            RECONCILE_INTERVAL
+        };
+
         let (event_tx, event_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(event_tx).ok();
         if let Some(watcher) = watcher.as_mut() {
@@ -106,7 +117,7 @@ pub fn spawn_directory_monitor(directory: PathBuf) -> Receiver<DirectorySnapshot
                 }
             }
 
-            match event_rx.recv_timeout(RECONCILE_INTERVAL) {
+            match event_rx.recv_timeout(reconcile_interval) {
                 Ok(_) => {
                     let mut quiet_since = Instant::now();
                     loop {
@@ -118,7 +129,7 @@ pub fn spawn_directory_monitor(directory: PathBuf) -> Receiver<DirectorySnapshot
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => std::thread::sleep(RECONCILE_INTERVAL),
+                Err(RecvTimeoutError::Disconnected) => std::thread::sleep(reconcile_interval),
             }
         }
     });

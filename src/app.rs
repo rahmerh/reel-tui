@@ -319,6 +319,8 @@ pub struct App {
     original_stream_order: Vec<u64>,
     original_default_streams: BTreeSet<u64>,
     sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
+    pub is_network_mount: bool,
+    pub disk_cache: crate::cache::DiskCache,
 }
 
 impl App {
@@ -327,6 +329,18 @@ impl App {
         request_tx: Sender<ProbeRequest>,
         edit_tx: Sender<EditRequest>,
     ) -> Result<Self> {
+        let is_network_mount = crate::mount::is_network_mount(&directory);
+        let disk_cache = crate::cache::DiskCache::load();
+        let mut in_memory_cache = HashMap::new();
+        for (path, entry) in &disk_cache.entries {
+            let key = CacheKey {
+                path: path.clone(),
+                length: entry.length,
+                modified: entry.modified,
+            };
+            in_memory_cache.insert(key, entry.outcome.clone());
+        }
+
         let mut app = Self {
             directory,
             files: Vec::new(),
@@ -367,10 +381,12 @@ impl App {
             edit_cancel: None,
             generation: 0,
             pending_since: None,
-            cache: HashMap::new(),
+            cache: in_memory_cache,
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
             sidecars_by_media: HashMap::new(),
+            is_network_mount,
+            disk_cache,
         };
         let snapshot = match scan_directory(&app.directory) {
             Ok(files) => DirectorySnapshot::Files(files),
@@ -656,6 +672,13 @@ impl App {
             };
             if self.files.iter().any(|file| key.matches_file(file)) {
                 self.cache.insert(key, response.outcome.clone());
+                self.disk_cache.insert(
+                    response.path.clone(),
+                    response.fingerprint.length,
+                    response.fingerprint.modified,
+                    response.outcome.clone(),
+                );
+                let _ = self.disk_cache.save();
             }
             if response.generation == self.generation
                 && self.selected_file().is_some_and(|file| {

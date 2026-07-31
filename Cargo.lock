@@ -1144,6 +1144,7 @@ dependencies = [
  "kernal",
  "notify",
  "ratatui",
+ "serde",
  "serde_json",
 ]
 

@@ -70,7 +70,11 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
             ))
         })
         .collect();
-    let title = format!(" Files ({}) ", app.files.len());
+    let title = if app.is_network_mount {
+        format!(" Files ({}) [NET] ", app.files.len())
+    } else {
+        format!(" Files ({}) ", app.files.len())
+    };
     let list = List::new(items)
         .block(
             Block::default()
@@ -221,20 +225,31 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let directory = app.directory.to_string_lossy();
+    let net_tag = if app.is_network_mount {
+        " [Network Mode]"
+    } else {
+        ""
+    };
     let hint = " ? keybinds ";
     let available = area.width as usize;
-    let directory_width = available.saturating_sub(hint.len());
+    let directory_width = available.saturating_sub(hint.len() + net_tag.len());
     let directory = truncate(&directory, directory_width);
     let padding = " ".repeat(
         available
             .saturating_sub(directory.chars().count())
-            .saturating_sub(hint.len()),
+            .saturating_sub(hint.len())
+            .saturating_sub(net_tag.len()),
     );
-    let line = Line::from(vec![
-        Span::styled(directory, Style::default().fg(Color::DarkGray)),
-        Span::raw(padding),
-        Span::styled(hint, Style::default().fg(Color::Cyan)),
-    ]);
+    let mut spans = vec![Span::styled(
+        directory,
+        Style::default().fg(Color::DarkGray),
+    )];
+    if app.is_network_mount {
+        spans.push(Span::styled(net_tag, Style::default().fg(Color::Yellow)));
+    }
+    spans.push(Span::raw(padding));
+    spans.push(Span::styled(hint, Style::default().fg(Color::Cyan)));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -2431,6 +2446,39 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn render_footer_should_include_network_mode_tag_only_when_in_network_mode() {
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx).unwrap();
+
+        app.is_network_mount = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| render_footer(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("[Network Mode]"));
+
+        app.is_network_mount = false;
+        terminal
+            .draw(|frame| render_footer(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content_local = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!content_local.contains("[Network Mode]"));
+    }
 
     #[test]
     fn truncate_should_keep_tail_with_ellipsis_when_value_exceeds_width() {

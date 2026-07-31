@@ -24,14 +24,16 @@ pub struct ProbeResponse {
     pub outcome: ProbeOutcome,
 }
 
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ProbeOutcome {
     Video(MediaInfo),
     NotVideo(String),
     Error(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub format: BTreeMap<String, Value>,
     pub streams: Vec<BTreeMap<String, Value>>,
@@ -68,25 +70,27 @@ impl MediaInfo {
 }
 
 pub(crate) fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-of",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-show_chapters",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "ffprobe was not found in PATH. Install FFmpeg to inspect media.".to_string()
-            } else {
-                format!("Could not start ffprobe: {error}")
-            }
-        })?;
+    let is_network = crate::mount::is_network_mount(path);
+    let mut command = Command::new("ffprobe");
+    command.args([
+        "-v",
+        "error",
+        "-of",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+    ]);
+    if is_network {
+        command.args(["-probesize", "2000000", "-analyzeduration", "3000000"]);
+    }
+    let output = command.arg(path).output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "ffprobe was not found in PATH. Install FFmpeg to inspect media.".to_string()
+        } else {
+            format!("Could not start ffprobe: {error}")
+        }
+    })?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if detail.is_empty() {
@@ -157,19 +161,21 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
 }
 
 pub(crate) fn probe_file(path: &Path) -> ProbeOutcome {
-    let output = match Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-of",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-show_chapters",
-        ])
-        .arg(path)
-        .output()
-    {
+    let is_network = crate::mount::is_network_mount(path);
+    let mut command = Command::new("ffprobe");
+    command.args([
+        "-v",
+        "error",
+        "-of",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+    ]);
+    if is_network {
+        command.args(["-probesize", "2000000", "-analyzeduration", "3000000"]);
+    }
+    let output = match command.arg(path).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ProbeOutcome::Error(

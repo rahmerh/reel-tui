@@ -1,6 +1,8 @@
 mod app;
+mod cache;
 mod edit;
 mod files;
+mod mount;
 mod probe;
 mod subtitle;
 mod ui;
