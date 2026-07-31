@@ -261,6 +261,14 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.move_selected_stream(1);
         }
+        (KeyCode::Char('h'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
+            input.reset_sequence();
+            app.transfer_subtitle(-1);
+        }
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
+            input.reset_sequence();
+            app.transfer_subtitle(1);
+        }
         (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.open_stream_details();
@@ -319,6 +327,7 @@ fn is_back_key(key: KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::subtitle::SubtitleSource;
     use std::{
         fs,
         path::PathBuf,
@@ -516,6 +525,38 @@ mod tests {
         assert_eq!(app.layer, Layer::Streams);
         handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
         assert_eq!(app.layer, Layer::Files);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ctrl_h_and_ctrl_l_should_trigger_transfer_subtitle() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = 2;
+        let mut input = InputState::default();
+
+        // Act - Ctrl+l: Mark for export
+        handle_key(&mut app, &mut input, ctrl('l'));
+        let source = SubtitleSource::Embedded(1);
+        assert!(app.subtitle_changes.contains_key(&source));
+
+        // Act - Ctrl+h: Cancel export
+        handle_key(&mut app, &mut input, ctrl('h'));
+        assert!(!app.subtitle_changes.contains_key(&source));
 
         // Cleanup
         drop(app);

@@ -36,6 +36,11 @@ jobs:
             exit 1
           fi
 
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:

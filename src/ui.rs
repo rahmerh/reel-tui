@@ -13,14 +13,13 @@ use serde_json::Value;
 use crate::{
     app::{
         App, CancelEditChoice, ContainerChoice, CustomResolutionField, Dialog, Layer,
-        SaveDialogField, SubtitleSettingsField, TrackRef, VideoSettingsField, VideoSettingsMode,
+        SaveDialogField, TrackRef, VideoSettingsField, VideoSettingsMode,
     },
     edit::{ContainerFormat, SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     subtitle::{SidecarEntry, SubtitleFormat, SubtitleSource, stream_cc, stream_forced},
 };
 
-const MIN_SUBTITLE_COLUMN_WIDTH: u16 = 38;
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -204,13 +203,8 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn subtitle_columns_fit(content_width: u16, embedded: usize, external: usize) -> bool {
-    embedded > 0
-        && external > 0
-        && content_width
-            >= MIN_SUBTITLE_COLUMN_WIDTH
-                .saturating_mul(2)
-                .saturating_add(SUBTITLE_COLUMN_GUTTER)
+fn subtitle_columns_fit(_content_width: u16, embedded: usize, external: usize) -> bool {
+    embedded > 0 || external > 0
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -332,30 +326,53 @@ fn media_text(
         }
     }
 
-    let embedded_subtitles = order
-        .iter()
-        .filter_map(|index| {
-            let stream = info
-                .streams
-                .iter()
-                .find(|stream| stream_index(stream) == Some(*index))?;
-            let selection_index = rows
-                .iter()
-                .position(|row| *row == TrackRef::Embedded(*index))?;
-            (string(stream, "codec_type") == Some("subtitle")).then_some((selection_index, stream))
-        })
-        .collect::<Vec<_>>();
-    let external_subtitles = sidecars
-        .iter()
-        .enumerate()
-        .map(|(sidecar_index, sidecar)| {
-            let selection_index = rows
-                .iter()
-                .position(|row| *row == TrackRef::Sidecar(sidecar_index))
-                .unwrap_or(0);
-            (selection_index, sidecar)
-        })
-        .collect::<Vec<_>>();
+    enum SubtitleRowItem<'a> {
+        Stream(usize, &'a std::collections::BTreeMap<String, Value>),
+        Sidecar(usize, &'a SidecarEntry),
+    }
+
+    let is_exported = |index: u64| {
+        subtitle_changes
+            .get(&SubtitleSource::Embedded(index))
+            .is_some_and(|c| c.export_target.is_some())
+    };
+    let is_imported = |sidecar: &SidecarEntry| {
+        subtitle_changes
+            .get(&SubtitleSource::Sidecar(sidecar.path.clone()))
+            .is_some_and(|c| c.import_into_media)
+    };
+
+    let mut left_subtitles = Vec::new();
+    let mut right_subtitles = Vec::new();
+
+    for (selection_index, row) in rows.iter().enumerate() {
+        match row {
+            TrackRef::Embedded(index) => {
+                if let Some(stream) = info
+                    .streams
+                    .iter()
+                    .find(|stream| stream_index(stream) == Some(*index))
+                    && string(stream, "codec_type") == Some("subtitle")
+                {
+                    if is_exported(*index) {
+                        right_subtitles.push(SubtitleRowItem::Stream(selection_index, stream));
+                    } else {
+                        left_subtitles.push(SubtitleRowItem::Stream(selection_index, stream));
+                    }
+                }
+            }
+            TrackRef::Sidecar(sidecar_index) => {
+                if let Some(sidecar) = sidecars.get(*sidecar_index) {
+                    if is_imported(sidecar) {
+                        left_subtitles.push(SubtitleRowItem::Sidecar(selection_index, sidecar));
+                    } else {
+                        right_subtitles.push(SubtitleRowItem::Sidecar(selection_index, sidecar));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     if subtitle_columns_side_by_side {
         if !lines.is_empty() {
@@ -363,20 +380,19 @@ fn media_text(
         }
         lines.push(subtitle_columns_line(
             Line::styled(
-                format!("Embedded subtitles ({})", embedded_subtitles.len()),
+                format!("Embedded subtitles ({})", left_subtitles.len()),
                 Style::default().fg(Color::Cyan).bold(),
             ),
             Line::styled(
-                format!("External subtitles ({})", external_subtitles.len()),
+                format!("External subtitles ({})", right_subtitles.len()),
                 Style::default().fg(Color::Cyan).bold(),
             ),
             subtitle_column_width,
         ));
-        let count = embedded_subtitles.len().max(external_subtitles.len());
+        let count = left_subtitles.len().max(right_subtitles.len());
         for row in 0..count {
-            let left = embedded_subtitles
-                .get(row)
-                .map(|(selection_index, stream)| {
+            let left = left_subtitles.get(row).map(|item| match item {
+                SubtitleRowItem::Stream(selection_index, stream) => {
                     if selected == Some(*selection_index) {
                         selected_line = Some(lines.len());
                     }
@@ -390,10 +406,8 @@ fn media_text(
                             .is_some_and(|index| conflicting_streams.contains(&index)),
                         stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                     )
-                });
-            let right = external_subtitles
-                .get(row)
-                .map(|(selection_index, sidecar)| {
+                }
+                SubtitleRowItem::Sidecar(selection_index, sidecar) => {
                     if selected == Some(*selection_index) {
                         selected_line = Some(lines.len());
                     }
@@ -403,7 +417,36 @@ fn media_text(
                         subtitle_changes
                             .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
                     )
-                });
+                }
+            });
+            let right = right_subtitles.get(row).map(|item| match item {
+                SubtitleRowItem::Stream(selection_index, stream) => {
+                    if selected == Some(*selection_index) {
+                        selected_line = Some(lines.len());
+                    }
+                    stream_line(
+                        stream,
+                        *selection_index,
+                        selected == Some(*selection_index),
+                        stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                        stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                        stream_index(stream)
+                            .is_some_and(|index| conflicting_streams.contains(&index)),
+                        stream_index(stream).is_some_and(|index| defaults.contains(&index)),
+                    )
+                }
+                SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                    if selected == Some(*selection_index) {
+                        selected_line = Some(lines.len());
+                    }
+                    sidecar_line(
+                        sidecar,
+                        selected == Some(*selection_index),
+                        subtitle_changes
+                            .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                    )
+                }
+            });
             lines.push(subtitle_optional_columns_line(
                 left,
                 right,
@@ -411,40 +454,76 @@ fn media_text(
             ));
         }
     } else {
-        if !embedded_subtitles.is_empty() {
+        if !left_subtitles.is_empty() {
             section(
                 &mut lines,
-                &format!("Embedded subtitles ({})", embedded_subtitles.len()),
+                &format!("Embedded subtitles ({})", left_subtitles.len()),
             );
-            for (selection_index, stream) in embedded_subtitles {
-                if selected == Some(selection_index) {
-                    selected_line = Some(lines.len());
+            for item in &left_subtitles {
+                match item {
+                    SubtitleRowItem::Stream(selection_index, stream) => {
+                        if selected == Some(*selection_index) {
+                            selected_line = Some(lines.len());
+                        }
+                        lines.push(stream_line(
+                            stream,
+                            *selection_index,
+                            selected == Some(*selection_index),
+                            stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                            stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                            stream_index(stream)
+                                .is_some_and(|index| conflicting_streams.contains(&index)),
+                            stream_index(stream).is_some_and(|index| defaults.contains(&index)),
+                        ));
+                    }
+                    SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                        if selected == Some(*selection_index) {
+                            selected_line = Some(lines.len());
+                        }
+                        lines.push(sidecar_line(
+                            sidecar,
+                            selected == Some(*selection_index),
+                            subtitle_changes
+                                .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                        ));
+                    }
                 }
-                lines.push(stream_line(
-                    stream,
-                    selection_index,
-                    selected == Some(selection_index),
-                    stream_index(stream).is_some_and(|index| deleted.contains(&index)),
-                    stream_index(stream).is_some_and(|index| changed.contains(&index)),
-                    stream_index(stream).is_some_and(|index| conflicting_streams.contains(&index)),
-                    stream_index(stream).is_some_and(|index| defaults.contains(&index)),
-                ));
             }
         }
-        if !external_subtitles.is_empty() {
+        if !right_subtitles.is_empty() {
             section(
                 &mut lines,
-                &format!("External subtitles ({})", external_subtitles.len()),
+                &format!("External subtitles ({})", right_subtitles.len()),
             );
-            for (selection_index, sidecar) in external_subtitles {
-                if selected == Some(selection_index) {
-                    selected_line = Some(lines.len());
+            for item in &right_subtitles {
+                match item {
+                    SubtitleRowItem::Stream(selection_index, stream) => {
+                        if selected == Some(*selection_index) {
+                            selected_line = Some(lines.len());
+                        }
+                        lines.push(stream_line(
+                            stream,
+                            *selection_index,
+                            selected == Some(*selection_index),
+                            stream_index(stream).is_some_and(|index| deleted.contains(&index)),
+                            stream_index(stream).is_some_and(|index| changed.contains(&index)),
+                            stream_index(stream)
+                                .is_some_and(|index| conflicting_streams.contains(&index)),
+                            stream_index(stream).is_some_and(|index| defaults.contains(&index)),
+                        ));
+                    }
+                    SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                        if selected == Some(*selection_index) {
+                            selected_line = Some(lines.len());
+                        }
+                        lines.push(sidecar_line(
+                            sidecar,
+                            selected == Some(*selection_index),
+                            subtitle_changes
+                                .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                        ));
+                    }
                 }
-                lines.push(sidecar_line(
-                    sidecar,
-                    selected == Some(selection_index),
-                    subtitle_changes.contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
-                ));
             }
         }
     }
@@ -928,7 +1007,11 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
         "Changes",
         Style::default().fg(Color::Cyan).bold(),
     )];
-    lines.extend(summary.into_iter().map(Line::from));
+    lines.extend(
+        summary
+            .into_iter()
+            .map(|item| Line::from(format!("• {item}"))),
+    );
     lines.push(Line::from(""));
 
     if app.media_will_change() {
@@ -1068,6 +1151,11 @@ fn keybindings_text() -> Text<'static> {
         "Ctrl-j / Ctrl-k",
         "Move track down / up within its type",
     );
+    keybinding(
+        &mut lines,
+        "Ctrl-h / Ctrl-l",
+        "Mark subtitle for import / export",
+    );
     keybinding(&mut lines, "a", "Make track the default for its type");
     keybinding(
         &mut lines,
@@ -1124,8 +1212,12 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
             .style(Style::default().fg(Color::Cyan).bold()),
         rows[0],
     );
+    let label = app
+        .edit_progress_label
+        .clone()
+        .unwrap_or_else(|| app.processing_description());
     frame.render_widget(
-        Paragraph::new(processing_info_line(app.processing_description())).centered(),
+        Paragraph::new(processing_info_line(label)).centered(),
         rows[2],
     );
 
@@ -1383,46 +1475,27 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         .find(|choice| codec_selected(choice))
         .map(|choice| choice.label.as_str())
         .unwrap_or_else(|| popup.source_format.label());
-    let sidecar = matches!(popup.source, SubtitleSource::Sidecar(_));
-    let exporting = change.is_some_and(|change| change.export_target.is_some());
-    let importing = change.is_some_and(|change| change.import_into_media);
     let mut lines = vec![setting_line(
         "Codec",
         codec_label,
-        popup.field == SubtitleSettingsField::Codec,
+        true,
         change.is_some_and(|change| change.embedded_target.is_some()),
     )];
-    if !sidecar {
-        lines.push(subtitle_export_line(
-            exporting,
-            popup.field == SubtitleSettingsField::Export,
-        ));
-    } else {
-        lines.push(subtitle_import_line(
-            importing,
-            popup.field == SubtitleSettingsField::Import,
-        ));
-    }
 
     if popup.dropdown_open {
         lines.push(Line::from(""));
-        match popup.field {
-            SubtitleSettingsField::Codec => {
-                for (position, choice) in codec_choices.iter().enumerate() {
-                    let label = match &choice.reason {
-                        Some(reason) => format!("{} — {reason}", choice.label),
-                        None => choice.label.clone(),
-                    };
-                    lines.push(subtitle_codec_line(
-                        &label,
-                        position == popup.codec_cursor,
-                        codec_staged(choice),
-                        choice.enabled,
-                        choice.current,
-                    ));
-                }
-            }
-            SubtitleSettingsField::Export | SubtitleSettingsField::Import => {}
+        for (position, choice) in codec_choices.iter().enumerate() {
+            let label = match &choice.reason {
+                Some(reason) => format!("{} — {reason}", choice.label),
+                None => choice.label.clone(),
+            };
+            lines.push(subtitle_codec_line(
+                &label,
+                position == popup.codec_cursor,
+                codec_staged(choice),
+                choice.enabled,
+                choice.current,
+            ));
         }
     }
     let title = match &popup.source {
@@ -1449,32 +1522,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn subtitle_export_line(checked: bool, focused: bool) -> Line<'static> {
-    subtitle_checkbox_line("Export", checked, focused)
-}
-
-fn subtitle_import_line(checked: bool, focused: bool) -> Line<'static> {
-    subtitle_checkbox_line("Import", checked, focused)
-}
-
-fn subtitle_checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{label:<12}"),
-            Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
-        ),
-        Span::styled(if checked { "[x]" } else { "[ ]" }, {
-            if focused {
-                focused_style(checked)
-            } else if checked {
-                changed_style()
-            } else {
-                Style::default().fg(Color::White)
-            }
-        }),
-    ])
 }
 
 fn setting_line(label: &str, value: &str, selected: bool, changed: bool) -> Line<'static> {
@@ -2559,12 +2606,12 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_columns_should_only_share_a_row_when_both_fit() {
+    fn subtitle_columns_should_always_share_a_row_when_subtitles_exist() {
         // Act / Assert
-        assert_that!(subtitle_columns_fit(77, 2, 2)).is_false();
-        assert_that!(subtitle_columns_fit(78, 2, 2)).is_true();
-        assert_that!(subtitle_columns_fit(120, 0, 2)).is_false();
-        assert_that!(subtitle_columns_fit(120, 2, 0)).is_false();
+        assert_that!(subtitle_columns_fit(10, 2, 2)).is_true();
+        assert_that!(subtitle_columns_fit(10, 0, 2)).is_true();
+        assert_that!(subtitle_columns_fit(10, 2, 0)).is_true();
+        assert_that!(subtitle_columns_fit(10, 0, 0)).is_false();
     }
 
     #[test]
@@ -2586,17 +2633,6 @@ mod tests {
         assert_that!(line.to_string()).is_equal_to("…ed subtitle  …al subtitle".to_string());
         assert_that!(line.spans[0].style.fg).contains(Color::Yellow);
         assert_that!(line.spans[2].style.fg).contains(Color::Cyan);
-    }
-
-    #[test]
-    fn subtitle_import_line_should_show_checked_and_focused_state() {
-        // Act
-        let line = subtitle_import_line(true, true);
-
-        // Assert
-        assert_that!(line.to_string()).is_equal_to("Import      [x]".to_string());
-        assert_that!(line.spans[0].style.fg).contains(Color::Cyan);
-        assert_that!(line.spans[1].style.bg).contains(Color::Cyan);
     }
 
     #[test]
@@ -3590,37 +3626,6 @@ mod tests {
         assert_eq!(staged_cursor.spans[0].style.bg, Some(Color::Cyan));
         assert!(
             staged_cursor.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
-    }
-
-    #[test]
-    fn subtitle_export_line_should_render_an_independent_checkbox() {
-        // Act
-        let unchecked = subtitle_export_line(false, true);
-        let checked = subtitle_export_line(true, false);
-
-        // Assert
-        assert_that!(unchecked.to_string())
-            .contains("Export      [ ]")
-            .does_not_contain("Export sidecar");
-        assert_that!(checked.to_string())
-            .contains("Export      [x]")
-            .does_not_contain("Export sidecar");
-        assert!(unchecked.to_string().starts_with("Export"));
-        assert_eq!(unchecked.spans[1].style.fg, Some(Color::White));
-        assert_eq!(unchecked.spans[1].style.bg, Some(Color::Cyan));
-        assert_eq!(checked.spans[1].style.fg, Some(Color::Yellow));
-        assert!(
-            checked.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
-        assert!(
-            !unchecked.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::ITALIC)

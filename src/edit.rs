@@ -15,6 +15,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
+    app::TrackRef,
     files::FileFingerprint,
     probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_any_file, probe_file},
     subtitle::{
@@ -253,6 +254,7 @@ pub struct EditRequest {
     pub default_streams: BTreeSet<u64>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub subtitle_changes: Vec<SubtitleChange>,
+    pub left_subtitle_order: Vec<TrackRef>,
     pub sidecars: Vec<SidecarEntry>,
     pub cancelled: Arc<AtomicBool>,
 }
@@ -314,19 +316,12 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
                     default_streams: &request.default_streams,
                     video_settings: &request.video_settings,
                     subtitle_changes: &request.subtitle_changes,
+                    left_subtitle_order: &request.left_subtitle_order,
                     sidecars: &request.sidecars,
                 },
                 &request.cancelled,
-                |progress| {
-                    let _ = progress_tx.send(EditEvent::Progress {
-                        progress,
-                        label: if request.video_settings.is_empty() {
-                            "Remuxing with ffmpeg…"
-                        } else {
-                            "Transcoding with ffmpeg…"
-                        }
-                        .to_string(),
-                    });
+                |progress, label| {
+                    let _ = progress_tx.send(EditEvent::Progress { progress, label });
                 },
             );
             let outcome = match result {
@@ -729,10 +724,11 @@ fn apply_edits(
     target: EditTarget<'_>,
     edits: TrackEdits<'_>,
     cancelled: &AtomicBool,
-    mut report_progress: impl FnMut(Option<f64>),
+    mut report_progress: impl FnMut(Option<f64>, String),
 ) -> Result<EditResult, EditError> {
     let TrackEdits {
         stream_order,
+        left_subtitle_order,
         deleted_streams,
         default_streams,
         video_settings,
@@ -829,7 +825,7 @@ fn apply_edits(
         container_changed,
     );
     if media_changed {
-        report_progress(duration.map(|_| 0.0));
+        report_progress(duration.map(|_| 0.0), "Preparing media edits…".to_string());
     }
 
     if cancelled.load(Ordering::Relaxed) {
@@ -847,6 +843,7 @@ fn apply_edits(
         sidecars,
         &workspace_path,
         cancelled,
+        &mut report_progress,
     )?;
     if !media_changed {
         validate_subtitle_sources(&source_info, subtitle_changes, sidecars).map_err(|_| {
@@ -872,12 +869,26 @@ fn apply_edits(
         }
         let mut publications = prepared.publications;
         resolve_export_duplicates(&mut publications, &workspace_path)?;
+        report_progress(None, "Publishing media output…".to_string());
         publish_transaction(None, None, &publications, cancelled)?;
         return Ok(EditResult {
             output_path: path.to_path_buf(),
             media_changed: false,
         });
     }
+
+    let ffmpeg_label = if let Some((_, settings)) = video_settings.iter().next() {
+        let codec_name = match settings.codec {
+            VideoCodec::Original => "video",
+            c => c.label(),
+        };
+        format!("Transcoding video to {codec_name}…")
+    } else if let Some(container) = target_container {
+        format!("Converting container to {}…", container.label())
+    } else {
+        "Remuxing media with ffmpeg…".to_string()
+    };
+
     let temporary = temporary_path(path, target_container).map_err(EditError::Failed)?;
     let mut cleanup = TempCleanup(Some(temporary.clone()));
     let output = run_ffmpeg(
@@ -886,15 +897,17 @@ fn apply_edits(
             temporary: &temporary,
             source_info: &source_info,
             stream_order: &output_stream_order,
+            left_subtitle_order,
             default_streams,
             video_settings,
             replacements: &prepared.replacements,
             imports: &prepared.imports,
+            sidecars,
             container: target_container,
             duration,
             cancelled,
         },
-        &mut report_progress,
+        &mut |progress| report_progress(progress, ffmpeg_label.clone()),
     )?;
     if !output.status.success() {
         return Err(EditError::Failed(command_error(
@@ -902,7 +915,10 @@ fn apply_edits(
             &output.stderr,
         )));
     }
-    report_progress(duration.map(|_| 0.98));
+    report_progress(
+        duration.map(|_| 0.98),
+        "Finishing media output…".to_string(),
+    );
 
     if cancelled.load(Ordering::Relaxed) {
         return Err(EditError::Cancelled);
@@ -923,10 +939,12 @@ fn apply_edits(
         &source_info,
         &output_info,
         &output_stream_order,
+        left_subtitle_order,
         default_streams,
         video_settings,
         &prepared.replacements,
         &prepared.imports,
+        sidecars,
     )
     .map_err(EditError::Failed)?;
     validate_subtitle_sources(&source_info, subtitle_changes, sidecars).map_err(|_| {
@@ -955,6 +973,8 @@ fn apply_edits(
     if cancelled.load(Ordering::Relaxed) {
         return Err(EditError::Cancelled);
     }
+
+    report_progress(None, "Publishing media output…".to_string());
     let output_path = match destination {
         SaveDestination::ReplaceOriginal => {
             let mut publications = prepared.publications.clone();
@@ -985,7 +1005,7 @@ fn apply_edits(
             copy
         }
     };
-    report_progress(Some(1.0));
+    report_progress(Some(1.0), "Finished.".to_string());
     Ok(EditResult {
         output_path,
         media_changed: true,
@@ -1035,6 +1055,7 @@ struct SubtitleReplacement {
 
 #[derive(Clone, Debug)]
 struct SubtitleImport {
+    source_path: PathBuf,
     target: SubtitleFormat,
     path: PathBuf,
     language: String,
@@ -1062,6 +1083,7 @@ fn prepare_subtitle_changes(
     sidecars: &[SidecarEntry],
     workspace: &Path,
     cancelled: &AtomicBool,
+    report_progress: &mut dyn FnMut(Option<f64>, String),
 ) -> Result<PreparedSubtitles, EditError> {
     let mut prepared = PreparedSubtitles::default();
     let media_stem = media_path
@@ -1090,6 +1112,17 @@ fn prepare_subtitle_changes(
                     .expect("subtitle sources are validated before preparation");
                 let mut replacement_artifact = None;
                 if let Some(target) = change.embedded_target {
+                    if change.needs_ocr() {
+                        report_progress(
+                            None,
+                            format!("Performing OCR on subtitle track #{index}…"),
+                        );
+                    } else {
+                        report_progress(
+                            None,
+                            format!("Converting subtitle track #{index} to {}…", target.label()),
+                        );
+                    }
                     let staged =
                         workspace.join(format!("embedded-{job}-{}.{}", index, target.extension()));
                     convert_subtitle(
@@ -1111,6 +1144,10 @@ fn prepare_subtitle_changes(
                     });
                 }
                 if let Some(target) = change.export_target {
+                    report_progress(
+                        None,
+                        format!("Exporting subtitle track #{index} as {}…", target.label()),
+                    );
                     let filename = sidecar_filename(
                         media_stem,
                         &stream_language(stream),
@@ -1150,6 +1187,11 @@ fn prepare_subtitle_changes(
                     .expect("subtitle sources are validated before preparation");
                 if change.import_into_media {
                     let target = change.embedded_target.unwrap_or(change.source_format);
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("sidecar");
+                    report_progress(None, format!("Importing {filename}…"));
                     let staged = workspace.join(format!("import-{job}.{}", target.extension()));
                     if target == change.source_format {
                         copy_subtitle_artifact(path, &staged, target)?;
@@ -1165,6 +1207,7 @@ fn prepare_subtitle_changes(
                     let input = subtitle_input_path(&staged, target);
                     validate_subtitle_output(&input, target)?;
                     prepared.imports.push(SubtitleImport {
+                        source_path: path.clone(),
                         target,
                         path: input,
                         language: sidecar.language.clone(),
@@ -1180,6 +1223,14 @@ fn prepare_subtitle_changes(
                 let target = change
                     .embedded_target
                     .expect("sidecar changes have a conversion target");
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("sidecar");
+                report_progress(
+                    None,
+                    format!("Converting {filename} to {}…", target.label()),
+                );
                 let base_filename = sidecar_filename(
                     media_stem,
                     &sidecar.language,
@@ -1516,6 +1567,7 @@ struct TrackEdits<'a> {
     default_streams: &'a BTreeSet<u64>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     subtitle_changes: &'a [SubtitleChange],
+    left_subtitle_order: &'a [TrackRef],
     sidecars: &'a [SidecarEntry],
 }
 
@@ -1855,53 +1907,132 @@ enum OutputTrack {
 fn output_track_plan(
     source: &MediaInfo,
     stream_order: &[u64],
-    import_count: usize,
+    left_subtitle_order: &[TrackRef],
+    subtitle_imports: &[SubtitleImport],
+    sidecars: &[SidecarEntry],
 ) -> Vec<OutputTrack> {
-    let insert_at = stream_order
-        .iter()
-        .rposition(|index| {
-            source
-                .streams
-                .iter()
-                .find(|stream| stream_index(stream) == Some(*index))
-                .is_some_and(|stream| stream_kind(stream) == Some("subtitle"))
-        })
-        .map(|position| position + 1)
-        .unwrap_or_else(|| {
-            stream_order
-                .iter()
-                .position(|index| {
-                    source
-                        .streams
-                        .iter()
-                        .find(|stream| stream_index(stream) == Some(*index))
-                        .is_some_and(|stream| {
-                            !matches!(stream_kind(stream), Some("video" | "audio"))
-                        })
-                })
-                .unwrap_or(stream_order.len())
-        });
-    let mut tracks = Vec::with_capacity(stream_order.len() + import_count);
-    for (position, index) in stream_order.iter().enumerate() {
-        if position == insert_at {
-            tracks.extend((0..import_count).map(OutputTrack::Imported));
+    if left_subtitle_order.is_empty() {
+        let insert_at = stream_order
+            .iter()
+            .rposition(|index| {
+                source
+                    .streams
+                    .iter()
+                    .find(|stream| stream_index(stream) == Some(*index))
+                    .is_some_and(|stream| stream_kind(stream) == Some("subtitle"))
+            })
+            .map(|position| position + 1)
+            .unwrap_or_else(|| {
+                stream_order
+                    .iter()
+                    .position(|index| {
+                        source
+                            .streams
+                            .iter()
+                            .find(|stream| stream_index(stream) == Some(*index))
+                            .is_some_and(|stream| {
+                                !matches!(stream_kind(stream), Some("video" | "audio"))
+                            })
+                    })
+                    .unwrap_or(stream_order.len())
+            });
+        let mut tracks = Vec::with_capacity(stream_order.len() + subtitle_imports.len());
+        for (position, index) in stream_order.iter().enumerate() {
+            if position == insert_at {
+                tracks.extend((0..subtitle_imports.len()).map(OutputTrack::Imported));
+            }
+            tracks.push(OutputTrack::Existing(*index));
         }
-        tracks.push(OutputTrack::Existing(*index));
+        if insert_at == stream_order.len() {
+            tracks.extend((0..subtitle_imports.len()).map(OutputTrack::Imported));
+        }
+        return tracks;
     }
-    if insert_at == stream_order.len() {
-        tracks.extend((0..import_count).map(OutputTrack::Imported));
+
+    let mut tracks = Vec::with_capacity(stream_order.len() + subtitle_imports.len());
+
+    for index in stream_order {
+        if let Some(stream) = source
+            .streams
+            .iter()
+            .find(|stream| stream_index(stream) == Some(*index))
+            && matches!(stream_kind(stream), Some("video" | "audio"))
+        {
+            tracks.push(OutputTrack::Existing(*index));
+        }
     }
+
+    let mut placed_embedded_subtitles = BTreeSet::new();
+    let mut placed_imports = BTreeSet::new();
+
+    for track in left_subtitle_order {
+        match track {
+            TrackRef::Embedded(index) => {
+                if stream_order.contains(index)
+                    && source.streams.iter().any(|stream| {
+                        stream_index(stream) == Some(*index)
+                            && stream_kind(stream) == Some("subtitle")
+                    })
+                {
+                    tracks.push(OutputTrack::Existing(*index));
+                    placed_embedded_subtitles.insert(*index);
+                }
+            }
+            TrackRef::Sidecar(sidecar_index) => {
+                if let Some(sidecar) = sidecars.get(*sidecar_index)
+                    && let Some(import_idx) = subtitle_imports
+                        .iter()
+                        .position(|import| import.source_path == sidecar.path)
+                    && !placed_imports.contains(&import_idx)
+                {
+                    tracks.push(OutputTrack::Imported(import_idx));
+                    placed_imports.insert(import_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for index in stream_order {
+        if source.streams.iter().any(|stream| {
+            stream_index(stream) == Some(*index) && stream_kind(stream) == Some("subtitle")
+        }) && !placed_embedded_subtitles.contains(index)
+        {
+            tracks.push(OutputTrack::Existing(*index));
+        }
+    }
+
+    for import_idx in 0..subtitle_imports.len() {
+        if !placed_imports.contains(&import_idx) {
+            tracks.push(OutputTrack::Imported(import_idx));
+        }
+    }
+
+    for index in stream_order {
+        if let Some(stream) = source
+            .streams
+            .iter()
+            .find(|stream| stream_index(stream) == Some(*index))
+            && !matches!(stream_kind(stream), Some("video" | "audio" | "subtitle"))
+        {
+            tracks.push(OutputTrack::Existing(*index));
+        }
+    }
+
     tracks
 }
 
+#[expect(clippy::too_many_arguments)]
 fn validate_result(
     source: &MediaInfo,
     output: &MediaInfo,
     stream_order: &[u64],
+    left_subtitle_order: &[TrackRef],
     default_streams: &BTreeSet<u64>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_replacements: &[SubtitleReplacement],
     subtitle_imports: &[SubtitleImport],
+    sidecars: &[SidecarEntry],
 ) -> Result<(), String> {
     let has_video = output
         .streams
@@ -1910,7 +2041,13 @@ fn validate_result(
     if !has_video {
         return Err("The remuxed file has no playable video track.".to_string());
     }
-    let output_tracks = output_track_plan(source, stream_order, subtitle_imports.len());
+    let output_tracks = output_track_plan(
+        source,
+        stream_order,
+        left_subtitle_order,
+        subtitle_imports,
+        sidecars,
+    );
     let expected_kinds = output_tracks
         .iter()
         .filter_map(|track| match track {
@@ -2055,10 +2192,12 @@ struct FfmpegPlan<'a> {
     temporary: &'a Path,
     source_info: &'a MediaInfo,
     stream_order: &'a [u64],
+    left_subtitle_order: &'a [TrackRef],
     default_streams: &'a BTreeSet<u64>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     replacements: &'a [SubtitleReplacement],
     imports: &'a [SubtitleImport],
+    sidecars: &'a [SidecarEntry],
     container: Option<ContainerFormat>,
     duration: Option<f64>,
     cancelled: &'a AtomicBool,
@@ -2087,7 +2226,13 @@ fn run_ffmpeg(
     for import in plan.imports {
         command.arg("-i").arg(&import.path);
     }
-    let output_tracks = output_track_plan(plan.source_info, plan.stream_order, plan.imports.len());
+    let output_tracks = output_track_plan(
+        plan.source_info,
+        plan.stream_order,
+        plan.left_subtitle_order,
+        plan.imports,
+        plan.sidecars,
+    );
     for track in &output_tracks {
         match track {
             OutputTrack::Existing(index) => {
@@ -2612,8 +2757,27 @@ mod tests {
             {"index": 3, "codec_type": "attachment"}
         ]));
 
+        let dummy_imports = vec![
+            SubtitleImport {
+                source_path: PathBuf::new(),
+                target: SubtitleFormat::SubRip,
+                path: PathBuf::new(),
+                language: "eng".to_string(),
+                forced: false,
+                cc: false,
+            },
+            SubtitleImport {
+                source_path: PathBuf::new(),
+                target: SubtitleFormat::SubRip,
+                path: PathBuf::new(),
+                language: "eng".to_string(),
+                forced: false,
+                cc: false,
+            },
+        ];
+
         // Act
-        let tracks = output_track_plan(&info, &[0, 1, 2, 3], 2);
+        let tracks = output_track_plan(&info, &[0, 1, 2, 3], &[], &dummy_imports, &[]);
 
         // Assert
         assert_eq!(
@@ -2637,9 +2801,17 @@ mod tests {
             {"index": 1, "codec_type": "audio"},
             {"index": 2, "codec_type": "attachment"}
         ]));
+        let dummy_imports = vec![SubtitleImport {
+            source_path: PathBuf::new(),
+            target: SubtitleFormat::SubRip,
+            path: PathBuf::new(),
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+        }];
 
         // Act
-        let tracks = output_track_plan(&info, &[0, 1, 2], 1);
+        let tracks = output_track_plan(&info, &[0, 1, 2], &[], &dummy_imports, &[]);
 
         // Assert
         assert_eq!(
@@ -2648,6 +2820,66 @@ mod tests {
                 OutputTrack::Existing(0),
                 OutputTrack::Existing(1),
                 OutputTrack::Imported(0),
+                OutputTrack::Existing(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_track_plan_should_respect_custom_left_subtitle_order() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "subtitle"},
+            {"index": 3, "codec_type": "subtitle"}
+        ]));
+        let sidecars = vec![SidecarEntry {
+            path: PathBuf::from("/tmp/sidecar.srt"),
+            companion: None,
+            display_name: "sidecar.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: FileFingerprint {
+                length: 10,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        }];
+        let imports = vec![SubtitleImport {
+            source_path: PathBuf::from("/tmp/sidecar.srt"),
+            target: SubtitleFormat::SubRip,
+            path: PathBuf::from("/tmp/staged.srt"),
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+        }];
+        let left_subtitle_order = vec![
+            TrackRef::Sidecar(0),
+            TrackRef::Embedded(3),
+            TrackRef::Embedded(2),
+        ];
+
+        // Act
+        let tracks = output_track_plan(
+            &info,
+            &[0, 1, 2, 3],
+            &left_subtitle_order,
+            &imports,
+            &sidecars,
+        );
+
+        // Assert
+        assert_eq!(
+            tracks,
+            vec![
+                OutputTrack::Existing(0),
+                OutputTrack::Existing(1),
+                OutputTrack::Imported(0),
+                OutputTrack::Existing(3),
                 OutputTrack::Existing(2),
             ]
         );
@@ -3087,10 +3319,11 @@ mod tests {
                 default_streams: &BTreeSet::from([1, 3]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
+                left_subtitle_order: &[],
                 sidecars: &[],
             },
             &AtomicBool::new(false),
-            |value| progress.push(value),
+            |value, _| progress.push(value),
         )
         .unwrap();
         let info = media_info(&source).unwrap();
@@ -3198,10 +3431,11 @@ mod tests {
                 default_streams: &BTreeSet::from([0, 1]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
+                left_subtitle_order: &[],
                 sidecars: &[],
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let output_info = media_info(&output.output_path).unwrap();
@@ -3286,10 +3520,11 @@ mod tests {
                 default_streams: &BTreeSet::new(),
                 video_settings: &settings,
                 subtitle_changes: &[],
+                left_subtitle_order: &[],
                 sidecars: &[],
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let info = media_info(&output.output_path).unwrap();
@@ -3375,10 +3610,11 @@ mod tests {
                     default_streams: &BTreeSet::new(),
                     video_settings: &settings,
                     subtitle_changes: &[],
+                    left_subtitle_order: &[],
                     sidecars: &[],
                 },
                 &AtomicBool::new(false),
-                |_| {},
+                |_, _| {},
             )
             .unwrap();
             let info = media_info(&output.output_path).unwrap();
@@ -3471,10 +3707,11 @@ mod tests {
                 default_streams: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &[],
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let output = media_info(&edited_copy.output_path).unwrap();
@@ -3571,10 +3808,11 @@ mod tests {
                 default_streams: &BTreeSet::from([0]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &[],
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let media = media_info(&result.output_path).unwrap();
@@ -3717,10 +3955,11 @@ mod tests {
                 default_streams: &BTreeSet::from([0, 1]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &sidecars,
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let output = media_info(&result.output_path).unwrap();
@@ -3832,10 +4071,11 @@ mod tests {
                 default_streams: &BTreeSet::from([0]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: std::slice::from_ref(&sidecar),
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         );
         let cancelled = apply_edits(
             EditTarget {
@@ -3849,10 +4089,11 @@ mod tests {
                 default_streams: &BTreeSet::from([0]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &[sidecar],
             },
             &AtomicBool::new(true),
-            |_| {},
+            |_, _| {},
         );
 
         // Assert
@@ -3951,10 +4192,11 @@ mod tests {
                 default_streams: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &[sidecar],
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         let converted = directory.join("movie.eng.ass");
@@ -4069,10 +4311,11 @@ mod tests {
                 default_streams: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
+                left_subtitle_order: &[],
                 sidecars: &sidecars,
             },
             &AtomicBool::new(false),
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
 
