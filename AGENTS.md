@@ -31,7 +31,7 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - `cargo run`: launch the TUI against the current directory. Ensure `ffmpeg` and `ffprobe` are available in `PATH`.
 - `cargo build`: compile a debug binary.
 - `cargo build --release`: compile an optimized release binary.
-- `cargo install --path .`: install or replace the `reel` executable in `~/.cargo/bin/reel`.
+- `cargo install --path .`: install or replace the `reel` executable in `~/.cargo/bin/reel`. Always run this after making changes.
 - `cargo test`: run all module-local unit tests.
 - `cargo fmt --check`: verify standard Rust formatting.
 - `cargo clippy --all-targets -- -D warnings`: run strict linting used by CI.
@@ -41,9 +41,11 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 
 Use `rustfmt` defaults (four-space indentation) and keep Clippy warning-free. Follow Rust conventions: `snake_case` for functions, variables, and modules; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Prefer small, responsibility-focused functions and propagate recoverable failures with `anyhow::Result`. Preserve terminal cleanup guarantees and keep blocking `ffmpeg`/`ffprobe` work off the UI event loop.
 
-## Testing Guidelines
+## Testing & Reinstallation Guidelines
 
 Add tests in the module affected by the change, using descriptive behavior names such as `cancelled_edit_preserves_original`. Use temporary paths for filesystem cases and deterministic JSON fixtures for probe parsing. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before submitting.
+
+**Mandatory Reinstall Step**: After making changes and successfully passing tests, ALWAYS run `cargo install --path .` so the updated `reel` binary is immediately installed to `~/.cargo/bin/reel`.
 
 ## Commit & Pull Request Guidelines
 

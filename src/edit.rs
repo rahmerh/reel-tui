@@ -252,6 +252,7 @@ pub struct EditRequest {
     pub stream_order: Vec<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
+    pub default_sidecars: BTreeSet<usize>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub subtitle_changes: Vec<SubtitleChange>,
     pub left_subtitle_order: Vec<TrackRef>,
@@ -314,6 +315,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
                     stream_order: &request.stream_order,
                     deleted_streams: &request.deleted_streams,
                     default_streams: &request.default_streams,
+                    default_sidecars: &request.default_sidecars,
                     video_settings: &request.video_settings,
                     subtitle_changes: &request.subtitle_changes,
                     left_subtitle_order: &request.left_subtitle_order,
@@ -731,6 +733,7 @@ fn apply_edits(
         left_subtitle_order,
         deleted_streams,
         default_streams,
+        default_sidecars,
         video_settings,
         subtitle_changes,
         sidecars,
@@ -841,6 +844,7 @@ fn apply_edits(
         &source_info,
         subtitle_changes,
         sidecars,
+        default_sidecars,
         &workspace_path,
         cancelled,
         &mut report_progress,
@@ -1061,6 +1065,7 @@ struct SubtitleImport {
     language: String,
     forced: bool,
     cc: bool,
+    default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1076,11 +1081,13 @@ struct PreparedSubtitles {
     publications: Vec<Publication>,
 }
 
+#[expect(clippy::too_many_arguments)]
 fn prepare_subtitle_changes(
     media_path: &Path,
     info: &MediaInfo,
     changes: &[SubtitleChange],
     sidecars: &[SidecarEntry],
+    default_sidecars: &BTreeSet<usize>,
     workspace: &Path,
     cancelled: &AtomicBool,
     report_progress: &mut dyn FnMut(Option<f64>, String),
@@ -1181,9 +1188,10 @@ fn prepare_subtitle_changes(
                 }
             }
             SubtitleSource::Sidecar(path) => {
-                let sidecar = sidecars
+                let (sidecar_index, sidecar) = sidecars
                     .iter()
-                    .find(|sidecar| &sidecar.path == path)
+                    .enumerate()
+                    .find(|(_, sidecar)| &sidecar.path == path)
                     .expect("subtitle sources are validated before preparation");
                 if change.import_into_media {
                     let target = change.embedded_target.unwrap_or(change.source_format);
@@ -1213,6 +1221,7 @@ fn prepare_subtitle_changes(
                         language: sidecar.language.clone(),
                         forced: sidecar.forced,
                         cc: sidecar.cc,
+                        default: default_sidecars.contains(&sidecar_index),
                     });
                     prepared.publications.push(Publication {
                         staged: Vec::new(),
@@ -1565,6 +1574,7 @@ struct TrackEdits<'a> {
     stream_order: &'a [u64],
     deleted_streams: &'a BTreeSet<u64>,
     default_streams: &'a BTreeSet<u64>,
+    default_sidecars: &'a BTreeSet<usize>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     subtitle_changes: &'a [SubtitleChange],
     left_subtitle_order: &'a [TrackRef],
@@ -2073,7 +2083,7 @@ fn validate_result(
         };
         let expected = match track {
             OutputTrack::Existing(index) => default_streams.contains(index),
-            OutputTrack::Imported(_) => false,
+            OutputTrack::Imported(import_index) => subtitle_imports[*import_index].default,
         };
         if is_default(stream) != expected {
             return Err(format!(
@@ -2344,6 +2354,9 @@ fn run_ffmpeg(
                     .arg(format!("-metadata:s:{output_index}"))
                     .arg(format!("language={}", import.language));
                 let mut disposition = Vec::new();
+                if import.default {
+                    disposition.push("default");
+                }
                 if import.forced {
                     disposition.push("forced");
                 }
@@ -2765,6 +2778,7 @@ mod tests {
                 language: "eng".to_string(),
                 forced: false,
                 cc: false,
+                default: false,
             },
             SubtitleImport {
                 source_path: PathBuf::new(),
@@ -2773,6 +2787,7 @@ mod tests {
                 language: "eng".to_string(),
                 forced: false,
                 cc: false,
+                default: false,
             },
         ];
 
@@ -2808,6 +2823,7 @@ mod tests {
             language: "eng".to_string(),
             forced: false,
             cc: false,
+            default: false,
         }];
 
         // Act
@@ -2856,6 +2872,7 @@ mod tests {
             language: "eng".to_string(),
             forced: false,
             cc: false,
+            default: false,
         }];
         let left_subtitle_order = vec![
             TrackRef::Sidecar(0),
@@ -3317,6 +3334,7 @@ mod tests {
                 stream_order: &[1, 0, 3],
                 deleted_streams: &BTreeSet::from([2]),
                 default_streams: &BTreeSet::from([1, 3]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -3429,6 +3447,7 @@ mod tests {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -3518,6 +3537,7 @@ mod tests {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &settings,
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -3608,6 +3628,7 @@ mod tests {
                     stream_order: &[0],
                     deleted_streams: &BTreeSet::new(),
                     default_streams: &BTreeSet::new(),
+                    default_sidecars: &BTreeSet::new(),
                     video_settings: &settings,
                     subtitle_changes: &[],
                     left_subtitle_order: &[],
@@ -3705,6 +3726,7 @@ mod tests {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -3806,6 +3828,7 @@ mod tests {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -3953,6 +3976,7 @@ mod tests {
                 stream_order: &[0, 1],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -4069,6 +4093,7 @@ mod tests {
                 stream_order: &[0],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -4087,6 +4112,7 @@ mod tests {
                 stream_order: &[0],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -4190,6 +4216,7 @@ mod tests {
                 stream_order: &[0],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -4309,6 +4336,7 @@ mod tests {
                 stream_order: &[0],
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],

@@ -48,15 +48,27 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_details(frame, app, columns[1]);
     render_footer(frame, app, rows[1]);
     if app.layer == Layer::StreamDetails {
+        dim_backdrop(frame);
         render_details_popup(frame, app);
     }
     if let Some(dialog) = app.dialog {
+        dim_backdrop(frame);
         render_dialog(frame, app, dialog);
     }
 }
 
+fn dim_backdrop(frame: &mut Frame) {
+    let dim_block = Block::default().style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(dim_block, frame.area());
+}
+
 fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.layer == Layer::Files;
+    let has_any_sidecars = app
+        .files
+        .iter()
+        .any(|file| !app.sidecars_for_media(&file.path).is_empty());
+
     let items: Vec<_> = app
         .files
         .iter()
@@ -66,6 +78,8 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.sidecars_for_media(&file.path)
                     .iter()
                     .map(|sidecar| sidecar.display_name.as_str()),
+                app.is_file_folded(&file.path),
+                has_any_sidecars,
             ))
         })
         .collect();
@@ -93,10 +107,21 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
 fn file_tree_lines<'a>(
     display_name: &str,
     sidecar_names: impl IntoIterator<Item = &'a str>,
+    folded: bool,
+    has_any_sidecars: bool,
 ) -> Vec<Line<'static>> {
     let sidecar_names = sidecar_names.into_iter().collect::<Vec<_>>();
+    if sidecar_names.is_empty() {
+        let prefix = if has_any_sidecars { "  " } else { "" };
+        return vec![Line::from(format!("{prefix}{display_name}"))];
+    }
+    let prefix = if folded { "▹ " } else { "▿ " };
+    let first_line = Line::from(format!("{prefix}{display_name}"));
+    if folded {
+        return vec![first_line];
+    }
     let mut lines = Vec::with_capacity(sidecar_names.len() + 1);
-    lines.push(Line::from(display_name.to_string()));
+    lines.push(first_line);
     let last = sidecar_names.len().saturating_sub(1);
     lines.extend(sidecar_names.into_iter().enumerate().map(|(index, name)| {
         Line::from(vec![
@@ -160,6 +185,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         sidecars: &app.sidecars,
                         deleted: &app.deleted_streams,
                         defaults: &app.default_streams,
+                        default_sidecars: &app.default_sidecars,
                         changed: &changed,
                         subtitle_changes: &app.subtitle_changes,
                         source_container: app.source_container(),
@@ -266,6 +292,7 @@ fn media_text(
         sidecars,
         deleted,
         defaults,
+        default_sidecars,
         changed,
         subtitle_changes,
         source_container,
@@ -328,7 +355,7 @@ fn media_text(
 
     enum SubtitleRowItem<'a> {
         Stream(usize, &'a std::collections::BTreeMap<String, Value>),
-        Sidecar(usize, &'a SidecarEntry),
+        Sidecar(usize, usize, &'a SidecarEntry),
     }
 
     let is_exported = |index: u64| {
@@ -364,9 +391,17 @@ fn media_text(
             TrackRef::Sidecar(sidecar_index) => {
                 if let Some(sidecar) = sidecars.get(*sidecar_index) {
                     if is_imported(sidecar) {
-                        left_subtitles.push(SubtitleRowItem::Sidecar(selection_index, sidecar));
+                        left_subtitles.push(SubtitleRowItem::Sidecar(
+                            selection_index,
+                            *sidecar_index,
+                            sidecar,
+                        ));
                     } else {
-                        right_subtitles.push(SubtitleRowItem::Sidecar(selection_index, sidecar));
+                        right_subtitles.push(SubtitleRowItem::Sidecar(
+                            selection_index,
+                            *sidecar_index,
+                            sidecar,
+                        ));
                     }
                 }
             }
@@ -407,7 +442,7 @@ fn media_text(
                         stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                     )
                 }
-                SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                SubtitleRowItem::Sidecar(selection_index, sidecar_index, sidecar) => {
                     if selected == Some(*selection_index) {
                         selected_line = Some(lines.len());
                     }
@@ -416,6 +451,7 @@ fn media_text(
                         selected == Some(*selection_index),
                         subtitle_changes
                             .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                        default_sidecars.contains(sidecar_index),
                     )
                 }
             });
@@ -435,7 +471,7 @@ fn media_text(
                         stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                     )
                 }
-                SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                SubtitleRowItem::Sidecar(selection_index, sidecar_index, sidecar) => {
                     if selected == Some(*selection_index) {
                         selected_line = Some(lines.len());
                     }
@@ -444,6 +480,7 @@ fn media_text(
                         selected == Some(*selection_index),
                         subtitle_changes
                             .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                        default_sidecars.contains(sidecar_index),
                     )
                 }
             });
@@ -476,7 +513,7 @@ fn media_text(
                             stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                         ));
                     }
-                    SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                    SubtitleRowItem::Sidecar(selection_index, sidecar_index, sidecar) => {
                         if selected == Some(*selection_index) {
                             selected_line = Some(lines.len());
                         }
@@ -485,6 +522,7 @@ fn media_text(
                             selected == Some(*selection_index),
                             subtitle_changes
                                 .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                            default_sidecars.contains(sidecar_index),
                         ));
                     }
                 }
@@ -512,7 +550,7 @@ fn media_text(
                             stream_index(stream).is_some_and(|index| defaults.contains(&index)),
                         ));
                     }
-                    SubtitleRowItem::Sidecar(selection_index, sidecar) => {
+                    SubtitleRowItem::Sidecar(selection_index, sidecar_index, sidecar) => {
                         if selected == Some(*selection_index) {
                             selected_line = Some(lines.len());
                         }
@@ -521,6 +559,7 @@ fn media_text(
                             selected == Some(*selection_index),
                             subtitle_changes
                                 .contains_key(&SubtitleSource::Sidecar(sidecar.path.clone())),
+                            default_sidecars.contains(sidecar_index),
                         ));
                     }
                 }
@@ -582,6 +621,7 @@ struct MediaTextState<'a> {
     sidecars: &'a [SidecarEntry],
     deleted: &'a std::collections::BTreeSet<u64>,
     defaults: &'a std::collections::BTreeSet<u64>,
+    default_sidecars: &'a std::collections::BTreeSet<usize>,
     changed: &'a std::collections::BTreeSet<u64>,
     subtitle_changes: &'a std::collections::BTreeMap<
         crate::subtitle::SubtitleSource,
@@ -595,18 +635,21 @@ struct MediaTextState<'a> {
     subtitle_column_width: usize,
 }
 
-fn sidecar_line(sidecar: &SidecarEntry, selected: bool, changed: bool) -> Line<'static> {
+fn sidecar_line(
+    sidecar: &SidecarEntry,
+    selected: bool,
+    changed: bool,
+    default: bool,
+) -> Line<'static> {
     let marker = if selected { "›" } else { " " };
-    let changed_marker = if changed { "  ✎" } else { "" };
     let details = subtitle_overview_details(
         sidecar.format.label(),
         crate::subtitle::normalized_language(&sidecar.language),
-        false,
+        default,
         sidecar.forced,
         sidecar.cc,
-        true,
     );
-    Line::from(format!("{marker}     {details}{changed_marker}",)).style(if selected {
+    Line::from(format!("{marker}     {details}")).style(if selected {
         focused_style(changed)
     } else if changed {
         changed_style()
@@ -728,7 +771,6 @@ fn stream_line(
             default,
             stream_forced(stream),
             stream_cc(stream),
-            false,
         )]
     } else {
         vec![codec.to_uppercase()]
@@ -842,7 +884,6 @@ fn subtitle_overview_details(
     default: bool,
     forced: bool,
     cc: bool,
-    external: bool,
 ) -> String {
     let language = language.to_ascii_uppercase();
     let mut parts = vec![format!("{format:<12}"), language];
@@ -854,9 +895,6 @@ fn subtitle_overview_details(
     }
     if cc {
         parts.push("[CC]".to_string());
-    }
-    if external {
-        parts.push("[External]".to_string());
     }
     parts.join(" · ")
 }
@@ -1143,6 +1181,12 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
     keybinding(&mut lines, "gg / G", "Go to the first/top or last/bottom");
     keybinding(&mut lines, "Ctrl-d / Ctrl-u", "Scroll ten lines");
+    keybinding(
+        &mut lines,
+        "za / zo / zc",
+        "Toggle / open / close sidecar fold",
+    );
+    keybinding(&mut lines, "zM / zR", "Close / open all sidecar folds");
     keybinding(&mut lines, "Enter", "Open, select, or confirm");
 
     keybindings_section(&mut lines, "Track editing");
@@ -2882,19 +2926,35 @@ mod tests {
         // Arrange
         let sidecars = ["movie.eng.srt", "movie.nld.forced.ass"];
 
-        // Act
-        let lines = file_tree_lines("movie.mkv", sidecars);
+        // Act - Unfolded (false, sidecars present)
+        let lines = file_tree_lines("movie.mkv", sidecars, false, true);
         let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let text = text.iter().map(String::as_str).collect::<Vec<_>>();
 
         // Assert
         assert_that!(text).contains_exactly_in_given_order([
-            "movie.mkv",
+            "▿ movie.mkv",
             "  ├── movie.eng.srt",
             "  └── movie.nld.forced.ass",
         ]);
         assert_eq!(lines[1].spans[0].style.fg, Some(Color::DarkGray));
         assert_eq!(lines[2].spans[1].style.fg, Some(Color::DarkGray));
+
+        // Act - Folded (true, sidecars present)
+        let folded_lines = file_tree_lines("movie.mkv", sidecars, true, true);
+        let folded_text = folded_lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let folded_strs = folded_text.iter().map(String::as_str).collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(folded_strs).contains_exactly_in_given_order(["▹ movie.mkv"]);
+
+        // Act - Standalone file when sidecars exist in folder
+        let standalone_padded = file_tree_lines("other.mp4", [], false, true);
+        assert_eq!(standalone_padded[0].to_string(), "  other.mp4");
+
+        // Act - Standalone file when NO sidecars exist in folder
+        let standalone_unpadded = file_tree_lines("other.mp4", [], false, false);
+        assert_eq!(standalone_unpadded[0].to_string(), "other.mp4");
     }
 
     #[test]
@@ -2917,8 +2977,8 @@ mod tests {
         };
 
         // Act
-        let changed = sidecar_line(&sidecar, false, true);
-        let focused = sidecar_line(&sidecar, true, true);
+        let changed = sidecar_line(&sidecar, false, true, false);
+        let focused = sidecar_line(&sidecar, true, true, false);
 
         // Assert
         assert_eq!(changed.style.fg, Some(Color::Yellow));
@@ -2927,25 +2987,22 @@ mod tests {
         assert_eq!(focused.style.bg, Some(Color::Cyan));
         assert!(focused.style.add_modifier.contains(Modifier::ITALIC));
         assert_that!(focused.to_string())
-            .contains("SubRip / SRT · ENG · [Forced] · [CC] · [External]")
-            .contains("✎")
+            .contains("SubRip / SRT · ENG · [Forced] · [CC]")
             .does_not_contain("movie.eng.srt")
             .does_not_contain(" - ");
         assert_that!(focused.to_string()).starts_with("›     SubRip / SRT");
     }
 
     #[test]
-    fn subtitle_overview_details_should_keep_format_language_and_external_in_columns() {
+    fn subtitle_overview_details_should_keep_format_language_and_flags_in_columns() {
         // Act
-        let short_format = subtitle_overview_details("ASS", "nld", false, false, false, false);
-        let tagged = subtitle_overview_details("ASS", "nld", true, true, true, false);
-        let external = subtitle_overview_details("ASS", "nld", false, false, false, true);
+        let short_format = subtitle_overview_details("ASS", "nld", false, false, false);
+        let tagged = subtitle_overview_details("ASS", "nld", true, true, true);
 
         // Assert
         assert_that!(short_format).is_equal_to("ASS          · NLD".to_string());
         assert_that!(tagged)
             .is_equal_to("ASS          · NLD · [Default] · [Forced] · [CC]".to_string());
-        assert_that!(external).is_equal_to("ASS          · NLD · [External]".to_string());
     }
 
     #[test]

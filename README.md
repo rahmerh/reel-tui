@@ -36,6 +36,14 @@ Or pass a target directory path:
 reel /path/to/media
 ```
 
+## How It Works
+
+`reel` uses a non-destructive, queued editing model:
+
+1. **Queue Edits**: As you navigate files and adjust container formats, track orders, video transcoding/resizing settings, or subtitle sidecars, your changes are held in an in-memory queue without modifying any files on disk.
+2. **Review & Execute (`Ctrl+S`)**: Pressing `Ctrl+S` opens a confirmation dialog that summarizes all queued operations for validation.
+3. **Batch Processing**: Once confirmed, `reel` executes the queued operations in a single pass via `ffmpeg`—staging intermediate work in scratch storage before publishing the final file.
+
 ## Features
 
 - **Media Inspection**: Inspect container formats, track layouts, duration, bitrates, and metadata across your video collection.

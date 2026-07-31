@@ -282,6 +282,7 @@ pub struct App {
     moved_streams: BTreeSet<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
+    pub default_sidecars: BTreeSet<usize>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub video_settings_popup: Option<VideoSettingsPopup>,
     pub sidecars: Vec<SidecarEntry>,
@@ -311,6 +312,7 @@ pub struct App {
     original_stream_order: Vec<u64>,
     original_default_streams: BTreeSet<u64>,
     sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
+    unfolded_files: BTreeSet<PathBuf>,
     pub is_network_mount: bool,
     pub disk_cache: crate::cache::DiskCache,
 }
@@ -349,6 +351,7 @@ impl App {
             moved_streams: BTreeSet::new(),
             deleted_streams: BTreeSet::new(),
             default_streams: BTreeSet::new(),
+            default_sidecars: BTreeSet::new(),
             video_settings: BTreeMap::new(),
             video_settings_popup: None,
             sidecars: Vec::new(),
@@ -378,6 +381,7 @@ impl App {
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
             sidecars_by_media: HashMap::new(),
+            unfolded_files: BTreeSet::new(),
             is_network_mount,
             disk_cache,
         };
@@ -435,6 +439,8 @@ impl App {
 
         self.files = files;
         self.sidecars_by_media = sidecars_by_media;
+        self.unfolded_files
+            .retain(|path| self.files.iter().any(|file| &file.path == path));
         self.cache
             .retain(|key, _| self.files.iter().any(|file| key.matches_file(file)));
 
@@ -504,6 +510,56 @@ impl App {
             .get(path)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    pub fn is_file_folded(&self, path: &Path) -> bool {
+        !self.unfolded_files.contains(path)
+    }
+
+    pub fn toggle_fold_selected_file(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        if let Some(file) = self.selected_file() {
+            let path = file.path.clone();
+            if !self.unfolded_files.remove(&path) {
+                self.unfolded_files.insert(path);
+            }
+        }
+    }
+
+    pub fn fold_selected_file(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        if let Some(path) = self.selected_file().map(|file| file.path.clone()) {
+            self.unfolded_files.remove(&path);
+        }
+    }
+
+    pub fn unfold_selected_file(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        if let Some(path) = self.selected_file().map(|file| file.path.clone()) {
+            self.unfolded_files.insert(path);
+        }
+    }
+
+    pub fn fold_all_files(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        self.unfolded_files.clear();
+    }
+
+    pub fn unfold_all_files(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        for file in &self.files {
+            self.unfolded_files.insert(file.path.clone());
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -965,6 +1021,7 @@ impl App {
                     };
                     change.export_target = Some(choice.format);
                     self.store_subtitle_change(source, change);
+                    self.default_streams.remove(&index);
                     self.notice = None;
                     true
                 } else {
@@ -998,6 +1055,7 @@ impl App {
                         return true;
                     }
                     change.import_into_media = false;
+                    self.default_sidecars.remove(&sidecar_index);
                     if let Some(target) = change.embedded_target {
                         let external_choices = self.subtitle_capabilities.format_choices(
                             source_format,
@@ -1386,47 +1444,74 @@ impl App {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
         }
-        if self.selected_track() == Some(TrackRef::Container) {
-            self.notice = Some("Default flags apply to tracks, not the container.".into());
-            return;
+        match self.selected_track() {
+            Some(TrackRef::Container) => {
+                self.notice = Some("Default flags apply to tracks, not the container.".into());
+            }
+            Some(TrackRef::Sidecar(sidecar_index)) => {
+                if !self.is_sidecar_imported(sidecar_index) {
+                    self.notice = Some("Sidecars can't be marked as default.".to_string());
+                    return;
+                }
+                if let Some(info) = self.media_info() {
+                    let embedded_subtitles: Vec<_> = info
+                        .streams
+                        .iter()
+                        .filter(|stream| stream_kind(stream) == Some("subtitle"))
+                        .filter_map(stream_index)
+                        .collect();
+                    for stream_index in embedded_subtitles {
+                        self.default_streams.remove(&stream_index);
+                    }
+                }
+                self.default_sidecars.clear();
+                self.default_sidecars.insert(sidecar_index);
+                self.notice = None;
+            }
+            Some(TrackRef::Embedded(index)) => {
+                if self.deleted_streams.contains(&index) {
+                    self.notice = Some(
+                        "Unmark this track for deletion before making it default.".to_string(),
+                    );
+                    return;
+                }
+                if self.is_stream_exported(index) {
+                    self.notice = Some("Sidecars can't be marked as default.".to_string());
+                    return;
+                }
+                let Some((kind, eligible)) = self.media_info().and_then(|info| {
+                    stream_by_index(info, index).map(|stream| {
+                        let kind = stream_kind(stream).unwrap_or("other").to_string();
+                        let eligible = matches!(kind.as_str(), "video" | "audio" | "subtitle")
+                            && !(kind == "video" && crate::probe::is_attached_picture(stream));
+                        (kind, eligible)
+                    })
+                }) else {
+                    return;
+                };
+                if !eligible {
+                    self.notice =
+                        Some("Only video, audio, and subtitle tracks can be default.".to_string());
+                    return;
+                }
+                let same_kind: Vec<_> = self
+                    .media_info()
+                    .into_iter()
+                    .flat_map(|info| &info.streams)
+                    .filter(|stream| stream_kind(stream) == Some(kind.as_str()))
+                    .filter_map(stream_index)
+                    .collect();
+                for stream_index in same_kind {
+                    self.default_streams.remove(&stream_index);
+                }
+                if kind == "subtitle" {
+                    self.default_sidecars.clear();
+                }
+                self.default_streams.insert(index);
+                self.notice = None;
+            }
+            None => {}
         }
-        let Some(index) = self.selected_stream_index() else {
-            self.notice =
-                Some("External subtitle files do not have a container default flag.".into());
-            return;
-        };
-        if self.deleted_streams.contains(&index) {
-            self.notice =
-                Some("Unmark this track for deletion before making it default.".to_string());
-            return;
-        }
-        let Some((kind, eligible)) = self.media_info().and_then(|info| {
-            stream_by_index(info, index).map(|stream| {
-                let kind = stream_kind(stream).unwrap_or("other").to_string();
-                let eligible = matches!(kind.as_str(), "video" | "audio" | "subtitle")
-                    && !(kind == "video" && crate::probe::is_attached_picture(stream));
-                (kind, eligible)
-            })
-        }) else {
-            return;
-        };
-        if !eligible {
-            self.notice =
-                Some("Only video, audio, and subtitle tracks can be default.".to_string());
-            return;
-        }
-        let same_kind: Vec<_> = self
-            .media_info()
-            .into_iter()
-            .flat_map(|info| &info.streams)
-            .filter(|stream| stream_kind(stream) == Some(kind.as_str()))
-            .filter_map(stream_index)
-            .collect();
-        for stream_index in same_kind {
-            self.default_streams.remove(&stream_index);
-        }
-        self.default_streams.insert(index);
-        self.notice = None;
     }
 
     pub fn source_container(&self) -> Option<ContainerFormat> {
@@ -2553,6 +2638,7 @@ impl App {
             stream_order,
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
+            default_sidecars: self.default_sidecars.clone(),
             video_settings: self.video_settings.clone(),
             subtitle_changes: self.subtitle_changes.values().cloned().collect(),
             left_subtitle_order: self.active_left_subtitle_tracks(),
@@ -2761,6 +2847,7 @@ impl App {
         self.moved_streams.clear();
         self.default_streams = defaults.clone();
         self.original_default_streams = defaults;
+        self.default_sidecars.clear();
         self.deleted_streams.clear();
         self.video_settings.clear();
         self.video_settings_popup = None;
@@ -2778,6 +2865,7 @@ impl App {
         self.deleted_streams.clear();
         self.default_streams.clear();
         self.original_default_streams.clear();
+        self.default_sidecars.clear();
         self.video_settings.clear();
         self.video_settings_popup = None;
         self.subtitle_changes.clear();
@@ -2822,6 +2910,7 @@ impl App {
     pub fn has_track_edits(&self) -> bool {
         self.container_target.is_some()
             || !self.deleted_streams.is_empty()
+            || !self.default_sidecars.is_empty()
             || !changed_streams(
                 &self.original_stream_order,
                 &self.stream_order,
@@ -2841,6 +2930,7 @@ impl App {
     pub fn media_will_change(&self) -> bool {
         self.container_target.is_some()
             || !self.deleted_streams.is_empty()
+            || !self.default_sidecars.is_empty()
             || !changed_streams(
                 &self.original_stream_order,
                 &self.stream_order,
@@ -3965,6 +4055,154 @@ mod tests {
         // Assert
         assert_that!(app.default_streams.clone()).is_equal_to(BTreeSet::from([0, 2]));
         assert_that!(app.changed_streams()).is_equal_to(BTreeSet::from([1, 2]));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn set_selected_stream_default_should_show_notice_when_sidecar_is_not_imported() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "disposition": {"default": 1}}
+        ]));
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        let sidecar_path = directory.join("movie.eng.srt");
+        app.sidecars = vec![SidecarEntry {
+            path: sidecar_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 10,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        }];
+        app.layer = Layer::Streams;
+        let sidecar_row = app
+            .track_rows()
+            .iter()
+            .position(|r| *r == TrackRef::Sidecar(0))
+            .unwrap();
+        app.selected_stream = sidecar_row;
+
+        // Act
+        app.set_selected_stream_default();
+
+        // Assert
+        assert_that!(app.notice.as_deref()).contains("Sidecars can't be marked as default.");
+        assert_that!(app.default_sidecars.is_empty()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn set_selected_stream_default_should_mark_imported_sidecar_as_default() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "disposition": {"default": 1}}
+        ]));
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        let sidecar_path = directory.join("movie.eng.srt");
+        app.sidecars = vec![SidecarEntry {
+            path: sidecar_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            cc: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 10,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        }];
+        app.layer = Layer::Streams;
+        let sidecar_row = app
+            .track_rows()
+            .iter()
+            .position(|r| *r == TrackRef::Sidecar(0))
+            .unwrap();
+        app.selected_stream = sidecar_row;
+        app.transfer_subtitle(-1); // Import sidecar
+
+        // Act
+        app.set_selected_stream_default();
+
+        // Assert
+        assert_that!(app.notice.is_none()).is_true();
+        assert_that!(app.default_sidecars.contains(&0)).is_true();
+        assert_that!(app.default_streams.contains(&1)).is_false();
+        assert_that!(app.has_track_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transfer_subtitle_should_clear_default_flag_when_embedded_subtitle_is_exported() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 1}}
+        ]));
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        let sub_row = app
+            .track_rows()
+            .iter()
+            .position(|r| *r == TrackRef::Embedded(1))
+            .unwrap();
+        app.selected_stream = sub_row;
+
+        // Act
+        app.transfer_subtitle(1); // Export subtitle to right column
+
+        // Assert
+        assert_that!(app.default_streams.contains(&1)).is_false();
+        assert_that!(app.is_stream_exported(1)).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn set_selected_stream_default_should_show_notice_when_embedded_subtitle_is_exported() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 0}}
+        ]));
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        let sub_row = app
+            .track_rows()
+            .iter()
+            .position(|r| *r == TrackRef::Embedded(1))
+            .unwrap();
+        app.selected_stream = sub_row;
+        app.transfer_subtitle(1); // Export subtitle to right column
+
+        // Act
+        app.set_selected_stream_default();
+
+        // Assert
+        assert_that!(app.notice.as_deref()).contains("Sidecars can't be marked as default.");
+        assert_that!(app.default_streams.contains(&1)).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -5508,6 +5746,36 @@ mod tests {
         assert_that!(app.dialog).contains(Dialog::Processing);
         assert_that!(app.cancel_edit_choice).is_equal_to(CancelEditChoice::KeepProcessing);
         assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fold_operations_should_toggle_and_manage_folded_files() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        app.layer = Layer::Files;
+        let directory = app.directory.clone();
+        let file_path = app.files[0].path.clone();
+
+        // Assert initial state: folded by default
+        assert_that!(app.is_file_folded(&file_path)).is_true();
+
+        // Act & Assert 1: Toggle unfold
+        app.toggle_fold_selected_file();
+        assert_that!(app.is_file_folded(&file_path)).is_false();
+
+        // Act & Assert 2: Toggle fold
+        app.toggle_fold_selected_file();
+        assert_that!(app.is_file_folded(&file_path)).is_true();
+
+        // Act & Assert 3: Unfold all & fold all
+        app.unfold_all_files();
+        assert_that!(app.is_file_folded(&file_path)).is_false();
+
+        app.fold_all_files();
+        assert_that!(app.is_file_folded(&file_path)).is_true();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

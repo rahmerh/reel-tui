@@ -54,14 +54,25 @@ enum InputOutcome {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZCommand {
+    Toggle,
+    Open,
+    Close,
+    CloseAll,
+    OpenAll,
+}
+
 #[derive(Default)]
 struct InputState {
     pending_g: Option<Instant>,
+    pending_z: Option<Instant>,
 }
 
 impl InputState {
     fn reset_sequence(&mut self) {
         self.pending_g = None;
+        self.pending_z = None;
     }
 
     fn is_double_g(&mut self, key: KeyEvent) -> bool {
@@ -79,6 +90,31 @@ impl InputState {
             self.pending_g = Some(Instant::now());
             false
         }
+    }
+
+    fn z_command(&mut self, key: KeyEvent) -> Option<ZCommand> {
+        let is_recent_z = self
+            .pending_z
+            .is_some_and(|pressed| pressed.elapsed() <= Duration::from_millis(750));
+
+        if is_recent_z {
+            self.pending_z = None;
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('z') => return Some(ZCommand::Toggle),
+                KeyCode::Char('o') => return Some(ZCommand::Open),
+                KeyCode::Char('c') => return Some(ZCommand::Close),
+                KeyCode::Char('M') => return Some(ZCommand::CloseAll),
+                KeyCode::Char('R') => return Some(ZCommand::OpenAll),
+                _ => {}
+            }
+        }
+
+        if key.code == KeyCode::Char('z') {
+            self.pending_z = Some(Instant::now());
+        } else {
+            self.pending_z = None;
+        }
+        None
     }
 }
 
@@ -314,6 +350,19 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char('G'), _) => {
             input.reset_sequence();
             app.select_last();
+        }
+        _ if app.layer == Layer::Files => {
+            if let Some(cmd) = input.z_command(key) {
+                match cmd {
+                    ZCommand::Toggle => app.toggle_fold_selected_file(),
+                    ZCommand::Open => app.unfold_selected_file(),
+                    ZCommand::Close => app.fold_selected_file(),
+                    ZCommand::CloseAll => app.fold_all_files(),
+                    ZCommand::OpenAll => app.unfold_all_files(),
+                }
+            } else if input.is_double_g(key) {
+                app.select_first();
+            }
         }
         _ if input.is_double_g(key) => app.select_first(),
         _ => {}
