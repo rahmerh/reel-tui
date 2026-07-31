@@ -1152,30 +1152,93 @@ fn destination_option(label: &'static str, chosen: bool) -> Span<'static> {
     )
 }
 
+pub fn filter_keybindings_text(text: Text<'static>, query: &str) -> (Text<'static>, usize) {
+    let clean_query = query.trim().to_lowercase();
+    if clean_query.is_empty() {
+        let count = text.lines.iter().filter(|l| is_keybinding_entry(l)).count();
+        return (text, count);
+    }
+    let mut match_count = 0;
+    let filtered_lines: Vec<Line<'static>> = text
+        .lines
+        .into_iter()
+        .filter(|line| {
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let matches = plain.to_lowercase().contains(&clean_query);
+            if matches && is_keybinding_entry(line) {
+                match_count += 1;
+            }
+            matches
+        })
+        .collect();
+    (Text::from(filtered_lines), match_count)
+}
+
+fn is_keybinding_entry(line: &Line) -> bool {
+    line.spans.iter().any(|s| s.content.starts_with("  "))
+}
+
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
     let area = popup_area(frame.area(), 80, 80);
-    let text = padded_popup_text(keybindings_text());
-    app.set_keybindings_max_scroll(max_scroll(&text, area));
+    let full_text = keybindings_text();
+    let (filtered_text, count) = filter_keybindings_text(full_text, &app.search.query);
+    app.search.match_count = count;
+    let text = padded_popup_text(filtered_text);
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keybindings ");
+
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Keybindings "),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((app.keybindings_scroll, 0)),
-        area,
-    );
+    frame.render_widget(block, area);
+
+    if app.search.is_active || !app.search.query.is_empty() {
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+        app.set_keybindings_max_scroll(max_scroll(&text, chunks[0]));
+
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.keybindings_scroll, 0)),
+            chunks[0],
+        );
+
+        let line = if app.search.query.is_empty() {
+            Line::styled("  Search: ...", Style::default().fg(Color::Yellow))
+        } else {
+            let match_suffix = match app.search.match_count {
+                0 => " (no matches)".to_string(),
+                1 => " (1 match)".to_string(),
+                n => format!(" ({n} matches)"),
+            };
+            Line::from(vec![
+                Span::styled("  Search: ", Style::default().fg(Color::Cyan)),
+                Span::styled(&app.search.query, Style::default().fg(Color::Yellow).bold()),
+                Span::styled(match_suffix, Style::default().fg(Color::DarkGray)),
+            ])
+        };
+
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+    } else {
+        app.set_keybindings_max_scroll(max_scroll(&text, inner));
+
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.keybindings_scroll, 0)),
+            inner,
+        );
+    }
 }
 
 fn keybindings_text() -> Text<'static> {
     let mut lines = Vec::new();
     keybindings_section(&mut lines, "General");
     keybinding(&mut lines, "?", "Open or close keybindings");
+    keybinding(&mut lines, "/", "Search in keybindings");
     keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
     keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
     keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
@@ -3597,6 +3660,26 @@ mod tests {
         for value in expected {
             assert_that!(&help).contains(value);
         }
+    }
+
+    #[test]
+    fn filter_keybindings_text_should_match_substring_case_insensitively() {
+        let raw = keybindings_text();
+        let (filtered, count) = filter_keybindings_text(raw, "track");
+        let content = filtered.to_string();
+
+        assert_that!(&content).contains("Move track down / up");
+        assert_that!(&content).does_not_contain("Open or close keybindings");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn filter_keybindings_text_should_return_all_lines_when_query_is_empty() {
+        let raw = keybindings_text();
+        let (filtered, count) = filter_keybindings_text(raw.clone(), "");
+
+        assert_eq!(filtered.lines.len(), raw.lines.len());
+        assert!(count > 0);
     }
 
     #[test]

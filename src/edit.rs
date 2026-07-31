@@ -1378,7 +1378,14 @@ fn convert_subtitle(
                 let extraction = Command::new("ffmpeg")
                     .args(["-v", "error", "-nostdin", "-y", "-i"])
                     .arg(media)
-                    .args(["-map", &format!("0:{index}"), "-c", "copy"])
+                    .args([
+                        "-map",
+                        &format!("0:{index}"),
+                        "-c",
+                        "copy",
+                        "-f",
+                        "matroska",
+                    ])
                     .arg(&extracted_path)
                     .output()
                     .map_err(|error| {

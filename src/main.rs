@@ -196,38 +196,78 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 _ => {}
             }
         }
-        Some(Dialog::Keybindings) => match (key.code, key.modifiers) {
-            (KeyCode::Char('?'), _) => {
-                input.reset_sequence();
-                app.dismiss_dialog();
+        Some(Dialog::Keybindings) => {
+            if app.search.is_active {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        input.reset_sequence();
+                        app.clear_search();
+                    }
+                    (KeyCode::Enter, _) => {
+                        input.reset_sequence();
+                        app.finish_search_input();
+                    }
+                    (KeyCode::Backspace, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.search_pop();
+                    }
+                    (KeyCode::Down, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_down(1);
+                    }
+                    (KeyCode::Up, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_up(1);
+                    }
+                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        input.reset_sequence();
+                        app.search_push(c);
+                    }
+                    _ => {}
+                }
+            } else {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.start_search();
+                    }
+                    (KeyCode::Char('?'), _) => {
+                        input.reset_sequence();
+                        app.dismiss_dialog();
+                    }
+                    (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_down(1);
+                    }
+                    (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_up(1);
+                    }
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_down(10);
+                    }
+                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_up(10);
+                    }
+                    (KeyCode::Char('G'), _) => {
+                        input.reset_sequence();
+                        app.scroll_keybindings_to_end();
+                    }
+                    _ if is_back_key(key) => {
+                        input.reset_sequence();
+                        if !app.search.query.is_empty() {
+                            app.clear_search();
+                        } else {
+                            app.dismiss_dialog();
+                        }
+                    }
+                    _ if input.is_double_g(key) => app.scroll_keybindings_to_start(),
+                    _ => {}
+                }
             }
-            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.scroll_keybindings_down(1);
-            }
-            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.scroll_keybindings_up(1);
-            }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                input.reset_sequence();
-                app.scroll_keybindings_down(10);
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                input.reset_sequence();
-                app.scroll_keybindings_up(10);
-            }
-            (KeyCode::Char('G'), _) => {
-                input.reset_sequence();
-                app.scroll_keybindings_to_end();
-            }
-            _ if is_back_key(key) => {
-                input.reset_sequence();
-                app.dismiss_dialog();
-            }
-            _ if input.is_double_g(key) => app.scroll_keybindings_to_start(),
-            _ => {}
-        },
+        }
         Some(Dialog::ConfirmSave) => {
             input.reset_sequence();
             match (key.code, key.modifiers) {
@@ -894,6 +934,50 @@ mod tests {
         assert_eq!(app.keybindings_scroll, 0);
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(app.keybindings_scroll, 30);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn keybindings_search_keyboard_events_should_support_lazygit_flow() {
+        let (mut app, directory) = test_app();
+        app.show_keybindings();
+        let mut input = InputState::default();
+
+        // 1. Press '/' to start search
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        assert!(app.search.is_active);
+
+        // 2. Type 't', 'r'
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        assert_eq!(app.search.query, "tr");
+        assert!(app.search.is_active);
+
+        // 3. Esc while typing cancels search and restores full list immediately
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert!(!app.search.is_active);
+        assert_eq!(app.search.query, "");
+        assert_eq!(app.dialog, Some(Dialog::Keybindings));
+
+        // 4. Press '/', type 't', 'r', press Enter to confirm
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert!(!app.search.is_active);
+        assert_eq!(app.search.query, "tr");
+        assert_eq!(app.dialog, Some(Dialog::Keybindings));
+
+        // 5. Esc while browsing filtered results clears filter
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_eq!(app.search.query, "");
+        assert_eq!(app.dialog, Some(Dialog::Keybindings));
+
+        // 6. Esc on empty filter closes popup
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_eq!(app.dialog, None);
 
         drop(app);
         fs::remove_dir_all(directory).unwrap();

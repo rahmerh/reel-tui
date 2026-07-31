@@ -34,6 +34,39 @@ pub enum Layer {
     StreamDetails,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchState {
+    pub query: String,
+    pub is_active: bool,
+    pub match_count: usize,
+}
+
+impl SearchState {
+    pub fn activate(&mut self) {
+        self.is_active = true;
+    }
+
+    pub fn deactivate(&mut self) {
+        self.is_active = false;
+    }
+
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.is_active = false;
+        self.match_count = 0;
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        self.query.push(c);
+    }
+
+    pub fn pop_char(&mut self) {
+        if self.query.pop().is_none() {
+            self.is_active = false;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialog {
     Keybindings,
@@ -315,6 +348,7 @@ pub struct App {
     unfolded_files: BTreeSet<PathBuf>,
     pub is_network_mount: bool,
     pub disk_cache: crate::cache::DiskCache,
+    pub search: SearchState,
 }
 
 impl App {
@@ -384,6 +418,7 @@ impl App {
             unfolded_files: BTreeSet::new(),
             is_network_mount,
             disk_cache,
+            search: SearchState::default(),
         };
         let snapshot = match scan_directory(&app.directory) {
             Ok(files) => DirectorySnapshot::Files(files),
@@ -1453,6 +1488,11 @@ impl App {
                     self.notice = Some("Sidecars can't be marked as default.".to_string());
                     return;
                 }
+                if self.default_sidecars.contains(&sidecar_index) {
+                    self.default_sidecars.remove(&sidecar_index);
+                    self.notice = None;
+                    return;
+                }
                 if let Some(info) = self.media_info() {
                     let embedded_subtitles: Vec<_> = info
                         .streams
@@ -1492,6 +1532,11 @@ impl App {
                 if !eligible {
                     self.notice =
                         Some("Only video, audio, and subtitle tracks can be default.".to_string());
+                    return;
+                }
+                if self.default_streams.contains(&index) {
+                    self.default_streams.remove(&index);
+                    self.notice = None;
                     return;
                 }
                 let same_kind: Vec<_> = self
@@ -2731,14 +2776,39 @@ impl App {
         self.edit_progress_label = None;
         self.edit_started = None;
         self.edit_cancel = None;
+        self.search.clear();
     }
 
     pub fn show_keybindings(&mut self) {
         if self.dialog.is_none() {
             self.keybindings_scroll = 0;
             self.keybindings_max_scroll = 0;
+            self.search.clear();
             self.dialog = Some(Dialog::Keybindings);
         }
+    }
+
+    pub fn start_search(&mut self) {
+        self.search.activate();
+    }
+
+    pub fn search_push(&mut self, ch: char) {
+        self.search.push_char(ch);
+        self.keybindings_scroll = 0;
+    }
+
+    pub fn search_pop(&mut self) {
+        self.search.pop_char();
+        self.keybindings_scroll = 0;
+    }
+
+    pub fn finish_search_input(&mut self) {
+        self.search.deactivate();
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.keybindings_scroll = 0;
     }
 
     pub fn scroll_keybindings_down(&mut self, amount: u16) {
@@ -4146,6 +4216,10 @@ mod tests {
         assert_that!(app.default_sidecars.contains(&0)).is_true();
         assert_that!(app.default_streams.contains(&1)).is_false();
         assert_that!(app.has_track_edits()).is_true();
+
+        // Act 2: Toggle default OFF
+        app.set_selected_stream_default();
+        assert_that!(app.default_sidecars.contains(&0)).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -5778,6 +5852,37 @@ mod tests {
         assert_that!(app.is_file_folded(&file_path)).is_true();
 
         // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_state_transitions_should_manage_query_and_active_flag() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+
+        assert!(!app.search.is_active);
+        assert_eq!(app.search.query, "");
+
+        app.start_search();
+        assert!(app.search.is_active);
+
+        app.search_push('a');
+        app.search_push('b');
+        assert_eq!(app.search.query, "ab");
+        assert!(app.search.is_active);
+
+        app.search_pop();
+        assert_eq!(app.search.query, "a");
+        assert!(app.search.is_active);
+
+        app.finish_search_input();
+        assert!(!app.search.is_active);
+        assert_eq!(app.search.query, "a");
+
+        app.clear_search();
+        assert!(!app.search.is_active);
+        assert_eq!(app.search.query, "");
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
