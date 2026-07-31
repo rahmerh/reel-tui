@@ -46,6 +46,7 @@ impl MediaInfo {
         let has_video = info.streams.iter().any(|stream| {
             stream.get("codec_type").and_then(Value::as_str) == Some("video")
                 && !is_attached_picture(stream)
+                && !is_still_image(stream, &info.format)
         });
 
         if !has_video {
@@ -131,6 +132,53 @@ pub(crate) fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {
         .and_then(|disposition| disposition.get("attached_pic"))
         .and_then(Value::as_i64)
         == Some(1)
+}
+
+pub(crate) fn is_still_image(
+    stream: &BTreeMap<String, Value>,
+    format: &BTreeMap<String, Value>,
+) -> bool {
+    let format_name = format
+        .get("format_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if format_name.contains("image2")
+        || format_name.contains("png")
+        || format_name.contains("jpeg")
+        || format_name.contains("webp")
+        || format_name.contains("bmp")
+        || format_name.contains("tiff")
+        || format_name.contains("gif")
+        || format_name.contains("tty")
+    {
+        return true;
+    }
+
+    let codec_name = stream
+        .get("codec_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+
+    let image_codecs = [
+        "png", "jpeg", "mjpeg", "webp", "bmp", "tiff", "gif", "svg", "pcx", "tga", "ppm", "pbm",
+        "pgm", "pam",
+    ];
+
+    if image_codecs.contains(&codec_name.as_str()) {
+        let duration = format
+            .get("duration")
+            .and_then(Value::as_str)
+            .and_then(|d| d.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if duration <= 0.0 {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
@@ -246,6 +294,24 @@ mod tests {
                 {"codec_type":"audio"},
                 {"codec_type":"video","disposition":{"attached_pic":1}}
             ]}"#,
+        )
+        .unwrap();
+
+        // Act
+        let result = MediaInfo::from_json(value);
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn from_json_should_return_error_when_input_is_still_image() {
+        // Arrange
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "png"}],
+                "format": {"format_name": "image2", "duration": "0.0"}
+            }"#,
         )
         .unwrap();
 

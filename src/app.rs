@@ -827,7 +827,7 @@ impl App {
         if self.media_info().is_some() {
             self.track_rows().len()
         } else {
-            self.stream_order.len() + self.sidecars.len()
+            0
         }
     }
 

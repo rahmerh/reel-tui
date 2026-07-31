@@ -53,7 +53,16 @@ impl DiskCache {
         };
 
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader).unwrap_or_default()
+        let mut cache: DiskCache = serde_json::from_reader(reader).unwrap_or_default();
+        cache.entries.retain(|_, entry| match &entry.outcome {
+            ProbeOutcome::Video(info) => info.streams.iter().any(|stream| {
+                stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+                    && !crate::probe::is_attached_picture(stream)
+                    && !crate::probe::is_still_image(stream, &info.format)
+            }),
+            _ => true,
+        });
+        cache
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -80,7 +89,22 @@ impl DiskCache {
     ) -> Option<ProbeOutcome> {
         let entry = self.entries.get(path)?;
         if entry.length == length && entry.modified == modified {
-            Some(entry.outcome.clone())
+            match &entry.outcome {
+                ProbeOutcome::Video(info) => {
+                    let valid_video = info.streams.iter().any(|stream| {
+                        stream.get("codec_type").and_then(serde_json::Value::as_str)
+                            == Some("video")
+                            && !crate::probe::is_attached_picture(stream)
+                            && !crate::probe::is_still_image(stream, &info.format)
+                    });
+                    if valid_video {
+                        Some(entry.outcome.clone())
+                    } else {
+                        None
+                    }
+                }
+                other => Some(other.clone()),
+            }
         } else {
             None
         }
@@ -120,8 +144,14 @@ mod tests {
         let now = SystemTime::now();
 
         let info = MediaInfo {
-            format: BTreeMap::from([("duration".to_string(), json!("120.0"))]),
-            streams: vec![],
+            format: BTreeMap::from([
+                ("format_name".to_string(), json!("matroska")),
+                ("duration".to_string(), json!("120.0")),
+            ]),
+            streams: vec![BTreeMap::from([
+                ("codec_type".to_string(), json!("video")),
+                ("codec_name".to_string(), json!("h264")),
+            ])],
             chapters: vec![],
         };
         let outcome = ProbeOutcome::Video(info);

@@ -182,7 +182,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                 text
             }
             Some(ProbeOutcome::NotVideo(reason)) => {
-                message("Not a video file", reason, Color::Yellow)
+                message("Unsupported format", reason, Color::Yellow)
             }
             Some(ProbeOutcome::Error(error)) => message("Probe error", error, Color::Red),
             None => Text::from("Select a file to inspect it."),
@@ -2478,6 +2478,58 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(!content_local.contains("[Network Mode]"));
+    }
+
+    #[test]
+    fn render_details_should_show_unsupported_format_only_for_non_video_outcomes() {
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx).unwrap();
+        app.files = vec![crate::files::FileEntry {
+            path: std::path::PathBuf::from("/media/image.png"),
+            display_name: "image.png".to_string(),
+            fingerprint: crate::files::FileFingerprint {
+                length: 100,
+                modified: None,
+            },
+        }];
+        app.list_state.select(Some(0));
+        app.loading = false;
+
+        // 1. Non-video outcome (PNG, JPEG, audio, NFO, etc.)
+        app.outcome = Some(ProbeOutcome::NotVideo("No video stream found".to_string()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| render_details(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Unsupported format"));
+
+        // 2. Accepted video container outcome (MKV, MP4, AVI, WEBM, MOV, etc.)
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {"format_name": "matroska", "duration": "120.0"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+        app.outcome = Some(ProbeOutcome::Video(info));
+        terminal
+            .draw(|frame| render_details(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer_valid = terminal.backend().buffer();
+        let content_valid = buffer_valid
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!content_valid.contains("Unsupported format"));
     }
 
     #[test]

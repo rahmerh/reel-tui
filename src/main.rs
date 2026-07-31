@@ -441,6 +441,12 @@ mod tests {
     fn l_should_enter_the_streams_panel_like_enter() {
         for code in [KeyCode::Char('l'), KeyCode::Enter] {
             let (mut app, directory) = test_app();
+            app.outcome = Some(ProbeOutcome::Video(
+                MediaInfo::from_json(serde_json::json!({
+                    "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+                }))
+                .unwrap(),
+            ));
             app.stream_order = vec![0];
 
             handle_key(&mut app, &mut InputState::default(), key(code));
