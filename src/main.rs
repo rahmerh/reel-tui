@@ -197,19 +197,19 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
             }
         }
         Some(Dialog::Keybindings) => {
-            if app.search.is_active {
+            if app.keybindings_search.is_active {
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => {
                         input.reset_sequence();
-                        app.clear_search();
+                        app.clear_keybindings_search();
                     }
                     (KeyCode::Enter, _) => {
                         input.reset_sequence();
-                        app.finish_search_input();
+                        app.finish_keybindings_search();
                     }
                     (KeyCode::Backspace, KeyModifiers::NONE) => {
                         input.reset_sequence();
-                        app.search_pop();
+                        app.keybindings_search_pop();
                     }
                     (KeyCode::Down, KeyModifiers::NONE) => {
                         input.reset_sequence();
@@ -221,7 +221,7 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                     }
                     (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                         input.reset_sequence();
-                        app.search_push(c);
+                        app.keybindings_search_push(c);
                     }
                     _ => {}
                 }
@@ -229,7 +229,7 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('/'), KeyModifiers::NONE) => {
                         input.reset_sequence();
-                        app.start_search();
+                        app.start_keybindings_search();
                     }
                     (KeyCode::Char('?'), _) => {
                         input.reset_sequence();
@@ -257,8 +257,8 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                     }
                     _ if is_back_key(key) => {
                         input.reset_sequence();
-                        if !app.search.query.is_empty() {
-                            app.clear_search();
+                        if !app.keybindings_search.query.is_empty() {
+                            app.clear_keybindings_search();
                         } else {
                             app.dismiss_dialog();
                         }
@@ -300,8 +300,42 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
 }
 
 fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutcome {
+    if app.layer == Layer::Files && app.file_search.is_active {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                input.reset_sequence();
+                app.cancel_file_search();
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.finish_file_search();
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.file_search_pop();
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.select_next();
+            }
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.select_previous();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                input.reset_sequence();
+                app.file_search_push(c);
+            }
+            _ => {}
+        }
+        return InputOutcome::Continue;
+    }
     if is_back_key(key) {
         input.reset_sequence();
+        if app.layer == Layer::Files && app.file_search_has_query() {
+            app.clear_file_search();
+            return InputOutcome::Continue;
+        }
         return if app.back() {
             InputOutcome::Continue
         } else {
@@ -309,6 +343,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         };
     }
     match (key.code, key.modifiers) {
+        (KeyCode::Char('/'), KeyModifiers::NONE) if app.layer == Layer::Files => {
+            input.reset_sequence();
+            app.start_file_search();
+        }
         (KeyCode::Char('?'), _) => {
             input.reset_sequence();
             app.show_keybindings();
@@ -421,6 +459,7 @@ fn is_back_key(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::subtitle::SubtitleSource;
+    use kernal::prelude::*;
     use std::{
         fs,
         path::PathBuf,
@@ -947,18 +986,18 @@ mod tests {
 
         // 1. Press '/' to start search
         handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
-        assert!(app.search.is_active);
+        assert!(app.keybindings_search.is_active);
 
         // 2. Type 't', 'r'
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
-        assert_eq!(app.search.query, "tr");
-        assert!(app.search.is_active);
+        assert_eq!(app.keybindings_search.query, "tr");
+        assert!(app.keybindings_search.is_active);
 
         // 3. Esc while typing cancels search and restores full list immediately
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
-        assert!(!app.search.is_active);
-        assert_eq!(app.search.query, "");
+        assert!(!app.keybindings_search.is_active);
+        assert_eq!(app.keybindings_search.query, "");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 4. Press '/', type 't', 'r', press Enter to confirm
@@ -966,19 +1005,73 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
-        assert!(!app.search.is_active);
-        assert_eq!(app.search.query, "tr");
+        assert!(!app.keybindings_search.is_active);
+        assert_eq!(app.keybindings_search.query, "tr");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 5. Esc while browsing filtered results clears filter
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
-        assert_eq!(app.search.query, "");
+        assert_eq!(app.keybindings_search.query, "");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 6. Esc on empty filter closes popup
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_eq!(app.dialog, None);
 
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_search_keyboard_events_should_filter_cancel_confirm_and_clear() {
+        // Arrange
+        let (mut app, directory) = test_app();
+        app.files = ["alpha.mkv", "beta.mkv"]
+            .into_iter()
+            .map(|name| FileEntry {
+                path: directory.join(name),
+                display_name: name.to_string(),
+                fingerprint: FileFingerprint {
+                    length: 0,
+                    modified: None,
+                },
+            })
+            .collect();
+        app.list_state.select(Some(0));
+        let mut input = InputState::default();
+
+        // Act: search for beta, then cancel while typing.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for ch in "beta".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(ch)));
+        }
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert: cancellation restores alpha.
+        assert_that!(app.file_search.query.as_str()).is_empty();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
+
+        // Act: confirm beta and open/close keybindings over the retained filter.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for ch in "beta".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
+        assert_that!(app.dialog).contains(Dialog::Keybindings);
+        assert_that!(app.file_search.query.as_str()).is_equal_to("beta");
+        handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
+
+        // Act and assert: first Esc clears the filter and keeps beta; second quits.
+        let cleared = handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(cleared).is_equal_to(InputOutcome::Continue);
+        assert_that!(app.file_search.query.as_str()).is_empty();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+        let quit = handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(quit).is_equal_to(InputOutcome::Quit);
+
+        // Cleanup
         drop(app);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -41,6 +41,12 @@ pub struct SearchState {
     pub match_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilePanelEntry {
+    pub file_index: usize,
+    pub sidecar_indices: Vec<usize>,
+}
+
 impl SearchState {
     pub fn activate(&mut self) {
         self.is_active = true;
@@ -348,7 +354,9 @@ pub struct App {
     unfolded_files: BTreeSet<PathBuf>,
     pub is_network_mount: bool,
     pub disk_cache: crate::cache::DiskCache,
-    pub search: SearchState,
+    pub keybindings_search: SearchState,
+    pub file_search: SearchState,
+    file_search_origin: Option<PathBuf>,
 }
 
 impl App {
@@ -418,7 +426,9 @@ impl App {
             unfolded_files: BTreeSet::new(),
             is_network_mount,
             disk_cache,
-            search: SearchState::default(),
+            keybindings_search: SearchState::default(),
+            file_search: SearchState::default(),
+            file_search_origin: None,
         };
         let snapshot = match scan_directory(&app.directory) {
             Ok(files) => DirectorySnapshot::Files(files),
@@ -457,13 +467,13 @@ impl App {
             .and_then(|path| self.sidecars_by_media.get(path))
             .cloned()
             .unwrap_or_default();
-        let selected_position = old_path
+        let source_position = old_path
             .as_ref()
             .and_then(|path| files.iter().position(|file| &file.path == path));
-        let selected_changed = selected_position
+        let selected_changed = source_position
             .zip(old_file.as_ref())
             .is_some_and(|(index, old)| files[index].fingerprint != old.fingerprint);
-        let selected_removed = old_path.is_some() && selected_position.is_none();
+        let selected_removed = old_path.is_some() && source_position.is_none();
         let was_processing = matches!(
             self.dialog,
             Some(Dialog::Processing | Dialog::ConfirmCancel)
@@ -479,7 +489,21 @@ impl App {
         self.cache
             .retain(|key, _| self.files.iter().any(|file| key.matches_file(file)));
 
-        if let Some(position) = selected_position {
+        if was_processing
+            && source_position.is_some()
+            && old_path
+                .as_deref()
+                .and_then(|path| self.file_panel_position(path))
+                .is_none()
+        {
+            self.file_search.clear();
+            self.file_search_origin = None;
+        }
+
+        if let Some(position) = old_path
+            .as_deref()
+            .and_then(|path| self.file_panel_position(path))
+        {
             self.list_state.select(Some(position));
             self.sidecars = old_path
                 .as_ref()
@@ -503,10 +527,11 @@ impl App {
             return;
         }
 
-        let selection = (!self.files.is_empty()).then(|| {
+        let result_count = self.file_panel_entries().len();
+        let selection = (result_count > 0).then(|| {
             old_selection
                 .unwrap_or(0)
-                .min(self.files.len().saturating_sub(1))
+                .min(result_count.saturating_sub(1))
         });
         self.list_state.select(selection);
         self.sidecars = self
@@ -535,9 +560,60 @@ impl App {
     }
 
     pub fn selected_file(&self) -> Option<&FileEntry> {
-        self.list_state
-            .selected()
-            .and_then(|index| self.files.get(index))
+        let position = self.list_state.selected()?;
+        if !self.file_search_has_query() {
+            return self.files.get(position);
+        }
+        self.file_panel_entries()
+            .get(position)
+            .and_then(|entry| self.files.get(entry.file_index))
+    }
+
+    pub fn file_panel_entries(&self) -> Vec<FilePanelEntry> {
+        let query = self.file_search.query.trim().to_lowercase();
+        self.files
+            .iter()
+            .enumerate()
+            .filter_map(|(file_index, file)| {
+                let sidecars = self.sidecars_for_media(&file.path);
+                let sidecar_indices = if query.is_empty() {
+                    (0..sidecars.len()).collect::<Vec<_>>()
+                } else {
+                    sidecars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, sidecar)| {
+                            sidecar
+                                .display_name
+                                .to_lowercase()
+                                .contains(&query)
+                                .then_some(index)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let file_matches =
+                    query.is_empty() || file.display_name.to_lowercase().contains(&query);
+                (file_matches || !sidecar_indices.is_empty()).then_some(FilePanelEntry {
+                    file_index,
+                    sidecar_indices,
+                })
+            })
+            .collect()
+    }
+
+    pub fn file_search_has_query(&self) -> bool {
+        !self.file_search.query.trim().is_empty()
+    }
+
+    fn file_panel_position(&self, path: &Path) -> Option<usize> {
+        if !self.file_search_has_query() {
+            return self.files.iter().position(|file| file.path == path);
+        }
+        self.file_panel_entries().iter().position(|entry| {
+            self.files
+                .get(entry.file_index)
+                .is_some_and(|file| file.path == path)
+        })
     }
 
     pub fn sidecars_for_media(&self, path: &Path) -> &[SidecarEntry] {
@@ -613,13 +689,14 @@ impl App {
             self.scroll_details_down(1);
             return;
         }
-        if self.files.is_empty() {
+        let result_count = self.file_panel_entries().len();
+        if result_count == 0 {
             return;
         }
         let next = self
             .list_state
             .selected()
-            .map(|index| (index + 1).min(self.files.len() - 1))
+            .map(|index| (index + 1).min(result_count - 1))
             .unwrap_or(0);
         self.select(next);
     }
@@ -655,7 +732,7 @@ impl App {
             self.selected_stream = 0;
             return;
         }
-        if !self.files.is_empty() {
+        if !self.file_panel_entries().is_empty() {
             self.select(0);
         }
     }
@@ -689,15 +766,24 @@ impl App {
             self.selected_stream = self.stream_count().saturating_sub(1);
             return;
         }
-        if !self.files.is_empty() {
-            self.select(self.files.len() - 1);
+        let result_count = self.file_panel_entries().len();
+        if result_count > 0 {
+            self.select(result_count - 1);
         }
     }
 
     fn select(&mut self, index: usize) {
-        if self.list_state.selected() != Some(index) {
+        self.select_file_position(Some(index));
+    }
+
+    fn select_file_position(&mut self, position: Option<usize>) {
+        self.select_file_position_with_force(position, false);
+    }
+
+    fn select_file_position_with_force(&mut self, position: Option<usize>, force: bool) {
+        if force || self.list_state.selected() != position {
             self.clear_edit_state();
-            self.list_state.select(Some(index));
+            self.list_state.select(position);
             self.sidecars = self
                 .selected_file()
                 .and_then(|file| self.sidecars_by_media.get(&file.path))
@@ -800,10 +886,19 @@ impl App {
                         if let Ok(files) = scan_directory(&self.directory) {
                             self.reconcile_files(files);
                         }
-                        if let Some(index) =
-                            self.files.iter().position(|file| file.path == output_path)
+                        if self.files.iter().any(|file| file.path == output_path)
+                            && self.file_panel_position(&output_path).is_none()
                         {
-                            self.list_state.select(Some(index));
+                            self.file_search.clear();
+                            self.file_search_origin = None;
+                        }
+                        if let Some(position) = self.file_panel_position(&output_path) {
+                            self.list_state.select(Some(position));
+                            self.sidecars = self
+                                .selected_file()
+                                .and_then(|file| self.sidecars_by_media.get(&file.path))
+                                .cloned()
+                                .unwrap_or_default();
                         }
                         self.clear_track_edits();
                         self.edit_error = None;
@@ -2776,39 +2871,101 @@ impl App {
         self.edit_progress_label = None;
         self.edit_started = None;
         self.edit_cancel = None;
-        self.search.clear();
+        self.keybindings_search.clear();
     }
 
     pub fn show_keybindings(&mut self) {
         if self.dialog.is_none() {
             self.keybindings_scroll = 0;
             self.keybindings_max_scroll = 0;
-            self.search.clear();
+            self.keybindings_search.clear();
             self.dialog = Some(Dialog::Keybindings);
         }
     }
 
-    pub fn start_search(&mut self) {
-        self.search.activate();
+    pub fn start_keybindings_search(&mut self) {
+        self.keybindings_search.activate();
     }
 
-    pub fn search_push(&mut self, ch: char) {
-        self.search.push_char(ch);
+    pub fn keybindings_search_push(&mut self, ch: char) {
+        self.keybindings_search.push_char(ch);
         self.keybindings_scroll = 0;
     }
 
-    pub fn search_pop(&mut self) {
-        self.search.pop_char();
+    pub fn keybindings_search_pop(&mut self) {
+        self.keybindings_search.pop_char();
         self.keybindings_scroll = 0;
     }
 
-    pub fn finish_search_input(&mut self) {
-        self.search.deactivate();
+    pub fn finish_keybindings_search(&mut self) {
+        self.keybindings_search.deactivate();
     }
 
-    pub fn clear_search(&mut self) {
-        self.search.clear();
+    pub fn clear_keybindings_search(&mut self) {
+        self.keybindings_search.clear();
         self.keybindings_scroll = 0;
+    }
+
+    pub fn start_file_search(&mut self) {
+        if self.layer != Layer::Files {
+            return;
+        }
+        if self.file_search.query.is_empty() {
+            self.file_search_origin = self.selected_file().map(|file| file.path.clone());
+        }
+        self.file_search.activate();
+    }
+
+    pub fn file_search_push(&mut self, ch: char) {
+        let selected_path = self.selected_file().map(|file| file.path.clone());
+        self.file_search.push_char(ch);
+        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
+    }
+
+    pub fn file_search_pop(&mut self) {
+        let selected_path = self.selected_file().map(|file| file.path.clone());
+        self.file_search.pop_char();
+        if !self.file_search.is_active {
+            self.file_search_origin = None;
+        }
+        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
+    }
+
+    pub fn finish_file_search(&mut self) {
+        self.file_search.deactivate();
+        self.file_search_origin = None;
+    }
+
+    pub fn cancel_file_search(&mut self) {
+        let selected_path = self.selected_file().map(|file| file.path.clone());
+        let original_path = self.file_search_origin.take();
+        self.file_search.clear();
+        self.reselect_file_after_view_change(selected_path, original_path);
+    }
+
+    pub fn clear_file_search(&mut self) {
+        let selected_path = self.selected_file().map(|file| file.path.clone());
+        self.file_search.clear();
+        self.file_search_origin = None;
+        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
+    }
+
+    fn reselect_file_after_view_change(
+        &mut self,
+        previous_path: Option<PathBuf>,
+        preferred_path: Option<PathBuf>,
+    ) {
+        let preferred_position = preferred_path
+            .as_deref()
+            .and_then(|path| self.file_panel_position(path));
+        let selection =
+            preferred_position.or_else(|| (!self.file_panel_entries().is_empty()).then_some(0));
+        let next_path = selection
+            .and_then(|position| self.file_panel_entries().get(position).cloned())
+            .and_then(|entry| self.files.get(entry.file_index))
+            .map(|file| file.path.clone());
+        let force = previous_path != next_path;
+        self.select_file_position_with_force(selection, force);
     }
 
     pub fn scroll_keybindings_down(&mut self, amount: u16) {
@@ -2837,9 +2994,10 @@ impl App {
         self.notice = None;
         match self.layer {
             Layer::Files => {
-                if !self.files.is_empty() {
+                let result_count = self.file_panel_entries().len();
+                if result_count > 0 {
                     let current = self.list_state.selected().unwrap_or(0);
-                    self.select(current.saturating_add(10).min(self.files.len() - 1));
+                    self.select(current.saturating_add(10).min(result_count - 1));
                 }
             }
             Layer::Streams => {
@@ -2859,7 +3017,7 @@ impl App {
         self.notice = None;
         match self.layer {
             Layer::Files => {
-                if !self.files.is_empty() {
+                if !self.file_panel_entries().is_empty() {
                     let current = self.list_state.selected().unwrap_or(0);
                     self.select(current.saturating_sub(10));
                 }
@@ -5856,33 +6014,149 @@ mod tests {
     }
 
     #[test]
-    fn search_state_transitions_should_manage_query_and_active_flag() {
+    fn keybindings_search_state_transitions_should_manage_query_and_active_flag() {
         let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
 
-        assert!(!app.search.is_active);
-        assert_eq!(app.search.query, "");
+        assert!(!app.keybindings_search.is_active);
+        assert_eq!(app.keybindings_search.query, "");
 
-        app.start_search();
-        assert!(app.search.is_active);
+        app.start_keybindings_search();
+        assert!(app.keybindings_search.is_active);
 
-        app.search_push('a');
-        app.search_push('b');
-        assert_eq!(app.search.query, "ab");
-        assert!(app.search.is_active);
+        app.keybindings_search_push('a');
+        app.keybindings_search_push('b');
+        assert_eq!(app.keybindings_search.query, "ab");
+        assert!(app.keybindings_search.is_active);
 
-        app.search_pop();
-        assert_eq!(app.search.query, "a");
-        assert!(app.search.is_active);
+        app.keybindings_search_pop();
+        assert_eq!(app.keybindings_search.query, "a");
+        assert!(app.keybindings_search.is_active);
 
-        app.finish_search_input();
-        assert!(!app.search.is_active);
-        assert_eq!(app.search.query, "a");
+        app.finish_keybindings_search();
+        assert!(!app.keybindings_search.is_active);
+        assert_eq!(app.keybindings_search.query, "a");
 
-        app.clear_search();
-        assert!(!app.search.is_active);
-        assert_eq!(app.search.query, "");
+        app.clear_keybindings_search();
+        assert!(!app.keybindings_search.is_active);
+        assert_eq!(app.keybindings_search.query, "");
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_search_should_match_media_and_only_matching_sidecars_case_insensitively() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "movie.eng.srt", "movie.nld.srt", "other.mkv"]);
+        app.layer = Layer::Files;
+        let directory = app.directory.clone();
+        let movie_path = directory.join("movie.mkv");
+        assert_that!(app.is_file_folded(&movie_path)).is_true();
+
+        // Act: match through one sidecar.
+        app.start_file_search();
+        for ch in "ENG".chars() {
+            app.file_search_push(ch);
+        }
+        let entries = app.file_panel_entries();
+
+        // Assert
+        assert_that!(entries.len()).is_equal_to(1);
+        let entry = &entries[0];
+        assert_that!(app.files[entry.file_index].display_name.as_str()).is_equal_to("movie.mkv");
+        let sidecars = app.sidecars_for_media(&movie_path);
+        let names = entry
+            .sidecar_indices
+            .iter()
+            .map(|index| sidecars[*index].display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_that!(names).contains_exactly_in_given_order(["movie.eng.srt"]);
+
+        // Act: a media-only match must not bring nonmatching sidecars along.
+        app.cancel_file_search();
+        app.start_file_search();
+        for ch in "movie.mkv".chars() {
+            app.file_search_push(ch);
+        }
+        let entries = app.file_panel_entries();
+
+        // Assert
+        assert_that!(entries.len()).is_equal_to(1);
+        assert_that!(&entries[0].sidecar_indices).is_empty();
+        assert_that!(app.is_file_folded(&movie_path)).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_search_should_restore_cancelled_selection_and_keep_confirmed_selection() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv", "beta.mkv", "gamma.mkv"]);
+        app.layer = Layer::Files;
+        app.select_next();
+        let directory = app.directory.clone();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+
+        // Act: move to a result, then cancel the search.
+        app.start_file_search();
+        for ch in "gamma".chars() {
+            app.file_search_push(ch);
+        }
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("gamma.mkv");
+        app.cancel_file_search();
+
+        // Assert: cancellation restores the pre-search file.
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+
+        // Act: confirm the same result, then clear the confirmed filter.
+        app.start_file_search();
+        for ch in "gamma".chars() {
+            app.file_search_push(ch);
+        }
+        app.finish_file_search();
+        app.clear_file_search();
+
+        // Assert: the confirmed result remains selected.
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("gamma.mkv");
+
+        // Act and assert: no matches leave no hidden selection.
+        app.start_file_search();
+        for ch in "missing".chars() {
+            app.file_search_push(ch);
+        }
+        assert_that!(app.file_panel_entries()).is_empty();
+        assert_that!(app.selected_file()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_search_should_reconcile_to_the_first_remaining_live_match() {
+        // Arrange
+        let mut app = test_file_app(&["alpha.mkv", "alpha.eng.srt", "beta.mkv", "beta.eng.srt"]);
+        app.layer = Layer::Files;
+        let directory = app.directory.clone();
+        app.start_file_search();
+        for ch in "eng".chars() {
+            app.file_search_push(ch);
+        }
+        app.finish_file_search();
+        app.select_next();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
+        std::fs::remove_file(directory.join("beta.eng.srt")).unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        assert_that!(app.file_panel_entries().len()).is_equal_to(1);
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

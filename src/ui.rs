@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::{
     app::{
         App, CancelEditChoice, ContainerChoice, CustomResolutionField, Dialog, Layer,
-        SaveDialogField, TrackRef, VideoSettingsField, VideoSettingsMode,
+        SaveDialogField, SearchState, TrackRef, VideoSettingsField, VideoSettingsMode,
     },
     edit::{ContainerFormat, SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -64,44 +64,56 @@ fn dim_backdrop(frame: &mut Frame) {
 
 fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.layer == Layer::Files;
-    let has_any_sidecars = app
-        .files
+    let entries = app.file_panel_entries();
+    let filtering = app.file_search_has_query();
+    let has_any_sidecars = entries
         .iter()
-        .any(|file| !app.sidecars_for_media(&file.path).is_empty());
+        .any(|entry| !entry.sidecar_indices.is_empty());
 
-    let items: Vec<_> = app
-        .files
+    let items: Vec<_> = entries
         .iter()
-        .map(|file| {
-            ListItem::new(file_tree_lines(
+        .filter_map(|entry| {
+            let file = app.files.get(entry.file_index)?;
+            let sidecars = app.sidecars_for_media(&file.path);
+            Some(ListItem::new(file_tree_lines(
                 &file.display_name,
-                app.sidecars_for_media(&file.path)
+                entry
+                    .sidecar_indices
                     .iter()
+                    .filter_map(|index| sidecars.get(*index))
                     .map(|sidecar| sidecar.display_name.as_str()),
-                app.is_file_folded(&file.path),
+                !filtering && app.is_file_folded(&file.path),
                 has_any_sidecars,
-            ))
+            )))
         })
         .collect();
+    app.file_search.match_count = entries.len();
     let title = if app.is_network_mount {
         format!(" Files ({}) [NET] ", app.files.len())
     } else {
         format!(" Files ({}) ", app.files.len())
     };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border(app.layer == Layer::Files))
+        .title(title);
+    let inner = block.inner(area);
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(focus_border(app.layer == Layer::Files))
-                .title(title),
-        )
         .highlight_style(if focused {
             focused_style(false)
         } else {
             Style::default().fg(Color::White).bold()
         })
         .highlight_symbol(if focused { "› " } else { "  " });
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    frame.render_widget(block, area);
+
+    if app.file_search.is_active || !app.file_search.query.is_empty() {
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
+        frame.render_widget(Paragraph::new(search_line(&app.file_search)), chunks[1]);
+    } else {
+        frame.render_stateful_widget(list, inner, &mut app.list_state);
+    }
 }
 
 fn file_tree_lines<'a>(
@@ -1178,11 +1190,27 @@ fn is_keybinding_entry(line: &Line) -> bool {
     line.spans.iter().any(|s| s.content.starts_with("  "))
 }
 
+fn search_line(search: &SearchState) -> Line<'_> {
+    if search.query.is_empty() {
+        return Line::styled("  Search: ...", Style::default().fg(Color::Yellow));
+    }
+    let match_suffix = match search.match_count {
+        0 => " (no matches)".to_string(),
+        1 => " (1 match)".to_string(),
+        count => format!(" ({count} matches)"),
+    };
+    Line::from(vec![
+        Span::styled("  Search: ", Style::default().fg(Color::Cyan)),
+        Span::styled(&search.query, Style::default().fg(Color::Yellow).bold()),
+        Span::styled(match_suffix, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
     let area = popup_area(frame.area(), 80, 80);
     let full_text = keybindings_text();
-    let (filtered_text, count) = filter_keybindings_text(full_text, &app.search.query);
-    app.search.match_count = count;
+    let (filtered_text, count) = filter_keybindings_text(full_text, &app.keybindings_search.query);
+    app.keybindings_search.match_count = count;
     let text = padded_popup_text(filtered_text);
 
     let block = Block::default()
@@ -1194,7 +1222,7 @@ fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    if app.search.is_active || !app.search.query.is_empty() {
+    if app.keybindings_search.is_active || !app.keybindings_search.query.is_empty() {
         let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
 
         app.set_keybindings_max_scroll(max_scroll(&text, chunks[0]));
@@ -1206,22 +1234,10 @@ fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
             chunks[0],
         );
 
-        let line = if app.search.query.is_empty() {
-            Line::styled("  Search: ...", Style::default().fg(Color::Yellow))
-        } else {
-            let match_suffix = match app.search.match_count {
-                0 => " (no matches)".to_string(),
-                1 => " (1 match)".to_string(),
-                n => format!(" ({n} matches)"),
-            };
-            Line::from(vec![
-                Span::styled("  Search: ", Style::default().fg(Color::Cyan)),
-                Span::styled(&app.search.query, Style::default().fg(Color::Yellow).bold()),
-                Span::styled(match_suffix, Style::default().fg(Color::DarkGray)),
-            ])
-        };
-
-        frame.render_widget(Paragraph::new(line), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(search_line(&app.keybindings_search)),
+            chunks[1],
+        );
     } else {
         app.set_keybindings_max_scroll(max_scroll(&text, inner));
 
@@ -1238,7 +1254,7 @@ fn keybindings_text() -> Text<'static> {
     let mut lines = Vec::new();
     keybindings_section(&mut lines, "General");
     keybinding(&mut lines, "?", "Open or close keybindings");
-    keybinding(&mut lines, "/", "Search in keybindings");
+    keybinding(&mut lines, "/", "Search files or keybindings");
     keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
     keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
     keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
@@ -2684,6 +2700,57 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(!content_valid.contains("Unsupported format"));
+    }
+
+    #[test]
+    fn render_files_should_reveal_only_matching_sidecars_during_search() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-file-search-ui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["movie.mkv", "movie.eng.srt", "movie.nld.srt"] {
+            std::fs::write(directory.join(name), b"media").unwrap();
+        }
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let movie_path = directory.join("movie.mkv");
+        app.start_file_search();
+        for ch in "eng".chars() {
+            app.file_search_push(ch);
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_files(frame, &mut app, frame.area()))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        // Assert
+        assert_that!(&content)
+            .contains("movie.mkv")
+            .contains("movie.eng.srt")
+            .contains("Search: eng (1 match)")
+            .does_not_contain("movie.nld.srt");
+        assert_that!(app.is_file_folded(&movie_path)).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
