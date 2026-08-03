@@ -10,7 +10,7 @@ mod ui;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use app::{App, Dialog, Layer};
+use app::{App, Dialog, Layer, SubtitleSettingsMode};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use edit::spawn_edit_worker;
 use files::spawn_directory_monitor;
@@ -131,69 +131,266 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 app.cancel_edit();
             }
         }
-        Some(Dialog::ConfirmCancel) => {
-            input.reset_sequence();
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
-                    app.choose_cancel_edit(-1)
-                }
-                (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
-                    app.choose_cancel_edit(1)
-                }
-                (KeyCode::Enter, _) => app.activate_cancel_edit(),
-                _ if is_back_key(key) => app.dismiss_cancel_edit(),
-                _ => {}
+        Some(Dialog::ConfirmCancel) => match (key.code, key.modifiers) {
+            (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_cancel_edit(-1)
             }
-        }
-        Some(Dialog::ContainerSettings) => {
-            input.reset_sequence();
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                    app.move_container_settings_cursor(1)
-                }
-                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                    app.move_container_settings_cursor(-1)
-                }
-                (KeyCode::Enter, _) => app.activate_container_settings(),
-                _ if is_back_key(key) => app.close_container_settings(),
-                _ => {}
+            (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_cancel_edit(1)
             }
-        }
+            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_cancel_edit_endpoint(true);
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_cancel_edit();
+            }
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.dismiss_cancel_edit();
+            }
+            _ if input.is_double_g(key) => app.choose_cancel_edit_endpoint(false),
+            _ => {}
+        },
+        Some(Dialog::ContainerSettings) => match (key.code, key.modifiers) {
+            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_container_settings_cursor(1)
+            }
+            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_container_settings_cursor(-1)
+            }
+            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_container_settings_to_endpoint(true);
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_container_settings();
+            }
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.close_container_settings();
+            }
+            _ if input.is_double_g(key) => app.move_container_settings_to_endpoint(false),
+            _ => {}
+        },
         Some(Dialog::VideoSettings) => {
-            input.reset_sequence();
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.save_from_video_settings(),
-                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                    app.move_video_settings_cursor(1)
+            if app.custom_resolution_input_active() {
+                input.reset_sequence();
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.save_from_video_settings(),
+                    (KeyCode::Esc, _) => app.finish_custom_resolution_input(),
+                    (KeyCode::Enter, _) => {
+                        app.finish_custom_resolution_input();
+                        app.activate_video_settings();
+                    }
+                    (KeyCode::Left, KeyModifiers::NONE) => {
+                        app.move_custom_resolution_input_cursor(-1)
+                    }
+                    (KeyCode::Right, KeyModifiers::NONE) => {
+                        app.move_custom_resolution_input_cursor(1)
+                    }
+                    (KeyCode::Home, KeyModifiers::NONE) => {
+                        app.move_custom_resolution_input_home(false)
+                    }
+                    (KeyCode::End, KeyModifiers::NONE) => {
+                        app.move_custom_resolution_input_home(true)
+                    }
+                    (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_custom_resolution(),
+                    (KeyCode::Delete, KeyModifiers::NONE) => app.delete_custom_resolution_input(),
+                    (KeyCode::Char(digit), KeyModifiers::NONE) if digit.is_ascii_digit() => {
+                        app.input_custom_resolution_digit(digit)
+                    }
+                    _ => {}
                 }
-                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                    app.move_video_settings_cursor(-1)
+            } else {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                        input.reset_sequence();
+                        app.save_from_video_settings();
+                    }
+                    (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.start_custom_resolution_input();
+                    }
+                    (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_video_settings_cursor(1)
+                    }
+                    (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_video_settings_cursor(-1)
+                    }
+                    (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_video_settings_to_endpoint(true);
+                    }
+                    (KeyCode::Enter, _) => {
+                        input.reset_sequence();
+                        app.activate_video_settings();
+                    }
+                    _ if is_back_key(key) => {
+                        input.reset_sequence();
+                        app.escape_video_settings();
+                    }
+                    _ if input.is_double_g(key) => app.move_video_settings_to_endpoint(false),
+                    _ => {}
                 }
-                (KeyCode::Char(digit), KeyModifiers::NONE) if digit.is_ascii_digit() => {
-                    app.input_custom_resolution_digit(digit)
-                }
-                (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_custom_resolution(),
-                (KeyCode::Enter, _) => app.activate_video_settings(),
-                _ if is_back_key(key) => app.escape_video_settings(),
-                _ => {}
             }
         }
         Some(Dialog::SubtitleSettings) => {
-            input.reset_sequence();
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                    app.move_subtitle_settings_cursor(1)
+            let mode = app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode)
+                .unwrap_or_default();
+            match mode {
+                SubtitleSettingsMode::TitleEdit => {
+                    input.reset_sequence();
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            app.save_from_subtitle_settings()
+                        }
+                        (KeyCode::Esc | KeyCode::Enter, _) => app.escape_subtitle_settings(),
+                        (KeyCode::Left, KeyModifiers::NONE) => app.move_subtitle_title_cursor(-1),
+                        (KeyCode::Right, KeyModifiers::NONE) => app.move_subtitle_title_cursor(1),
+                        (KeyCode::Home, KeyModifiers::NONE) => app.move_subtitle_title_home(false),
+                        (KeyCode::End, KeyModifiers::NONE) => app.move_subtitle_title_home(true),
+                        (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_subtitle_title(),
+                        (KeyCode::Delete, KeyModifiers::NONE) => app.delete_subtitle_title(),
+                        (KeyCode::Char(character), modifiers)
+                            if modifiers == KeyModifiers::NONE
+                                || modifiers == KeyModifiers::SHIFT =>
+                        {
+                            app.input_subtitle_title(character)
+                        }
+                        _ => {}
+                    }
                 }
-                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                    app.move_subtitle_settings_cursor(-1)
+                SubtitleSettingsMode::LanguageDropdown => {
+                    let searching = app
+                        .subtitle_settings_popup
+                        .as_ref()
+                        .is_some_and(|popup| popup.language_search.is_active);
+                    if searching {
+                        input.reset_sequence();
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Esc, _) => app.cancel_subtitle_language_search(),
+                            (KeyCode::Down, KeyModifiers::NONE)
+                            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                app.move_subtitle_settings_cursor(1)
+                            }
+                            (KeyCode::Up, KeyModifiers::NONE)
+                            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                app.move_subtitle_settings_cursor(-1)
+                            }
+                            (KeyCode::Left, KeyModifiers::NONE) => {
+                                app.move_subtitle_language_cursor(-1)
+                            }
+                            (KeyCode::Right, KeyModifiers::NONE) => {
+                                app.move_subtitle_language_cursor(1)
+                            }
+                            (KeyCode::Home, KeyModifiers::NONE) => {
+                                app.move_subtitle_language_home(false)
+                            }
+                            (KeyCode::End, KeyModifiers::NONE) => {
+                                app.move_subtitle_language_home(true)
+                            }
+                            (KeyCode::Enter, _) => app.activate_subtitle_settings(),
+                            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                                app.backspace_subtitle_language()
+                            }
+                            (KeyCode::Delete, KeyModifiers::NONE) => app.delete_subtitle_language(),
+                            (KeyCode::Char(character), modifiers)
+                                if modifiers == KeyModifiers::NONE
+                                    || modifiers == KeyModifiers::SHIFT =>
+                            {
+                                app.input_subtitle_language(character)
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                input.reset_sequence();
+                                app.toggle_subtitle_field_help();
+                            }
+                            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.start_subtitle_language_search();
+                            }
+                            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_subtitle_settings_cursor(1)
+                            }
+                            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_subtitle_settings_cursor(-1)
+                            }
+                            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_subtitle_settings_to_endpoint(true);
+                            }
+                            (KeyCode::Enter, _) => {
+                                input.reset_sequence();
+                                app.activate_subtitle_settings();
+                            }
+                            _ if is_back_key(key) => {
+                                input.reset_sequence();
+                                app.escape_subtitle_settings();
+                            }
+                            _ if input.is_double_g(key) => {
+                                app.move_subtitle_settings_to_endpoint(false)
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                (KeyCode::Enter | KeyCode::Char(' '), _) => app.activate_subtitle_settings(),
-                (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                    app.close_subtitle_settings();
-                    app.request_save();
+                SubtitleSettingsMode::Summary | SubtitleSettingsMode::CodecDropdown => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            input.reset_sequence();
+                            app.toggle_subtitle_field_help();
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            input.reset_sequence();
+                            app.save_from_subtitle_settings()
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.start_subtitle_title_input();
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_subtitle_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_subtitle_settings_cursor(-1)
+                        }
+                        (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_subtitle_settings_to_endpoint(true);
+                        }
+                        (KeyCode::Enter, _) => {
+                            input.reset_sequence();
+                            app.activate_subtitle_settings()
+                        }
+                        _ if is_back_key(key) => {
+                            input.reset_sequence();
+                            app.escape_subtitle_settings();
+                        }
+                        _ if input.is_double_g(key) => {
+                            app.move_subtitle_settings_to_endpoint(false)
+                        }
+                        _ => {}
+                    }
                 }
-                _ if is_back_key(key) => app.escape_subtitle_settings(),
-                _ => {}
             }
         }
         Some(Dialog::Keybindings) => {
@@ -211,11 +408,33 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                         input.reset_sequence();
                         app.keybindings_search_pop();
                     }
-                    (KeyCode::Down, KeyModifiers::NONE) => {
+                    (KeyCode::Delete, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.keybindings_search_delete();
+                    }
+                    (KeyCode::Left, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_keybindings_search_cursor(-1);
+                    }
+                    (KeyCode::Right, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_keybindings_search_cursor(1);
+                    }
+                    (KeyCode::Home, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_keybindings_search_home(false);
+                    }
+                    (KeyCode::End, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_keybindings_search_home(true);
+                    }
+                    (KeyCode::Down, KeyModifiers::NONE)
+                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
                         app.scroll_keybindings_down(1);
                     }
-                    (KeyCode::Up, KeyModifiers::NONE) => {
+                    (KeyCode::Up, KeyModifiers::NONE)
+                    | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
                         app.scroll_keybindings_up(1);
                     }
@@ -257,7 +476,7 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                     }
                     _ if is_back_key(key) => {
                         input.reset_sequence();
-                        if !app.keybindings_search.query.is_empty() {
+                        if !app.keybindings_search.value.is_empty() {
                             app.clear_keybindings_search();
                         } else {
                             app.dismiss_dialog();
@@ -268,26 +487,38 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                 }
             }
         }
-        Some(Dialog::ConfirmSave) => {
-            input.reset_sequence();
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                    app.move_save_dialog_cursor(1)
-                }
-                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                    app.move_save_dialog_cursor(-1)
-                }
-                (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
-                    app.choose_save_destination(-1)
-                }
-                (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
-                    app.choose_save_destination(1)
-                }
-                (KeyCode::Enter, _) => app.activate_save_dialog(),
-                _ if is_back_key(key) => app.dismiss_dialog(),
-                _ => {}
+        Some(Dialog::ConfirmSave) => match (key.code, key.modifiers) {
+            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_save_dialog_cursor(1)
             }
-        }
+            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_save_dialog_cursor(-1)
+            }
+            (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_save_destination(-1)
+            }
+            (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_save_destination(1)
+            }
+            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_save_dialog_to_endpoint(true);
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_save_dialog();
+            }
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.dismiss_dialog();
+            }
+            _ if input.is_double_g(key) => app.move_save_dialog_to_endpoint(false),
+            _ => {}
+        },
         Some(Dialog::Error) => {
             input.reset_sequence();
             if key.code == KeyCode::Enter || is_back_key(key) {
@@ -314,11 +545,31 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
                 input.reset_sequence();
                 app.file_search_pop();
             }
-            (KeyCode::Down, KeyModifiers::NONE) => {
+            (KeyCode::Delete, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.file_search_delete();
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_file_search_cursor(-1);
+            }
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_file_search_cursor(1);
+            }
+            (KeyCode::Home, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_file_search_home(false);
+            }
+            (KeyCode::End, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_file_search_home(true);
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 input.reset_sequence();
                 app.select_next();
             }
-            (KeyCode::Up, KeyModifiers::NONE) => {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 input.reset_sequence();
                 app.select_previous();
             }
@@ -362,10 +613,6 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char('d'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.toggle_delete_selected_stream();
-        }
-        (KeyCode::Char('a'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
-            input.reset_sequence();
-            app.set_selected_stream_default();
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
@@ -470,8 +717,9 @@ mod tests {
     use super::*;
     use crate::{
         app::{
-            CustomResolutionDraft, CustomResolutionField, VideoSettingsField, VideoSettingsMode,
-            VideoSettingsPopup,
+            CancelEditChoice, ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField,
+            SaveDialogField, SubtitleSettingsField, TextInputState, VideoSettingsField,
+            VideoSettingsMode, VideoSettingsPopup,
         },
         edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
         files::{FileEntry, FileFingerprint},
@@ -492,6 +740,34 @@ mod tests {
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
         let app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        (app, directory)
+    }
+
+    fn subtitle_settings_app() -> (App, PathBuf) {
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {
+                        "index": 1,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng"},
+                        "disposition": {"default": 0}
+                    }
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|track| *track == crate::app::TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
         (app, directory)
     }
 
@@ -635,7 +911,7 @@ mod tests {
             format: SubtitleFormat::SubRip,
             language: "eng".to_string(),
             forced: false,
-            cc: false,
+            hearing_impaired: false,
             number: None,
             fingerprint: FileFingerprint {
                 length: 0,
@@ -800,8 +1076,8 @@ mod tests {
             codec_cursor: 0,
             resolution_cursor: 0,
             custom_resolution: Some(CustomResolutionDraft {
-                width: String::new(),
-                height: String::new(),
+                width: TextInputState::default(),
+                height: TextInputState::default(),
                 scaling: CustomScaling::FitPad,
                 field: CustomResolutionField::Width,
                 scaling_cursor: 0,
@@ -810,13 +1086,27 @@ mod tests {
         });
         let mut input = InputState::default();
 
-        // Act
+        // Act: digits are ignored until i activates the selected value field.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('9')));
+        assert_eq!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .width
+                .value,
+            ""
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('1')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('2')));
         handle_key(&mut app, &mut input, key(KeyCode::Backspace));
-        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('8')));
-        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         handle_key(&mut app, &mut input, key(KeyCode::Down));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
@@ -829,13 +1119,226 @@ mod tests {
             .custom_resolution
             .as_ref()
             .unwrap();
-        assert_eq!(draft.width, "1");
-        assert_eq!(draft.height, "8");
+        assert_eq!(draft.width.value, "1");
+        assert_eq!(draft.height.value, "8");
         assert_eq!(draft.field, CustomResolutionField::Scaling);
         assert_eq!(draft.scaling, CustomScaling::Stretch);
         assert!(!draft.scaling_dropdown_open);
 
         // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_title_should_require_i_and_keep_text_editing_conventional() {
+        // Arrange
+        let (mut app, directory) = subtitle_settings_app();
+        let mut input = InputState::default();
+        app.move_subtitle_settings_cursor(1);
+        app.move_subtitle_settings_cursor(1);
+        assert_eq!(
+            app.subtitle_settings_popup.as_ref().unwrap().field,
+            SubtitleSettingsField::Title
+        );
+
+        // Act / Assert: Enter, Space, and ordinary text do not start editing.
+        for code in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('x')] {
+            handle_key(&mut app, &mut input, key(code));
+            let popup = app.subtitle_settings_popup.as_ref().unwrap();
+            assert_eq!(popup.mode, SubtitleSettingsMode::Summary);
+            assert!(!popup.title_input.is_active);
+            assert_eq!(popup.title_input.value, "");
+        }
+
+        // Act: i starts editing; q is text; arrows and Esc retain conventional behavior.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('A')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert
+        let popup = app.subtitle_settings_popup.as_ref().unwrap();
+        assert_eq!(popup.mode, SubtitleSettingsMode::Summary);
+        assert!(!popup.title_input.is_active);
+        assert_eq!(
+            app.subtitle_popup_metadata().unwrap().title.as_deref(),
+            Some("Aq")
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_language_should_use_normal_navigation_until_slash_starts_search() {
+        // Arrange
+        let (mut app, directory) = subtitle_settings_app();
+        let mut input = InputState::default();
+        app.move_subtitle_settings_cursor(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Act / Assert: letters do not filter in navigation mode.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('d')));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .value,
+            ""
+        );
+
+        // Act: slash starts search and Ctrl-n remains result navigation.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in "dutch".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, ctrl('n'));
+
+        // Assert
+        let popup = app.subtitle_settings_popup.as_ref().unwrap();
+        assert!(popup.language_search.is_active);
+        assert_eq!(popup.language_search.value, "dutch");
+        assert_eq!(app.filtered_subtitle_languages().len(), 1);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_field_help_should_toggle_follow_navigation_and_leave_text_input_alone() {
+        // Arrange
+        let (mut app, directory) = subtitle_settings_app();
+        let mut input = InputState::default();
+        let shifted_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+
+        // Act: open help, navigate, and enter the language dropdown.
+        handle_key(&mut app, &mut input, shifted_k);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert: help remains passive and follows the parent field.
+        let popup = app.subtitle_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.field, SubtitleSettingsField::Language);
+        assert_eq!(popup.mode, SubtitleSettingsMode::LanguageDropdown);
+
+        // Act: K toggles help while navigating, but types during search.
+        handle_key(&mut app, &mut input, shifted_k);
+        assert!(!app.subtitle_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, shifted_k);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, shifted_k);
+
+        // Assert
+        let popup = app.subtitle_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.language_search.value, "K");
+
+        // Act: return to the summary, edit Title, and type K there too.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, shifted_k);
+
+        // Assert
+        let popup = app.subtitle_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.mode, SubtitleSettingsMode::TitleEdit);
+        assert_eq!(popup.title_input.value, "K");
+
+        // Act: closing and reopening the editor resets help to closed.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        app.open_track_settings();
+
+        // Assert
+        assert!(!app.subtitle_settings_popup.as_ref().unwrap().help_visible);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_should_not_mark_the_selected_stream_as_default() {
+        // Arrange
+        let (mut app, directory) = subtitle_settings_app();
+        app.close_subtitle_settings();
+        let mut input = InputState::default();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('a')));
+
+        // Assert
+        assert!(app.default_streams.is_empty());
+        assert!(app.default_sidecars.is_empty());
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selectable_dialogs_should_support_gg_and_g_endpoints() {
+        // Arrange: container choices.
+        let (mut app, directory) = test_app();
+        app.dialog = Some(Dialog::ContainerSettings);
+        app.container_settings_popup = Some(ContainerSettingsPopup { cursor: 1 });
+        let last_container = app.container_choices().len() - 1;
+        let mut input = InputState::default();
+
+        // Act / Assert
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().cursor,
+            last_container
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(app.container_settings_popup.as_ref().unwrap().cursor, 0);
+
+        // Arrange / Act / Assert: video summary fields.
+        app.dialog = Some(Dialog::VideoSettings);
+        app.video_settings_popup = Some(VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Codec,
+            mode: VideoSettingsMode::Summary,
+            codec_cursor: 0,
+            resolution_cursor: 0,
+            custom_resolution: None,
+        });
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(
+            app.video_settings_popup.as_ref().unwrap().field,
+            VideoSettingsField::Resolution
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.video_settings_popup.as_ref().unwrap().field,
+            VideoSettingsField::Codec
+        );
+
+        // Arrange / Act / Assert: save and cancel choices.
+        app.container_target = Some(crate::edit::ContainerFormat::Matroska);
+        app.dialog = Some(Dialog::ConfirmSave);
+        app.save_dialog_field = SaveDialogField::Start;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(app.save_dialog_field, SaveDialogField::Destination);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(app.save_dialog_field, SaveDialogField::Start);
+
+        app.dialog = Some(Dialog::ConfirmCancel);
+        app.cancel_edit_choice = CancelEditChoice::CancelProcessing;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(app.cancel_edit_choice, CancelEditChoice::KeepProcessing);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(app.cancel_edit_choice, CancelEditChoice::CancelProcessing);
+
         drop(app);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -867,8 +1370,8 @@ mod tests {
                 codec_cursor: 0,
                 resolution_cursor: 0,
                 custom_resolution: Some(CustomResolutionDraft {
-                    width: "1280".to_string(),
-                    height: "720".to_string(),
+                    width: TextInputState::new("1280".to_string()),
+                    height: TextInputState::new("720".to_string()),
                     scaling: CustomScaling::FitPad,
                     field: CustomResolutionField::Scaling,
                     scaling_cursor: 0,
@@ -991,13 +1494,13 @@ mod tests {
         // 2. Type 't', 'r'
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
-        assert_eq!(app.keybindings_search.query, "tr");
+        assert_eq!(app.keybindings_search.value, "tr");
         assert!(app.keybindings_search.is_active);
 
         // 3. Esc while typing cancels search and restores full list immediately
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert!(!app.keybindings_search.is_active);
-        assert_eq!(app.keybindings_search.query, "");
+        assert_eq!(app.keybindings_search.value, "");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 4. Press '/', type 't', 'r', press Enter to confirm
@@ -1006,12 +1509,12 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         assert!(!app.keybindings_search.is_active);
-        assert_eq!(app.keybindings_search.query, "tr");
+        assert_eq!(app.keybindings_search.value, "tr");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 5. Esc while browsing filtered results clears filter
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
-        assert_eq!(app.keybindings_search.query, "");
+        assert_eq!(app.keybindings_search.value, "");
         assert_eq!(app.dialog, Some(Dialog::Keybindings));
 
         // 6. Esc on empty filter closes popup
@@ -1049,7 +1552,7 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
 
         // Assert: cancellation restores alpha.
-        assert_that!(app.file_search.query.as_str()).is_empty();
+        assert_that!(app.file_search.value.as_str()).is_empty();
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
 
         // Act: confirm beta and open/close keybindings over the retained filter.
@@ -1060,13 +1563,13 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
         assert_that!(app.dialog).contains(Dialog::Keybindings);
-        assert_that!(app.file_search.query.as_str()).is_equal_to("beta");
+        assert_that!(app.file_search.value.as_str()).is_equal_to("beta");
         handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
 
         // Act and assert: first Esc clears the filter and keeps beta; second quits.
         let cleared = handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(cleared).is_equal_to(InputOutcome::Continue);
-        assert_that!(app.file_search.query.as_str()).is_empty();
+        assert_that!(app.file_search.value.as_str()).is_empty();
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
         let quit = handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(quit).is_equal_to(InputOutcome::Quit);

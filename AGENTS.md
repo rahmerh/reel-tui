@@ -45,7 +45,20 @@ Use `rustfmt` defaults (four-space indentation) and keep Clippy warning-free. Fo
 
 Add tests in the module affected by the change, using descriptive behavior names such as `cancelled_edit_preserves_original`. Use temporary paths for filesystem cases and deterministic JSON fixtures for probe parsing. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before submitting.
 
+### Coverage and Regression Policy
+
+- Maintain a project target of at least **90% measured line coverage**, and prefer coverage comfortably above 90%. Measure branch coverage as well when the installed Rust coverage tooling supports it, and improve weak branch coverage rather than relying on the line percentage alone.
+- Until the repository reaches 90%, changes must not reduce overall coverage. New or modified production paths should be covered comprehensively and should improve coverage where practical, especially in modules below the target.
+- Every bug fix must include a focused regression test that fails before the fix and passes afterward. Reproduce the complete failure mode, including effects on neighboring or untouched data; do not test only the value directly changed by the user.
+- Cover meaningful success, failure, cancellation, validation, and transaction/rollback paths. For FFmpeg and ffprobe behavior, include integration tests using small deterministic media fixtures when unit tests cannot verify the real command semantics.
+- Treat coverage as a diagnostic floor, not proof of correctness. Do not inflate it with assertion-free tests, broad exclusions, or tests that execute code without validating observable behavior.
+- Report the measured coverage method and totals with completed changes. If coverage cannot be measured in the current environment, state that explicitly rather than estimating it.
+
 **Mandatory Reinstall Step**: After making changes and successfully passing tests, ALWAYS run `cargo install --path .` so the updated `reel` binary is immediately installed to `~/.cargo/bin/reel`.
+
+### Edit Progress Contract
+
+Treat accurate progress reporting as a required part of every Save workflow change. Every blocking subprocess, potentially slow filesystem operation, validation pass, transaction phase, rollback, and cleanup path must emit a concise typed progress phase immediately before doing the work. Use measured phase-local progress only when the underlying operation exposes reliable units; otherwise show the indeterminate loader rather than estimating. Keep labels short enough for the Save dialog, use basenames and compact codec names, and omit redundant import/export wording. New or changed edit paths must include regression tests for their progress sequence, cancellation, and cleanup behavior.
 
 ## Commit & Pull Request Guidelines
 

@@ -5,6 +5,8 @@ use std::{
     sync::OnceLock,
 };
 
+use isolang::{Language, languages};
+
 use crate::files::{FileEntry, FileFingerprint};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -37,6 +39,18 @@ impl SubtitleFormat {
             Self::Ttml => "TTML",
             Self::MovText => "MOV Text",
             Self::Pgs => "PGS / SUP",
+            Self::VobSub => "VobSub",
+        }
+    }
+
+    pub fn overview_label(self) -> &'static str {
+        match self {
+            Self::SubRip => "SRT",
+            Self::Ass => "ASS",
+            Self::WebVtt => "VTT",
+            Self::Ttml => "TTML",
+            Self::MovText => "MOVTXT",
+            Self::Pgs => "PGS",
             Self::VobSub => "VobSub",
         }
     }
@@ -132,6 +146,26 @@ pub enum SubtitleSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtitleMetadata {
+    pub language: String,
+    pub title: Option<String>,
+    pub forced: bool,
+    pub cc: bool,
+    pub hearing_impaired: bool,
+    pub original: bool,
+    pub commentary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubtitleFlag {
+    Forced,
+    Cc,
+    HearingImpaired,
+    Original,
+    Commentary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtitleChange {
     pub source: SubtitleSource,
     pub source_format: SubtitleFormat,
@@ -139,19 +173,19 @@ pub struct SubtitleChange {
     pub export_target: Option<SubtitleFormat>,
     pub import_into_media: bool,
     pub ocr_language: Option<String>,
+    pub metadata: Option<SubtitleMetadata>,
 }
 
 impl SubtitleChange {
     pub fn removes_from_media(&self) -> bool {
-        matches!(self.source, SubtitleSource::Embedded(_))
-            && self.embedded_target.is_none()
-            && self.export_target.is_some()
+        matches!(self.source, SubtitleSource::Embedded(_)) && self.export_target.is_some()
     }
 
     pub fn changes_media(&self) -> bool {
         match self.source {
             SubtitleSource::Embedded(_) => {
                 self.removes_from_media()
+                    || self.metadata.is_some()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -165,6 +199,7 @@ impl SubtitleChange {
             SubtitleSource::Embedded(_) => self.changes_media() || self.export_target.is_some(),
             SubtitleSource::Sidecar(_) => {
                 self.import_into_media
+                    || self.metadata.is_some()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -183,6 +218,106 @@ impl SubtitleChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageChoice {
+    pub code: String,
+    pub two_letter: String,
+    pub name: String,
+}
+
+impl LanguageChoice {
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, self.code)
+    }
+
+    pub fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || self.name.to_ascii_lowercase().contains(&query)
+            || self.code.contains(&query)
+            || self.two_letter.contains(&query)
+    }
+}
+
+pub fn common_language_choices() -> Vec<LanguageChoice> {
+    let mut choices = languages()
+        .filter_map(|language| {
+            let two_letter = language.to_639_1()?;
+            Some(LanguageChoice {
+                code: language.to_639_3().to_string(),
+                two_letter: two_letter.to_string(),
+                name: language.to_name().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    choices.dedup_by(|left, right| left.code == right.code);
+    choices
+}
+
+pub fn canonical_language_code(code: &str) -> Option<String> {
+    let normalized = code.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "und" {
+        return None;
+    }
+    let (base, suffix) = normalized
+        .split_once(['-', '_'])
+        .map_or((normalized.as_str(), None), |(base, suffix)| {
+            (base, (!suffix.is_empty()).then_some(suffix))
+        });
+    let canonical_base = match base {
+        "alb" => "sqi",
+        "arm" => "hye",
+        "baq" => "eus",
+        "bur" => "mya",
+        "chi" => "zho",
+        "cze" => "ces",
+        "dut" => "nld",
+        "fre" => "fra",
+        "geo" => "kat",
+        "ger" => "deu",
+        "gre" => "ell",
+        "ice" => "isl",
+        "mac" => "mkd",
+        "mao" => "mri",
+        "may" => "msa",
+        "per" => "fas",
+        "rum" => "ron",
+        "slo" => "slk",
+        "tib" => "bod",
+        "wel" => "cym",
+        _ => base,
+    };
+    let language = Language::from_639_1(canonical_base)
+        .or_else(|| Language::from_639_3(canonical_base))
+        .or_else(|| canonical_base.parse().ok())?;
+    let canonical = language.to_639_3();
+    Some(suffix.map_or_else(
+        || canonical.to_string(),
+        |suffix| format!("{canonical}-{suffix}"),
+    ))
+}
+
+pub fn language_choice(code: &str) -> Option<LanguageChoice> {
+    let canonical = canonical_language_code(code)?;
+    let base = canonical
+        .split_once(['-', '_'])
+        .map_or(canonical.as_str(), |(base, _)| base);
+    let language = Language::from_639_1(base)
+        .or_else(|| Language::from_639_3(base))
+        .or_else(|| base.parse().ok())?;
+    Some(LanguageChoice {
+        code: canonical,
+        two_letter: language.to_639_1().unwrap_or_default().to_string(),
+        name: language.to_name().to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SidecarEntry {
     pub path: PathBuf,
     pub companion: Option<PathBuf>,
@@ -190,7 +325,7 @@ pub struct SidecarEntry {
     pub format: SubtitleFormat,
     pub language: String,
     pub forced: bool,
-    pub cc: bool,
+    pub hearing_impaired: bool,
     pub number: Option<usize>,
     pub fingerprint: FileFingerprint,
     pub companion_fingerprint: Option<FileFingerprint>,
@@ -452,7 +587,7 @@ pub fn partition_sidecars(
                 format,
                 language: parsed.language,
                 forced: parsed.forced,
-                cc: parsed.cc,
+                hearing_impaired: parsed.hearing_impaired,
                 number: parsed.number,
                 fingerprint: file.fingerprint,
                 companion_fingerprint: companion_entry.map(|entry| entry.fingerprint),
@@ -477,7 +612,7 @@ pub fn partition_sidecars(
 struct ParsedSidecar {
     language: String,
     forced: bool,
-    cc: bool,
+    hearing_impaired: bool,
     number: Option<usize>,
 }
 
@@ -534,12 +669,12 @@ fn parse_sidecar_for_media<'a>(
         return None;
     }
     let mut forced = false;
-    let mut cc = false;
+    let mut hearing_impaired = false;
     let mut number = None;
     for token in tokens {
         match token.to_ascii_lowercase().as_str() {
             "forced" if !forced => forced = true,
-            "cc" if !cc => cc = true,
+            "cc" | "sdh" | "hi" => hearing_impaired = true,
             value if number.is_none() => number = value.parse().ok(),
             _ => return None,
         }
@@ -547,9 +682,9 @@ fn parse_sidecar_for_media<'a>(
     Some((
         media_stem.1,
         ParsedSidecar {
-            language,
+            language: canonical_language_code(&language).unwrap_or(language),
             forced,
-            cc,
+            hearing_impaired,
             number,
         },
     ))
@@ -559,19 +694,19 @@ pub fn sidecar_filename(
     media_stem: &str,
     language: &str,
     forced: bool,
-    cc: bool,
+    hearing_impaired: bool,
     number: Option<usize>,
     format: SubtitleFormat,
 ) -> String {
     let mut parts = vec![
         media_stem.to_string(),
-        normalized_language(language).to_string(),
+        canonical_language_code(language).unwrap_or_else(|| "und".to_string()),
     ];
     if forced {
         parts.push("forced".to_string());
     }
-    if cc {
-        parts.push("cc".to_string());
+    if hearing_impaired {
+        parts.push("sdh".to_string());
     }
     if let Some(number) = number {
         parts.push(number.to_string());
@@ -599,8 +734,19 @@ pub fn stream_language(stream: &BTreeMap<String, serde_json::Value>) -> String {
         .and_then(serde_json::Value::as_object)
         .and_then(|tags| tags.get("language"))
         .and_then(serde_json::Value::as_str)
-        .map(|language| normalized_language(language).to_ascii_lowercase())
+        .and_then(canonical_language_code)
         .unwrap_or_else(|| "und".to_string())
+}
+
+pub fn stream_title(stream: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    stream
+        .get("tags")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|tags| tags.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
 }
 
 pub fn stream_forced(stream: &BTreeMap<String, serde_json::Value>) -> bool {
@@ -608,11 +754,23 @@ pub fn stream_forced(stream: &BTreeMap<String, serde_json::Value>) -> bool {
 }
 
 pub fn stream_cc(stream: &BTreeMap<String, serde_json::Value>) -> bool {
-    disposition(stream, "hearing_impaired")
+    disposition(stream, "captions")
         || matches!(
             stream.get("codec_name").and_then(serde_json::Value::as_str),
             Some("eia_608" | "eia_708")
         )
+}
+
+pub fn stream_hearing_impaired(stream: &BTreeMap<String, serde_json::Value>) -> bool {
+    disposition(stream, "hearing_impaired")
+}
+
+pub fn stream_original(stream: &BTreeMap<String, serde_json::Value>) -> bool {
+    disposition(stream, "original")
+}
+
+pub fn stream_commentary(stream: &BTreeMap<String, serde_json::Value>) -> bool {
+    disposition(stream, "comment")
 }
 
 fn disposition(stream: &BTreeMap<String, serde_json::Value>, name: &str) -> bool {
@@ -646,6 +804,90 @@ mod tests {
     }
 
     #[test]
+    fn embedded_subtitle_state_matrix_should_remove_every_exported_combination() {
+        let targets = std::iter::once(None)
+            .chain(SubtitleFormat::COMMON_TARGETS.map(Some))
+            .collect::<Vec<_>>();
+
+        for embedded_target in &targets {
+            for export_target in &targets {
+                let change = SubtitleChange {
+                    source: SubtitleSource::Embedded(7),
+                    source_format: SubtitleFormat::SubRip,
+                    embedded_target: *embedded_target,
+                    export_target: *export_target,
+                    import_into_media: false,
+                    ocr_language: None,
+                    metadata: None,
+                };
+                let converted_in_media =
+                    embedded_target.is_some_and(|target| target != SubtitleFormat::SubRip);
+                let exported = export_target.is_some();
+
+                assert_eq!(
+                    change.removes_from_media(),
+                    exported,
+                    "embedded={embedded_target:?}, export={export_target:?}"
+                );
+                assert_eq!(
+                    change.changes_media(),
+                    exported || converted_in_media,
+                    "embedded={embedded_target:?}, export={export_target:?}"
+                );
+                assert_eq!(
+                    change.has_effect(),
+                    exported || converted_in_media,
+                    "embedded={embedded_target:?}, export={export_target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_subtitle_state_matrix_should_distinguish_conversion_from_import() {
+        let targets = std::iter::once(None)
+            .chain(SubtitleFormat::COMMON_TARGETS.map(Some))
+            .collect::<Vec<_>>();
+
+        for embedded_target in targets {
+            for import_into_media in [false, true] {
+                let change = SubtitleChange {
+                    source: SubtitleSource::Sidecar(PathBuf::from("/media/movie.eng.srt")),
+                    source_format: SubtitleFormat::SubRip,
+                    embedded_target,
+                    export_target: None,
+                    import_into_media,
+                    ocr_language: None,
+                    metadata: None,
+                };
+                let converted =
+                    embedded_target.is_some_and(|target| target != SubtitleFormat::SubRip);
+
+                assert_that!(change.removes_from_media()).is_false();
+                assert_eq!(change.changes_media(), import_into_media);
+                assert_eq!(change.has_effect(), import_into_media || converted);
+            }
+        }
+    }
+
+    #[test]
+    fn overview_label_should_return_compact_labels_when_format_is_known() {
+        // Arrange
+        let formats = SubtitleFormat::COMMON_TARGETS;
+
+        // Act
+        let labels = formats
+            .into_iter()
+            .map(SubtitleFormat::overview_label)
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert_that!(labels).contains_exactly_in_given_order([
+            "SRT", "ASS", "VTT", "TTML", "MOVTXT", "PGS", "VobSub",
+        ]);
+    }
+
+    #[test]
     fn partition_sidecars_should_attach_matching_files_when_name_contains_language_and_flags() {
         // Arrange
         let directory = std::env::temp_dir().join(format!(
@@ -658,7 +900,7 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let media = file(&directory, "movie.mkv");
-        let subtitle = file(&directory, "movie.eng.forced.cc.2.srt");
+        let subtitle = file(&directory, "movie.eng.forced.cc.sdh.2.srt");
         let unrelated = file(&directory, "other.eng.srt");
 
         // Act
@@ -676,10 +918,38 @@ mod tests {
         let entry = &sidecars[&media.path][0];
         assert_that!(entry.language.as_str()).is_equal_to("eng");
         assert_that!(entry.forced).is_true();
-        assert_that!(entry.cc).is_true();
+        assert_that!(entry.hearing_impaired).is_true();
         assert_that!(entry.number).contains(2);
 
         // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sidecar_accessibility_aliases_should_collapse_to_hearing_impaired() {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-sidecar-aliases-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let media_by_stem = media_paths_by_stem(std::slice::from_ref(&media));
+
+        for filename in [
+            "movie.eng.cc.srt",
+            "movie.eng.sdh.srt",
+            "movie.eng.hi.srt",
+            "movie.eng.cc.sdh.srt",
+        ] {
+            let (_, parsed) =
+                parse_sidecar_for_media(filename, SubtitleFormat::SubRip, &media_by_stem).unwrap();
+            assert_that!(parsed.hearing_impaired).is_true();
+        }
+
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -715,7 +985,24 @@ mod tests {
         let result = sidecar_filename("movie", "eng", true, true, Some(2), SubtitleFormat::SubRip);
 
         // Assert
-        assert_that!(result).is_equal_to("movie.eng.forced.cc.2.srt".to_string());
+        assert_that!(result).is_equal_to("movie.eng.forced.sdh.2.srt".to_string());
+    }
+
+    #[test]
+    fn caption_and_hearing_impaired_dispositions_should_remain_independent() {
+        let captions = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"captions": 1, "hearing_impaired": 0}}),
+        )
+        .unwrap();
+        let hearing_impaired = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"captions": 0, "hearing_impaired": 1}}),
+        )
+        .unwrap();
+
+        assert_that!(stream_cc(&captions)).is_true();
+        assert_that!(stream_hearing_impaired(&captions)).is_false();
+        assert_that!(stream_cc(&hearing_impaired)).is_false();
+        assert_that!(stream_hearing_impaired(&hearing_impaired)).is_true();
     }
 
     #[test]
@@ -841,5 +1128,81 @@ mod tests {
         assert_that!(srt_without_seconv.reason.as_deref().unwrap()).contains("seconv");
         assert_that!(srt_without_language.enabled).is_false();
         assert_that!(srt_without_language.reason.as_deref().unwrap()).contains("Tesseract");
+    }
+
+    #[test]
+    fn common_languages_should_be_searchable_and_exclude_undetermined() {
+        let choices = common_language_choices();
+
+        assert_that!(choices.iter().any(|choice| choice.code == "und")).is_false();
+        assert_that!(
+            choices
+                .iter()
+                .find(|choice| choice.code == "nld")
+                .unwrap()
+                .matches("dut")
+        )
+        .is_true();
+        assert_that!(
+            choices
+                .iter()
+                .find(|choice| choice.code == "nld")
+                .unwrap()
+                .matches("nl")
+        )
+        .is_true();
+        assert_that!(language_choice("und")).is_none();
+        assert_that!(language_choice("en-US").unwrap().code.as_str()).is_equal_to("eng-us");
+    }
+
+    #[test]
+    fn legacy_language_codes_should_be_read_but_canonicalized_for_output() {
+        for (legacy, canonical) in [
+            ("alb", "sqi"),
+            ("arm", "hye"),
+            ("baq", "eus"),
+            ("bur", "mya"),
+            ("chi", "zho"),
+            ("cze", "ces"),
+            ("dut", "nld"),
+            ("fre", "fra"),
+            ("geo", "kat"),
+            ("ger", "deu"),
+            ("gre", "ell"),
+            ("ice", "isl"),
+            ("mac", "mkd"),
+            ("mao", "mri"),
+            ("may", "msa"),
+            ("per", "fas"),
+            ("rum", "ron"),
+            ("slo", "slk"),
+            ("tib", "bod"),
+            ("wel", "cym"),
+        ] {
+            assert_that!(canonical_language_code(legacy).as_deref()).contains(canonical);
+            assert_that!(language_choice(legacy).unwrap().code.as_str()).is_equal_to(canonical);
+        }
+        assert_that!(canonical_language_code("cze-CZ").as_deref()).contains("ces-cz");
+        assert_that!(canonical_language_code("und")).is_none();
+        assert_that!(canonical_language_code("invalid-language-tag")).is_none();
+    }
+
+    #[test]
+    fn embedded_and_sidecar_languages_should_emit_canonical_codes() {
+        let stream = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"language": "cze"}}),
+        )
+        .unwrap();
+
+        assert_that!(stream_language(&stream)).is_equal_to("ces".to_string());
+        assert_that!(sidecar_filename(
+            "movie",
+            "dut",
+            false,
+            false,
+            None,
+            SubtitleFormat::SubRip,
+        ))
+        .is_equal_to("movie.nld.srt".to_string());
     }
 }
