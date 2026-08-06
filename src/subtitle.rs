@@ -165,6 +165,48 @@ pub enum SubtitleFlag {
     Commentary,
 }
 
+impl SubtitleFlag {
+    pub const ALL: [Self; 5] = [
+        Self::Forced,
+        Self::Cc,
+        Self::HearingImpaired,
+        Self::Original,
+        Self::Commentary,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Forced => "Forced",
+            Self::Cc => "CC",
+            Self::HearingImpaired => "Hearing impaired",
+            Self::Original => "Original",
+            Self::Commentary => "Commentary",
+        }
+    }
+}
+
+impl SubtitleMetadata {
+    pub fn get_flag(&self, flag: SubtitleFlag) -> bool {
+        match flag {
+            SubtitleFlag::Forced => self.forced,
+            SubtitleFlag::Cc => self.cc,
+            SubtitleFlag::HearingImpaired => self.hearing_impaired,
+            SubtitleFlag::Original => self.original,
+            SubtitleFlag::Commentary => self.commentary,
+        }
+    }
+
+    pub fn set_flag(&mut self, flag: SubtitleFlag, value: bool) {
+        match flag {
+            SubtitleFlag::Forced => self.forced = value,
+            SubtitleFlag::Cc => self.cc = value,
+            SubtitleFlag::HearingImpaired => self.hearing_impaired = value,
+            SubtitleFlag::Original => self.original = value,
+            SubtitleFlag::Commentary => self.commentary = value,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtitleChange {
     pub source: SubtitleSource,

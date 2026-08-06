@@ -281,6 +281,17 @@ impl SubtitleSettingsField {
             Self::Title | Self::Default | Self::Original | Self::Commentary
         )
     }
+
+    pub fn subtitle_flag(self) -> Option<SubtitleFlag> {
+        match self {
+            Self::Forced => Some(SubtitleFlag::Forced),
+            Self::Cc => Some(SubtitleFlag::Cc),
+            Self::HearingImpaired => Some(SubtitleFlag::HearingImpaired),
+            Self::Original => Some(SubtitleFlag::Original),
+            Self::Commentary => Some(SubtitleFlag::Commentary),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,19 +307,15 @@ pub struct SubtitleDisplayState {
 }
 
 impl SubtitleDisplayState {
+    pub fn original_metadata(&self) -> &SubtitleMetadata {
+        &self.original_metadata
+    }
+
     pub fn field_visible(&self, field: SubtitleSettingsField) -> bool {
         if self.external {
             return field != SubtitleSettingsField::Cc && !field.requires_embedded_subtitle();
         }
-        let flag = match field {
-            SubtitleSettingsField::Forced => Some(SubtitleFlag::Forced),
-            SubtitleSettingsField::Cc => Some(SubtitleFlag::Cc),
-            SubtitleSettingsField::HearingImpaired => Some(SubtitleFlag::HearingImpaired),
-            SubtitleSettingsField::Original => Some(SubtitleFlag::Original),
-            SubtitleSettingsField::Commentary => Some(SubtitleFlag::Commentary),
-            _ => None,
-        };
-        flag.is_none_or(|flag| {
+        field.subtitle_flag().is_none_or(|flag| {
             self.container
                 .is_some_and(|container| container.supports_subtitle_flag(flag))
         })
@@ -2424,14 +2431,7 @@ impl App {
             return None;
         }
         let external = self.subtitle_source_external(&popup.source);
-        let flag = match field {
-            SubtitleSettingsField::Forced => SubtitleFlag::Forced,
-            SubtitleSettingsField::Cc => SubtitleFlag::Cc,
-            SubtitleSettingsField::HearingImpaired => SubtitleFlag::HearingImpaired,
-            SubtitleSettingsField::Original => SubtitleFlag::Original,
-            SubtitleSettingsField::Commentary => SubtitleFlag::Commentary,
-            _ => return None,
-        };
+        let flag = field.subtitle_flag()?;
         if external
             && matches!(
                 flag,

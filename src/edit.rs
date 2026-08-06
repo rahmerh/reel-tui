@@ -19,9 +19,10 @@ use crate::{
     files::FileFingerprint,
     probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_any_file, probe_file},
     subtitle::{
-        SidecarEntry, SubtitleChange, SubtitleFormat, SubtitleMetadata, SubtitleSource,
-        canonical_language_code, language_choice, sidecar_filename, stream_cc, stream_commentary,
-        stream_forced, stream_hearing_impaired, stream_language, stream_original, stream_title,
+        SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
+        SubtitleSource, canonical_language_code, language_choice, sidecar_filename, stream_cc,
+        stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
+        stream_original, stream_title,
     },
 };
 
@@ -124,8 +125,6 @@ impl ContainerFormat {
     }
 
     pub fn supports_subtitle_flag(self, flag: crate::subtitle::SubtitleFlag) -> bool {
-        use crate::subtitle::SubtitleFlag;
-
         match self {
             Self::Matroska => flag != SubtitleFlag::Cc,
             Self::Mp4 => !matches!(flag, SubtitleFlag::Original),
@@ -135,22 +134,10 @@ impl ContainerFormat {
     }
 
     pub fn retain_supported_subtitle_metadata(self, metadata: &mut SubtitleMetadata) {
-        use crate::subtitle::SubtitleFlag;
-
-        if !self.supports_subtitle_flag(SubtitleFlag::Forced) {
-            metadata.forced = false;
-        }
-        if !self.supports_subtitle_flag(SubtitleFlag::Cc) {
-            metadata.cc = false;
-        }
-        if !self.supports_subtitle_flag(SubtitleFlag::HearingImpaired) {
-            metadata.hearing_impaired = false;
-        }
-        if !self.supports_subtitle_flag(SubtitleFlag::Original) {
-            metadata.original = false;
-        }
-        if !self.supports_subtitle_flag(SubtitleFlag::Commentary) {
-            metadata.commentary = false;
+        for flag in SubtitleFlag::ALL {
+            if !self.supports_subtitle_flag(flag) {
+                metadata.set_flag(flag, false);
+            }
         }
     }
 }
@@ -750,28 +737,17 @@ fn subtitle_flag_conflicts(
     target: ContainerFormat,
     track: &str,
 ) -> Vec<String> {
-    use crate::subtitle::SubtitleFlag;
-
-    [
-        (SubtitleFlag::Forced, metadata.forced, "Forced"),
-        (SubtitleFlag::Cc, metadata.cc, "CC"),
-        (
-            SubtitleFlag::HearingImpaired,
-            metadata.hearing_impaired,
-            "Hearing impaired",
-        ),
-        (SubtitleFlag::Original, metadata.original, "Original"),
-        (SubtitleFlag::Commentary, metadata.commentary, "Commentary"),
-    ]
-    .into_iter()
-    .filter(|(flag, enabled, _)| *enabled && !target.supports_subtitle_flag(*flag))
-    .map(|(_, _, label)| {
-        format!(
-            "{} can't store the {label} flag on {track}. Clear it or choose another container.",
-            target.label()
-        )
-    })
-    .collect()
+    SubtitleFlag::ALL
+        .into_iter()
+        .filter(|flag| metadata.get_flag(*flag) && !target.supports_subtitle_flag(*flag))
+        .map(|flag| {
+            format!(
+                "{} can't store the {} flag on {track}. Clear it or choose another container.",
+                target.label(),
+                flag.label()
+            )
+        })
+        .collect()
 }
 
 fn container_conflict_entries(
