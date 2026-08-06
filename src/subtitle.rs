@@ -410,16 +410,8 @@ impl ToolCapabilities {
         let ffmpeg = encoders.is_some() && muxers.is_some();
         let seconv = command_succeeds("seconv", &["--version"]);
         let tesseract_languages = command_stdout("tesseract", &["--list-langs"])
-            .map(|output| {
-                output
-                    .lines()
-                    .skip_while(|line| !line.starts_with("List of available languages"))
-                    .skip(1)
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && *line != "osd")
-                    .map(str::to_string)
-                    .collect()
-            })
+            .as_deref()
+            .map(parse_tesseract_languages)
             .unwrap_or_default();
 
         Self {
@@ -557,6 +549,17 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
             let name = fields.next()?;
             (flags.contains('E') || flags.starts_with('S')).then(|| name.to_string())
         })
+        .collect()
+}
+
+fn parse_tesseract_languages(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .skip_while(|line| !line.starts_with("List of available languages"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "osd")
+        .map(str::to_string)
         .collect()
 }
 
@@ -1272,5 +1275,152 @@ mod tests {
             SubtitleFormat::SubRip,
         ))
         .is_equal_to("movie.nld.srt".to_string());
+    }
+
+    #[test]
+    fn stream_title_should_extract_and_trim_title_tag() {
+        let present = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"title": "  My Title  "}}),
+        )
+        .unwrap();
+        let empty = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"title": ""}}),
+        )
+        .unwrap();
+        let whitespace = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"title": "   "}}),
+        )
+        .unwrap();
+        let missing_title = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"language": "eng"}}),
+        )
+        .unwrap();
+        let missing_tags = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"codec_name": "srt"}),
+        )
+        .unwrap();
+
+        assert_that!(stream_title(&present)).is_equal_to(Some("My Title".to_string()));
+        assert_that!(stream_title(&empty)).is_none();
+        assert_that!(stream_title(&whitespace)).is_none();
+        assert_that!(stream_title(&missing_title)).is_none();
+        assert_that!(stream_title(&missing_tags)).is_none();
+    }
+
+    #[test]
+    fn stream_disposition_flags_should_be_parsed_correctly() {
+        let forced = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"forced": 1, "original": 0, "comment": 0}}),
+        )
+        .unwrap();
+        let original = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"forced": 0, "original": 1, "comment": 0}}),
+        )
+        .unwrap();
+        let comment = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"forced": 0, "original": 0, "comment": 1}}),
+        )
+        .unwrap();
+        let missing =
+            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(serde_json::json!({}))
+                .unwrap();
+
+        assert_that!(stream_forced(&forced)).is_true();
+        assert_that!(stream_forced(&original)).is_false();
+        assert_that!(stream_forced(&missing)).is_false();
+
+        assert_that!(stream_original(&original)).is_true();
+        assert_that!(stream_original(&forced)).is_false();
+        assert_that!(stream_original(&missing)).is_false();
+
+        assert_that!(stream_commentary(&comment)).is_true();
+        assert_that!(stream_commentary(&forced)).is_false();
+        assert_that!(stream_commentary(&missing)).is_false();
+
+        let hi = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"hearing_impaired": 1}}),
+        )
+        .unwrap();
+        assert_that!(stream_hearing_impaired(&hi)).is_true();
+        let not_hi = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"hearing_impaired": 0}}),
+        )
+        .unwrap();
+        assert_that!(stream_hearing_impaired(&not_hi)).is_false();
+    }
+
+    #[test]
+    fn stream_cc_should_detect_captions_disposition_or_eia_codecs() {
+        let captions_disp = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"captions": 1}}),
+        )
+        .unwrap();
+        let eia_608 = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"codec_name": "eia_608"}),
+        )
+        .unwrap();
+        let eia_708 = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"codec_name": "eia_708"}),
+        )
+        .unwrap();
+        let neither = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"disposition": {"captions": 0}, "codec_name": "subrip"}),
+        )
+        .unwrap();
+
+        assert_that!(stream_cc(&captions_disp)).is_true();
+        assert_that!(stream_cc(&eia_608)).is_true();
+        assert_that!(stream_cc(&eia_708)).is_true();
+        assert_that!(stream_cc(&neither)).is_false();
+    }
+
+    #[test]
+    fn parse_capability_names_should_extract_encoders_and_muxers() {
+        let output = " Encoders:
+  V..... = Video
+  A..... = Audio
+  S..... = Subtitle
+  .E.... = Frame-level multithreading
+  ..S... = Slice-level multithreading
+  ...X.. = Codec is experimental
+  ....B. = Supports draw_horiz_band
+  .....D = Supports direct rendering method 1
+  ------
+  V..... libx264              libx264 H.264
+  S..... srt                  SubRip subtitle
+  S..... webvtt               WebVTT subtitle
+  A..X.. aac                  AAC
+        ";
+
+        let capabilities = parse_capability_names(output);
+
+        assert_that!(capabilities.contains("srt")).is_true();
+        assert_that!(capabilities.contains("webvtt")).is_true();
+        assert_that!(capabilities.contains("libx264")).is_false();
+        assert_that!(capabilities.contains("aac")).is_false();
+
+        let muxer_output = " File formats:
+  D. = Demuxing supported
+  .E = Muxing supported
+  --
+  E  3g2             3GP2 (3GPP2 file format)
+  .E mp4             MP4 (MPEG-4 Part 14)
+  D  matroska        Matroska
+        ";
+        let muxers = parse_capability_names(muxer_output);
+        assert_that!(muxers.contains("3g2")).is_true();
+        assert_that!(muxers.contains("mp4")).is_true();
+        assert_that!(muxers.contains("matroska")).is_false();
+    }
+
+    #[test]
+    fn parse_tesseract_languages_should_extract_languages_and_ignore_osd() {
+        let output = "List of available languages (3):
+eng
+osd
+fra
+";
+        let langs = parse_tesseract_languages(output);
+        assert_that!(langs).contains_exactly_in_given_order(["eng".to_string(), "fra".to_string()]);
     }
 }
