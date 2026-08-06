@@ -2111,10 +2111,19 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
             "For an external sidecar, Reel represents this choice with the .forced file name marker."
                 .to_string(),
         ),
-        SubtitleSettingsField::HearingImpaired if external_sidecar => Some(
-            "For an external sidecar, Reel represents this choice with the canonical .sdh file name marker."
-                .to_string(),
-        ),
+        SubtitleSettingsField::Cc if !external_sidecar => state.as_ref().map(|_| {
+            "External subtitle files use SDH (hearing impaired) in place of CC. If this track is exported, CC will be stored as SDH.".to_string()
+        }),
+        SubtitleSettingsField::HearingImpaired if external_sidecar => {
+            let cc_folded = state.as_ref().is_some_and(|state| {
+                state.original_metadata().cc
+            });
+            Some(if cc_folded {
+                "For an external sidecar, Reel represents this choice with the .sdh file name marker. The original CC flag has been folded into this field.".to_string()
+            } else {
+                "For an external sidecar, Reel represents this choice with the canonical .sdh file name marker.".to_string()
+            })
+        }
         _ => None,
     };
     if let Some(context) = context {
