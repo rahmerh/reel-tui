@@ -726,11 +726,15 @@ fn sidecar_line_with_subtitle_context(
     let mut hearing_impaired = metadata.map_or(sidecar.hearing_impaired, |metadata| {
         metadata.cc || metadata.hearing_impaired
     });
+    let mut original = metadata.is_some_and(|metadata| metadata.original);
+    let mut commentary = metadata.is_some_and(|metadata| metadata.commentary);
     if change.is_some_and(|change| change.import_into_media)
         && let Some(container) = container
     {
         forced &= container.supports_subtitle_flag(SubtitleFlag::Forced);
         hearing_impaired &= container.supports_subtitle_flag(SubtitleFlag::HearingImpaired);
+        original &= container.supports_subtitle_flag(SubtitleFlag::Original);
+        commentary &= container.supports_subtitle_flag(SubtitleFlag::Commentary);
     }
     let format = change
         .and_then(|change| change.export_target.or(change.embedded_target))
@@ -744,6 +748,8 @@ fn sidecar_line_with_subtitle_context(
             forced,
             cc: false,
             hearing_impaired,
+            original,
+            commentary,
         },
         max_width.map(|width| width.saturating_sub(prefix.chars().count())),
     );
@@ -915,6 +921,10 @@ fn stream_line_with_subtitle_context(
             || stream_hearing_impaired(stream),
             |metadata| metadata.hearing_impaired,
         );
+        let mut original =
+            metadata.map_or_else(|| stream_original(stream), |metadata| metadata.original);
+        let mut commentary =
+            metadata.map_or_else(|| stream_commentary(stream), |metadata| metadata.commentary);
         if subtitle_change.is_some_and(|change| change.export_target.is_some()) {
             hearing_impaired |= cc;
             cc = false;
@@ -922,6 +932,8 @@ fn stream_line_with_subtitle_context(
             forced &= container.supports_subtitle_flag(SubtitleFlag::Forced);
             cc &= container.supports_subtitle_flag(SubtitleFlag::Cc);
             hearing_impaired &= container.supports_subtitle_flag(SubtitleFlag::HearingImpaired);
+            original &= container.supports_subtitle_flag(SubtitleFlag::Original);
+            commentary &= container.supports_subtitle_flag(SubtitleFlag::Commentary);
         }
         let format = subtitle_change
             .and_then(|change| change.export_target.or(change.embedded_target))
@@ -936,6 +948,8 @@ fn stream_line_with_subtitle_context(
                 forced,
                 cc,
                 hearing_impaired,
+                original,
+                commentary,
             },
             max_width.map(|width| {
                 width.saturating_sub(marker.chars().count() + index_text.chars().count())
@@ -1049,6 +1063,8 @@ struct SubtitleOverviewFlags {
     forced: bool,
     cc: bool,
     hearing_impaired: bool,
+    original: bool,
+    commentary: bool,
 }
 
 fn subtitle_overview_details(
@@ -1074,6 +1090,12 @@ fn subtitle_overview_details(
     }
     if flags.hearing_impaired {
         active.push("HI");
+    }
+    if flags.original {
+        active.push("OG");
+    }
+    if flags.commentary {
+        active.push("CM");
     }
 
     let flag_tag = (!active.is_empty()).then(|| format!("[{}]", active.join("/")));
@@ -4351,6 +4373,8 @@ mod tests {
                 forced: true,
                 cc: true,
                 hearing_impaired: false,
+                original: false,
+                commentary: false,
             },
             None,
         );
@@ -4374,6 +4398,8 @@ mod tests {
                 forced: true,
                 cc: true,
                 hearing_impaired: true,
+                original: false,
+                commentary: false,
             },
             None,
         );
@@ -4394,6 +4420,8 @@ mod tests {
                 forced: true,
                 cc: true,
                 hearing_impaired: false,
+                original: false,
+                commentary: false,
             },
             Some(30),
         );
