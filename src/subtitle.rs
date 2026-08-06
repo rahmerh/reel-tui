@@ -554,7 +554,7 @@ pub fn partition_sidecars(
         else {
             continue;
         };
-        let Some((media_path, parsed)) =
+        let Some((media_paths, parsed)) =
             parse_sidecar_for_media(&file.display_name, format, &media_by_stem)
         else {
             continue;
@@ -577,21 +577,23 @@ pub fn partition_sidecars(
         if let Some(entry) = companion_entry {
             matched_paths.insert(entry.path.clone());
         }
-        sidecars
-            .entry(media_path.clone())
-            .or_default()
-            .push(SidecarEntry {
-                path: file.path.clone(),
-                companion: companion_entry.map(|entry| entry.path.clone()),
-                display_name: file.display_name.clone(),
-                format,
-                language: parsed.language,
-                forced: parsed.forced,
-                hearing_impaired: parsed.hearing_impaired,
-                number: parsed.number,
-                fingerprint: file.fingerprint,
-                companion_fingerprint: companion_entry.map(|entry| entry.fingerprint),
-            });
+        for media_path in media_paths {
+            sidecars
+                .entry(media_path.clone())
+                .or_default()
+                .push(SidecarEntry {
+                    path: file.path.clone(),
+                    companion: companion_entry.map(|entry| entry.path.clone()),
+                    display_name: file.display_name.clone(),
+                    format,
+                    language: parsed.language.clone(),
+                    forced: parsed.forced,
+                    hearing_impaired: parsed.hearing_impaired,
+                    number: parsed.number,
+                    fingerprint: file.fingerprint,
+                    companion_fingerprint: companion_entry.map(|entry| entry.fingerprint),
+                });
+        }
     }
 
     for entries in sidecars.values_mut() {
@@ -645,15 +647,14 @@ fn parse_sidecar_for_media<'a>(
     filename: &str,
     _format: SubtitleFormat,
     media_by_stem: &'a HashMap<String, Vec<PathBuf>>,
-) -> Option<(&'a PathBuf, ParsedSidecar)> {
+) -> Option<(&'a [PathBuf], ParsedSidecar)> {
     let without_extension = filename.rsplit_once('.')?.0;
-    let (media_stem, tail) = media_by_stem.iter().find_map(|(stem, paths)| {
+    let (_media_stem, media_paths, tail) = media_by_stem.iter().find_map(|(stem, paths)| {
         let prefix = format!("{stem}.");
         without_extension
             .to_ascii_lowercase()
             .strip_prefix(&prefix)
-            .filter(|_| paths.len() == 1)
-            .map(|tail| ((stem, &paths[0]), tail.to_string()))
+            .map(|tail| (stem, paths.as_slice(), tail.to_string()))
     })?;
     let mut tokens = tail.split('.').collect::<Vec<_>>();
     if tokens.is_empty() {
@@ -680,7 +681,7 @@ fn parse_sidecar_for_media<'a>(
         }
     }
     Some((
-        media_stem.1,
+        media_paths,
         ParsedSidecar {
             language: canonical_language_code(&language).unwrap_or(language),
             forced,
@@ -922,6 +923,31 @@ mod tests {
         assert_that!(entry.number).contains(2);
 
         // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partition_sidecars_should_match_sidecars_for_multiple_media_files_sharing_the_same_stem() {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-multi-stem-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media_mkv = file(&directory, "movie.mkv");
+        let media_mp4 = file(&directory, "movie.mp4");
+        let subtitle = file(&directory, "movie.eng.srt");
+
+        let (visible, sidecars) =
+            partition_sidecars(vec![media_mkv.clone(), media_mp4.clone(), subtitle]);
+
+        assert_that!(visible).has_length(2);
+        assert_that!(&sidecars[&media_mkv.path]).has_length(1);
+        assert_that!(&sidecars[&media_mp4.path]).has_length(1);
+
         fs::remove_dir_all(directory).unwrap();
     }
 
