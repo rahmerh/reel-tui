@@ -263,11 +263,31 @@ impl Default for VideoSettings {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContainerMetadata {
+    pub title: Option<String>,
+    pub comment: Option<String>,
+    pub date: Option<String>,
+    pub genre: Option<String>,
+    pub artist: Option<String>,
+}
+
+impl ContainerMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.comment.is_none()
+            && self.date.is_none()
+            && self.genre.is_none()
+            && self.artist.is_none()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EditRequest {
     pub path: PathBuf,
     pub destination: SaveDestination,
     pub container: Option<ContainerFormat>,
+    pub container_metadata: Option<ContainerMetadata>,
     pub stream_order: Vec<u64>,
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
@@ -424,6 +444,7 @@ pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
                     source: &request.path,
                     destination: request.destination,
                     container: request.container,
+                    container_metadata: request.container_metadata.as_ref(),
                 },
                 TrackEdits {
                     stream_order: &request.stream_order,
@@ -1082,6 +1103,7 @@ fn apply_edits(
         let duration = media_duration(&source_info);
         let container_changed = target_container
             .is_some_and(|container| ContainerFormat::from_path(path) != Some(container));
+        let container_metadata_changed = target.container_metadata.is_some();
         let media_changed = media_changes_required(
             &source_info,
             &output_stream_order,
@@ -1089,7 +1111,7 @@ fn apply_edits(
             default_streams,
             video_settings,
             subtitle_changes,
-            container_changed,
+            container_changed || container_metadata_changed,
         );
         if cancelled.load(Ordering::Relaxed) {
             return Err(EditError::Cancelled);
@@ -1154,7 +1176,8 @@ fn apply_edits(
             });
         }
 
-        let media_operation = media_write_label(target_container, video_settings);
+        let media_operation =
+            media_write_label(target_container, video_settings, container_metadata_changed);
 
         let temporary = temporary_path(path, target_container).map_err(EditError::Failed)?;
         media_cleanup.0 = Some(temporary.clone());
@@ -1172,6 +1195,7 @@ fn apply_edits(
                 subtitle_changes,
                 sidecars,
                 container: target_container,
+                container_metadata: target.container_metadata,
                 duration,
                 cancelled,
             },
@@ -1310,6 +1334,7 @@ struct EditResult {
 fn media_write_label(
     target_container: Option<ContainerFormat>,
     video_settings: &BTreeMap<u64, VideoSettings>,
+    container_metadata_changed: bool,
 ) -> String {
     match (!video_settings.is_empty(), target_container) {
         (true, Some(container)) => {
@@ -1317,6 +1342,7 @@ fn media_write_label(
         }
         (true, None) => "Encoding video".to_string(),
         (false, Some(container)) => format!("Remuxing to {}", container.label()),
+        (false, None) if container_metadata_changed => "Updating container metadata".to_string(),
         (false, None) => "Remuxing media".to_string(),
     }
 }
@@ -2042,6 +2068,7 @@ struct EditTarget<'a> {
     source: &'a Path,
     destination: SaveDestination,
     container: Option<ContainerFormat>,
+    container_metadata: Option<&'a ContainerMetadata>,
 }
 
 #[derive(Clone, Copy)]
@@ -2835,6 +2862,7 @@ struct FfmpegPlan<'a> {
     subtitle_changes: &'a [SubtitleChange],
     sidecars: &'a [SidecarEntry],
     container: Option<ContainerFormat>,
+    container_metadata: Option<&'a ContainerMetadata>,
     duration: Option<f64>,
     cancelled: &'a AtomicBool,
 }
@@ -2894,6 +2922,23 @@ fn run_ffmpeg(
         }
     }
     command.args(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]);
+    if let Some(metadata) = plan.container_metadata {
+        if let Some(title) = &metadata.title {
+            command.arg("-metadata").arg(format!("title={title}"));
+        }
+        if let Some(comment) = &metadata.comment {
+            command.arg("-metadata").arg(format!("comment={comment}"));
+        }
+        if let Some(date) = &metadata.date {
+            command.arg("-metadata").arg(format!("date={date}"));
+        }
+        if let Some(genre) = &metadata.genre {
+            command.arg("-metadata").arg(format!("genre={genre}"));
+        }
+        if let Some(artist) = &metadata.artist {
+            command.arg("-metadata").arg(format!("artist={artist}"));
+        }
+    }
     let mut video_output_index = 0;
     for source_index in plan.stream_order {
         let Some(stream) = plan
@@ -3378,6 +3423,37 @@ mod tests {
         MediaInfo::from_json(serde_json::json!({"streams": streams})).unwrap()
     }
 
+    /// Reports a tool-gated test as skipped rather than letting it pass silently, so a
+    /// green run on a machine without `ffmpeg` is not mistaken for a run that actually
+    /// exercised the pipeline. Each entry is a program name, optionally narrowed to one
+    /// encoder as `"ffmpeg:libx264"`.
+    fn require_tools(test: &str, tools: &[&str]) -> bool {
+        for tool in tools {
+            let (program, encoder) = match tool.split_once(':') {
+                Some((program, encoder)) => (program, Some(encoder)),
+                None => (*tool, None),
+            };
+            let succeeds = |arguments: &[&str]| {
+                Command::new(program)
+                    .args(arguments)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            // ffmpeg spells it `-version`, most other tools `--version`.
+            let available = match encoder {
+                Some(encoder) => succeeds(&["-v", "error", "-h", &format!("encoder={encoder}")]),
+                None => succeeds(&["-version"]) || succeeds(&["--version"]),
+            };
+            if !available {
+                eprintln!("SKIPPED {test}: {tool} is not available");
+                return false;
+            }
+        }
+        true
+    }
+
     fn english_subtitle_metadata() -> SubtitleMetadata {
         SubtitleMetadata {
             language: "eng".to_string(),
@@ -3578,16 +3654,24 @@ mod tests {
             },
         )]);
 
-        assert_that!(media_write_label(None, &BTreeMap::new()))
+        assert_that!(media_write_label(None, &BTreeMap::new(), false))
             .is_equal_to("Remuxing media".to_string());
+        assert_that!(media_write_label(None, &BTreeMap::new(), true))
+            .is_equal_to("Updating container metadata".to_string());
         assert_that!(media_write_label(
             Some(ContainerFormat::Mp4),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            false
         ))
         .is_equal_to("Remuxing to MP4".to_string());
-        assert_that!(media_write_label(None, &settings)).is_equal_to("Encoding video".to_string());
-        assert_that!(media_write_label(Some(ContainerFormat::Mp4), &settings))
-            .is_equal_to("Encoding video and remuxing to MP4".to_string());
+        assert_that!(media_write_label(None, &settings, false))
+            .is_equal_to("Encoding video".to_string());
+        assert_that!(media_write_label(
+            Some(ContainerFormat::Mp4),
+            &settings,
+            false
+        ))
+        .is_equal_to("Encoding video and remuxing to MP4".to_string());
     }
 
     #[test]
@@ -4248,13 +4332,10 @@ mod tests {
     fn apply_edits_should_remux_order_defaults_and_deletions_when_source_contains_multiple_tracks()
     {
         // Arrange
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_remux_order_defaults_and_deletions_when_source_contains_multiple_tracks",
+            &["ffmpeg"],
+        ) {
             return;
         }
 
@@ -4332,6 +4413,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[1, 0, 3],
@@ -4418,13 +4500,10 @@ mod tests {
     #[test]
     fn apply_edits_should_create_a_valid_mp4_copy_when_only_the_container_changes() {
         // Arrange
-        if !Command::new("ffmpeg")
-            .args(["-v", "error", "-h", "encoder=aac"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_create_a_valid_mp4_copy_when_only_the_container_changes",
+            &["ffmpeg:aac"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -4469,6 +4548,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -4500,13 +4580,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_keep_captions_and_hearing_impaired_independent_in_mp4() {
-        if !Command::new("ffmpeg")
-            .args(["-v", "error", "-h", "encoder=mov_text"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_keep_captions_and_hearing_impaired_independent_in_mp4",
+            &["ffmpeg:mov_text"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -4576,6 +4653,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -4606,6 +4684,7 @@ mod tests {
                 source: &result.output_path,
                 destination: SaveDestination::CreateCopy,
                 container: Some(ContainerFormat::Matroska),
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -4644,13 +4723,10 @@ mod tests {
     #[test]
     fn apply_edits_should_create_an_edited_copy_without_changing_the_source() {
         // Arrange
-        if !Command::new("ffmpeg")
-            .args(["-v", "error", "-h", "encoder=libx264"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_create_an_edited_copy_without_changing_the_source",
+            &["ffmpeg:libx264"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -4702,6 +4778,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -4736,13 +4813,10 @@ mod tests {
     #[test]
     fn apply_edits_should_honor_each_custom_scaling_mode() {
         // Arrange
-        if !Command::new("ffmpeg")
-            .args(["-v", "error", "-h", "encoder=libx264"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_honor_each_custom_scaling_mode",
+            &["ffmpeg:libx264"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -4793,6 +4867,7 @@ mod tests {
                     source: &source,
                     destination: SaveDestination::CreateCopy,
                     container: None,
+                    container_metadata: None,
                 },
                 TrackEdits {
                     stream_order: &[0],
@@ -4822,13 +4897,10 @@ mod tests {
     #[test]
     fn apply_edits_should_export_converted_subtitle_without_retaining_an_embedded_copy() {
         // Arrange
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_export_converted_subtitle_without_retaining_an_embedded_copy",
+            &["ffmpeg"],
+        ) {
             return;
         }
 
@@ -4893,6 +4965,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -4926,19 +4999,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_export_vobsub_with_flags_and_remove_the_embedded_subtitle() {
-        if !Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-            || !Command::new("seconv")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_export_vobsub_with_flags_and_remove_the_embedded_subtitle",
+            &["ffmpeg", "seconv"],
+        ) {
             return;
         }
 
@@ -5009,6 +5073,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -5043,13 +5108,10 @@ mod tests {
     #[test]
     fn apply_edits_should_export_and_remove_incompatible_subtitle_during_mp4_conversion() {
         // Arrange
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_export_and_remove_incompatible_subtitle_during_mp4_conversion",
+            &["ffmpeg"],
+        ) {
             return;
         }
 
@@ -5114,6 +5176,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -5149,13 +5212,10 @@ mod tests {
     #[test]
     fn apply_edits_should_import_sidecars_after_embedded_subtitles_and_remove_the_sources() {
         // Arrange
-        if !Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "apply_edits_should_import_sidecars_after_embedded_subtitles_and_remove_the_sources",
+            &["ffmpeg"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -5264,6 +5324,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0, 1],
@@ -5312,13 +5373,10 @@ mod tests {
     #[test]
     fn failed_or_cancelled_sidecar_import_should_leave_media_and_sidecar_untouched() {
         // Arrange
-        if !Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !require_tools(
+            "failed_or_cancelled_sidecar_import_should_leave_media_and_sidecar_untouched",
+            &["ffmpeg"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -5384,6 +5442,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0],
@@ -5403,6 +5462,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0],
@@ -5437,13 +5497,10 @@ mod tests {
     #[test]
     fn apply_edits_should_drop_source_number_when_converted_target_has_no_duplicate() {
         // Arrange
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_drop_source_number_when_converted_target_has_no_duplicate",
+            &["ffmpeg"],
+        ) {
             return;
         }
 
@@ -5509,6 +5566,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0],
@@ -5540,13 +5598,10 @@ mod tests {
     #[test]
     fn apply_edits_should_number_converted_sidecar_when_matching_target_already_exists() {
         // Arrange
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_number_converted_sidecar_when_matching_target_already_exists",
+            &["ffmpeg"],
+        ) {
             return;
         }
 
@@ -5631,6 +5686,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &[0],
@@ -5744,6 +5800,303 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_write_container_metadata_and_leave_the_tracks_alone() {
+        // Arrange: a title, comment, date, genre and artist staged on the container. Each
+        // is written by its own ffmpeg argument, and a metadata-only save must not disturb
+        // the streams it is not about.
+        if !require_tools(
+            "apply_edits_should_write_container_metadata_and_leave_the_tracks_alone",
+            &["ffmpeg"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-container-metadata-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-c:v",
+                "ffv1",
+                "-metadata",
+                "title=Old title",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        let info = media_info(&source).unwrap();
+        let stream_order = info
+            .streams
+            .iter()
+            .filter_map(stream_index)
+            .collect::<Vec<_>>();
+        let metadata = ContainerMetadata {
+            title: Some("Big Buck Bunny".to_string()),
+            comment: Some("Open movie".to_string()),
+            date: Some("2008".to_string()),
+            genre: Some("Animation".to_string()),
+            artist: Some("Blender Foundation".to_string()),
+        };
+
+        // Act
+        apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: Some(&metadata),
+            },
+            TrackEdits {
+                stream_order: &stream_order,
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert: every field is written, the old title is replaced rather than kept
+        // alongside, and the video track survives untouched.
+        let output = media_info(&source).unwrap();
+        assert_that!(output.container_title().as_deref()).contains("Big Buck Bunny");
+        assert_that!(output.container_comment().as_deref()).contains("Open movie");
+        assert_that!(output.container_date().as_deref()).contains("2008");
+        assert_that!(output.container_genre().as_deref()).contains("Animation");
+        assert_that!(output.container_artist().as_deref()).contains("Blender Foundation");
+        assert_that!(
+            output
+                .streams
+                .iter()
+                .filter(|stream| stream_kind(stream) == Some("video"))
+                .count()
+        )
+        .is_equal_to(1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn edit_request(path: PathBuf, cancelled: Arc<AtomicBool>) -> EditRequest {
+        EditRequest {
+            path,
+            destination: SaveDestination::ReplaceOriginal,
+            container: None,
+            container_metadata: None,
+            stream_order: vec![0, 1],
+            deleted_streams: BTreeSet::from([1]),
+            default_streams: BTreeSet::new(),
+            default_sidecars: BTreeSet::new(),
+            video_settings: BTreeMap::new(),
+            subtitle_changes: Vec::new(),
+            left_subtitle_order: Vec::new(),
+            sidecars: Vec::new(),
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn edit_worker_should_report_progress_then_a_finished_event_for_each_request() {
+        // Arrange: the worker is the only thing standing between the UI thread and a
+        // multi-minute ffmpeg run, so it has to answer every request exactly once —
+        // including the ones that fail.
+        let (requests, events) = spawn_edit_worker();
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-edit-worker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let missing = directory.join("not-a-file.mkv");
+
+        // Act: a source that does not exist, so the run fails without needing ffmpeg.
+        requests
+            .send(edit_request(
+                missing.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .unwrap();
+
+        // Assert: progress may or may not arrive first, but a Finished event always does,
+        // naming the file it was about.
+        let mut outcome = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while outcome.is_none() && std::time::Instant::now() < deadline {
+            match events.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(EditEvent::Finished { path, outcome: got }) => {
+                    assert_eq!(path, missing, "the event must name its request");
+                    outcome = Some(got);
+                }
+                Ok(EditEvent::Progress(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            matches!(outcome, Some(EditOutcome::SourceChanged(_))),
+            "a source that vanished should be reported as such, got {outcome:?}",
+        );
+
+        // Act: an existing file, with the request cancelled before it starts.
+        let existing = directory.join("movie.mkv");
+        fs::write(&existing, b"not really media").unwrap();
+        requests
+            .send(edit_request(existing, Arc::new(AtomicBool::new(true))))
+            .unwrap();
+
+        // Assert: still answered, as Cancelled — a request the worker swallows would
+        // leave the progress dialog up forever.
+        let mut outcome = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while outcome.is_none() && std::time::Instant::now() < deadline {
+            match events.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(EditEvent::Finished { outcome: got, .. }) => outcome = Some(got),
+                Ok(EditEvent::Progress(_)) => {}
+                Err(_) => break,
+            }
+        }
+        // The source is inspected before the cancellation flag is consulted, so an
+        // unreadable file reports the read failure; either way the request is answered.
+        assert!(
+            matches!(
+                outcome,
+                Some(EditOutcome::Cancelled | EditOutcome::Failed(_))
+            ),
+            "a second request must be answered too, got {outcome:?}",
+        );
+
+        drop(requests);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publish_transaction_should_restore_every_backup_when_one_publish_fails() {
+        // Arrange: two sidecars publishing together, the second of which cannot be moved
+        // because its staged file is gone. This is the transaction's whole reason for
+        // existing: a half-published edit would leave one subtitle replaced and the other
+        // missing, with no way for the user to tell what happened.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let original = directory.join("movie.eng.srt");
+        let second = directory.join("movie.nld.srt");
+        let staged = workspace.join("staged-eng");
+        fs::write(&original, b"old subtitle").unwrap();
+        fs::write(&staged, b"new subtitle").unwrap();
+        let publications = [
+            Publication {
+                staged: vec![(staged.clone(), original.clone())],
+                remove: vec![original.clone()],
+            },
+            Publication {
+                // Never written, so publishing it fails partway through.
+                staged: vec![(workspace.join("staged-nld"), second.clone())],
+                remove: Vec::new(),
+            },
+        ];
+
+        // Act
+        let result = publish_transaction(None, None, &publications, &AtomicBool::new(false));
+
+        // Assert: the transaction reports failure and the directory is exactly as it was.
+        let Err(EditError::Failed(error)) = result else {
+            panic!("a missing staged file should fail the transaction");
+        };
+        assert_that!(error.as_str()).contains("Could not publish");
+        assert_that!(fs::read(&original).unwrap()).is_equal_to(b"old subtitle".to_vec());
+        assert!(
+            !second.exists(),
+            "the second sidecar was never published and must not exist",
+        );
+        // The backup is rolled back into place rather than left beside the original.
+        let leftovers: Vec<_> = fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().starts_with("transaction-backup"))
+            .collect();
+        assert!(leftovers.is_empty(), "backups left behind: {leftovers:?}");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn command_error_should_summarise_stderr_without_letting_it_run_away() {
+        // Arrange / Act / Assert: ffmpeg's stderr goes straight into an error dialog, so
+        // it has to be one line and it has to fit.
+        assert_that!(command_error("Could not remux", b"").as_str()).is_equal_to("Could not remux");
+        assert_that!(
+            command_error("Could not remux", b"\n  first line  \n\n  second line\n").as_str()
+        )
+        .is_equal_to("Could not remux: first line second line");
+
+        let long = command_error("Failed", "é".repeat(500).as_bytes());
+        let detail = long.strip_prefix("Failed: ").expect("the heading is kept");
+        assert_that!(detail.chars().count()).is_equal_to(361);
+        assert!(
+            detail.ends_with('…'),
+            "a truncated detail is marked as such"
+        );
+    }
+
+    #[test]
+    fn container_metadata_should_only_be_empty_when_no_field_is_set() {
+        // Arrange / Act / Assert: an empty metadata block means "write nothing", so a
+        // single set field has to be enough to make it non-empty.
+        assert!(ContainerMetadata::default().is_empty());
+        for metadata in [
+            ContainerMetadata {
+                title: Some("Big Buck Bunny".to_string()),
+                ..ContainerMetadata::default()
+            },
+            ContainerMetadata {
+                comment: Some("a note".to_string()),
+                ..ContainerMetadata::default()
+            },
+            ContainerMetadata {
+                date: Some("2008".to_string()),
+                ..ContainerMetadata::default()
+            },
+            ContainerMetadata {
+                genre: Some("Animation".to_string()),
+                ..ContainerMetadata::default()
+            },
+            ContainerMetadata {
+                artist: Some("Blender Foundation".to_string()),
+                ..ContainerMetadata::default()
+            },
+        ] {
+            assert!(!metadata.is_empty(), "{metadata:?} sets a field");
+        }
     }
 
     #[test]
@@ -6034,13 +6387,10 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_change_should_stage_a_collision_safe_filename_rename() {
-        if Command::new("ffprobe")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "metadata_only_sidecar_change_should_stage_a_collision_safe_filename_rename",
+            &["ffprobe"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -6108,13 +6458,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_write_and_validate_embedded_subtitle_metadata() {
-        if Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+        if !require_tools(
+            "apply_edits_should_write_and_validate_embedded_subtitle_metadata",
+            &["ffmpeg"],
+        ) {
             return;
         }
         let directory = std::env::temp_dir().join(format!(
@@ -6214,6 +6561,7 @@ mod tests {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
                 container: None,
+                container_metadata: None,
             },
             TrackEdits {
                 stream_order: &stream_order,

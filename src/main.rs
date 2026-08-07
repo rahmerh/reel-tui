@@ -10,8 +10,12 @@ mod ui;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use app::{App, Dialog, Layer, SubtitleSettingsMode};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use app::{App, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
 use edit::spawn_edit_worker;
 use files::spawn_directory_monitor;
 use probe::spawn_probe_worker;
@@ -29,6 +33,7 @@ fn main() -> Result<()> {
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {
+        let _paste = BracketedPaste::enable()?;
         loop {
             app.receive_directory_snapshots(&directory_rx);
             app.receive_probe_results(&result_rx);
@@ -36,16 +41,41 @@ fn main() -> Result<()> {
             app.start_pending_probe();
             terminal.draw(|frame| ui::render(frame, &mut app))?;
 
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && handle_key(&mut app, &mut input, key) == InputOutcome::Quit
-            {
-                break;
+            if event::poll(Duration::from_millis(50))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if handle_key(&mut app, &mut input, key) == InputOutcome::Quit {
+                            break;
+                        }
+                    }
+                    // Only arrives while bracketed paste is on, which is why the
+                    // clipboard lands as one edit rather than a burst of key events.
+                    Event::Paste(text) => app.paste_text(&text),
+                    _ => {}
+                }
             }
         }
         Ok(())
     })
+}
+
+/// Turns bracketed paste on for the lifetime of the TUI. `ratatui::run` restores raw
+/// mode and the alternate screen but knows nothing about this mode, so it is undone in
+/// `Drop` — including while unwinding, or the shell inherits a terminal that wraps every
+/// paste in escape sequences.
+struct BracketedPaste;
+
+impl BracketedPaste {
+    fn enable() -> Result<Self> {
+        execute!(std::io::stdout(), EnableBracketedPaste)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for BracketedPaste {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,30 +185,67 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
             _ if input.is_double_g(key) => app.choose_cancel_edit_endpoint(false),
             _ => {}
         },
-        Some(Dialog::ContainerSettings) => match (key.code, key.modifiers) {
-            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_container_settings_cursor(1)
+        Some(Dialog::ContainerSettings) => {
+            let mode = app
+                .container_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode)
+                .unwrap_or_default();
+            match mode {
+                ContainerSettingsMode::TextEdit => {
+                    input.reset_sequence();
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.confirm_save(),
+                        (KeyCode::Esc | KeyCode::Enter, _) => app.escape_container_settings(),
+                        _ => {
+                            handle_text_input_key(app, key);
+                        }
+                    }
+                }
+                ContainerSettingsMode::Summary | ContainerSettingsMode::FormatDropdown => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            input.reset_sequence();
+                            app.confirm_save();
+                        }
+                        (KeyCode::Char('K'), KeyModifiers::SHIFT) => {
+                            input.reset_sequence();
+                            app.toggle_container_help();
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_container_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_container_settings_cursor(-1)
+                        }
+                        (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_container_settings_to_endpoint(true);
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.start_container_text_input();
+                        }
+                        // Enter still drives the Format dropdown; it no longer opens a
+                        // metadata field, so `i` is the one way into every text field.
+                        (KeyCode::Enter, _) => {
+                            input.reset_sequence();
+                            app.activate_container_settings();
+                        }
+                        _ if is_back_key(key) => {
+                            input.reset_sequence();
+                            app.escape_container_settings();
+                        }
+                        _ if input.is_double_g(key) => {
+                            app.move_container_settings_to_endpoint(false)
+                        }
+                        _ => {}
+                    }
+                }
             }
-            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_container_settings_cursor(-1)
-            }
-            (KeyCode::Char('G'), KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_container_settings_to_endpoint(true);
-            }
-            (KeyCode::Enter, _) => {
-                input.reset_sequence();
-                app.activate_container_settings();
-            }
-            _ if is_back_key(key) => {
-                input.reset_sequence();
-                app.close_container_settings();
-            }
-            _ if input.is_double_g(key) => app.move_container_settings_to_endpoint(false),
-            _ => {}
-        },
+        }
         Some(Dialog::VideoSettings) => {
             if app.custom_resolution_input_active() {
                 input.reset_sequence();
@@ -189,24 +256,9 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                         app.finish_custom_resolution_input();
                         app.activate_video_settings();
                     }
-                    (KeyCode::Left, KeyModifiers::NONE) => {
-                        app.move_custom_resolution_input_cursor(-1)
+                    _ => {
+                        handle_text_input_key(app, key);
                     }
-                    (KeyCode::Right, KeyModifiers::NONE) => {
-                        app.move_custom_resolution_input_cursor(1)
-                    }
-                    (KeyCode::Home, KeyModifiers::NONE) => {
-                        app.move_custom_resolution_input_home(false)
-                    }
-                    (KeyCode::End, KeyModifiers::NONE) => {
-                        app.move_custom_resolution_input_home(true)
-                    }
-                    (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_custom_resolution(),
-                    (KeyCode::Delete, KeyModifiers::NONE) => app.delete_custom_resolution_input(),
-                    (KeyCode::Char(digit), KeyModifiers::NONE) if digit.is_ascii_digit() => {
-                        app.input_custom_resolution_digit(digit)
-                    }
-                    _ => {}
                 }
             } else {
                 match (key.code, key.modifiers) {
@@ -257,19 +309,9 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                             app.save_from_subtitle_settings()
                         }
                         (KeyCode::Esc | KeyCode::Enter, _) => app.escape_subtitle_settings(),
-                        (KeyCode::Left, KeyModifiers::NONE) => app.move_subtitle_title_cursor(-1),
-                        (KeyCode::Right, KeyModifiers::NONE) => app.move_subtitle_title_cursor(1),
-                        (KeyCode::Home, KeyModifiers::NONE) => app.move_subtitle_title_home(false),
-                        (KeyCode::End, KeyModifiers::NONE) => app.move_subtitle_title_home(true),
-                        (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_subtitle_title(),
-                        (KeyCode::Delete, KeyModifiers::NONE) => app.delete_subtitle_title(),
-                        (KeyCode::Char(character), modifiers)
-                            if modifiers == KeyModifiers::NONE
-                                || modifiers == KeyModifiers::SHIFT =>
-                        {
-                            app.input_subtitle_title(character)
+                        _ => {
+                            handle_text_input_key(app, key);
                         }
-                        _ => {}
                     }
                 }
                 SubtitleSettingsMode::LanguageDropdown => {
@@ -289,30 +331,10 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                             | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                                 app.move_subtitle_settings_cursor(-1)
                             }
-                            (KeyCode::Left, KeyModifiers::NONE) => {
-                                app.move_subtitle_language_cursor(-1)
-                            }
-                            (KeyCode::Right, KeyModifiers::NONE) => {
-                                app.move_subtitle_language_cursor(1)
-                            }
-                            (KeyCode::Home, KeyModifiers::NONE) => {
-                                app.move_subtitle_language_home(false)
-                            }
-                            (KeyCode::End, KeyModifiers::NONE) => {
-                                app.move_subtitle_language_home(true)
-                            }
                             (KeyCode::Enter, _) => app.activate_subtitle_settings(),
-                            (KeyCode::Backspace, KeyModifiers::NONE) => {
-                                app.backspace_subtitle_language()
+                            _ => {
+                                handle_text_input_key(app, key);
                             }
-                            (KeyCode::Delete, KeyModifiers::NONE) => app.delete_subtitle_language(),
-                            (KeyCode::Char(character), modifiers)
-                                if modifiers == KeyModifiers::NONE
-                                    || modifiers == KeyModifiers::SHIFT =>
-                            {
-                                app.input_subtitle_language(character)
-                            }
-                            _ => {}
                         }
                     } else {
                         match (key.code, key.modifiers) {
@@ -404,30 +426,6 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                         input.reset_sequence();
                         app.finish_keybindings_search();
                     }
-                    (KeyCode::Backspace, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.keybindings_search_pop();
-                    }
-                    (KeyCode::Delete, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.keybindings_search_delete();
-                    }
-                    (KeyCode::Left, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.move_keybindings_search_cursor(-1);
-                    }
-                    (KeyCode::Right, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.move_keybindings_search_cursor(1);
-                    }
-                    (KeyCode::Home, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.move_keybindings_search_home(false);
-                    }
-                    (KeyCode::End, KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.move_keybindings_search_home(true);
-                    }
                     (KeyCode::Down, KeyModifiers::NONE)
                     | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
@@ -438,11 +436,11 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
                         input.reset_sequence();
                         app.scroll_keybindings_up(1);
                     }
-                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        input.reset_sequence();
-                        app.keybindings_search_push(c);
+                    _ => {
+                        if handle_text_input_key(app, key) {
+                            input.reset_sequence();
+                        }
                     }
-                    _ => {}
                 }
             } else {
                 match (key.code, key.modifiers) {
@@ -530,6 +528,35 @@ fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutc
     InputOutcome::Continue
 }
 
+/// The editing keys every text field shares. Callers match their own keys first —
+/// Escape, Enter, Ctrl-s, list navigation — and fall through to here, so cursor
+/// movement, deletion and typing behave identically in all six fields. Returns whether
+/// the key was consumed.
+fn handle_text_input_key(app: &mut App, key: KeyEvent) -> bool {
+    match (key.code, key.modifiers) {
+        (KeyCode::Left, KeyModifiers::NONE) => app.move_text_cursor(-1),
+        (KeyCode::Right, KeyModifiers::NONE) => app.move_text_cursor(1),
+        (KeyCode::Home, KeyModifiers::NONE) => app.move_text_home(false),
+        (KeyCode::End, KeyModifiers::NONE) => app.move_text_home(true),
+        // Readline habits, since every caller here is a single-line field: Ctrl-a/e for
+        // the ends, Ctrl-w for the previous word, Ctrl-u to clear what is behind the
+        // cursor. Callers that bind these to something else match them first.
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => app.move_text_home(false),
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => app.move_text_home(true),
+        (KeyCode::Backspace, KeyModifiers::NONE) => app.backspace_text(),
+        (KeyCode::Delete, KeyModifiers::NONE) => app.delete_text(),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => app.delete_word_before_cursor(),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.clear_text_to_start(),
+        // Which characters actually land is the field's own `CharClass`; the key layer
+        // does not second-guess it.
+        (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            app.input_text_char(character)
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutcome {
     if app.layer == Layer::Files && app.file_search.is_active {
         match (key.code, key.modifiers) {
@@ -541,30 +568,6 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
                 input.reset_sequence();
                 app.finish_file_search();
             }
-            (KeyCode::Backspace, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.file_search_pop();
-            }
-            (KeyCode::Delete, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.file_search_delete();
-            }
-            (KeyCode::Left, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_file_search_cursor(-1);
-            }
-            (KeyCode::Right, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_file_search_cursor(1);
-            }
-            (KeyCode::Home, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_file_search_home(false);
-            }
-            (KeyCode::End, KeyModifiers::NONE) => {
-                input.reset_sequence();
-                app.move_file_search_home(true);
-            }
             (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 input.reset_sequence();
                 app.select_next();
@@ -573,11 +576,11 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
                 input.reset_sequence();
                 app.select_previous();
             }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                input.reset_sequence();
-                app.file_search_push(c);
+            _ => {
+                if handle_text_input_key(app, key) {
+                    input.reset_sequence();
+                }
             }
-            _ => {}
         }
         return InputOutcome::Continue;
     }
@@ -717,9 +720,10 @@ mod tests {
     use super::*;
     use crate::{
         app::{
-            CancelEditChoice, ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField,
-            SaveDialogField, SubtitleSettingsField, TextInputState, VideoSettingsField,
-            VideoSettingsMode, VideoSettingsPopup,
+            CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
+            ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField, SaveDialogField,
+            SubtitleSettingsField, TextInputState, VideoSettingsField, VideoSettingsMode,
+            VideoSettingsPopup,
         },
         edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
         files::{FileEntry, FileFingerprint},
@@ -768,6 +772,25 @@ mod tests {
             .position(|track| *track == crate::app::TrackRef::Embedded(1))
             .unwrap();
         app.open_track_settings();
+        (app, directory)
+    }
+
+    fn container_settings_app() -> (App, PathBuf) {
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|track| *track == crate::app::TrackRef::Container)
+            .unwrap();
+        app.open_container_settings();
         (app, directory)
     }
 
@@ -840,7 +863,7 @@ mod tests {
     fn error_dialog_should_consume_navigation_without_changing_underlying_selection() {
         let (mut app, directory) = test_app();
         app.layer = Layer::Streams;
-        app.stream_order = vec![0, 1, 2];
+        app.stream_order = vec![0, 1, 2, 3];
         app.selected_stream = 1;
         app.dialog = Some(Dialog::Error);
         let mut input = InputState::default();
@@ -1131,6 +1154,89 @@ mod tests {
     }
 
     #[test]
+    fn readline_keys_should_edit_text_without_colliding_with_dialog_bindings() {
+        // Arrange: a subtitle title in edit mode.
+        let (mut app, directory) = subtitle_settings_app();
+        let mut input = InputState::default();
+        app.move_subtitle_settings_cursor(1);
+        app.move_subtitle_settings_cursor(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for character in "one two".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Act / Assert: Ctrl-a and Ctrl-e reach the ends, as Home and End do.
+        handle_key(&mut app, &mut input, ctrl('a'));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .title_input
+                .cursor,
+            0
+        );
+        handle_key(&mut app, &mut input, ctrl('e'));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .title_input
+                .cursor,
+            7
+        );
+
+        // Act / Assert: Ctrl-w takes the last word, Ctrl-u the rest of the line.
+        handle_key(&mut app, &mut input, ctrl('w'));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .title_input
+                .value,
+            "one "
+        );
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .title_input
+                .value,
+            ""
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ctrl_u_should_scroll_the_keybindings_dialog_until_its_search_is_open() {
+        // Arrange: Ctrl-u is a half-page scroll here and a line kill inside the search,
+        // so the two must not shadow each other.
+        let (mut app, directory) = test_app();
+        let mut input = InputState::default();
+        app.dialog = Some(Dialog::Keybindings);
+        app.keybindings_scroll = 20;
+
+        // Act / Assert: with the search closed it still scrolls.
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(app.keybindings_scroll, 10);
+
+        // Act: open the search and type a query.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in "quit".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Act / Assert: now it clears the query instead of scrolling.
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_eq!(app.keybindings_search.value, "");
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn subtitle_title_should_require_i_and_keep_text_editing_conventional() {
         // Arrange
         let (mut app, directory) = subtitle_settings_app();
@@ -1165,6 +1271,59 @@ mod tests {
         assert_eq!(
             app.subtitle_popup_metadata().unwrap().title.as_deref(),
             Some("Aq")
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_metadata_should_require_i_and_leave_enter_to_the_format_dropdown() {
+        // Arrange
+        let (mut app, directory) = container_settings_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: Enter still drives the Format dropdown.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().mode,
+            ContainerSettingsMode::FormatDropdown
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().mode,
+            ContainerSettingsMode::Summary
+        );
+
+        // Act / Assert: on a metadata field, Enter no longer starts editing.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().field,
+            ContainerSettingsField::Title
+        );
+        for code in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('x')] {
+            handle_key(&mut app, &mut input, key(code));
+            let popup = app.container_settings_popup.as_ref().unwrap();
+            assert_eq!(popup.mode, ContainerSettingsMode::Summary);
+            assert!(!popup.text_input.is_active);
+        }
+
+        // Act: i is the one way in, matching every other text field.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().mode,
+            ContainerSettingsMode::TextEdit
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert
+        let popup = app.container_settings_popup.as_ref().unwrap();
+        assert_eq!(popup.mode, ContainerSettingsMode::Summary);
+        assert!(!popup.text_input.is_active);
+        assert_eq!(
+            app.effective_container_metadata().unwrap().title.as_deref(),
+            Some("q")
         );
 
         drop(app);
@@ -1285,19 +1444,28 @@ mod tests {
         // Arrange: container choices.
         let (mut app, directory) = test_app();
         app.dialog = Some(Dialog::ContainerSettings);
-        app.container_settings_popup = Some(ContainerSettingsPopup { cursor: 1 });
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::FormatDropdown,
+            help_visible: false,
+            format_cursor: 1,
+            text_input: TextInputState::default(),
+        });
         let last_container = app.container_choices().len() - 1;
         let mut input = InputState::default();
 
         // Act / Assert
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(
-            app.container_settings_popup.as_ref().unwrap().cursor,
+            app.container_settings_popup.as_ref().unwrap().format_cursor,
             last_container
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
-        assert_eq!(app.container_settings_popup.as_ref().unwrap().cursor, 0);
+        assert_eq!(
+            app.container_settings_popup.as_ref().unwrap().format_cursor,
+            0
+        );
 
         // Arrange / Act / Assert: video summary fields.
         app.dialog = Some(Dialog::VideoSettings);
@@ -1401,6 +1569,260 @@ mod tests {
             drop(app);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn language_dropdown_keys_should_search_move_and_commit() {
+        // Arrange: the language list is long enough that typing is the only practical way
+        // through it, so search, movement and the endpoint jumps all have to work inside
+        // the open dropdown rather than leaking out to the pane behind it.
+        let (mut app, directory) = subtitle_settings_app();
+        let mut input = InputState::default();
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.subtitle_settings_popup.as_ref().unwrap().mode,
+            crate::app::SubtitleSettingsMode::LanguageDropdown,
+        );
+
+        // Act / Assert: `j` and `k` move within the list.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        let after_down = app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_cursor;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        let after_up = app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_cursor;
+        assert!(after_down > after_up, "`j` then `k` should return");
+
+        // `G` and `gg` jump to the ends.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        let last = app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_cursor;
+        assert_eq!(last, app.filtered_subtitle_languages().len() - 1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_cursor,
+            0
+        );
+
+        // `/` starts a search that narrows the list, and Enter commits the match.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in "dut".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        let matches = app.filtered_subtitle_languages();
+        assert!(
+            !matches.is_empty() && matches.len() < 50,
+            "the search should narrow the list, got {}",
+            matches.len(),
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.subtitle_metadata_for(&SubtitleSource::Embedded(1))
+                .unwrap()
+                .language,
+            "nld",
+            "the searched-for language should be committed",
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_dialog_keys_should_move_between_the_action_and_the_destination() {
+        // Arrange: the save dialog is the last stop before an irreversible write, so both
+        // its rows have to be reachable and Escape has to get out.
+        let (mut app, directory) = subtitle_settings_app();
+        app.dismiss_dialog();
+        app.container_target = Some(crate::edit::ContainerFormat::Mp4);
+        app.deleted_streams.insert(1);
+        app.layer = Layer::Streams;
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, ctrl('s'));
+        assert_eq!(app.dialog, Some(Dialog::ConfirmSave));
+        let start = app.save_destination;
+
+        // Act / Assert: the destination row has to be focused before `l` and `h` mean
+        // anything — they must not change the destination from the action row.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_eq!(
+            app.save_destination, start,
+            "not on the destination row yet"
+        );
+        app.save_dialog_field = SaveDialogField::Destination;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_ne!(app.save_destination, start, "`l` should switch destination");
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_eq!(app.save_destination, start, "`h` should switch back");
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        let moved = app.save_dialog_field;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        assert_ne!(moved, app.save_dialog_field, "`j` and `k` should differ");
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        let end = app.save_dialog_field;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_ne!(end, app.save_dialog_field, "the two ends should differ");
+
+        // Escape backs out without saving.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_eq!(app.dialog, None, "Escape should close the save dialog");
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stream_pane_keys_should_reorder_delete_transfer_and_save() {
+        // Arrange: the editing keys of the stream pane. Each is one keystroke away from
+        // its neighbour, so a misrouted binding silently edits the wrong thing.
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                    {"index": 2, "codec_type": "audio", "codec_name": "ac3"},
+                    {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1, 2, 3];
+        app.layer = Layer::Streams;
+        let mut input = InputState::default();
+        let audio_row = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(1))
+            .unwrap();
+
+        // Act / Assert: Ctrl-j and Ctrl-k reorder the selected track.
+        app.selected_stream = audio_row;
+        handle_key(&mut app, &mut input, ctrl('j'));
+        assert_eq!(app.stream_order, vec![0, 2, 1, 3], "Ctrl-j moves it down");
+        handle_key(&mut app, &mut input, ctrl('k'));
+        assert_eq!(app.stream_order, vec![0, 1, 2, 3], "Ctrl-k moves it back");
+
+        // `d` marks the track for deletion and moves on, so a run of `d` deletes a run of
+        // tracks; pressing it again on the same row is what undeletes.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('d')));
+        assert!(app.deleted_streams.contains(&1), "`d` deletes");
+        assert_ne!(app.selected_stream, audio_row, "`d` advances the selection");
+        app.selected_stream = audio_row;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('d')));
+        assert!(app.deleted_streams.is_empty(), "`d` undeletes");
+
+        // Ctrl-l exports a subtitle to the external column, Ctrl-h brings it back.
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(3))
+            .unwrap();
+        handle_key(&mut app, &mut input, ctrl('l'));
+        assert!(app.is_stream_exported(3), "Ctrl-l should stage the export",);
+        handle_key(&mut app, &mut input, ctrl('h'));
+        assert!(!app.is_stream_exported(3), "Ctrl-h should undo it");
+
+        // Ctrl-s opens the save confirmation for the staged edits.
+        handle_key(&mut app, &mut input, ctrl('l'));
+        handle_key(&mut app, &mut input, ctrl('s'));
+        assert_eq!(app.dialog, Some(Dialog::ConfirmSave));
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn z_fold_commands_should_need_a_recent_leading_z() {
+        // Arrange: `zo`, `zc`, `zR`, `zM` and `za` are vim's fold commands, and folding a
+        // file hides its sidecars from the list. A stale `z` must not turn a later `c`
+        // into a fold command, or an unrelated keystroke collapses the tree the user was
+        // reading.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-fold-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for name in ["a.mkv", "a.eng.srt", "b.mkv", "b.nld.srt"] {
+            fs::write(directory.join(name), b"media").unwrap();
+        }
+        let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        app.layer = Layer::Files;
+        app.select_first();
+        let mut input = InputState::default();
+        let a = directory.join("a.mkv");
+        let b = directory.join("b.mkv");
+        let unfolded = |app: &App| {
+            [&a, &b]
+                .iter()
+                .filter(|path| !app.is_file_folded(path))
+                .count()
+        };
+        assert_eq!(unfolded(&app), 0, "everything starts folded");
+
+        // Act / Assert: a bare `o` on its own does nothing.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('o')));
+        assert_eq!(unfolded(&app), 0, "`o` alone is not a command");
+
+        // `zo` reveals the selected file's sidecar, `zc` hides it again.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('o')));
+        assert_eq!(unfolded(&app), 1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        assert_eq!(unfolded(&app), 0);
+
+        // `za` toggles, and `zR` / `zM` act on every file at once.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('a')));
+        assert_eq!(unfolded(&app), 1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
+        assert_eq!(unfolded(&app), 2, "`zR` unfolds every file");
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('M')));
+        assert_eq!(unfolded(&app), 0, "`zM` folds every file");
+
+        // A `z` that has timed out does not arm the next key.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        input.pending_z = Some(Instant::now() - Duration::from_secs(2));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('o')));
+        assert_eq!(unfolded(&app), 0, "an expired `z` must not still be armed");
+
+        // And an unrelated key between them disarms it too.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('o')));
+        assert_eq!(unfolded(&app), 0, "`z x o` is not a fold command");
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

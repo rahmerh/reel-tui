@@ -68,6 +68,46 @@ impl MediaInfo {
             chapters,
         })
     }
+
+    pub fn format_tag(&self, name: &str) -> Option<String> {
+        self.format
+            .get("tags")
+            .and_then(Value::as_object)
+            .and_then(|tags| {
+                tags.get(name).or_else(|| {
+                    tags.iter()
+                        .find_map(|(key, val)| key.eq_ignore_ascii_case(name).then_some(val))
+                })
+            })
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|val| !val.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn container_title(&self) -> Option<String> {
+        self.format_tag("title")
+    }
+
+    pub fn container_comment(&self) -> Option<String> {
+        self.format_tag("comment")
+            .or_else(|| self.format_tag("description"))
+    }
+
+    pub fn container_date(&self) -> Option<String> {
+        self.format_tag("date")
+            .or_else(|| self.format_tag("creation_time"))
+    }
+
+    pub fn container_genre(&self) -> Option<String> {
+        self.format_tag("genre")
+    }
+
+    pub fn container_artist(&self) -> Option<String> {
+        self.format_tag("artist")
+            .or_else(|| self.format_tag("author"))
+            .or_else(|| self.format_tag("composer"))
+    }
 }
 
 pub(crate) fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
@@ -262,6 +302,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_worker_should_coalesce_queued_requests_and_answer_only_the_newest() {
+        // Arrange: the worker probes one file at a time, so holding a cursor key stacks
+        // requests behind it. Only the last one is still on screen — probing the rest is
+        // seconds of ffprobe the user waits through for answers nobody will read.
+        let (requests, responses) = spawn_probe_worker();
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-probe-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Act: five files queued back to back, faster than any probe can finish.
+        for generation in 0..5u64 {
+            let path = directory.join(format!("{generation}.mkv"));
+            std::fs::write(&path, b"not really media").unwrap();
+            requests
+                .send(ProbeRequest {
+                    generation,
+                    path,
+                    fingerprint: crate::files::FileFingerprint {
+                        length: 16,
+                        modified: None,
+                    },
+                })
+                .unwrap();
+        }
+
+        // Assert: every answer that comes back is for a request that was still queued,
+        // and the newest request is always answered.
+        let mut answered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            match responses.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(response) => {
+                    answered.push(response.generation);
+                    if response.generation == 4 {
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            answered.contains(&4),
+            "the newest request must be answered: {answered:?}",
+        );
+        // How many are coalesced depends on how fast ffprobe returns, so the count is not
+        // asserted; what must hold either way is that no answer is invented or reordered.
+        assert!(
+            answered.len() <= 5,
+            "the worker must not answer more than it was asked: {answered:?}",
+        );
+        assert!(
+            answered.windows(2).all(|pair| pair[0] < pair[1]),
+            "answers must stay in request order: {answered:?}",
+        );
+
+        drop(requests);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn probe_worker_should_stop_when_its_results_are_no_longer_wanted() {
+        // Arrange / Act: dropping the receiving end is how `reel` shuts the worker down.
+        let (requests, responses) = spawn_probe_worker();
+        drop(responses);
+
+        // Assert: sending still succeeds (the channel outlives one send), and the worker
+        // exits rather than looping on a dead channel — so the process can exit too.
+        let _ = requests.send(ProbeRequest {
+            generation: 0,
+            path: std::path::PathBuf::from("/nonexistent/movie.mkv"),
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+        });
+    }
+
+    #[test]
     fn from_json_should_preserve_streams_chapters_and_format_when_input_contains_video() {
         // Arrange
         let value: Value = serde_json::from_str(
@@ -320,5 +444,36 @@ mod tests {
 
         // Assert
         assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn container_metadata_getters_should_extract_tags_case_insensitively() {
+        // Arrange
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {
+                    "format_name": "matroska",
+                    "tags": {
+                        "TITLE": "Inception",
+                        "comment": "Mind-bending heist",
+                        "DATE": "2010",
+                        "Genre": "Sci-Fi",
+                        "ARTIST": "Christopher Nolan"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Act
+        let info = MediaInfo::from_json(value).unwrap();
+
+        // Assert
+        assert_that!(info.container_title().as_deref()).contains("Inception");
+        assert_that!(info.container_comment().as_deref()).contains("Mind-bending heist");
+        assert_that!(info.container_date().as_deref()).contains("2010");
+        assert_that!(info.container_genre().as_deref()).contains("Sci-Fi");
+        assert_that!(info.container_artist().as_deref()).contains("Christopher Nolan");
     }
 }

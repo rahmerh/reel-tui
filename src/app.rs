@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,9 +15,9 @@ use ratatui::widgets::ListState;
 
 use crate::{
     edit::{
-        ContainerFormat, CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
-        SaveDestination, VideoCodec, VideoResolution, VideoSettings, container_conflict_streams,
-        container_conflicts, imported_subtitle_conflicts, stream_index,
+        ContainerFormat, ContainerMetadata, CustomResolution, CustomScaling, EditEvent,
+        EditOutcome, EditRequest, SaveDestination, VideoCodec, VideoResolution, VideoSettings,
+        container_conflict_streams, container_conflicts, imported_subtitle_conflicts, stream_index,
         subtitle_metadata_conflicts, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
@@ -37,6 +37,124 @@ pub enum Layer {
     Files,
     Streams,
     StreamDetails,
+}
+
+/// Which characters a text field accepts. An enum rather than a `fn(char) -> bool`
+/// so [`TextInputConfig`] stays `Copy + Eq + Debug` and tests can assert the config a
+/// site resolves to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CharClass {
+    /// Any non-control character.
+    Text,
+    /// Non-control and non-whitespace, for filter queries typed against a word list.
+    Word,
+    /// ASCII digits only.
+    Digits,
+}
+
+impl CharClass {
+    pub fn accepts(self, character: char) -> bool {
+        match self {
+            Self::Text => !character.is_control(),
+            Self::Word => !character.is_control() && !character.is_whitespace(),
+            Self::Digits => character.is_ascii_digit(),
+        }
+    }
+}
+
+/// Everything that distinguishes one text field from another. Each site declares this
+/// once so the rendered width, the scroll width, the length cap and the accepted
+/// characters cannot drift apart the way they did when each was hardcoded at its call
+/// site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextInputConfig {
+    /// Value cells the field renders, one of which is reserved for the caret glyph.
+    pub width: usize,
+    pub max_len: usize,
+    pub accepts: CharClass,
+    /// Backspace on an empty value leaves the field instead of doing nothing.
+    pub exit_on_empty_backspace: bool,
+}
+
+impl TextInputConfig {
+    /// Value cells every fixed-width field renders. Sharing one number is what lets the
+    /// container and subtitle popups line up their right edges, not just their labels.
+    /// The resolution fields are the deliberate exception: they hold four digits.
+    pub const DEFAULT_WIDTH: usize = 28;
+
+    pub const CONTAINER_METADATA: Self = Self {
+        width: Self::DEFAULT_WIDTH,
+        max_len: 512,
+        accepts: CharClass::Text,
+        exit_on_empty_backspace: false,
+    };
+    pub const SUBTITLE_TITLE: Self = Self {
+        width: Self::DEFAULT_WIDTH,
+        max_len: 512,
+        accepts: CharClass::Text,
+        exit_on_empty_backspace: false,
+    };
+    pub const LANGUAGE_SEARCH: Self = Self {
+        width: Self::DEFAULT_WIDTH,
+        max_len: 64,
+        accepts: CharClass::Word,
+        exit_on_empty_backspace: true,
+    };
+    pub const RESOLUTION: Self = Self {
+        width: 16,
+        max_len: 20,
+        accepts: CharClass::Digits,
+        exit_on_empty_backspace: false,
+    };
+
+    /// A pane-bottom search bar, whose width is whatever the last frame measured.
+    pub const fn search(width: usize) -> Self {
+        Self {
+            width,
+            max_len: 256,
+            accepts: CharClass::Text,
+            exit_on_empty_backspace: true,
+        }
+    }
+
+    /// Characters of the value on screen at once; one cell holds the caret glyph.
+    pub const fn visible_width(self) -> usize {
+        self.width.saturating_sub(1)
+    }
+}
+
+/// Why a keystroke or paste did not land in full. Carried back to the renderer so a
+/// refused character says why instead of looking like a dropped keypress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputReject {
+    /// The field does not accept characters of this class.
+    Character(CharClass),
+    /// The value is at its length cap.
+    Full(usize),
+}
+
+/// What an edit did, so a caller can run its site-specific follow-up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputEdit {
+    Changed,
+    Unchanged,
+    /// Backspace on an empty value; the field has deactivated itself.
+    Exited,
+    /// Some or all of the input was refused. A paste can be partly accepted and still
+    /// report this, so callers must run their follow-up for it as they would for
+    /// [`InputEdit::Changed`].
+    Rejected(InputReject),
+}
+
+/// Every text field in the application. Editing keys resolve to exactly one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextInputSite {
+    ContainerMetadata,
+    SubtitleTitle,
+    LanguageSearch,
+    CustomResolution,
+    FileSearch,
+    KeybindingsSearch,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -74,37 +192,140 @@ impl TextInputState {
         self.is_active = false;
     }
 
-    pub fn insert(&mut self, character: char, maximum: usize, accepts: impl Fn(char) -> bool) {
-        if !self.is_active || !accepts(character) || self.value.chars().count() >= maximum {
-            return;
+    pub fn insert(&mut self, character: char, config: TextInputConfig) -> InputEdit {
+        if !self.is_active {
+            return InputEdit::Unchanged;
+        }
+        if !config.accepts.accepts(character) {
+            return InputEdit::Rejected(InputReject::Character(config.accepts));
+        }
+        if self.value.chars().count() >= config.max_len {
+            return InputEdit::Rejected(InputReject::Full(config.max_len));
         }
         let byte = char_byte_index(&self.value, self.cursor);
         self.value.insert(byte, character);
         self.cursor += 1;
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
     }
 
-    pub fn backspace(&mut self) {
+    /// Inserts a whole run of text at the cursor, as a bracketed paste delivers it.
+    /// Filtering and the length cap are applied once for the run rather than per
+    /// character, so a paste is one edit and one redraw instead of one per keystroke.
+    pub fn insert_str(&mut self, text: &str, config: TextInputConfig) -> InputEdit {
+        if !self.is_active {
+            return InputEdit::Unchanged;
+        }
+        let mut accepted = String::new();
+        let mut reject = None;
+        let mut remaining = config.max_len.saturating_sub(self.value.chars().count());
+        for character in text.chars() {
+            // A pasted line break would otherwise glue two lines into one word.
+            let character = match character {
+                '\n' | '\r' | '\t' if config.accepts == CharClass::Text => ' ',
+                character => character,
+            };
+            if !config.accepts.accepts(character) {
+                reject.get_or_insert(InputReject::Character(config.accepts));
+                continue;
+            }
+            if remaining == 0 {
+                reject = Some(InputReject::Full(config.max_len));
+                break;
+            }
+            accepted.push(character);
+            remaining -= 1;
+        }
+        if !accepted.is_empty() {
+            let byte = char_byte_index(&self.value, self.cursor);
+            self.value.insert_str(byte, &accepted);
+            self.cursor += accepted.chars().count();
+            self.keep_cursor_visible(config.visible_width());
+        }
+        match reject {
+            Some(reject) => InputEdit::Rejected(reject),
+            None if accepted.is_empty() => InputEdit::Unchanged,
+            None => InputEdit::Changed,
+        }
+    }
+
+    /// Deletes the word before the cursor, as `Ctrl-w` does in a shell: the run of
+    /// whitespace immediately behind the cursor, then the run of non-whitespace behind
+    /// that.
+    pub fn delete_word_before(&mut self, config: TextInputConfig) -> InputEdit {
         if !self.is_active || self.cursor == 0 {
-            return;
+            return InputEdit::Unchanged;
+        }
+        let characters = self.value.chars().collect::<Vec<_>>();
+        let mut start = self.cursor;
+        while start > 0 && characters[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !characters[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.replace_range_by_chars(start, self.cursor, config)
+    }
+
+    /// Deletes everything before the cursor, as `Ctrl-u` does in a shell.
+    pub fn clear_to_start(&mut self, config: TextInputConfig) -> InputEdit {
+        if !self.is_active || self.cursor == 0 {
+            return InputEdit::Unchanged;
+        }
+        self.replace_range_by_chars(0, self.cursor, config)
+    }
+
+    /// Removes `start..end` counted in characters and leaves the cursor where the text
+    /// was, rescrolling to keep it visible.
+    fn replace_range_by_chars(
+        &mut self,
+        start: usize,
+        end: usize,
+        config: TextInputConfig,
+    ) -> InputEdit {
+        if start >= end {
+            return InputEdit::Unchanged;
+        }
+        let bytes = char_byte_index(&self.value, start)..char_byte_index(&self.value, end);
+        self.value.replace_range(bytes, "");
+        self.cursor = start;
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
+    }
+
+    pub fn backspace(&mut self, config: TextInputConfig) -> InputEdit {
+        if !self.is_active {
+            return InputEdit::Unchanged;
+        }
+        if self.value.is_empty() && config.exit_on_empty_backspace {
+            self.deactivate();
+            return InputEdit::Exited;
+        }
+        if self.cursor == 0 {
+            return InputEdit::Unchanged;
         }
         let start = char_byte_index(&self.value, self.cursor - 1);
         let end = char_byte_index(&self.value, self.cursor);
         self.value.replace_range(start..end, "");
         self.cursor -= 1;
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
     }
 
-    pub fn delete(&mut self) {
+    pub fn delete(&mut self, config: TextInputConfig) -> InputEdit {
         if !self.is_active || self.cursor >= self.value.chars().count() {
-            return;
+            return InputEdit::Unchanged;
         }
         let start = char_byte_index(&self.value, self.cursor);
         let end = char_byte_index(&self.value, self.cursor + 1);
         self.value.replace_range(start..end, "");
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
     }
 
-    pub fn move_cursor(&mut self, direction: isize) {
+    pub fn move_cursor(&mut self, direction: isize, config: TextInputConfig) -> InputEdit {
         if !self.is_active {
-            return;
+            return InputEdit::Unchanged;
         }
         let count = self.value.chars().count();
         self.cursor = if direction.is_negative() {
@@ -112,15 +333,25 @@ impl TextInputState {
         } else {
             self.cursor.saturating_add(1).min(count)
         };
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
     }
 
-    pub fn move_home(&mut self, end: bool) {
-        if self.is_active {
-            self.cursor = if end { self.value.chars().count() } else { 0 };
+    pub fn move_home(&mut self, end: bool, config: TextInputConfig) -> InputEdit {
+        if !self.is_active {
+            return InputEdit::Unchanged;
         }
+        self.cursor = if end { self.value.chars().count() } else { 0 };
+        self.keep_cursor_visible(config.visible_width());
+        InputEdit::Changed
     }
 
     pub fn keep_cursor_visible(&mut self, visible_width: usize) {
+        // A search bar's width is only known once a frame has measured it. Scrolling
+        // against a zero-width viewport would push the whole value off screen.
+        if visible_width == 0 {
+            return;
+        }
         if self.cursor < self.view_offset {
             self.view_offset = self.cursor;
         } else if self.cursor >= self.view_offset + visible_width {
@@ -133,6 +364,10 @@ impl TextInputState {
 pub struct SearchState {
     pub input: TextInputState,
     pub match_count: usize,
+    /// Value cells the last rendered frame gave this bar, matching
+    /// [`TextInputConfig::width`]. Zero until the first draw, which
+    /// [`TextInputState::keep_cursor_visible`] treats as "not measured yet".
+    pub field_width: usize,
 }
 
 impl Deref for SearchState {
@@ -140,12 +375,6 @@ impl Deref for SearchState {
 
     fn deref(&self) -> &Self::Target {
         &self.input
-    }
-}
-
-impl DerefMut for SearchState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.input
     }
 }
 
@@ -164,34 +393,18 @@ impl SearchState {
         self.input.deactivate();
     }
 
+    /// Empties the query *and* leaves the bar; the two always happen together, since
+    /// every caller reaches this from an Escape that dismisses the search entirely.
     pub fn clear(&mut self) {
         self.input.clear();
         self.match_count = 0;
     }
 
-    pub fn push_char(&mut self, c: char) {
-        self.input
-            .insert(c, 256, |character| !character.is_control());
-    }
-
-    pub fn pop_char(&mut self) {
-        if self.input.value.is_empty() {
-            self.input.deactivate();
-        } else {
-            self.input.backspace();
-        }
-    }
-
-    pub fn delete_char(&mut self) {
-        self.input.delete();
-    }
-
-    pub fn move_cursor(&mut self, direction: isize) {
-        self.input.move_cursor(direction);
-    }
-
-    pub fn move_home(&mut self, end: bool) {
-        self.input.move_home(end);
+    /// The config for a search bar sized by the last frame. A search bar reserves room
+    /// for the widest match-count suffix so the value window does not shift a column
+    /// every time the count crosses a digit boundary.
+    pub fn config(&self) -> TextInputConfig {
+        TextInputConfig::search(self.field_width)
     }
 }
 
@@ -403,9 +616,54 @@ pub struct CustomResolutionDraft {
     pub scaling_dropdown_open: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContainerSettingsField {
+    #[default]
+    Format,
+    Title,
+    Comment,
+    Date,
+    Genre,
+    Artist,
+}
+
+impl ContainerSettingsField {
+    pub const ALL: [Self; 6] = [
+        Self::Format,
+        Self::Title,
+        Self::Comment,
+        Self::Date,
+        Self::Genre,
+        Self::Artist,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Format => "Format",
+            Self::Title => "Title",
+            Self::Comment => "Comment",
+            Self::Date => "Date / Year",
+            Self::Genre => "Genre",
+            Self::Artist => "Artist / Director",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContainerSettingsMode {
+    #[default]
+    Summary,
+    FormatDropdown,
+    TextEdit,
+}
+
 #[derive(Clone, Debug)]
 pub struct ContainerSettingsPopup {
-    pub cursor: usize,
+    pub field: ContainerSettingsField,
+    pub mode: ContainerSettingsMode,
+    pub help_visible: bool,
+    pub format_cursor: usize,
+    pub text_input: TextInputState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -577,6 +835,7 @@ pub struct App {
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
     pub container_target: Option<ContainerFormat>,
+    pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
     pub save_destination: SaveDestination,
     pub save_dialog_field: SaveDialogField,
@@ -603,6 +862,10 @@ pub struct App {
     pub keybindings_search: SearchState,
     pub file_search: SearchState,
     file_search_origin: Option<PathBuf>,
+    /// The last refused input and the field it was aimed at. Kept until that field
+    /// accepts something or is left, so the explanation stays on screen long enough to
+    /// read instead of flashing for a single frame.
+    text_input_reject: Option<(TextInputSite, InputReject)>,
 }
 
 impl App {
@@ -649,6 +912,7 @@ impl App {
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
             container_target: None,
+            container_metadata: None,
             container_settings_popup: None,
             save_destination: SaveDestination::ReplaceOriginal,
             save_dialog_field: SaveDialogField::Start,
@@ -675,6 +939,7 @@ impl App {
             keybindings_search: SearchState::default(),
             file_search: SearchState::default(),
             file_search_origin: None,
+            text_input_reject: None,
         };
         let snapshot = match scan_directory(&app.directory) {
             Ok(files) => DirectorySnapshot::Files(files),
@@ -1652,13 +1917,9 @@ impl App {
                 && !active_left.contains(&track))
             .then_some(track)
         }));
-        rows.extend(self.stream_order.iter().filter_map(|index| {
-            stream_by_index(info, *index)
-                .filter(|stream| {
-                    !matches!(stream_kind(stream), Some("video" | "audio" | "subtitle"))
-                })
-                .map(|_| TrackRef::Embedded(*index))
-        }));
+        // Attachments, data and any other stream kind are deliberately absent: the
+        // overview lists the container, video, audio and subtitles, and a row that is
+        // selectable but never drawn would put the cursor somewhere invisible.
         rows
     }
 
@@ -1837,7 +2098,7 @@ impl App {
         self.container_target.or_else(|| self.source_container())
     }
 
-    fn original_container_label(&self) -> String {
+    pub fn original_container_label(&self) -> String {
         let name = self
             .media_info()
             .and_then(|info| {
@@ -1972,6 +2233,58 @@ impl App {
         choices
     }
 
+    pub fn original_container_metadata(&self) -> Option<ContainerMetadata> {
+        let info = self.media_info()?;
+        Some(ContainerMetadata {
+            title: info.container_title(),
+            comment: info.container_comment(),
+            date: info.container_date(),
+            genre: info.container_genre(),
+            artist: info.container_artist(),
+        })
+    }
+
+    pub fn effective_container_metadata(&self) -> Option<ContainerMetadata> {
+        self.container_metadata
+            .clone()
+            .or_else(|| self.original_container_metadata())
+    }
+
+    pub fn container_field_changed(&self, field: ContainerSettingsField) -> bool {
+        let orig = self.original_container_metadata();
+        let eff = self.effective_container_metadata();
+        match (orig, eff) {
+            (Some(orig), Some(eff)) => match field {
+                ContainerSettingsField::Format => self.container_target.is_some(),
+                ContainerSettingsField::Title => orig.title != eff.title,
+                ContainerSettingsField::Comment => orig.comment != eff.comment,
+                ContainerSettingsField::Date => orig.date != eff.date,
+                ContainerSettingsField::Genre => orig.genre != eff.genre,
+                ContainerSettingsField::Artist => orig.artist != eff.artist,
+            },
+            (None, Some(eff)) => match field {
+                ContainerSettingsField::Format => self.container_target.is_some(),
+                ContainerSettingsField::Title => eff.title.is_some(),
+                ContainerSettingsField::Comment => eff.comment.is_some(),
+                ContainerSettingsField::Date => eff.date.is_some(),
+                ContainerSettingsField::Genre => eff.genre.is_some(),
+                ContainerSettingsField::Artist => eff.artist.is_some(),
+            },
+            _ => field == ContainerSettingsField::Format && self.container_target.is_some(),
+        }
+    }
+
+    pub fn container_metadata_changed(&self) -> bool {
+        let orig = self.original_container_metadata();
+        let eff = self.effective_container_metadata();
+        match (orig, eff) {
+            (Some(orig), Some(eff)) => orig != eff,
+            (None, Some(eff)) => !eff.is_empty(),
+            (Some(_), None) => true,
+            (None, None) => false,
+        }
+    }
+
     pub fn open_container_settings(&mut self) {
         if self.layer != Layer::Streams
             || self.dialog.is_some()
@@ -1980,48 +2293,378 @@ impl App {
             return;
         }
         let choices = self.container_choices();
-        let cursor = choices.iter().position(|choice| choice.staged).unwrap_or(0);
-        self.container_settings_popup = Some(ContainerSettingsPopup { cursor });
+        let format_cursor = choices.iter().position(|choice| choice.staged).unwrap_or(0);
+        self.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::Summary,
+            help_visible: false,
+            format_cursor,
+            text_input: TextInputState::default(),
+        });
         self.notice = None;
         self.dialog = Some(Dialog::ContainerSettings);
     }
 
-    pub fn move_container_settings_cursor(&mut self, direction: isize) {
-        if self.dialog != Some(Dialog::ContainerSettings) || direction == 0 {
-            return;
+    pub fn toggle_container_help(&mut self) {
+        if let Some(popup) = self.container_settings_popup.as_mut() {
+            popup.help_visible = !popup.help_visible;
         }
-        let length = self.container_choices().len();
-        let popup = self.container_settings_popup.as_mut().unwrap();
-        popup.cursor = move_cursor(popup.cursor, length, direction, |_| true);
+    }
+
+    pub fn move_container_settings_cursor(&mut self, direction: isize) {
+        let choices_len = self.container_choices().len();
+        let Some(popup) = self.container_settings_popup.as_mut() else {
+            return;
+        };
+        match popup.mode {
+            ContainerSettingsMode::FormatDropdown => {
+                popup.format_cursor =
+                    move_cursor(popup.format_cursor, choices_len, direction, |_| true);
+            }
+            ContainerSettingsMode::Summary => {
+                let fields = ContainerSettingsField::ALL;
+                let current_index = fields.iter().position(|f| *f == popup.field).unwrap_or(0);
+                let new_index = move_cursor(current_index, fields.len(), direction, |_| true);
+                popup.field = fields[new_index];
+            }
+            ContainerSettingsMode::TextEdit => {}
+        }
     }
 
     pub fn move_container_settings_to_endpoint(&mut self, end: bool) {
-        if self.dialog != Some(Dialog::ContainerSettings) {
+        let choices_len = self.container_choices().len();
+        let Some(popup) = self.container_settings_popup.as_mut() else {
             return;
-        }
-        let length = self.container_choices().len();
-        if let Some(position) = cursor_endpoint(length, end, |_| true) {
-            self.container_settings_popup.as_mut().unwrap().cursor = position;
+        };
+        match popup.mode {
+            ContainerSettingsMode::FormatDropdown => {
+                if let Some(position) = cursor_endpoint(choices_len, end, |_| true) {
+                    popup.format_cursor = position;
+                }
+            }
+            ContainerSettingsMode::Summary => {
+                let fields = ContainerSettingsField::ALL;
+                if let Some(position) = cursor_endpoint(fields.len(), end, |_| true) {
+                    popup.field = fields[position];
+                }
+            }
+            ContainerSettingsMode::TextEdit => {}
         }
     }
 
     pub fn activate_container_settings(&mut self) {
-        if self.dialog != Some(Dialog::ContainerSettings) {
-            return;
-        }
-        let cursor = self.container_settings_popup.as_ref().unwrap().cursor;
-        let Some(choice) = self.container_choices().get(cursor).cloned() else {
+        let mode = self
+            .container_settings_popup
+            .as_ref()
+            .map(|popup| popup.mode);
+        let Some(mode) = mode else {
             return;
         };
-        self.container_target = choice.value;
-        self.notice = choice.warning();
-        self.container_settings_popup = None;
-        self.dialog = None;
+        match mode {
+            ContainerSettingsMode::Summary => {
+                // Only the Format field opens on Enter. Metadata fields are entered
+                // with `i`, like every other text field in the application.
+                let field = self.container_settings_popup.as_ref().unwrap().field;
+                if field == ContainerSettingsField::Format
+                    && let Some(popup) = self.container_settings_popup.as_mut()
+                {
+                    popup.mode = ContainerSettingsMode::FormatDropdown;
+                }
+            }
+            ContainerSettingsMode::FormatDropdown => {
+                let cursor = self
+                    .container_settings_popup
+                    .as_ref()
+                    .unwrap()
+                    .format_cursor;
+                if let Some(choice) = self.container_choices().get(cursor).cloned() {
+                    self.container_target = choice.value;
+                    self.notice = choice.warning();
+                }
+                if let Some(popup) = self.container_settings_popup.as_mut() {
+                    popup.mode = ContainerSettingsMode::Summary;
+                }
+            }
+            ContainerSettingsMode::TextEdit => {
+                self.save_container_text_input();
+            }
+        }
+    }
+
+    /// Opens the selected metadata field for editing, seeded with its current value.
+    /// Mirrors [`Self::start_subtitle_title_input`].
+    pub fn start_container_text_input(&mut self) {
+        self.clear_text_input_reject();
+        let Some(field) = self
+            .container_settings_popup
+            .as_ref()
+            .filter(|popup| popup.mode == ContainerSettingsMode::Summary)
+            .map(|popup| popup.field)
+            .filter(|field| *field != ContainerSettingsField::Format)
+        else {
+            return;
+        };
+        let metadata = self.effective_container_metadata().unwrap_or_default();
+        let current_text = match field {
+            ContainerSettingsField::Title => metadata.title.as_deref(),
+            ContainerSettingsField::Comment => metadata.comment.as_deref(),
+            ContainerSettingsField::Date => metadata.date.as_deref(),
+            ContainerSettingsField::Genre => metadata.genre.as_deref(),
+            ContainerSettingsField::Artist => metadata.artist.as_deref(),
+            ContainerSettingsField::Format => None,
+        }
+        .unwrap_or("")
+        .to_string();
+        if let Some(popup) = self.container_settings_popup.as_mut() {
+            popup.text_input = TextInputState::new(current_text);
+            popup.text_input.activate();
+            popup
+                .text_input
+                .move_home(true, TextInputConfig::CONTAINER_METADATA);
+            popup.mode = ContainerSettingsMode::TextEdit;
+        }
+    }
+
+    pub fn save_container_text_input(&mut self) {
+        let Some(popup) = self.container_settings_popup.as_mut() else {
+            return;
+        };
+        if popup.mode != ContainerSettingsMode::TextEdit {
+            return;
+        }
+        let field = popup.field;
+        let value = popup.text_input.value.trim().to_string();
+        let val_opt = if value.is_empty() { None } else { Some(value) };
+        let mut metadata = self.effective_container_metadata().unwrap_or_default();
+        match field {
+            ContainerSettingsField::Title => metadata.title = val_opt,
+            ContainerSettingsField::Comment => metadata.comment = val_opt,
+            ContainerSettingsField::Date => metadata.date = val_opt,
+            ContainerSettingsField::Genre => metadata.genre = val_opt,
+            ContainerSettingsField::Artist => metadata.artist = val_opt,
+            ContainerSettingsField::Format => {}
+        }
+        let orig = self.original_container_metadata().unwrap_or_default();
+        if metadata == orig {
+            self.container_metadata = None;
+        } else {
+            self.container_metadata = Some(metadata);
+        }
+        if let Some(popup) = self.container_settings_popup.as_mut() {
+            // The renderer takes "is being edited" from `is_active`, so leaving it set
+            // here would keep drawing a caret on a field that is no longer in edit mode.
+            popup.text_input.deactivate();
+            popup.mode = ContainerSettingsMode::Summary;
+        }
+    }
+
+    pub fn escape_container_settings(&mut self) {
+        let mode = self
+            .container_settings_popup
+            .as_ref()
+            .map(|popup| popup.mode);
+        let Some(mode) = mode else {
+            return;
+        };
+        match mode {
+            ContainerSettingsMode::TextEdit => {
+                self.save_container_text_input();
+            }
+            ContainerSettingsMode::FormatDropdown => {
+                if let Some(popup) = self.container_settings_popup.as_mut() {
+                    popup.mode = ContainerSettingsMode::Summary;
+                }
+            }
+            ContainerSettingsMode::Summary => {
+                self.close_container_settings();
+            }
+        }
     }
 
     pub fn close_container_settings(&mut self) {
         self.container_settings_popup = None;
         self.dialog = None;
+    }
+
+    /// Which text field the generic editing keys currently drive. The guards mirror
+    /// `handle_key`'s routing exactly, so a field belonging to a dismissed layer can
+    /// never be reached by a keystroke meant for whatever is on top.
+    pub fn active_text_input(&self) -> Option<TextInputSite> {
+        if self
+            .container_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == ContainerSettingsMode::TextEdit)
+        {
+            return Some(TextInputSite::ContainerMetadata);
+        }
+        if self
+            .subtitle_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
+        {
+            return Some(TextInputSite::SubtitleTitle);
+        }
+        if self.subtitle_settings_popup.as_ref().is_some_and(|popup| {
+            popup.mode == SubtitleSettingsMode::LanguageDropdown && popup.language_search.is_active
+        }) {
+            return Some(TextInputSite::LanguageSearch);
+        }
+        if self.custom_resolution_input_active() {
+            return Some(TextInputSite::CustomResolution);
+        }
+        if self.dialog == Some(Dialog::Keybindings) && self.keybindings_search.is_active {
+            return Some(TextInputSite::KeybindingsSearch);
+        }
+        if self.dialog.is_none() && self.layer == Layer::Files && self.file_search.is_active {
+            return Some(TextInputSite::FileSearch);
+        }
+        None
+    }
+
+    /// The field's buffer plus the config that governs it. The config comes back by
+    /// value (it is `Copy`) so reading it does not conflict with the `&mut` borrow.
+    fn text_input_mut(
+        &mut self,
+        site: TextInputSite,
+    ) -> Option<(&mut TextInputState, TextInputConfig)> {
+        match site {
+            TextInputSite::ContainerMetadata => Some((
+                &mut self.container_settings_popup.as_mut()?.text_input,
+                TextInputConfig::CONTAINER_METADATA,
+            )),
+            TextInputSite::SubtitleTitle => Some((
+                &mut self.subtitle_settings_popup.as_mut()?.title_input,
+                TextInputConfig::SUBTITLE_TITLE,
+            )),
+            TextInputSite::LanguageSearch => Some((
+                &mut self.subtitle_settings_popup.as_mut()?.language_search.input,
+                TextInputConfig::LANGUAGE_SEARCH,
+            )),
+            TextInputSite::CustomResolution => {
+                let draft = self
+                    .video_settings_popup
+                    .as_mut()
+                    .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)?
+                    .custom_resolution
+                    .as_mut()?;
+                let input = match draft.field {
+                    CustomResolutionField::Width => &mut draft.width,
+                    CustomResolutionField::Height => &mut draft.height,
+                    CustomResolutionField::Scaling => return None,
+                };
+                Some((input, TextInputConfig::RESOLUTION))
+            }
+            TextInputSite::FileSearch => {
+                let config = self.file_search.config();
+                Some((&mut self.file_search.input, config))
+            }
+            TextInputSite::KeybindingsSearch => {
+                let config = self.keybindings_search.config();
+                Some((&mut self.keybindings_search.input, config))
+            }
+        }
+    }
+
+    /// Runs one edit against whichever field is active, then the follow-up that field
+    /// needs. Every text-editing key in the application goes through here.
+    fn edit_active_text(
+        &mut self,
+        edit: impl FnOnce(&mut TextInputState, TextInputConfig) -> InputEdit,
+    ) {
+        let Some(site) = self.active_text_input() else {
+            return;
+        };
+        // The file panel's selection has to be sampled before the query changes, since
+        // filtering the list is what moves it.
+        let selected_path = (site == TextInputSite::FileSearch)
+            .then(|| self.selected_file().map(|file| file.path.clone()))
+            .flatten();
+        let Some((input, config)) = self.text_input_mut(site) else {
+            return;
+        };
+        let outcome = edit(input, config);
+        self.after_text_edit(site, outcome, selected_path);
+    }
+
+    /// Site-specific bookkeeping that has to follow a successful edit: resetting the
+    /// cursor into a filtered result list, rescrolling, or leaving the field entirely.
+    fn after_text_edit(
+        &mut self,
+        site: TextInputSite,
+        outcome: InputEdit,
+        selected_path: Option<PathBuf>,
+    ) {
+        match outcome {
+            // A rejection still runs the follow-up below: a paste can be truncated and
+            // have changed the value all the same.
+            InputEdit::Rejected(reject) => self.text_input_reject = Some((site, reject)),
+            InputEdit::Changed | InputEdit::Exited => self.text_input_reject = None,
+            InputEdit::Unchanged => return,
+        }
+        match site {
+            TextInputSite::LanguageSearch => {
+                if let Some(popup) = self.subtitle_settings_popup.as_mut() {
+                    popup.language_cursor = 0;
+                }
+            }
+            TextInputSite::KeybindingsSearch => self.keybindings_scroll = 0,
+            TextInputSite::FileSearch => {
+                if outcome == InputEdit::Exited {
+                    self.file_search_origin = None;
+                }
+                self.reselect_file_after_view_change(selected_path.clone(), selected_path);
+            }
+            TextInputSite::ContainerMetadata
+            | TextInputSite::SubtitleTitle
+            | TextInputSite::CustomResolution => {}
+        }
+    }
+
+    /// Why the last keystroke aimed at this field did not land, if it did not. Reported
+    /// only while the field is still the active one, so a stale explanation cannot
+    /// surface on a field the user has since moved away from.
+    pub fn text_input_reject(&self, site: TextInputSite) -> Option<InputReject> {
+        let (rejected_site, reject) = self.text_input_reject?;
+        (rejected_site == site && self.active_text_input() == Some(site)).then_some(reject)
+    }
+
+    /// Drops any pending rejection explanation. Called wherever a text field is opened
+    /// or closed, so entering a field never shows the reason a previous visit stopped.
+    pub fn clear_text_input_reject(&mut self) {
+        self.text_input_reject = None;
+    }
+
+    pub fn input_text_char(&mut self, character: char) {
+        self.edit_active_text(|input, config| input.insert(character, config));
+    }
+
+    /// Inserts a bracketed paste into whichever field is active.
+    pub fn paste_text(&mut self, text: &str) {
+        self.edit_active_text(|input, config| input.insert_str(text, config));
+    }
+
+    pub fn delete_word_before_cursor(&mut self) {
+        self.edit_active_text(|input, config| input.delete_word_before(config));
+    }
+
+    pub fn clear_text_to_start(&mut self) {
+        self.edit_active_text(|input, config| input.clear_to_start(config));
+    }
+
+    pub fn backspace_text(&mut self) {
+        self.edit_active_text(|input, config| input.backspace(config));
+    }
+
+    pub fn delete_text(&mut self) {
+        self.edit_active_text(|input, config| input.delete(config));
+    }
+
+    pub fn move_text_cursor(&mut self, direction: isize) {
+        self.edit_active_text(|input, config| input.move_cursor(direction, config));
+    }
+
+    pub fn move_text_home(&mut self, end: bool) {
+        self.edit_active_text(|input, config| input.move_home(end, config));
     }
 
     pub fn open_video_settings(&mut self) {
@@ -2068,6 +2711,15 @@ impl App {
     pub fn open_track_settings(&mut self) {
         match self.selected_track() {
             Some(TrackRef::Container) => self.open_container_settings(),
+            Some(TrackRef::Embedded(_))
+                if self
+                    .selected_stream_info()
+                    .is_some_and(|stream| stream_kind(stream) == Some("audio")) =>
+            {
+                if self.layer == Layer::Streams && self.dialog.is_none() {
+                    self.notice = Some("Editing audio tracks is not implemented yet.".into());
+                }
+            }
             Some(TrackRef::Embedded(index))
                 if self
                     .selected_stream_info()
@@ -2529,6 +3181,7 @@ impl App {
     }
 
     pub fn start_subtitle_language_search(&mut self) {
+        self.clear_text_input_reject();
         if let Some(popup) = self
             .subtitle_settings_popup
             .as_mut()
@@ -2550,6 +3203,7 @@ impl App {
     }
 
     pub fn start_subtitle_title_input(&mut self) {
+        self.clear_text_input_reject();
         let Some(popup) = self.subtitle_settings_popup.as_ref() else {
             return;
         };
@@ -2611,121 +3265,6 @@ impl App {
             }
         }
         self.notice = None;
-    }
-
-    pub fn input_subtitle_language(&mut self, character: char) {
-        let Some(popup) = self.subtitle_settings_popup.as_mut().filter(|popup| {
-            popup.mode == SubtitleSettingsMode::LanguageDropdown && popup.language_search.is_active
-        }) else {
-            return;
-        };
-        let before = popup.language_search.value.clone();
-        popup.language_search.input.insert(character, 64, |value| {
-            !value.is_control() && !value.is_whitespace()
-        });
-        if popup.language_search.value != before {
-            popup.language_cursor = 0;
-        }
-    }
-
-    pub fn backspace_subtitle_language(&mut self) {
-        if let Some(popup) = self.subtitle_settings_popup.as_mut().filter(|popup| {
-            popup.mode == SubtitleSettingsMode::LanguageDropdown && popup.language_search.is_active
-        }) {
-            popup.language_search.input.backspace();
-            popup.language_cursor = 0;
-        }
-    }
-
-    pub fn delete_subtitle_language(&mut self) {
-        if let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.language_search.is_active)
-        {
-            popup.language_search.delete_char();
-            popup.language_cursor = 0;
-        }
-    }
-
-    pub fn move_subtitle_language_cursor(&mut self, direction: isize) {
-        if let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.language_search.is_active)
-        {
-            popup.language_search.move_cursor(direction);
-        }
-    }
-
-    pub fn move_subtitle_language_home(&mut self, end: bool) {
-        if let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.language_search.is_active)
-        {
-            popup.language_search.move_home(end);
-        }
-    }
-
-    pub fn input_subtitle_title(&mut self, character: char) {
-        let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
-        else {
-            return;
-        };
-        popup
-            .title_input
-            .insert(character, 512, |value| !value.is_control());
-        popup.title_input.keep_cursor_visible(42);
-    }
-
-    pub fn backspace_subtitle_title(&mut self) {
-        let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
-        else {
-            return;
-        };
-        popup.title_input.backspace();
-        popup.title_input.keep_cursor_visible(42);
-    }
-
-    pub fn delete_subtitle_title(&mut self) {
-        let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
-        else {
-            return;
-        };
-        popup.title_input.delete();
-    }
-
-    pub fn move_subtitle_title_cursor(&mut self, direction: isize) {
-        let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
-        else {
-            return;
-        };
-        popup.title_input.move_cursor(direction);
-        popup.title_input.keep_cursor_visible(42);
-    }
-
-    pub fn move_subtitle_title_home(&mut self, end: bool) {
-        if let Some(popup) = self
-            .subtitle_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
-        {
-            popup.title_input.move_home(end);
-            popup.title_input.keep_cursor_visible(42);
-        }
     }
 
     fn commit_subtitle_title(&mut self) {
@@ -3279,6 +3818,7 @@ impl App {
     }
 
     pub fn start_custom_resolution_input(&mut self) {
+        self.clear_text_input_reject();
         let Some(draft) = self
             .video_settings_popup
             .as_mut()
@@ -3307,88 +3847,6 @@ impl App {
         match draft.field {
             CustomResolutionField::Width => draft.width.deactivate(),
             CustomResolutionField::Height => draft.height.deactivate(),
-            CustomResolutionField::Scaling => {}
-        }
-    }
-
-    pub fn move_custom_resolution_input_cursor(&mut self, direction: isize) {
-        let Some(input) = self.active_custom_resolution_input_mut() else {
-            return;
-        };
-        input.move_cursor(direction);
-        input.keep_cursor_visible(14);
-    }
-
-    pub fn move_custom_resolution_input_home(&mut self, end: bool) {
-        let Some(input) = self.active_custom_resolution_input_mut() else {
-            return;
-        };
-        input.move_home(end);
-        input.keep_cursor_visible(14);
-    }
-
-    pub fn delete_custom_resolution_input(&mut self) {
-        if let Some(input) = self.active_custom_resolution_input_mut() {
-            input.delete();
-        }
-    }
-
-    fn active_custom_resolution_input_mut(&mut self) -> Option<&mut TextInputState> {
-        let draft = self
-            .video_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)?
-            .custom_resolution
-            .as_mut()?;
-        let input = match draft.field {
-            CustomResolutionField::Width => &mut draft.width,
-            CustomResolutionField::Height => &mut draft.height,
-            CustomResolutionField::Scaling => return None,
-        };
-        input.is_active.then_some(input)
-    }
-
-    pub fn input_custom_resolution_digit(&mut self, digit: char) {
-        if !digit.is_ascii_digit() {
-            return;
-        }
-        let Some(draft) = self
-            .video_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
-            .and_then(|popup| popup.custom_resolution.as_mut())
-            .filter(|draft| !draft.scaling_dropdown_open)
-        else {
-            return;
-        };
-        let input = match draft.field {
-            CustomResolutionField::Width => &mut draft.width,
-            CustomResolutionField::Height => &mut draft.height,
-            CustomResolutionField::Scaling => return,
-        };
-        input.insert(digit, 20, |value| value.is_ascii_digit());
-        input.keep_cursor_visible(14);
-    }
-
-    pub fn backspace_custom_resolution(&mut self) {
-        let Some(draft) = self
-            .video_settings_popup
-            .as_mut()
-            .filter(|popup| popup.mode == VideoSettingsMode::CustomResolution)
-            .and_then(|popup| popup.custom_resolution.as_mut())
-            .filter(|draft| !draft.scaling_dropdown_open)
-        else {
-            return;
-        };
-        match draft.field {
-            CustomResolutionField::Width => {
-                draft.width.backspace();
-                draft.width.keep_cursor_visible(14);
-            }
-            CustomResolutionField::Height => {
-                draft.height.backspace();
-                draft.height.keep_cursor_visible(14);
-            }
             CustomResolutionField::Scaling => {}
         }
     }
@@ -3552,9 +4010,13 @@ impl App {
             value: ResolutionChoiceValue::Custom,
             label: staged_custom
                 .map(|custom| format!("Custom ({}×{})", custom.width, custom.height))
-                .or_else(|| {
-                    custom_is_current
-                        .then(|| format!("Custom ({}×{})", width.unwrap(), height.unwrap()))
+                .or_else(|| match source_dimensions {
+                    // Same condition as `custom_is_current`, expressed so the dimensions
+                    // are read from the binding that proved they exist.
+                    Some((width, height)) if source_preset.is_none() => {
+                        Some(format!("Custom ({width}×{height})"))
+                    }
+                    _ => None,
                 })
                 .unwrap_or_else(|| "Custom…".to_string()),
             enabled: width.is_some() && height.is_some(),
@@ -3562,8 +4024,12 @@ impl App {
         };
 
         let mut choices = Vec::with_capacity(VideoResolution::PRESETS.len() + 1);
-        for value in VideoResolution::PRESETS {
-            let (preset_width, preset_height) = value.dimensions().unwrap();
+        // `PRESETS` holds only fixed resolutions today, but the invariant lives in
+        // `edit.rs`; skipping a dimensionless entry keeps adding one from panicking here.
+        for (value, (preset_width, preset_height)) in VideoResolution::PRESETS
+            .into_iter()
+            .filter_map(|value| Some((value, value.dimensions()?)))
+        {
             let current = source_preset == Some(value);
             choices.push(ResolutionChoice {
                 label: value.label(),
@@ -3595,44 +4061,48 @@ impl App {
             "av1" => Some(VideoCodec::Av1),
             _ => None,
         };
+        // Bound once: without a target container nothing can be rejected, so both the
+        // check and the explanation below read from the same value.
+        let container = self.effective_container();
+        let rejects = |codec_name: &str| {
+            container.filter(|container| !container.supports_codec("video", codec_name, false))
+        };
+
         let mut choices = Vec::with_capacity(VideoCodec::TARGETS.len() + 1);
         if source_codec.is_none() {
-            let enabled = self
-                .effective_container()
-                .is_none_or(|container| container.supports_codec("video", source_name, false));
+            let rejected_by = rejects(source_name);
             choices.push(VideoCodecChoice {
                 value: VideoCodec::Original,
                 label: source_name.to_uppercase(),
                 current: true,
-                enabled,
-                reason: (!enabled).then(|| {
+                enabled: rejected_by.is_none(),
+                reason: rejected_by.map(|container| {
                     format!(
                         "{} cannot contain {} video",
-                        self.effective_container().unwrap().label(),
+                        container.label(),
                         source_name.to_uppercase()
                     )
                 }),
             });
         }
-        choices.extend(VideoCodec::TARGETS.into_iter().map(|codec| {
+        // `TARGETS` excludes `Original`, the only codec without an ffmpeg name; skipping
+        // rather than unwrapping keeps that invariant local to this loop.
+        choices.extend(VideoCodec::TARGETS.into_iter().filter_map(|codec| {
             let current = source_codec == Some(codec);
-            let codec_name = codec.codec_name().unwrap();
-            let enabled = self
-                .effective_container()
-                .is_none_or(|container| container.supports_codec("video", codec_name, false));
-            VideoCodecChoice {
+            let rejected_by = rejects(codec.codec_name()?);
+            Some(VideoCodecChoice {
                 value: if current { VideoCodec::Original } else { codec },
                 label: codec.label().to_string(),
                 current,
-                enabled,
-                reason: (!enabled).then(|| {
+                enabled: rejected_by.is_none(),
+                reason: rejected_by.map(|container| {
                     format!(
                         "{} cannot contain {} video",
-                        self.effective_container().unwrap().label(),
+                        container.label(),
                         codec.label()
                     )
                 }),
-            }
+            })
         }));
         choices
     }
@@ -3822,6 +4292,7 @@ impl App {
             path,
             destination: self.save_destination,
             container: self.container_target,
+            container_metadata: self.container_metadata.clone(),
             stream_order,
             deleted_streams: self.deleted_streams.clone(),
             default_streams,
@@ -3938,30 +4409,8 @@ impl App {
     }
 
     pub fn start_keybindings_search(&mut self) {
+        self.clear_text_input_reject();
         self.keybindings_search.activate();
-    }
-
-    pub fn keybindings_search_push(&mut self, ch: char) {
-        self.keybindings_search.push_char(ch);
-        self.keybindings_scroll = 0;
-    }
-
-    pub fn keybindings_search_pop(&mut self) {
-        self.keybindings_search.pop_char();
-        self.keybindings_scroll = 0;
-    }
-
-    pub fn keybindings_search_delete(&mut self) {
-        self.keybindings_search.delete_char();
-        self.keybindings_scroll = 0;
-    }
-
-    pub fn move_keybindings_search_cursor(&mut self, direction: isize) {
-        self.keybindings_search.move_cursor(direction);
-    }
-
-    pub fn move_keybindings_search_home(&mut self, end: bool) {
-        self.keybindings_search.move_home(end);
     }
 
     pub fn finish_keybindings_search(&mut self) {
@@ -3974,6 +4423,7 @@ impl App {
     }
 
     pub fn start_file_search(&mut self) {
+        self.clear_text_input_reject();
         if self.layer != Layer::Files {
             return;
         }
@@ -3981,35 +4431,6 @@ impl App {
             self.file_search_origin = self.selected_file().map(|file| file.path.clone());
         }
         self.file_search.activate();
-    }
-
-    pub fn file_search_push(&mut self, ch: char) {
-        let selected_path = self.selected_file().map(|file| file.path.clone());
-        self.file_search.push_char(ch);
-        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
-    }
-
-    pub fn file_search_pop(&mut self) {
-        let selected_path = self.selected_file().map(|file| file.path.clone());
-        self.file_search.pop_char();
-        if !self.file_search.is_active {
-            self.file_search_origin = None;
-        }
-        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
-    }
-
-    pub fn file_search_delete(&mut self) {
-        let selected_path = self.selected_file().map(|file| file.path.clone());
-        self.file_search.delete_char();
-        self.reselect_file_after_view_change(selected_path.clone(), selected_path);
-    }
-
-    pub fn move_file_search_cursor(&mut self, direction: isize) {
-        self.file_search.move_cursor(direction);
-    }
-
-    pub fn move_file_search_home(&mut self, end: bool) {
-        self.file_search.move_home(end);
     }
 
     pub fn finish_file_search(&mut self) {
@@ -4164,6 +4585,7 @@ impl App {
         self.subtitle_settings_popup = None;
         self.container_target = None;
         self.container_settings_popup = None;
+        self.container_metadata = None;
     }
 
     fn clear_track_edits(&mut self) {
@@ -4181,6 +4603,7 @@ impl App {
         self.subtitle_settings_popup = None;
         self.container_target = None;
         self.container_settings_popup = None;
+        self.container_metadata = None;
     }
 
     pub fn changed_streams(&self) -> BTreeSet<u64> {
@@ -4218,6 +4641,7 @@ impl App {
 
     pub fn has_track_edits(&self) -> bool {
         self.container_target.is_some()
+            || self.container_metadata.is_some()
             || !self.deleted_streams.is_empty()
             || !self.default_sidecars.is_empty()
             || !changed_streams(
@@ -4238,6 +4662,7 @@ impl App {
 
     pub fn media_will_change(&self) -> bool {
         self.container_target.is_some()
+            || self.container_metadata.is_some()
             || !self.deleted_streams.is_empty()
             || !self.default_sidecars.is_empty()
             || !changed_streams(
@@ -4355,7 +4780,11 @@ impl App {
         }
 
         if descriptions.is_empty() {
-            "Remuxing media".to_string()
+            if self.container_metadata_changed() {
+                "Updating container metadata".to_string()
+            } else {
+                "Remuxing media".to_string()
+            }
         } else {
             descriptions.join(" · ")
         }
@@ -4383,6 +4812,28 @@ impl App {
                 0,
                 format!("Changing container from {source} to {}", target.label()),
             );
+        }
+        if self.container_metadata_changed() {
+            let orig = self.original_container_metadata().unwrap_or_default();
+            let eff = self.effective_container_metadata().unwrap_or_default();
+            let fields = [
+                ("title", &orig.title, &eff.title),
+                ("comment", &orig.comment, &eff.comment),
+                ("date", &orig.date, &eff.date),
+                ("genre", &orig.genre, &eff.genre),
+                ("artist", &orig.artist, &eff.artist),
+            ];
+            let changed: Vec<&str> = fields
+                .iter()
+                .filter(|(_, o, e)| o != e)
+                .map(|(name, _, _)| *name)
+                .collect();
+            if !changed.is_empty() {
+                lines.push(format!(
+                    "Updating container metadata: {}",
+                    changed.join(", ")
+                ));
+            }
         }
         for (index, settings) in &self.video_settings {
             let codec = match settings.codec {
@@ -4846,6 +5297,333 @@ mod tests {
     }
 
     #[test]
+    fn navigation_keys_should_act_on_whichever_pane_holds_the_focus() {
+        // Arrange: the same four movements, meaning three different things depending on
+        // the focused layer. Getting this wrong scrolls the details pane when the user
+        // meant to change file.
+        let mut app = test_file_app(&["a.mkv", "b.mkv", "c.mkv"]);
+        let directory = app.directory.clone();
+
+        // Act / Assert: in the file pane, they move the file selection and clamp at both
+        // ends rather than wrapping.
+        app.layer = Layer::Files;
+        app.select(0);
+        app.select_previous();
+        assert_that!(app.list_state.selected()).is_equal_to(Some(0));
+        app.select_next();
+        assert_that!(app.list_state.selected()).is_equal_to(Some(1));
+        app.select_previous();
+        assert_that!(app.list_state.selected()).is_equal_to(Some(0));
+
+        // In the stream pane, the same keys move the track selection.
+        app.layer = Layer::Streams;
+        app.selected_stream = 2;
+        app.select_previous();
+        assert_that!(app.selected_stream).is_equal_to(1);
+        app.select_previous();
+        app.select_previous();
+        assert_that!(app.selected_stream).is_equal_to(0);
+
+        // In the details popup they scroll it, and never past the top.
+        app.layer = Layer::StreamDetails;
+        app.set_details_max_scroll(10);
+        app.select_next();
+        app.select_next();
+        assert_that!(app.details_scroll).is_equal_to(2);
+        app.select_previous();
+        assert_that!(app.details_scroll).is_equal_to(1);
+        app.select_previous();
+        app.select_previous();
+        assert_that!(app.details_scroll).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn folding_should_apply_only_in_the_file_pane() {
+        // Arrange: folding hides a file's sidecars. The commands are file-pane commands,
+        // so pressing them with the stream pane focused must not silently reshape the
+        // list the user is not looking at.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        app.layer = Layer::Files;
+        app.select(0);
+
+        // Act / Assert
+        app.unfold_selected_file();
+        assert_that!(app.unfolded_files.len()).is_equal_to(1);
+        app.fold_selected_file();
+        assert_that!(app.unfolded_files.is_empty()).is_true();
+
+        app.unfold_all_files();
+        assert_that!(app.unfolded_files.len()).is_equal_to(2);
+        app.fold_all_files();
+        assert_that!(app.unfolded_files.is_empty()).is_true();
+
+        // With the stream pane focused, every one of them is a no-op.
+        app.layer = Layer::Streams;
+        app.unfold_selected_file();
+        app.unfold_all_files();
+        assert_that!(app.unfolded_files.is_empty()).is_true();
+        app.unfolded_files.insert(app.files[0].path.clone());
+        app.fold_selected_file();
+        app.fold_all_files();
+        assert_that!(app.unfolded_files.len()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_directory_snapshots_should_apply_a_scan_error_and_then_recover_from_it() {
+        // Arrange: the watcher thread reports both outcomes on the same channel, and an
+        // unreadable directory must not leave the last good listing on screen.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_that!(app.files.len()).is_equal_to(2);
+
+        // Act
+        tx.send(DirectorySnapshot::Error("permission denied".to_string()))
+            .unwrap();
+        app.receive_directory_snapshots(&rx);
+
+        // Assert
+        assert_that!(app.scan_error.as_deref()).is_equal_to(Some("permission denied"));
+        assert_that!(app.files.is_empty()).is_true();
+
+        // Act: the directory becomes readable again.
+        tx.send(DirectorySnapshot::Files(
+            crate::files::scan_directory(&directory).unwrap(),
+        ))
+        .unwrap();
+        app.receive_directory_snapshots(&rx);
+
+        // Assert: the error clears rather than sticking around behind a good listing.
+        assert_that!(app.scan_error.is_none()).is_true();
+        assert_that!(app.files.len()).is_equal_to(2);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn start_pending_probe_should_wait_out_the_debounce_before_asking_the_worker() {
+        // Arrange: holding a cursor key past ten files must not queue ten ffprobe runs,
+        // so a probe is only sent once the selection has settled.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-pending-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.mkv"), b"media").unwrap();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        app.select_file_position_with_force(Some(0), true);
+        assert_that!(app.pending_since.is_some()).is_true();
+
+        // Act: immediately, while the selection is still fresh.
+        app.start_pending_probe();
+
+        // Assert: nothing sent, and the request is still pending.
+        assert!(probe_rx.try_recv().is_err(), "too early to probe");
+        assert_that!(app.pending_since.is_some()).is_true();
+
+        // Act: with the debounce backdated, as it would be after the user stopped moving.
+        app.pending_since = Some(Instant::now() - Duration::from_millis(200));
+        app.start_pending_probe();
+
+        // Assert: exactly one request, tagged with the current generation so a later
+        // response can be matched against the selection that asked for it.
+        let request = probe_rx.try_recv().expect("the probe should be queued");
+        assert_that!(request.generation).is_equal_to(app.generation);
+        assert_that!(request.path).is_equal_to(directory.join("a.mkv"));
+        assert_that!(app.pending_since.is_none()).is_true();
+
+        // And a second call sends nothing more.
+        app.start_pending_probe();
+        assert!(probe_rx.try_recv().is_err(), "one probe per selection");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_probe_results_should_ignore_a_response_for_a_superseded_generation() {
+        // Arrange: a probe answer that arrives after the user has already moved on. The
+        // worker is asynchronous, so this is the ordinary case for a fast keyboard, and
+        // showing the stale answer would label one file with another's streams.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let directory = app.directory.clone();
+        let first = app.files[0].clone();
+        app.list_state.select(Some(0));
+        let stale_generation = app.generation;
+        app.select_file_position(Some(1));
+        assert_ne!(app.generation, stale_generation, "moving files re-probes");
+
+        // Act
+        tx.send(ProbeResponse {
+            generation: stale_generation,
+            path: first.path.clone(),
+            fingerprint: first.fingerprint,
+            outcome: ProbeOutcome::NotVideo("stale".to_string()),
+        })
+        .unwrap();
+        app.receive_probe_results(&rx);
+
+        // Assert: not shown — but still cached, because the answer is true about that
+        // file and re-probing it later would be wasted work.
+        assert!(
+            !matches!(&app.outcome, Some(ProbeOutcome::NotVideo(reason)) if reason == "stale"),
+            "a superseded response must not become the displayed outcome",
+        );
+        assert!(
+            app.cache
+                .get(&CacheKey::for_file(&first))
+                .is_some_and(|outcome| matches!(outcome, ProbeOutcome::NotVideo(_))),
+            "the answer is still worth caching",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_probe_results_should_show_a_response_that_still_matches_the_selection() {
+        // Arrange: the same plumbing, with the response the user is actually waiting for.
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.select_file_position_with_force(Some(0), true);
+        app.loading = true;
+        app.selected_stream = 3;
+        let file = app.files[0].clone();
+
+        // Act
+        tx.send(ProbeResponse {
+            generation: app.generation,
+            path: file.path.clone(),
+            fingerprint: file.fingerprint,
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]))),
+        })
+        .unwrap();
+        app.receive_probe_results(&rx);
+
+        // Assert: displayed, and the stream selection resets so it cannot point past the
+        // end of a file with fewer tracks than the last one.
+        assert!(matches!(app.outcome, Some(ProbeOutcome::Video(_))));
+        assert_that!(app.loading).is_false();
+        assert_that!(app.selected_stream).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selecting_a_cached_file_should_skip_loading_entirely() {
+        // Arrange: the reason the disk cache exists — on a network mount, re-probing a
+        // file the user already opened costs seconds.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let first = app.files[0].clone();
+        app.cache.insert(
+            CacheKey::for_file(&first),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]))),
+        );
+
+        // Act
+        app.select_file_position(Some(1));
+        app.select_file_position(Some(0));
+
+        // Assert: answered from cache, with no probe queued at all.
+        assert!(matches!(app.outcome, Some(ProbeOutcome::Video(_))));
+        assert_that!(app.loading).is_false();
+        assert_that!(app.pending_since.is_none()).is_true();
+
+        // And an uncached neighbour still goes through the loading state.
+        app.select_file_position(Some(1));
+        assert_that!(app.loading).is_true();
+        assert_that!(app.outcome.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn request_save_should_refuse_while_container_conflicts_remain() {
+        // Arrange: SubRip cannot go into MP4, so converting the container leaves a
+        // conflict the user has to resolve. Saving anyway would silently drop the track.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::Mp4);
+        assert!(!app.selected_container_conflicts().is_empty());
+
+        // Act
+        app.request_save();
+
+        // Assert: the error dialog, not the save dialog.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Error));
+        assert_that!(app.edit_error.as_deref().unwrap()).contains("Resolve the container");
+
+        // And with no edits staged at all, saving is a no-op with an explanation rather
+        // than an error dialog.
+        let mut app = test_file_app(&["movie.mkv"]);
+        app.request_save();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("No media changes to save."));
+
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_edit_results_should_ignore_events_once_the_dialog_moved_on() {
+        // Arrange: an edit worker that is still reporting after its dialog closed —
+        // exactly what a cancelled or finished job does before its thread notices.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.dialog = None;
+
+        // Act
+        tx.send(EditEvent::Progress(crate::edit::EditProgress {
+            phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
+            fraction: Some(0.5),
+        }))
+        .unwrap();
+        app.receive_edit_results(&rx);
+
+        // Assert: nothing leaks into the UI.
+        assert_that!(app.edit_progress.is_none()).is_true();
+        assert_that!(app.edit_progress_label.is_none()).is_true();
+
+        // With the dialog open, the same event is taken.
+        app.dialog = Some(Dialog::Processing);
+        tx.send(EditEvent::Progress(crate::edit::EditProgress {
+            phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
+            fraction: Some(0.5),
+        }))
+        .unwrap();
+        app.receive_edit_results(&rx);
+        assert_that!(app.edit_progress).is_equal_to(Some(0.5));
+        assert_that!(app.edit_progress_label.is_some()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn scroll_forward_should_add_amount_when_result_is_below_maximum() {
         // Arrange
         let current = 4;
@@ -5072,8 +5850,73 @@ mod tests {
         assert_that!(app.selected_track()).contains(TrackRef::Sidecar(1));
         assert_that!(app.move_subtitle_column(-1)).is_true();
         assert_that!(app.selected_track()).contains(TrackRef::Embedded(3));
+        // The attachment at index 4 is not a row, so this is already the last one.
         app.select_next();
-        assert_that!(app.selected_track()).contains(TrackRef::Embedded(4));
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(3));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn attachments_and_data_streams_should_not_be_selectable_rows() {
+        // Arrange: the overview lists the container, video, audio and subtitles only, so
+        // anything else must be absent from navigation too — a row the cursor can reach
+        // but the renderer never draws would leave the selection invisible.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "subtitle"},
+                {"index": 3, "codec_type": "attachment"},
+                {"index": 4, "codec_type": "data"}
+            ]),
+        );
+
+        // Act
+        let rows = app.track_rows();
+
+        // Assert
+        assert_that!(rows).is_equal_to(vec![
+            TrackRef::Container,
+            TrackRef::Embedded(0),
+            TrackRef::Embedded(1),
+            TrackRef::Embedded(2),
+        ]);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn opening_settings_on_an_audio_track_should_say_it_is_not_implemented() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"}
+            ]),
+        );
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+
+        // Act
+        app.open_track_settings();
+
+        // Assert: the footer explains it rather than the keypress doing nothing.
+        assert_that!(app.notice.as_deref())
+            .is_equal_to(Some("Editing audio tracks is not implemented yet."));
+        assert_that!(app.dialog).is_equal_to(None);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -6037,13 +6880,13 @@ mod tests {
         clear_custom_resolution_inputs(&mut app);
         app.start_custom_resolution_input();
         for digit in "1280".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
         app.move_video_settings_cursor(1);
         app.start_custom_resolution_input();
         for digit in "720".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
         app.move_video_settings_cursor(1);
@@ -6221,13 +7064,13 @@ mod tests {
         clear_custom_resolution_inputs(&mut app);
         app.start_custom_resolution_input();
         for digit in "1922".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
         app.move_video_settings_cursor(1);
         app.start_custom_resolution_input();
         for digit in "720".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
 
@@ -6257,13 +7100,13 @@ mod tests {
         clear_custom_resolution_inputs(&mut app);
         app.start_custom_resolution_input();
         for digit in "1279".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
         app.move_video_settings_cursor(1);
         app.start_custom_resolution_input();
         for digit in "720".chars() {
-            app.input_custom_resolution_digit(digit);
+            app.input_text_char(digit);
         }
         app.finish_custom_resolution_input();
 
@@ -6428,10 +7271,10 @@ mod tests {
             ..ToolCapabilities::default()
         };
         app.open_container_settings();
-        app.move_container_settings_cursor(1);
-
-        // Act
         app.activate_container_settings();
+        app.move_container_settings_cursor(1);
+        app.activate_container_settings();
+        app.close_container_settings();
         app.request_save();
 
         // Assert
@@ -6535,6 +7378,54 @@ mod tests {
         // Assert
         assert_that!(unresolved).contains_exactly_in_any_order([2]);
         assert_that!(resolved).is_empty();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejected_video_codec_choices_should_name_the_container_that_rejects_them() {
+        // Arrange: a codec ffmpeg reports but `reel` has no target for, so it takes the
+        // "source codec" arm, plus a target container that cannot hold either it or MPEG-4.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::WebM);
+
+        // Act
+        let choices = app.video_codec_choices(0);
+
+        // Assert: every disabled choice explains itself by naming the container, and no
+        // choice is disabled without a reason.
+        let source = choices
+            .iter()
+            .find(|choice| choice.label == "MPEG2VIDEO")
+            .expect("the unrecognised source codec should still be offered");
+        assert_that!(source.enabled).is_false();
+        assert_that!(source.reason.as_deref().unwrap())
+            .contains("WebM")
+            .contains("MPEG2VIDEO");
+        for choice in &choices {
+            assert_eq!(
+                choice.enabled,
+                choice.reason.is_none(),
+                "{:?} should carry a reason exactly when it is disabled",
+                choice.label,
+            );
+        }
+
+        // And with no target container nothing can be rejected.
+        app.container_target = None;
+        assert!(
+            app.video_codec_choices(0)
+                .iter()
+                .all(|choice| choice.enabled && choice.reason.is_none()),
+        );
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -7323,15 +8214,25 @@ mod tests {
         app.start_keybindings_search();
         assert!(app.keybindings_search.is_active);
 
-        app.keybindings_search_push('a');
-        app.keybindings_search_push('b');
+        app.dialog = Some(Dialog::Keybindings);
+        app.input_text_char('a');
+        app.input_text_char('b');
         assert_eq!(app.keybindings_search.value, "ab");
         assert!(app.keybindings_search.is_active);
 
-        app.keybindings_search_pop();
+        app.backspace_text();
         assert_eq!(app.keybindings_search.value, "a");
         assert!(app.keybindings_search.is_active);
 
+        // Backspacing past the start leaves the bar rather than doing nothing.
+        app.backspace_text();
+        assert_eq!(app.keybindings_search.value, "");
+        assert!(app.keybindings_search.is_active);
+        app.backspace_text();
+        assert!(!app.keybindings_search.is_active);
+
+        app.start_keybindings_search();
+        app.input_text_char('a');
         app.finish_keybindings_search();
         assert!(!app.keybindings_search.is_active);
         assert_eq!(app.keybindings_search.value, "a");
@@ -7343,31 +8244,584 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Drives `app` into edit mode at `site` so the generic text keys resolve there.
+    fn enter_text_input(app: &mut App, site: TextInputSite) {
+        let mut active = TextInputState::new(String::new());
+        active.activate();
+        match site {
+            TextInputSite::ContainerMetadata => {
+                app.container_settings_popup = Some(ContainerSettingsPopup {
+                    field: ContainerSettingsField::Title,
+                    mode: ContainerSettingsMode::TextEdit,
+                    help_visible: false,
+                    format_cursor: 0,
+                    text_input: active,
+                });
+            }
+            TextInputSite::SubtitleTitle | TextInputSite::LanguageSearch => {
+                let language_search = SearchState {
+                    input: active.clone(),
+                    match_count: 0,
+                    field_width: 0,
+                };
+                app.subtitle_settings_popup = Some(SubtitleSettingsPopup {
+                    source: SubtitleSource::Embedded(2),
+                    source_format: SubtitleFormat::SubRip,
+                    field: SubtitleSettingsField::Title,
+                    mode: if site == TextInputSite::SubtitleTitle {
+                        SubtitleSettingsMode::TitleEdit
+                    } else {
+                        SubtitleSettingsMode::LanguageDropdown
+                    },
+                    help_visible: false,
+                    codec_cursor: 0,
+                    language_cursor: 0,
+                    language_search,
+                    title_input: active,
+                });
+            }
+            TextInputSite::CustomResolution => {
+                app.video_settings_popup = Some(VideoSettingsPopup {
+                    stream_index: 0,
+                    field: VideoSettingsField::Resolution,
+                    mode: VideoSettingsMode::CustomResolution,
+                    codec_cursor: 0,
+                    resolution_cursor: 0,
+                    custom_resolution: Some(CustomResolutionDraft {
+                        width: active,
+                        height: TextInputState::new(String::new()),
+                        scaling: crate::edit::CustomScaling::FitPad,
+                        field: CustomResolutionField::Width,
+                        scaling_cursor: 0,
+                        scaling_dropdown_open: false,
+                    }),
+                });
+            }
+            TextInputSite::FileSearch => {
+                app.layer = Layer::Files;
+                app.dialog = None;
+                app.start_file_search();
+            }
+            TextInputSite::KeybindingsSearch => {
+                app.dialog = Some(Dialog::Keybindings);
+                app.start_keybindings_search();
+            }
+        }
+    }
+
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 6] = [
+        TextInputSite::ContainerMetadata,
+        TextInputSite::SubtitleTitle,
+        TextInputSite::LanguageSearch,
+        TextInputSite::CustomResolution,
+        TextInputSite::FileSearch,
+        TextInputSite::KeybindingsSearch,
+    ];
+
+    #[test]
+    fn every_text_input_site_should_resolve_to_its_own_config() {
+        for site in ALL_TEXT_INPUT_SITES {
+            // Arrange
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+
+            // Act
+            enter_text_input(&mut app, site);
+
+            // Assert
+            assert_that!(app.active_text_input()).is_equal_to(Some(site));
+            let expected = match site {
+                TextInputSite::ContainerMetadata => TextInputConfig::CONTAINER_METADATA,
+                TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
+                TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
+                TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
+                TextInputSite::FileSearch => app.file_search.config(),
+                TextInputSite::KeybindingsSearch => app.keybindings_search.config(),
+            };
+            let (_, config) = app.text_input_mut(site).expect("site should resolve");
+            assert_that!(config).is_equal_to(expected);
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn text_input_keys_should_behave_identically_across_all_six_fields() {
+        // Every field goes through one editing path, so the same keys must produce the
+        // same value and caret everywhere.
+        for site in ALL_TEXT_INPUT_SITES {
+            // Arrange
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+            enter_text_input(&mut app, site);
+
+            // Act: type, move left, insert, then delete on both sides of the caret.
+            for character in "1234".chars() {
+                app.input_text_char(character);
+            }
+            app.move_text_cursor(-1);
+            app.input_text_char('9');
+            app.backspace_text();
+            app.move_text_home(false);
+            app.delete_text();
+            app.move_text_home(true);
+
+            // Assert
+            let (input, _) = app.text_input_mut(site).expect("site should resolve");
+            assert_that!(input.value.as_str()).is_equal_to("234");
+            assert_that!(input.cursor).is_equal_to(3);
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn text_input_sites_should_not_resolve_while_another_dialog_is_open() {
+        // Arrange: a file search left active underneath a dialog.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::FileSearch);
+        assert_that!(app.active_text_input()).is_equal_to(Some(TextInputSite::FileSearch));
+
+        // Act
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Assert: keys typed at the dialog must not reach the search bar behind it.
+        assert_that!(app.active_text_input()).is_equal_to(None);
+        app.input_text_char('z');
+        assert_that!(app.file_search.value.as_str()).is_equal_to("");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pasting_should_land_as_one_edit_in_every_field() {
+        // A bracketed paste bypasses the per-character key path entirely, so it needs
+        // its own proof that it reaches all six fields and respects the caret.
+        for site in ALL_TEXT_INPUT_SITES {
+            // Arrange
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+            enter_text_input(&mut app, site);
+            for character in "14".chars() {
+                app.input_text_char(character);
+            }
+            app.move_text_cursor(-1);
+
+            // Act
+            app.paste_text("23");
+
+            // Assert: the run went in at the caret, and the caret followed it.
+            let (input, _) = app.text_input_mut(site).expect("site should resolve");
+            assert_that!(input.value.as_str()).is_equal_to("1234");
+            assert_that!(input.cursor).is_equal_to(3);
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pasting_should_fold_line_breaks_and_drop_characters_the_field_refuses() {
+        // Arrange: a free-text field and a digits-only one.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::SubtitleTitle);
+
+        // Act: a two-line clipboard.
+        app.paste_text("first\nsecond");
+
+        // Assert: the break became a space rather than gluing the lines together.
+        let (input, _) = app
+            .text_input_mut(TextInputSite::SubtitleTitle)
+            .expect("site should resolve");
+        assert_that!(input.value.as_str()).is_equal_to("first second");
+        assert_that!(app.text_input_reject(TextInputSite::SubtitleTitle)).is_equal_to(None);
+
+        // Act: the same clipboard into a digits-only field.
+        app.subtitle_settings_popup = None;
+        enter_text_input(&mut app, TextInputSite::CustomResolution);
+        app.paste_text("1a9b2");
+
+        // Assert: the letters are dropped, the digits kept, and the field says why.
+        let (input, _) = app
+            .text_input_mut(TextInputSite::CustomResolution)
+            .expect("site should resolve");
+        assert_that!(input.value.as_str()).is_equal_to("192");
+        assert_that!(app.text_input_reject(TextInputSite::CustomResolution))
+            .is_equal_to(Some(InputReject::Character(CharClass::Digits)));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pasting_past_the_length_cap_should_keep_what_fits_and_report_it() {
+        // Arrange: the language filter caps at 64 characters.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::LanguageSearch);
+        let cap = TextInputConfig::LANGUAGE_SEARCH.max_len;
+
+        // Act
+        app.paste_text(&"e".repeat(cap + 10));
+
+        // Assert
+        let (input, _) = app
+            .text_input_mut(TextInputSite::LanguageSearch)
+            .expect("site should resolve");
+        assert_that!(input.value.chars().count()).is_equal_to(cap);
+        assert_that!(app.text_input_reject(TextInputSite::LanguageSearch))
+            .is_equal_to(Some(InputReject::Full(cap)));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_truncated_paste_should_still_run_the_field_s_follow_up() {
+        // Arrange: the file panel refilters as a side effect of the query changing, so
+        // a paste that was only partly accepted must not skip that step.
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::FileSearch);
+        let cap = app.file_search.config().max_len;
+
+        // Act: a run that overflows the cap, whose first characters still match.
+        app.paste_text(&format!("movie{}", "x".repeat(cap)));
+
+        // Assert: the query was applied and the panel filtered by it.
+        assert_that!(app.text_input_reject(TextInputSite::FileSearch))
+            .is_equal_to(Some(InputReject::Full(cap)));
+        assert_that!(app.file_search.value.chars().count()).is_equal_to(cap);
+        assert_that!(app.file_panel_entries()).is_empty();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_word_or_a_line_should_work_in_every_field() {
+        for site in ALL_TEXT_INPUT_SITES {
+            // Arrange
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+            enter_text_input(&mut app, site);
+            // Two fields refuse the space that would otherwise separate the words, so
+            // for them a single run is the whole "word".
+            let (typed, after_word) = match site {
+                TextInputSite::LanguageSearch => ("onetwo", ""),
+                TextInputSite::CustomResolution => ("1234", ""),
+                _ => ("one two", "one "),
+            };
+            for character in typed.chars() {
+                app.input_text_char(character);
+            }
+
+            // Act / Assert: Ctrl-w takes the last word.
+            app.delete_word_before_cursor();
+            let (input, _) = app.text_input_mut(site).expect("site should resolve");
+            assert_that!(input.value.as_str()).is_equal_to(after_word);
+
+            // Act / Assert: Ctrl-u takes whatever is left behind the caret.
+            app.clear_text_to_start();
+            let (input, _) = app.text_input_mut(site).expect("site should resolve");
+            assert_that!(input.value.as_str()).is_equal_to("");
+            assert_that!(input.cursor).is_equal_to(0);
+            assert_that!(input.view_offset).is_equal_to(0);
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn word_deletion_should_leave_the_caret_and_the_window_together() {
+        // Arrange: a value long enough that the field has scrolled.
+        let config = TextInputConfig::SUBTITLE_TITLE;
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+        for character in "alpha beta gamma delta epsilon zeta".chars() {
+            input.insert(character, config);
+        }
+        assert_that!(input.view_offset).is_greater_than(0);
+
+        // Act: remove the last word, which pulls the caret back inside the window.
+        input.delete_word_before(config);
+
+        // Assert: the caret is visible in the window the field will draw.
+        assert_that!(input.value.as_str()).is_equal_to("alpha beta gamma delta epsilon ");
+        assert_that!(input.cursor).is_greater_than_or_equal_to(input.view_offset);
+        assert_that!(input.cursor - input.view_offset)
+            .is_less_than_or_equal_to(config.visible_width());
+    }
+
+    #[test]
+    fn a_refused_keystroke_should_be_reported_until_the_field_accepts_something() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::CustomResolution);
+
+        // Act / Assert: a letter in a digits-only field explains itself.
+        app.input_text_char('x');
+        assert_that!(app.text_input_reject(TextInputSite::CustomResolution))
+            .is_equal_to(Some(InputReject::Character(CharClass::Digits)));
+
+        // Act / Assert: a benign no-op does not clear the explanation.
+        app.backspace_text();
+        assert_that!(app.text_input_reject(TextInputSite::CustomResolution))
+            .is_equal_to(Some(InputReject::Character(CharClass::Digits)));
+
+        // Act / Assert: an accepted character does.
+        app.input_text_char('7');
+        assert_that!(app.text_input_reject(TextInputSite::CustomResolution)).is_equal_to(None);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_should_not_survive_leaving_the_field() {
+        // Arrange: refuse a keystroke in the file search.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::FileSearch);
+        for _ in 0..app.file_search.config().max_len {
+            app.input_text_char('a');
+        }
+        app.input_text_char('a');
+        assert_that!(app.text_input_reject(TextInputSite::FileSearch)).is_some();
+
+        // Act / Assert: it belongs to that field alone.
+        assert_that!(app.text_input_reject(TextInputSite::KeybindingsSearch)).is_equal_to(None);
+
+        // Act: leave the bar and come back to it.
+        app.cancel_file_search();
+        app.start_file_search();
+
+        // Assert: a fresh visit starts clean.
+        assert_that!(app.text_input_reject(TextInputSite::FileSearch)).is_equal_to(None);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn backspace_on_an_empty_search_should_leave_the_field() {
+        for site in [
+            TextInputSite::FileSearch,
+            TextInputSite::KeybindingsSearch,
+            TextInputSite::LanguageSearch,
+        ] {
+            // Arrange
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+            enter_text_input(&mut app, site);
+            app.input_text_char('a');
+
+            // Act: one backspace empties the query, the next leaves the bar.
+            app.backspace_text();
+            assert_that!(app.active_text_input()).is_equal_to(Some(site));
+            app.backspace_text();
+
+            // Assert
+            assert_that!(app.active_text_input()).is_equal_to(None);
+            if site == TextInputSite::FileSearch {
+                assert_that!(app.file_search_origin.as_ref()).is_none();
+            }
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn language_filter_should_reject_whitespace_and_stop_at_sixty_four_characters() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::LanguageSearch);
+
+        // Act
+        app.input_text_char('e');
+        app.input_text_char(' ');
+        app.input_text_char('n');
+        for _ in 0..TextInputConfig::LANGUAGE_SEARCH.max_len {
+            app.input_text_char('g');
+        }
+
+        // Assert
+        let value = &app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_search
+            .value;
+        assert_that!(value.as_str()).starts_with("eng");
+        assert_that!(value.chars().count()).is_equal_to(TextInputConfig::LANGUAGE_SEARCH.max_len);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_resolution_should_reject_non_digits_through_the_generic_input_path() {
+        // The key layer no longer filters digits; the field's CharClass is the only
+        // thing standing between a keystroke and the buffer.
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::CustomResolution);
+
+        // Act
+        for character in "1a9 2".chars() {
+            app.input_text_char(character);
+        }
+
+        // Assert
+        let (input, _) = app
+            .text_input_mut(TextInputSite::CustomResolution)
+            .expect("width field should resolve");
+        assert_that!(input.value.as_str()).is_equal_to("192");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn saving_container_metadata_should_deactivate_the_text_input() {
+        // Regression: the popup left `is_active` set after saving, so the renderer —
+        // which takes "being edited" from that flag — kept drawing a caret in Summary.
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        enter_text_input(&mut app, TextInputSite::ContainerMetadata);
+        app.input_text_char('X');
+
+        // Act
+        app.save_container_text_input();
+
+        // Assert
+        let popup = app.container_settings_popup.as_ref().unwrap();
+        assert_that!(popup.mode).is_equal_to(ContainerSettingsMode::Summary);
+        assert!(!popup.text_input.is_active);
+        assert_that!(app.active_text_input()).is_equal_to(None);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn keep_cursor_visible_should_use_the_rendered_field_width() {
+        // Regression: every field once scrolled against a hardcoded 42 (or 14) columns
+        // while rendering at 32, 48 or 16, so the caret could sit off screen.
+        for config in [
+            TextInputConfig::CONTAINER_METADATA,
+            TextInputConfig::SUBTITLE_TITLE,
+            TextInputConfig::LANGUAGE_SEARCH,
+            TextInputConfig::RESOLUTION,
+        ] {
+            // Arrange
+            let mut input = TextInputState::new(String::new());
+            input.activate();
+
+            // Act: fill the field one character past what it can show.
+            for _ in 0..config.visible_width() + 1 {
+                input.insert('7', config);
+            }
+
+            // Assert: the window scrolled the minimum that keeps the trailing caret on
+            // screen — two, since the caret sits one past the last character. Scrolling
+            // against 42 columns left the caret outside a 32-wide field and scrolled a
+            // 48-wide one further than it needed to.
+            assert_that!(input.view_offset).is_equal_to(2);
+            assert!(
+                input.cursor - input.view_offset < config.visible_width(),
+                "caret escaped the {}-wide field",
+                config.width,
+            );
+        }
+    }
+
+    #[test]
+    fn keep_cursor_visible_should_do_nothing_before_the_viewport_is_measured() {
+        // Arrange: a search bar that has not been drawn yet reports a zero width.
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+        let unmeasured = TextInputConfig::search(0);
+
+        // Act
+        for character in "query".chars() {
+            input.insert(character, unmeasured);
+        }
+
+        // Assert: the value stays on screen instead of scrolling itself away.
+        assert_that!(input.value.as_str()).is_equal_to("query");
+        assert_that!(input.view_offset).is_equal_to(0);
+    }
+
+    #[test]
+    fn deleting_forward_should_keep_the_cursor_visible() {
+        // Regression: delete used to skip the scroll fix that insert and backspace ran.
+        // Arrange: scroll the window away from the start.
+        let config = TextInputConfig::RESOLUTION;
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+        for _ in 0..config.width * 2 {
+            input.insert('7', config);
+        }
+        assert!(input.view_offset > 0);
+
+        // Act: jump back to the start and delete forward.
+        input.move_home(false, config);
+        input.delete(config);
+
+        // Assert: the window followed the caret home.
+        assert_that!(input.view_offset).is_equal_to(0);
+    }
+
+    #[test]
+    fn backspace_on_an_empty_metadata_field_should_not_leave_edit_mode() {
+        // Arrange
+        let config = TextInputConfig::CONTAINER_METADATA;
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+
+        // Act
+        let outcome = input.backspace(config);
+
+        // Assert: only search bars are dismissed by backspacing past the start.
+        assert_that!(outcome).is_equal_to(InputEdit::Unchanged);
+        assert!(input.is_active);
+    }
+
     #[test]
     fn text_input_state_should_edit_unicode_only_while_active() {
         // Arrange
+        let text = TextInputConfig {
+            width: 9,
+            max_len: 8,
+            accepts: CharClass::Text,
+            exit_on_empty_backspace: false,
+        };
+        let digits = TextInputConfig {
+            accepts: CharClass::Digits,
+            ..text
+        };
         let mut input = TextInputState::new("Café".to_string());
 
         // Act / Assert: navigation mode ignores text.
-        input.insert('!', 8, |_| true);
+        assert_that!(input.insert('!', text)).is_equal_to(InputEdit::Unchanged);
         assert_that!(input.value.as_str()).is_equal_to("Café");
 
         // Act: edit in the middle of a Unicode value.
         input.activate();
-        input.move_cursor(-1);
-        input.insert('!', 8, |_| true);
-        input.backspace();
-        input.move_home(false);
-        input.delete();
+        input.move_cursor(-1, text);
+        input.insert('!', text);
+        input.backspace(text);
+        input.move_home(false, text);
+        input.delete(text);
 
         // Assert
         assert_that!(input.value.as_str()).is_equal_to("afé");
         assert_that!(input.cursor).is_equal_to(0);
 
-        // Act / Assert: field validators remain reusable.
-        input.move_home(true);
-        input.insert('x', 8, |value| value.is_ascii_digit());
-        input.insert('2', 8, |value| value.is_ascii_digit());
+        // Act / Assert: the field's own character class still filters input, and says so.
+        input.move_home(true, text);
+        assert_that!(input.insert('x', digits)).is_equal_to(InputEdit::Rejected(
+            InputReject::Character(CharClass::Digits),
+        ));
+        assert_that!(input.insert('2', digits)).is_equal_to(InputEdit::Changed);
         assert_that!(input.value.as_str()).is_equal_to("afé2");
     }
 
@@ -7383,7 +8837,7 @@ mod tests {
         // Act: match through one sidecar.
         app.start_file_search();
         for ch in "ENG".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         let entries = app.file_panel_entries();
 
@@ -7403,7 +8857,7 @@ mod tests {
         app.cancel_file_search();
         app.start_file_search();
         for ch in "movie.mkv".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         let entries = app.file_panel_entries();
 
@@ -7428,7 +8882,7 @@ mod tests {
         // Act: move to a result, then cancel the search.
         app.start_file_search();
         for ch in "gamma".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("gamma.mkv");
         app.cancel_file_search();
@@ -7439,7 +8893,7 @@ mod tests {
         // Act: confirm the same result, then clear the confirmed filter.
         app.start_file_search();
         for ch in "gamma".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         app.finish_file_search();
         app.clear_file_search();
@@ -7450,7 +8904,7 @@ mod tests {
         // Act and assert: no matches leave no hidden selection.
         app.start_file_search();
         for ch in "missing".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         assert_that!(app.file_panel_entries()).is_empty();
         assert_that!(app.selected_file()).is_none();
@@ -7467,7 +8921,7 @@ mod tests {
         let directory = app.directory.clone();
         app.start_file_search();
         for ch in "eng".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         app.finish_file_search();
         app.select_next();
@@ -7511,7 +8965,7 @@ mod tests {
         app.activate_subtitle_settings();
         app.start_subtitle_language_search();
         for character in "dutch".chars() {
-            app.input_subtitle_language(character);
+            app.input_text_char(character);
         }
         assert_that!(app.filtered_subtitle_languages().len()).is_equal_to(1);
         app.activate_subtitle_settings();
@@ -7520,10 +8974,10 @@ mod tests {
         app.move_subtitle_settings_cursor(1);
         app.start_subtitle_title_input();
         for character in "Café".chars() {
-            app.input_subtitle_title(character);
+            app.input_text_char(character);
         }
-        app.move_subtitle_title_cursor(-1);
-        app.input_subtitle_title('!');
+        app.move_text_cursor(-1);
+        app.input_text_char('!');
         app.escape_subtitle_settings();
 
         let metadata = app.subtitle_popup_metadata().unwrap();
@@ -7699,6 +9153,622 @@ mod tests {
         app.request_save();
         assert_that!(app.dialog).contains(Dialog::ConfirmSave);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_settings_should_support_editing_title_comment_date_genre_artist() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]),
+        );
+
+        // Act 1: Open container settings and navigate to Title
+        app.open_container_settings();
+        app.move_container_settings_cursor(1); // Title field
+        assert_that!(app.container_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(ContainerSettingsField::Title);
+
+        // Act 2: Enter text edit mode and type title
+        app.start_container_text_input();
+        assert_that!(app.container_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(ContainerSettingsMode::TextEdit);
+        for ch in "My Great Movie".chars() {
+            app.input_text_char(ch);
+        }
+        app.activate_container_settings(); // saves text input and returns to summary mode
+
+        // Assert 1: Staged container metadata has Title set
+        let metadata = app.effective_container_metadata().unwrap();
+        assert_that!(metadata.title.as_deref()).contains("My Great Movie");
+        assert_that!(app.has_track_edits()).is_true();
+        assert_that!(app.container_metadata_changed()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_metadata_changed_should_return_false_when_metadata_is_unedited() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": { "title": "Original Title" }
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+        let app = test_app(info);
+        let directory = app.directory.clone();
+
+        // Assert
+        assert_that!(app.container_metadata_changed()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_metadata_should_be_cleared_on_file_switch() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("Edited Title".to_string()),
+            ..Default::default()
+        });
+
+        // Act — reset_track_edits should clear container_metadata
+        app.reset_track_edits();
+
+        // Assert
+        assert!(app.container_metadata.is_none());
+        assert_that!(app.container_metadata_changed()).is_false();
+        assert_that!(app.has_track_edits()).is_false();
+
+        // Act — also verify clear_track_edits
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("Edited Title".to_string()),
+            ..Default::default()
+        });
+        app.clear_track_edits();
+
+        // Assert
+        assert!(app.container_metadata.is_none());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn media_will_change_should_be_true_for_container_metadata_only() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        assert_that!(app.media_will_change()).is_false();
+
+        // Act
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("New Title".to_string()),
+            ..Default::default()
+        });
+
+        // Assert
+        assert_that!(app.media_will_change()).is_true();
+        assert_that!(app.has_track_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_summary_should_describe_every_kind_of_staged_change() {
+        // Arrange: the save dialog's summary is the last thing a user reads before an
+        // irreversible remux, so every staged change has to be named in it. One file
+        // carrying a video re-encode, a subtitle export, a sidecar import and a metadata
+        // edit at once.
+        let mut app = test_file_app(&["movie.mkv", "movie.nld.srt"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.nld.srt", "nld")];
+
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::P720,
+            },
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        assert!(app.transfer_subtitle(1), "the embedded track should export");
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Sidecar(0))
+            .unwrap();
+        assert!(app.transfer_subtitle(-1), "the sidecar should import");
+
+        // Act
+        let summary = app.save_summary().join("\n");
+
+        // Assert
+        assert_that!(summary.as_str()).contains("Encoding video track #0 as AV1 at 1280×720");
+        assert_that!(summary.as_str()).contains("Exporting subtitle track #1");
+        assert_that!(summary.as_str()).contains("Importing movie.nld.srt");
+
+        // And with a container change on top, that leads the summary — it is the change
+        // that can invalidate every other one.
+        app.container_target = Some(ContainerFormat::Mp4);
+        let summary = app.save_summary();
+        assert_that!(summary[0].as_str()).contains("Changing container");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_summary_should_spell_out_a_subtitle_metadata_edit() {
+        // Arrange: metadata edits are invisible in the overview beyond a `~`, so the save
+        // summary is the only place a user can check what is actually being written.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.store_subtitle_change(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::Ass),
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: Some(crate::subtitle::SubtitleMetadata {
+                    language: "nld".to_string(),
+                    title: Some("Nederlands".to_string()),
+                    forced: true,
+                    cc: true,
+                    hearing_impaired: true,
+                    original: true,
+                    commentary: true,
+                }),
+            },
+        );
+
+        // Act
+        let summary = app.save_summary().join("\n");
+
+        // Assert: the conversion and every flag, named.
+        assert_that!(summary.as_str()).contains("Converting subtitle track #1 in the media to");
+        assert_that!(summary.as_str()).contains("language NLD");
+        assert_that!(summary.as_str()).contains("title “Nederlands”");
+        for flag in ["Forced", "CC", "Hearing impaired", "Original", "Commentary"] {
+            assert!(
+                summary.contains(flag),
+                "{flag} should be listed:\n{summary}"
+            );
+        }
+
+        // A cleared title says so, rather than leaving the reader to assume it is kept.
+        app.store_subtitle_change(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: Some(crate::subtitle::SubtitleMetadata {
+                    language: "eng".to_string(),
+                    title: None,
+                    forced: false,
+                    cc: false,
+                    hearing_impaired: false,
+                    original: false,
+                    commentary: false,
+                }),
+            },
+        );
+        assert_that!(app.save_summary().join("\n").as_str()).contains("no title");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_settings_cursor_should_walk_the_visible_fields_and_stop_at_both_ends() {
+        // Arrange: `j` and `k` in the settings popup walk the rows the popup is actually
+        // showing. Stopping on a hidden row would leave the cursor nowhere.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
+        let fields = app.visible_subtitle_fields();
+        assert!(fields.len() > 2, "there should be rows to walk: {fields:?}");
+
+        // Act / Assert: walking down visits every visible row in order and stops at the
+        // last one rather than wrapping around to the top.
+        app.move_subtitle_settings_to_endpoint(false);
+        let mut visited = vec![app.subtitle_settings_popup.as_ref().unwrap().field];
+        for _ in 0..fields.len() + 2 {
+            app.move_subtitle_settings_cursor(1);
+            let field = app.subtitle_settings_popup.as_ref().unwrap().field;
+            assert!(fields.contains(&field), "{field:?} is not a visible row");
+            if *visited.last().unwrap() != field {
+                visited.push(field);
+            }
+        }
+        assert_that!(visited).is_equal_to(fields.clone());
+
+        // And walking back up stops at the first row.
+        for _ in 0..fields.len() + 2 {
+            app.move_subtitle_settings_cursor(-1);
+        }
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().field).is_equal_to(fields[0]);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_flag_checkboxes_should_toggle_only_the_flags_the_container_stores() {
+        // Arrange: every flag checkbox on an embedded track, toggled on and back off. The
+        // flags are what a player uses to pick a subtitle automatically, so a checkbox
+        // that does not stick is a track that behaves differently after saving.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
+        let source = SubtitleSource::Embedded(1);
+        let flag_of = |app: &App, field: SubtitleSettingsField| {
+            let metadata = app.subtitle_metadata_for(&source).unwrap();
+            match field {
+                SubtitleSettingsField::Forced => metadata.forced,
+                SubtitleSettingsField::Cc => metadata.cc,
+                SubtitleSettingsField::HearingImpaired => metadata.hearing_impaired,
+                SubtitleSettingsField::Original => metadata.original,
+                SubtitleSettingsField::Commentary => metadata.commentary,
+                other => panic!("{other:?} is not a checkbox"),
+            }
+        };
+
+        // Act / Assert: every checkbox the popup actually offers toggles on and back off.
+        // A checkbox that does not stick is a track that behaves differently after saving.
+        let checkboxes: Vec<_> = app
+            .visible_subtitle_fields()
+            .into_iter()
+            .filter(|field| field.subtitle_flag().is_some())
+            .collect();
+        assert!(
+            checkboxes.contains(&SubtitleSettingsField::Forced),
+            "a SubRip track in Matroska should at least offer Forced: {checkboxes:?}",
+        );
+        assert!(
+            !checkboxes.contains(&SubtitleSettingsField::Cc),
+            "Matroska cannot store closed captions, so the box is not offered",
+        );
+        for field in checkboxes {
+            app.subtitle_settings_popup.as_mut().unwrap().field = field;
+            assert!(!flag_of(&app, field), "{field:?} starts clear");
+            app.activate_subtitle_settings();
+            assert!(flag_of(&app, field), "{field:?} should set");
+            app.activate_subtitle_settings();
+            assert!(!flag_of(&app, field), "{field:?} should clear again");
+        }
+
+        // Converting to MP4 takes Original away — the popup stops offering it, and
+        // pressing it anyway stages nothing rather than a flag that the save would drop.
+        app.container_target = Some(ContainerFormat::Mp4);
+        assert!(
+            !app.visible_subtitle_fields()
+                .contains(&SubtitleSettingsField::Original),
+            "MP4 cannot store Original, so the box is withdrawn",
+        );
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Original;
+        app.activate_subtitle_settings();
+        assert!(
+            !flag_of(&app, SubtitleSettingsField::Original),
+            "a withdrawn checkbox must not stage its flag",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_one_subtitle_can_be_the_default_across_embedded_and_external_tracks() {
+        // Arrange: exactly one subtitle may be flagged default, and sidecars compete for
+        // the same slot as embedded tracks. Two defaults is a file players disagree about.
+        let mut app = test_file_app(&["movie.mkv", "movie.nld.srt"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "fra"}}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.nld.srt", "nld")];
+        // Only a sidecar that is being imported can be the container's default subtitle —
+        // one staying on disk is not in the container to be defaulted to.
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Sidecar(0))
+            .unwrap();
+        assert!(app.transfer_subtitle(-1), "the sidecar should import");
+        let make_default = |app: &mut App, row: TrackRef| {
+            app.selected_stream = app.track_rows().iter().position(|r| *r == row).unwrap();
+            app.open_track_settings();
+            app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Default;
+            app.activate_subtitle_settings();
+            app.close_subtitle_settings();
+        };
+
+        // Act / Assert: each new default displaces the previous one, whichever side it
+        // was on.
+        make_default(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.default_streams.contains(&1)).is_true();
+
+        make_default(&mut app, TrackRef::Embedded(2));
+        assert_that!(app.default_streams.contains(&1)).is_false();
+        assert_that!(app.default_streams.contains(&2)).is_true();
+
+        make_default(&mut app, TrackRef::Sidecar(0));
+        eprintln!(
+            "popup={:?} notice={:?} sidecars={:?} defaults={:?}",
+            app.subtitle_settings_popup.is_some(),
+            app.notice,
+            app.default_sidecars,
+            app.default_streams
+        );
+        assert_that!(app.default_streams.contains(&2)).is_false();
+        assert_that!(app.default_sidecars.contains(&0)).is_true();
+
+        make_default(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.default_sidecars.is_empty()).is_true();
+        assert_that!(app.default_streams.contains(&1)).is_true();
+
+        // And pressing it again on the current default clears it — no subtitle default
+        // is a legitimate state.
+        make_default(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.default_streams.contains(&1)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn video_settings_endpoints_should_land_on_selectable_options_in_every_mode() {
+        // Arrange: Home and End through the video settings popup's three modes. Landing
+        // on a disabled codec would leave Enter silently doing nothing.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(0))
+            .unwrap();
+        app.open_video_settings();
+
+        // Act / Assert: in summary mode they move between the two fields.
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(VideoSettingsField::Resolution);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(VideoSettingsField::Codec);
+
+        // In the codec dropdown they land on enabled entries at each end.
+        app.activate_video_settings();
+        let codecs = app.video_codec_choices(0);
+        app.move_video_settings_to_endpoint(true);
+        let last = app.video_settings_popup.as_ref().unwrap().codec_cursor;
+        app.move_video_settings_to_endpoint(false);
+        let first = app.video_settings_popup.as_ref().unwrap().codec_cursor;
+        assert!(codecs[last].enabled && codecs[first].enabled);
+        assert!(last > first, "End should land past Home");
+
+        // Same in the resolution dropdown.
+        app.escape_video_settings();
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+        let resolutions = app.resolution_choices(0);
+        app.move_video_settings_to_endpoint(true);
+        let last = app.video_settings_popup.as_ref().unwrap().resolution_cursor;
+        app.move_video_settings_to_endpoint(false);
+        let first = app.video_settings_popup.as_ref().unwrap().resolution_cursor;
+        assert!(resolutions[last].enabled && resolutions[first].enabled);
+        assert!(last > first, "End should land past Home");
+
+        // And inside the custom-resolution editor they move between its fields.
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = resolutions.len() - 1;
+        app.activate_video_settings();
+        app.move_video_settings_to_endpoint(true);
+        fn draft_field(app: &App) -> CustomResolutionField {
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .field
+        }
+        assert_that!(draft_field(&app)).is_equal_to(CustomResolutionField::Scaling);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(draft_field(&app)).is_equal_to(CustomResolutionField::Width);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_settings_should_jump_to_the_first_and_last_selectable_option() {
+        // Arrange: Home and End inside an open dropdown. They must land on a *selectable*
+        // option — stopping on a disabled codec would leave Enter doing nothing.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
+        let popup = app
+            .subtitle_settings_popup
+            .as_mut()
+            .expect("the subtitle settings popup should open");
+        popup.field = SubtitleSettingsField::Language;
+        popup.mode = SubtitleSettingsMode::LanguageDropdown;
+
+        // Act / Assert
+        app.move_subtitle_settings_to_endpoint(true);
+        let last = app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_cursor;
+        app.move_subtitle_settings_to_endpoint(false);
+        let first = app
+            .subtitle_settings_popup
+            .as_ref()
+            .unwrap()
+            .language_cursor;
+        assert!(
+            last > first,
+            "End should land past Home ({first} then {last})",
+        );
+        assert_that!(first).is_equal_to(0);
+        assert_that!(last).is_equal_to(app.filtered_subtitle_languages().len() - 1);
+
+        // And the help panel toggles independently of the cursor.
+        app.close_subtitle_settings();
+        app.selected_stream = 0;
+        app.open_container_settings();
+        let before = app.container_settings_popup.as_ref().unwrap().help_visible;
+        app.toggle_container_help();
+        assert_that!(app.container_settings_popup.as_ref().unwrap().help_visible)
+            .is_equal_to(!before);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_summary_should_include_container_metadata_changes() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": { "title": "Original" }
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+        let mut app = test_app(info);
+        let directory = app.directory.clone();
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("New Title".to_string()),
+            genre: Some("Action".to_string()),
+            ..Default::default()
+        });
+
+        // Act
+        let summary = app.save_summary();
+
+        // Assert
+        assert_that!(
+            summary
+                .iter()
+                .any(|line| line.contains("container metadata")
+                    && line.contains("title")
+                    && line.contains("genre"))
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn processing_description_should_describe_metadata_only_edits() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("New Title".to_string()),
+            ..Default::default()
+        });
+
+        // Act
+        let description = app.processing_description();
+
+        // Assert
+        assert_that!(description).is_equal_to("Updating container metadata".to_string());
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -9,13 +9,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CancelEditChoice, ContainerChoice, CustomResolutionField, Dialog, Layer,
-        SaveDialogField, SearchState, SubtitleDisplayState, SubtitleSettingsField,
-        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputState, TrackRef, VideoSettingsField,
-        VideoSettingsMode,
+        App, CancelEditChoice, CharClass, ContainerChoice, ContainerSettingsField,
+        ContainerSettingsMode, ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject,
+        Layer, SaveDialogField, SearchState, SubtitleDisplayState, SubtitleSettingsField,
+        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
+        TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode,
     },
     edit::{ContainerFormat, SaveDestination, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -94,11 +96,8 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     app.file_search.match_count = entries.len();
-    let title = if app.is_network_mount {
-        format!(" Files ({}) [NET] ", app.files.len())
-    } else {
-        format!(" Files ({}) ", app.files.len())
-    };
+    // Network mode is reported once, in the footer.
+    let title = format!(" Files ({}) ", app.files.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border(app.layer == Layer::Files))
@@ -116,7 +115,9 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.file_search.is_active || !app.file_search.value.is_empty() {
         let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
         frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
-        frame.render_widget(Paragraph::new(search_line(&app.file_search)), chunks[1]);
+        let reject = app.text_input_reject(TextInputSite::FileSearch);
+        let search = search_line(&mut app.file_search, chunks[1], reject);
+        frame.render_widget(Paragraph::new(search), chunks[1]);
     } else {
         frame.render_stateful_widget(list, inner, &mut app.list_state);
     }
@@ -208,6 +209,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         subtitle_changes: &app.subtitle_changes,
                         source_container: app.source_container(),
                         container_target: app.container_target,
+                        container_metadata_changed: app.container_metadata_changed(),
                         container_conflicts: container_conflicts.len(),
                         conflicting_streams: &conflicting_streams,
                         subtitle_columns_side_by_side,
@@ -319,6 +321,7 @@ fn media_text(
         subtitle_changes,
         source_container,
         container_target,
+        container_metadata_changed,
         container_conflicts,
         conflicting_streams,
         subtitle_columns_side_by_side,
@@ -339,6 +342,7 @@ fn media_text(
         info,
         source_container,
         container_target,
+        container_metadata_changed,
         container_conflicts,
         selected == Some(container_index),
     ));
@@ -628,50 +632,9 @@ fn media_text(
         }
     }
 
-    let other: Vec<_> = order
-        .iter()
-        .filter_map(|index| {
-            let stream = info
-                .streams
-                .iter()
-                .find(|stream| stream_index(stream) == Some(*index))?;
-            let selection_index = rows
-                .iter()
-                .position(|row| *row == TrackRef::Embedded(*index))?;
-            (!matches!(
-                string(stream, "codec_type"),
-                Some("video" | "audio" | "subtitle")
-            ))
-            .then_some((selection_index, stream))
-        })
-        .collect();
-    if !other.is_empty() {
-        section(&mut lines, &format!("Other ({})", other.len()));
-        for (selection_index, stream) in other {
-            if selected == Some(selection_index) {
-                selected_line = Some(lines.len());
-            }
-            lines.push(stream_line(
-                stream,
-                selection_index,
-                selected == Some(selection_index),
-                stream_index(stream).is_some_and(|index| deleted.contains(&index)),
-                stream_index(stream).is_some_and(|index| changed.contains(&index)),
-                stream_index(stream).is_some_and(|index| conflicting_streams.contains(&index)),
-                stream_index(stream).is_some_and(|index| defaults.contains(&index)),
-            ));
-        }
-    }
-
-    if !info.chapters.is_empty() {
-        section(
-            &mut lines,
-            &format!(
-                "Chapters ({}) · detailed chapter information coming later",
-                info.chapters.len()
-            ),
-        );
-    }
+    // Only the container, video, audio and subtitle sections are listed. Attachments
+    // and data streams have no editor, and the chapter section said only that chapter
+    // support was still to come.
 
     (Text::from(lines), selected_line)
 }
@@ -690,6 +653,7 @@ struct MediaTextState<'a> {
     >,
     source_container: Option<crate::edit::ContainerFormat>,
     container_target: Option<crate::edit::ContainerFormat>,
+    container_metadata_changed: bool,
     container_conflicts: usize,
     conflicting_streams: &'a std::collections::BTreeSet<u64>,
     subtitle_columns_side_by_side: bool,
@@ -722,44 +686,42 @@ fn sidecar_line_with_subtitle_context(
         .map(|metadata| metadata.language.as_str())
         .unwrap_or(&sidecar.language);
     let title = metadata.and_then(|metadata| metadata.title.as_deref());
-    let mut forced = metadata.map_or(sidecar.forced, |metadata| metadata.forced);
-    let mut hearing_impaired = metadata.map_or(sidecar.hearing_impaired, |metadata| {
-        metadata.cc || metadata.hearing_impaired
-    });
-    let mut original = metadata.is_some_and(|metadata| metadata.original);
-    let mut commentary = metadata.is_some_and(|metadata| metadata.commentary);
+    // A sidecar has no closed-caption flag of its own, so a staged CC reads as hearing
+    // impaired — that is what an import writes into the container.
+    let mut flags = SubtitleOverviewFlags {
+        default,
+        forced: metadata.map_or(sidecar.forced, |metadata| metadata.forced),
+        cc: false,
+        hearing_impaired: metadata.map_or(sidecar.hearing_impaired, |metadata| {
+            metadata.cc || metadata.hearing_impaired
+        }),
+        original: metadata.is_some_and(|metadata| metadata.original),
+        commentary: metadata.is_some_and(|metadata| metadata.commentary),
+    };
+    // Only an imported sidecar has to live inside the container; one staying on disk
+    // keeps every flag its own filename carries.
     if change.is_some_and(|change| change.import_into_media)
         && let Some(container) = container
     {
-        forced &= container.supports_subtitle_flag(SubtitleFlag::Forced);
-        hearing_impaired &= container.supports_subtitle_flag(SubtitleFlag::HearingImpaired);
-        original &= container.supports_subtitle_flag(SubtitleFlag::Original);
-        commentary &= container.supports_subtitle_flag(SubtitleFlag::Commentary);
+        flags = flags.supported_by(container);
     }
-    let format = change
-        .and_then(|change| change.export_target.or(change.embedded_target))
-        .unwrap_or(sidecar.format);
+    let format =
+        subtitle_output_format_label(change, || sidecar.format.overview_label().to_string());
     let details = subtitle_overview_details(
-        format.overview_label(),
+        &format,
         crate::subtitle::normalized_language(language),
         title,
-        SubtitleOverviewFlags {
-            default,
-            forced,
-            cc: false,
-            hearing_impaired,
-            original,
-            commentary,
-        },
+        flags,
         max_width.map(|width| width.saturating_sub(prefix.chars().count())),
     );
-    Line::from(format!("{prefix}{details}")).style(if selected {
-        focused_style(changed)
-    } else if changed {
-        changed_style()
-    } else {
-        Style::default()
-    })
+    Line::from(format!("{prefix}{details}")).style(
+        TrackRowState {
+            selected,
+            changed,
+            ..TrackRowState::default()
+        }
+        .line_style(),
+    )
 }
 
 fn subtitle_columns_line(
@@ -810,6 +772,7 @@ fn container_line(
     info: &MediaInfo,
     source_container: Option<crate::edit::ContainerFormat>,
     target: Option<crate::edit::ContainerFormat>,
+    metadata_changed: bool,
     conflicts: usize,
     selected: bool,
 ) -> Line<'static> {
@@ -826,15 +789,14 @@ fn container_line(
         || source.clone(),
         |target| format!("{source} → {}", target.label()),
     );
+    // Format, duration, size — nothing else. The title and bit rate are in the `i`
+    // panel, and the overview row is for telling files apart at a glance.
     let mut parts = vec![format];
     if let Some(duration) = number_string(&info.format, "duration").and_then(parse_number) {
         parts.push(format_duration(duration));
     }
     if let Some(size) = number_string(&info.format, "size").and_then(parse_number) {
         parts.push(format_bytes(size));
-    }
-    if let Some(bit_rate) = number_string(&info.format, "bit_rate").and_then(parse_number) {
-        parts.push(format_bitrate(bit_rate));
     }
     if conflicts > 0 {
         parts.push(format!(
@@ -843,16 +805,16 @@ fn container_line(
         ));
     }
     let marker = if selected { "›" } else { " " };
-    let changed = target.is_some();
-    Line::from(format!("{marker}    {}", parts.join("  ·  "))).style(if selected {
-        focused_style(changed)
-    } else if conflicts > 0 {
-        warning_style(changed)
-    } else if changed {
-        changed_style()
-    } else {
-        Style::default()
-    })
+    let changed = target.is_some() || metadata_changed;
+    Line::from(format!("{marker}    {}", parts.join("  ·  "))).style(
+        TrackRowState {
+            selected,
+            deleted: false,
+            conflict: conflicts > 0,
+            changed,
+        }
+        .line_style(),
+    )
 }
 
 fn stream_line(
@@ -915,42 +877,34 @@ fn stream_line_with_subtitle_context(
             || original_title.as_deref(),
             |metadata| metadata.title.as_deref(),
         );
-        let mut forced = metadata.map_or_else(|| stream_forced(stream), |metadata| metadata.forced);
-        let mut cc = metadata.map_or_else(|| stream_cc(stream), |metadata| metadata.cc);
-        let mut hearing_impaired = metadata.map_or_else(
-            || stream_hearing_impaired(stream),
-            |metadata| metadata.hearing_impaired,
-        );
-        let mut original =
-            metadata.map_or_else(|| stream_original(stream), |metadata| metadata.original);
-        let mut commentary =
-            metadata.map_or_else(|| stream_commentary(stream), |metadata| metadata.commentary);
+        let mut flags = SubtitleOverviewFlags {
+            default,
+            forced: metadata.map_or_else(|| stream_forced(stream), |metadata| metadata.forced),
+            cc: metadata.map_or_else(|| stream_cc(stream), |metadata| metadata.cc),
+            hearing_impaired: metadata.map_or_else(
+                || stream_hearing_impaired(stream),
+                |metadata| metadata.hearing_impaired,
+            ),
+            original: metadata
+                .map_or_else(|| stream_original(stream), |metadata| metadata.original),
+            commentary: metadata
+                .map_or_else(|| stream_commentary(stream), |metadata| metadata.commentary),
+        };
         if subtitle_change.is_some_and(|change| change.export_target.is_some()) {
-            hearing_impaired |= cc;
-            cc = false;
+            // An exported track leaves the container entirely: no container can veto its
+            // flags, but a sidecar filename cannot spell "closed captions".
+            flags.hearing_impaired |= flags.cc;
+            flags.cc = false;
         } else if let Some(container) = container {
-            forced &= container.supports_subtitle_flag(SubtitleFlag::Forced);
-            cc &= container.supports_subtitle_flag(SubtitleFlag::Cc);
-            hearing_impaired &= container.supports_subtitle_flag(SubtitleFlag::HearingImpaired);
-            original &= container.supports_subtitle_flag(SubtitleFlag::Original);
-            commentary &= container.supports_subtitle_flag(SubtitleFlag::Commentary);
+            flags = flags.supported_by(container);
         }
-        let format = subtitle_change
-            .and_then(|change| change.export_target.or(change.embedded_target))
-            .map(|format| format.overview_label().to_string())
-            .unwrap_or_else(|| subtitle_format_overview_label(codec));
+        let format =
+            subtitle_output_format_label(subtitle_change, || subtitle_format_overview_label(codec));
         vec![subtitle_overview_details(
             &format,
             crate::subtitle::normalized_language(language),
             title,
-            SubtitleOverviewFlags {
-                default,
-                forced,
-                cc,
-                hearing_impaired,
-                original,
-                commentary,
-            },
+            flags,
             max_width.map(|width| {
                 width.saturating_sub(marker.chars().count() + index_text.chars().count())
             }),
@@ -959,6 +913,9 @@ fn stream_line_with_subtitle_context(
         vec![codec.to_uppercase()]
     };
 
+    // Video reads format, resolution, frame rate; audio reads format, channels,
+    // language. Neither carries a title: the `i` panel has it, and the overview row is
+    // for scanning.
     match kind {
         "video" => {
             if let (Some(width), Some(height)) = (
@@ -980,8 +937,8 @@ fn stream_line_with_subtitle_context(
             } else if let Some(channels) = number_string(stream, "channels") {
                 details.push(format!("{channels} ch"));
             }
-            if let Some(rate) = number_string(stream, "sample_rate").and_then(parse_number) {
-                details.push(format_sample_rate(rate));
+            if let Some(language) = tag(stream, "language").filter(|code| *code != "und") {
+                details.push(language_display_name(language));
             }
         }
         "subtitle" => {}
@@ -992,62 +949,26 @@ fn stream_line_with_subtitle_context(
         }
     }
 
-    if !subtitle {
-        if let Some(language) = tag(stream, "language")
-            && language != "und"
-        {
-            details.push(language.to_uppercase());
-        }
-        if let Some(title) = tag(stream, "title") {
-            details.push(title.to_string());
-        }
-        details.extend(disposition_flags(stream, default));
+    if !subtitle && let Some(flags) = disposition_flag_tag(stream, default) {
+        details.push(flags);
     }
 
-    let semantic_span_style = if selected {
-        Style::default()
-    } else if deleted {
-        Style::default().fg(Color::Red).bold()
-    } else if conflict {
-        warning_style(false).bold()
-    } else if changed {
-        changed_style().bold()
-    } else {
-        Style::default()
+    let state = TrackRowState {
+        selected,
+        deleted,
+        conflict,
+        changed,
     };
-    let index_style = if selected {
-        Style::default()
-    } else if deleted {
-        Style::default().fg(Color::Red)
-    } else if conflict {
-        warning_style(false)
-    } else if changed {
-        changed_style()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let line = Line::from(vec![
+    Line::from(vec![
         if marker == "  " {
             Span::raw(marker)
         } else {
-            Span::styled(marker, semantic_span_style)
+            Span::styled(marker, state.marker_style())
         },
-        Span::styled(index_text, index_style),
+        Span::styled(index_text, state.index_style()),
         Span::raw(details.join(if subtitle { " - " } else { "  ·  " })),
-    ]);
-    if selected {
-        line.style(focused_style(changed && !deleted))
-    } else {
-        line.style(if deleted {
-            Style::default().fg(Color::Red)
-        } else if conflict {
-            warning_style(changed)
-        } else if changed {
-            changed_style()
-        } else {
-            Style::default()
-        })
-    }
+    ])
+    .style(state.line_style())
 }
 
 fn subtitle_format_overview_label(codec: &str) -> String {
@@ -1065,6 +986,36 @@ struct SubtitleOverviewFlags {
     hearing_impaired: bool,
     original: bool,
     commentary: bool,
+}
+
+impl SubtitleOverviewFlags {
+    /// Clears every flag `container` cannot store, so the overview promises only what
+    /// will survive the remux. The single place a container's flag support is consulted
+    /// for display — the embedded and sidecar rows must not drift apart on this.
+    ///
+    /// `default` is not a subtitle disposition the container can veto, so it is kept.
+    fn supported_by(self, container: ContainerFormat) -> Self {
+        let supported = |flag, value: bool| value && container.supports_subtitle_flag(flag);
+        Self {
+            default: self.default,
+            forced: supported(SubtitleFlag::Forced, self.forced),
+            cc: supported(SubtitleFlag::Cc, self.cc),
+            hearing_impaired: supported(SubtitleFlag::HearingImpaired, self.hearing_impaired),
+            original: supported(SubtitleFlag::Original, self.original),
+            commentary: supported(SubtitleFlag::Commentary, self.commentary),
+        }
+    }
+}
+
+/// The format label an overview row should show: whatever the row is being converted to,
+/// or `fallback` when it is staying as it is.
+fn subtitle_output_format_label(
+    change: Option<&SubtitleChange>,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    change
+        .and_then(|change| change.export_target.or(change.embedded_target))
+        .map_or_else(fallback, |format| format.overview_label().to_string())
 }
 
 fn subtitle_overview_details(
@@ -1181,37 +1132,157 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
     );
 }
 
+fn container_field_help_title(field: ContainerSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+fn container_field_help_text(_app: &App, popup: &ContainerSettingsPopup) -> Text<'static> {
+    let description = match popup.field {
+        ContainerSettingsField::Format => {
+            "Sets the target container format written to the output file (e.g. MKV, MP4, MOV, WebM).\n\nIt's possible that a container doesn't support certain tracks, each conflict has to be resolved before you're able to save all edits."
+        }
+        ContainerSettingsField::Title => {
+            "Title tag written to the container metadata. Displayed by media players as the main work or episode title."
+        }
+        ContainerSettingsField::Comment => {
+            "Comment or synopsis tag written to the container metadata."
+        }
+        ContainerSettingsField::Date => {
+            "Release year or creation timestamp written to the container metadata. Commonly in the 'yyyy-MM-dd' format."
+        }
+        ContainerSettingsField::Genre => {
+            "Genre tag written to the container metadata.\n\nStored exactly as typed. Most players read a comma-separated list as multiple genres, for example \u{201c}Animation, Adventure, Comedy\u{201d}."
+        }
+        ContainerSettingsField::Artist => {
+            "Creator, director, or artist tag written to the container metadata."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
 fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.container_settings_popup.as_ref() else {
         return;
     };
-    let choices = app.container_choices();
+    let effective = app.effective_container_metadata().unwrap_or_default();
+    let selected = |field| popup.field == field;
+    let changed = |field| app.container_field_changed(field);
+
     let mut lines = Vec::new();
-    for (position, choice) in choices.iter().enumerate() {
-        lines.push(container_choice_line(choice, position == popup.cursor));
+    let mut field_lines = Vec::new();
+
+    // 1. Format Field
+    field_lines.push((ContainerSettingsField::Format, lines.len()));
+    let choices = app.container_choices();
+    let format_label = choices
+        .iter()
+        .find(|choice| choice.value == app.container_target)
+        .map(|choice| choice.label.clone())
+        .unwrap_or_else(|| app.original_container_label());
+    lines.push(setting_line(
+        "Format",
+        &format_label,
+        selected(ContainerSettingsField::Format) && popup.mode == ContainerSettingsMode::Summary,
+        changed(ContainerSettingsField::Format),
+        popup.mode == ContainerSettingsMode::FormatDropdown,
+    ));
+
+    if popup.mode == ContainerSettingsMode::FormatDropdown {
+        let last_index = choices.len().saturating_sub(1);
+        for (position, choice) in choices.iter().enumerate() {
+            lines.push(container_choice_line(
+                choice,
+                position == popup.format_cursor,
+                position == last_index,
+            ));
+        }
     }
-    let text = padded_popup_text(Text::from(lines));
-    let height = (text.lines.len() as u16 + 2)
-        .max(8)
-        .min(frame.area().height.saturating_sub(2));
-    let area = centered_fixed(frame.area(), 88, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Container format "),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
+
+    // 2. Metadata Text Fields. The third column is the hint shown while the field is
+    // empty: an example of the value wanted, not a restatement of the label.
+    let text_fields = [
+        (
+            "Title",
+            ContainerSettingsField::Title,
+            effective.title.as_deref(),
+            "e.g. Big Buck Bunny",
+        ),
+        (
+            "Comment",
+            ContainerSettingsField::Comment,
+            effective.comment.as_deref(),
+            "a note about this file",
+        ),
+        (
+            "Date",
+            ContainerSettingsField::Date,
+            effective.date.as_deref(),
+            "e.g. 2008-04-10",
+        ),
+        (
+            "Genre",
+            ContainerSettingsField::Genre,
+            effective.genre.as_deref(),
+            "e.g. Animation",
+        ),
+        (
+            "Artist",
+            ContainerSettingsField::Artist,
+            effective.artist.as_deref(),
+            "e.g. Blender Foundation",
+        ),
+    ];
+
+    lines.push(Line::from(""));
+
+    for (label, field, val, hint) in text_fields {
+        field_lines.push((field, lines.len()));
+        let editing = selected(field) && popup.mode == ContainerSettingsMode::TextEdit;
+        let value = if editing {
+            FieldValue::Editing(&popup.text_input)
+        } else {
+            FieldValue::Static(val.unwrap_or(""))
+        };
+        lines.push(text_field_line(
+            TextField::new(label, value, TextInputConfig::CONTAINER_METADATA.width)
+                .selected(selected(field))
+                .changed(changed(field))
+                .placeholder(hint)
+                .reject(app.text_input_reject(TextInputSite::ContainerMetadata)),
+        ));
+    }
+
+    let focus_line = match popup.mode {
+        ContainerSettingsMode::FormatDropdown => 1 + popup.format_cursor,
+        ContainerSettingsMode::Summary | ContainerSettingsMode::TextEdit => field_lines
+            .iter()
+            .find_map(|(field, line)| (*field == popup.field).then_some(*line))
+            .unwrap_or(0),
+    };
+
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: " Container settings ".to_string(),
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    container_field_help_text(app, popup),
+                    container_field_help_title(popup.field),
+                )
+            }),
+            min_height: 10,
+        },
     );
 }
 
-fn container_choice_line(choice: &ContainerChoice, cursor: bool) -> Line<'static> {
+fn container_choice_line(choice: &ContainerChoice, cursor: bool, last: bool) -> Line<'static> {
     let changed = choice.staged && !choice.current;
-    let mut line = subtitle_codec_line(&choice.label, cursor, changed, true, choice.current);
+    let mut line = subtitle_codec_line(&choice.label, cursor, changed, true, last);
     if let Some(warning) = choice.warning() {
         let target_prefix = format!("{} ", choice.label);
         let warning = warning.strip_prefix(&target_prefix).unwrap_or(&warning);
@@ -1399,31 +1470,31 @@ fn is_keybinding_entry(line: &Line) -> bool {
     line.spans.iter().any(|s| s.content.starts_with("  "))
 }
 
-fn search_line(search: &SearchState) -> Line<'_> {
-    if search.value.is_empty() && !search.is_active {
-        return Line::styled("  Search: ...", Style::default().fg(Color::Yellow));
-    }
-    let match_suffix = match search.match_count {
-        0 => " (no matches)".to_string(),
-        1 => " (1 match)".to_string(),
-        count => format!(" ({count} matches)"),
-    };
-    let cursor_byte = search
-        .value
-        .char_indices()
-        .nth(search.cursor)
-        .map_or(search.value.len(), |(index, _)| index);
-    let (before, after) = search.value.split_at(cursor_byte);
-    Line::from(vec![
-        Span::styled("  Search: ", Style::default().fg(Color::Cyan)),
-        Span::styled(before, Style::default().fg(Color::Yellow).bold()),
-        Span::styled(
-            if search.is_active { "▏" } else { "" },
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(after, Style::default().fg(Color::Yellow).bold()),
-        Span::styled(match_suffix, Style::default().fg(Color::DarkGray)),
-    ])
+/// Columns a search bar gives up to its label, its frame and the widest match-count
+/// suffix it might grow. Reserving the widest keeps the value window from shifting a
+/// column each time the count crosses a digit boundary.
+const SEARCH_BAR_OVERHEAD: usize = "  Search ".len() + FIELD_FRAME_COLUMNS + " (999 matches)".len();
+
+/// Columns a frame costs a row: the opening glyph and its gutter, plus the closing
+/// gutter and glyph. Counted rather than measured because the glyphs are multi-byte.
+const FIELD_FRAME_COLUMNS: usize = 4;
+
+/// Renders a pane-bottom search bar and records the width it was given, so the next
+/// keystroke scrolls the caret against the width actually drawn.
+fn search_line(search: &mut SearchState, area: Rect, reject: Option<InputReject>) -> Line<'static> {
+    search.field_width = (area.width as usize).saturating_sub(SEARCH_BAR_OVERHEAD);
+    text_field_line(
+        TextField::new(
+            "Search",
+            FieldValue::Editing(&search.input),
+            search.field_width,
+        )
+        .bar()
+        .selected(search.is_active)
+        .placeholder("type to filter")
+        .suffix(match_suffix(search.match_count))
+        .reject(reject),
+    )
 }
 
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
@@ -1454,10 +1525,9 @@ fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
             chunks[0],
         );
 
-        frame.render_widget(
-            Paragraph::new(search_line(&app.keybindings_search)),
-            chunks[1],
-        );
+        let reject = app.text_input_reject(TextInputSite::KeybindingsSearch);
+        let search = search_line(&mut app.keybindings_search, chunks[1], reject);
+        frame.render_widget(Paragraph::new(search), chunks[1]);
     } else {
         app.set_keybindings_max_scroll(max_scroll(&text, inner));
 
@@ -1512,15 +1582,36 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "Ctrl-c", "Cancel processing");
 
     keybindings_section(&mut lines, "Text input");
-    keybinding(&mut lines, "i", "Edit the selected text or number field");
+    keybinding(
+        &mut lines,
+        "i",
+        "Edit the selected text or number field in a settings dialog",
+    );
+    keybinding(
+        &mut lines,
+        "/",
+        "Search the file list, keybindings, or languages",
+    );
     keybinding(&mut lines, "Left/Right", "Move the text cursor");
-    keybinding(&mut lines, "Home/End", "Move to the start or end of text");
+    keybinding(
+        &mut lines,
+        "Home/End or Ctrl-a/Ctrl-e",
+        "Move to the start or end of text",
+    );
     keybinding(
         &mut lines,
         "Backspace/Delete",
         "Delete text around the cursor",
     );
+    keybinding(&mut lines, "Ctrl-w", "Delete the word before the cursor");
+    keybinding(&mut lines, "Ctrl-u", "Delete everything before the cursor");
+    keybinding(&mut lines, "Paste", "Insert the clipboard as one edit");
     keybinding(&mut lines, "Esc / Enter", "Finish or accept text input");
+    keybinding(
+        &mut lines,
+        "Esc",
+        "Discard a search query and leave the bar",
+    );
     Text::from(lines)
 }
 
@@ -1658,51 +1749,56 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
         .map(|choice| choice.label.clone())
         .unwrap_or_else(|| settings.resolution.label());
 
-    let mut lines = vec![
-        setting_line(
-            "Codec",
-            codec_label,
-            popup.field == VideoSettingsField::Codec,
-            settings.codec != crate::edit::VideoCodec::Original,
-        ),
-        setting_line(
-            "Resolution",
-            &resolution_label,
-            popup.field == VideoSettingsField::Resolution,
-            settings.resolution != crate::edit::VideoResolution::Original,
-        ),
-    ];
-    if popup.mode == VideoSettingsMode::Dropdown {
-        lines.push(Line::from(""));
-        match popup.field {
-            VideoSettingsField::Codec => {
-                for (position, choice) in codec_choices.iter().enumerate() {
-                    let label = match &choice.reason {
-                        Some(reason) => format!("{} — {reason}", choice.label),
-                        None => choice.label.clone(),
-                    };
-                    lines.push(subtitle_codec_line(
-                        &label,
-                        position == popup.codec_cursor,
-                        settings.codec != crate::edit::VideoCodec::Original
-                            && choice.value == settings.codec,
-                        choice.enabled,
-                        choice.current,
-                    ));
-                }
-            }
-            VideoSettingsField::Resolution => {
-                for (position, choice) in resolution_choices.iter().enumerate() {
-                    let selected = choice.selected(settings.resolution);
-                    lines.push(dropdown_line(
-                        &choice.label,
-                        position == popup.resolution_cursor,
-                        selected,
-                        choice.enabled,
-                        settings.resolution != crate::edit::VideoResolution::Original && selected,
-                    ));
-                }
-            }
+    let codec_expanded =
+        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Codec;
+    let resolution_expanded =
+        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Resolution;
+    // Each field's options are pushed straight after that field's own row. Collecting
+    // both rows first and appending the options at the end would hang an expanded
+    // Codec list underneath Resolution.
+    let mut lines = vec![setting_line(
+        "Codec",
+        codec_label,
+        popup.field == VideoSettingsField::Codec,
+        settings.codec != crate::edit::VideoCodec::Original,
+        codec_expanded,
+    )];
+    if codec_expanded {
+        let last_index = codec_choices.len().saturating_sub(1);
+        for (position, choice) in codec_choices.iter().enumerate() {
+            let label = match &choice.reason {
+                Some(reason) => format!("{} — {reason}", choice.label),
+                None => choice.label.clone(),
+            };
+            lines.push(subtitle_codec_line(
+                &label,
+                position == popup.codec_cursor,
+                settings.codec != crate::edit::VideoCodec::Original
+                    && choice.value == settings.codec,
+                choice.enabled,
+                position == last_index,
+            ));
+        }
+    }
+    lines.push(setting_line(
+        "Resolution",
+        &resolution_label,
+        popup.field == VideoSettingsField::Resolution,
+        settings.resolution != crate::edit::VideoResolution::Original,
+        resolution_expanded,
+    ));
+    if resolution_expanded {
+        let last_index = resolution_choices.len().saturating_sub(1);
+        for (position, choice) in resolution_choices.iter().enumerate() {
+            let selected = choice.selected(settings.resolution);
+            lines.push(dropdown_line(
+                &choice.label,
+                position == popup.resolution_cursor,
+                selected,
+                choice.enabled,
+                settings.resolution != crate::edit::VideoResolution::Original && selected,
+                position == last_index,
+            ));
         }
     }
 
@@ -1741,11 +1837,14 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         Line::styled(source, Style::default().fg(Color::DarkGray)),
         Line::from(""),
     ];
+    let reject = app.text_input_reject(TextInputSite::CustomResolution);
     lines.push(custom_input_line(
         "Width",
         &draft.width,
         draft.field == CustomResolutionField::Width,
         width_changed,
+        "e.g. 1920",
+        reject,
     ));
     lines.push(Line::from(""));
     lines.push(custom_input_line(
@@ -1753,6 +1852,8 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         &draft.height,
         draft.field == CustomResolutionField::Height,
         height_changed,
+        "e.g. 1080",
+        reject,
     ));
     lines.push(Line::from(""));
     if let Some(error) = app.custom_resolution_error() {
@@ -1781,15 +1882,25 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-const CUSTOM_INPUT_WIDTH: usize = 16;
-
 fn custom_input_line(
     label: &str,
     input: &TextInputState,
     focused: bool,
     changed: bool,
+    placeholder: &str,
+    reject: Option<InputReject>,
 ) -> Line<'static> {
-    text_input_line(label, input, focused, changed, CUSTOM_INPUT_WIDTH, None)
+    text_field_line(
+        TextField::new(
+            label,
+            FieldValue::Editing(input),
+            TextInputConfig::RESOLUTION.width,
+        )
+        .selected(focused)
+        .changed(changed)
+        .placeholder(placeholder)
+        .reject(reject),
+    )
 }
 
 fn custom_scaling_lines(draft: &crate::app::CustomResolutionDraft) -> Vec<Line<'static>> {
@@ -1800,9 +1911,10 @@ fn custom_scaling_lines(draft: &crate::app::CustomResolutionDraft) -> Vec<Line<'
         draft.scaling.label(),
         focused,
         changed,
+        draft.scaling_dropdown_open,
     )];
     if draft.scaling_dropdown_open {
-        lines.push(Line::from(""));
+        let last_index = crate::edit::CustomScaling::OPTIONS.len().saturating_sub(1);
         for (position, scaling) in crate::edit::CustomScaling::OPTIONS.iter().enumerate() {
             lines.push(dropdown_line(
                 scaling.label(),
@@ -1810,6 +1922,7 @@ fn custom_scaling_lines(draft: &crate::app::CustomResolutionDraft) -> Vec<Line<'
                 *scaling == draft.scaling,
                 true,
                 changed && *scaling == draft.scaling,
+                position == last_index,
             ));
         }
     }
@@ -1842,12 +1955,13 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         codec_label,
         selected(SubtitleSettingsField::Codec),
         changed(SubtitleSettingsField::Codec),
+        popup.mode == SubtitleSettingsMode::CodecDropdown,
     ));
     let mut codec_dropdown_start = None;
 
     if popup.mode == SubtitleSettingsMode::CodecDropdown {
-        lines.push(Line::from(""));
         codec_dropdown_start = Some(lines.len());
+        let last_index = codec_choices.len().saturating_sub(1);
         for (position, choice) in codec_choices.iter().enumerate() {
             let label = match &choice.reason {
                 Some(reason) => format!("{} — {reason}", choice.label),
@@ -1858,9 +1972,10 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                 position == popup.codec_cursor,
                 codec_staged(choice),
                 choice.enabled,
-                choice.current,
+                position == last_index,
             ));
         }
+        lines.push(Line::from(""));
     }
     let language = metadata
         .as_ref()
@@ -1873,26 +1988,26 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
         &language,
         selected(SubtitleSettingsField::Language),
         changed(SubtitleSettingsField::Language),
+        popup.mode == SubtitleSettingsMode::LanguageDropdown,
     ));
     let mut language_dropdown_start = None;
     if popup.mode == SubtitleSettingsMode::LanguageDropdown {
         let choices = app.filtered_subtitle_languages();
-        let mut search = text_input_line(
-            "Search",
-            &popup.language_search.input,
-            true,
-            false,
-            32,
-            None,
-        );
-        search.spans.push(Span::styled(
-            format!("  ({} matches)", choices.len()),
-            Style::default().fg(Color::DarkGray),
+        lines.push(text_field_line(
+            TextField::new(
+                "Search",
+                FieldValue::Editing(&popup.language_search.input),
+                TextInputConfig::LANGUAGE_SEARCH.width,
+            )
+            .selected(popup.language_search.is_active)
+            .placeholder("type to filter")
+            .suffix(match_suffix(choices.len()))
+            .reject(app.text_input_reject(TextInputSite::LanguageSearch)),
         ));
-        lines.push(search);
         language_dropdown_start = Some(lines.len());
         let start = popup.language_cursor.saturating_sub(5).min(choices.len());
         let end = (start + 10).min(choices.len());
+        let last_index = end.saturating_sub(1);
         for (position, choice) in choices.iter().enumerate().take(end).skip(start) {
             lines.push(dropdown_line(
                 &choice.label(),
@@ -1905,25 +2020,36 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                     && metadata
                         .as_ref()
                         .is_some_and(|metadata| metadata.language == choice.code),
+                position == last_index,
             ));
         }
         if choices.is_empty() {
-            lines.push(Line::styled(
-                "    No matching languages",
-                Style::default().fg(Color::DarkGray),
-            ));
+            lines.push(Line::from(vec![
+                tree_guide_span(true),
+                Span::styled(
+                    "No matching languages",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         }
+        lines.push(Line::from(""));
     }
     if app.subtitle_field_visible(SubtitleSettingsField::Title) {
         field_lines.push((SubtitleSettingsField::Title, lines.len()));
-        lines.push(text_input_line(
-            "Title",
-            &popup.title_input,
-            selected(SubtitleSettingsField::Title),
-            changed(SubtitleSettingsField::Title),
-            SUBTITLE_TITLE_WIDTH,
-            app.subtitle_field_reason(SubtitleSettingsField::Title)
-                .as_deref(),
+        lines.push(text_field_line(
+            TextField::new(
+                "Title",
+                FieldValue::Editing(&popup.title_input),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )
+            .selected(selected(SubtitleSettingsField::Title))
+            .changed(changed(SubtitleSettingsField::Title))
+            .placeholder("name shown in player menus")
+            .reason(
+                app.subtitle_field_reason(SubtitleSettingsField::Title)
+                    .as_deref(),
+            )
+            .reject(app.text_input_reject(TextInputSite::SubtitleTitle)),
         ));
     }
 
@@ -2002,15 +2128,52 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             .find_map(|(field, line)| (*field == popup.field).then_some(*line))
             .unwrap_or(0),
     };
-    let text = padded_popup_text(Text::from(lines));
-    let height = (text.lines.len() as u16 + 2).max(12);
-    let help_text = popup
-        .help_visible
-        .then(|| subtitle_field_help_text(app, popup));
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title,
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    subtitle_field_help_text(app, popup),
+                    subtitle_field_help_title(popup.field),
+                )
+            }),
+            min_height: 12,
+        },
+    );
+}
+
+/// A settings popup: a scrolling field list, optionally beside a help panel explaining
+/// the focused field. The container, subtitle and any future settings dialog differ only
+/// in what they put in these fields — the geometry, scrolling and chrome are shared.
+struct SettingsDialog {
+    text: Text<'static>,
+    title: String,
+    /// Line the focused field sits on, kept on screen by scrolling to it.
+    focus_line: usize,
+    /// Help text and its panel title, when the user has the panel open.
+    help: Option<(Text<'static>, String)>,
+    /// Floor for the popup's height, so a short dialog still reads as a dialog.
+    min_height: u16,
+}
+
+fn render_settings_dialog(frame: &mut Frame, dialog: SettingsDialog) {
+    let SettingsDialog {
+        text,
+        title,
+        focus_line,
+        help,
+        min_height,
+    } = dialog;
+    let height = (text.lines.len() as u16 + 2).max(min_height);
     let (area, help_area) =
-        subtitle_settings_dialog_areas(frame.area(), height, help_text.as_ref());
+        subtitle_settings_dialog_areas(frame.area(), height, help.as_ref().map(|(text, _)| text));
+
     let visible_lines = area.height.saturating_sub(2) as usize;
     let scroll = (focus_line + 1).saturating_sub(visible_lines.saturating_sub(1)) as u16;
+
     frame.render_widget(Clear, combined_popup_area(area, help_area));
     frame.render_widget(
         Paragraph::new(text)
@@ -2024,14 +2187,14 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             .scroll((scroll, 0)),
         area,
     );
-    if let (Some(help_text), Some(help_area)) = (help_text, help_area) {
+    if let (Some((help_text, help_title)), Some(help_area)) = (help, help_area) {
         frame.render_widget(
             Paragraph::new(help_text)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Blue))
-                        .title(subtitle_field_help_title(popup.field)),
+                        .title(help_title),
                 )
                 .wrap(Wrap { trim: false }),
             help_area,
@@ -2039,8 +2202,14 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
     }
 }
 
-const SUBTITLE_TITLE_WIDTH: usize = 48;
-const SUBTITLE_CHECKBOX_LABEL_WIDTH: usize = 18;
+/// Two columns for `setting_line`'s chevron, or its blank stand-in on checkbox and
+/// text rows.
+const FIELD_MARKER_WIDTH: usize = 2;
+/// Column every row's value chrome lands on: a dropdown's `[`, a checkbox's `[x]`, or
+/// a text field's frame. Sized for the marker plus the longest label ("Hearing
+/// impaired", 16) plus a two-space gutter. One grid shared by all three row builders
+/// is what keeps the settings popups aligned.
+const FIELD_VALUE_COLUMN: usize = FIELD_MARKER_WIDTH + 18;
 const SUBTITLE_SETTINGS_WIDTH: u16 = 86;
 const SUBTITLE_HELP_WIDTH: u16 = 44;
 const SUBTITLE_HELP_GAP: u16 = 2;
@@ -2053,7 +2222,7 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
     let mut paragraphs = vec![(
         match popup.field {
             SubtitleSettingsField::Codec => {
-                "Sets the subtitle format written to the output. Text formats remain searchable and editable; image formats preserve rendered graphics. Converting an image subtitle to text requires OCR."
+                "Sets the subtitle format written to the output. Text formats remain searchable and editable; image formats preserve rendered graphics. Converting an image subtitle to text requires seconv and tesseract to be in your PATH."
             }
             SubtitleSettingsField::Language => {
                 "Identifies the subtitle language to players and media libraries. It changes metadata only; it does not translate the subtitle text."
@@ -2062,19 +2231,19 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
                 "An optional name shown by players, such as “English SDH” or “Director commentary.” Use it to distinguish subtitle tracks that otherwise look alike."
             }
             SubtitleSettingsField::Default => {
-                "Marks this as the subtitle track a player should prefer automatically. Enabling it clears the Default flag from other subtitle tracks, though players can still apply their own preferences."
+                "Marks this as the subtitle track a player should prefer automatically.\n\nReel only allows 1 default flag, although technically you're allowed multiple default flags. Reel will automatically toggle other default track(s) when you mark something as default."
             }
             SubtitleSettingsField::Forced => {
                 "Marks subtitles containing essential dialogue that should appear when ordinary subtitles are off, such as foreign-language lines. It does not make the whole track permanently visible."
             }
             SubtitleSettingsField::Cc => {
-                "Marks the track as closed captions: a transcription of speech and relevant sounds. Use it only when the track was authored as captions; this flag does not add missing cues."
+                "Marks the track as closed captions: a transcription of speech and relevant sounds. This flag is metadata only, it does not add missing cues."
             }
             SubtitleSettingsField::HearingImpaired => {
-                "Marks the track as intended for deaf or hard-of-hearing viewers, usually with speaker labels and sound cues. This flag does not change the subtitle content."
+                "Marks the track as intended for deaf or hard-of-hearing viewers, usually with speaker labels and sound cues. This flag is metadata only, it does not change the subtitle content."
             }
             SubtitleSettingsField::Original => {
-                "Marks the subtitle as matching the work’s original language. This means original-language subtitles, not an untouched or source file."
+                "Marks the subtitle as matching the work’s original language. This means it's the same language as the file was originally recorded in."
             }
             SubtitleSettingsField::Commentary => {
                 "Marks the track as commentary or annotation rather than the main dialogue subtitles, for example director commentary."
@@ -2087,22 +2256,6 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
     let external_sidecar = matches!(popup.source, SubtitleSource::Sidecar(_))
         && state.as_ref().is_some_and(|state| state.external);
     let context = match popup.field {
-        SubtitleSettingsField::Codec => state.as_ref().map(|state| {
-            if state.external {
-                format!(
-                    "This subtitle will be saved as {} outside the media file.",
-                    state.format.label()
-                )
-            } else if let Some(container) = app.effective_container() {
-                format!(
-                    "This subtitle will be stored as {} in {}.",
-                    state.format.label(),
-                    container.label()
-                )
-            } else {
-                format!("The selected output format is {}.", state.format.label())
-            }
-        }),
         SubtitleSettingsField::Language if external_sidecar => Some(
             "For an external sidecar, Reel also writes the canonical language code into its file name."
                 .to_string(),
@@ -2136,12 +2289,21 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
         ));
     }
 
+    help_paragraphs(paragraphs)
+}
+
+/// Lays help paragraphs out with a blank line between them. A paragraph may itself
+/// contain a blank line, written `\n\n`, which reads as a break of its own — that is how
+/// a field adds a caveat without its caller having to know how many paragraphs it has.
+fn help_paragraphs(paragraphs: Vec<(String, Style)>) -> Text<'static> {
     let mut lines = Vec::new();
-    for (position, (paragraph, style)) in paragraphs.into_iter().enumerate() {
-        if position > 0 {
-            lines.push(Line::from(""));
+    for (text, style) in paragraphs {
+        for paragraph in text.split("\n\n") {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::styled(paragraph.to_string(), style));
         }
-        lines.push(Line::styled(paragraph, style));
     }
     padded_popup_text(Text::from(lines))
 }
@@ -2160,7 +2322,18 @@ fn subtitle_settings_dialog_areas(
         .saturating_add(editor.width)
         .saturating_add(SUBTITLE_HELP_GAP);
     if help_x.saturating_add(SUBTITLE_HELP_WIDTH) <= frame_area.x.saturating_add(frame_area.width) {
-        let help = Rect::new(help_x, editor.y, SUBTITLE_HELP_WIDTH, editor.height);
+        // The panel matches the dialog's height, but grows past it rather than clipping
+        // a help text that wraps longer — it is its own box, so it may be the taller of
+        // the two.
+        let height = wrapped_popup_height(help_text, SUBTITLE_HELP_WIDTH)
+            .max(editor.height)
+            .min(
+                frame_area
+                    .height
+                    .saturating_sub(editor.y.saturating_sub(frame_area.y))
+                    .max(1),
+            );
+        let help = Rect::new(help_x, editor.y, SUBTITLE_HELP_WIDTH, height);
         return (editor, Some(help));
     }
 
@@ -2223,59 +2396,314 @@ fn wrapped_popup_height(text: &Text<'_>, width: u16) -> u16 {
     u16::try_from(height).unwrap_or(u16::MAX)
 }
 
-fn text_input_line(
-    label: &str,
-    input: &TextInputState,
+/// What a field shows: a live editor with caret and horizontal scroll, or a static
+/// value for a field that is merely selected or idle.
+enum FieldValue<'a> {
+    Editing(&'a TextInputState),
+    Static(&'a str),
+}
+
+/// Where a field's label sits. Both chromes draw the same frame; they differ only in
+/// how much room the label is given, because a pane-bottom search bar cannot afford the
+/// popups' twenty-column label grid on a narrow pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldChrome {
+    /// A settings-popup row, whose frame lands on [`FIELD_VALUE_COLUMN`] alongside
+    /// `setting_line`'s `[` and `subtitle_checkbox_line`'s `[x]`.
+    Row,
+    /// A pane-bottom search bar: the label is followed immediately by the frame.
+    Bar,
+}
+
+/// One text field. Every editable value in the application renders through this, so
+/// the caret, the horizontal scroll and the focus treatment exist in exactly one place.
+struct TextField<'a> {
+    label: &'a str,
+    value: FieldValue<'a>,
+    /// Value cells, matching the site's `TextInputConfig::width` so what is drawn and
+    /// what the cursor scrolls against can never disagree.
+    width: usize,
     selected: bool,
     changed: bool,
-    width: usize,
-    reason: Option<&str>,
-) -> Line<'static> {
+    chrome: FieldChrome,
+    /// Shown in place of an empty value while the field is idle.
+    placeholder: Option<&'a str>,
+    /// Trailing dim text, such as a match count.
+    suffix: Option<String>,
+    /// Why the field is unavailable; also renders it disabled.
+    reason: Option<&'a str>,
+    /// Why the last keystroke did not land, if it did not.
+    reject: Option<InputReject>,
+}
+
+impl<'a> TextField<'a> {
+    fn new(label: &'a str, value: FieldValue<'a>, width: usize) -> Self {
+        Self {
+            label,
+            value,
+            width,
+            selected: false,
+            changed: false,
+            chrome: FieldChrome::Row,
+            placeholder: None,
+            suffix: None,
+            reason: None,
+            reject: None,
+        }
+    }
+
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn changed(mut self, changed: bool) -> Self {
+        self.changed = changed;
+        self
+    }
+
+    fn bar(mut self) -> Self {
+        self.chrome = FieldChrome::Bar;
+        self
+    }
+
+    fn placeholder(mut self, placeholder: &'a str) -> Self {
+        self.placeholder = Some(placeholder);
+        self
+    }
+
+    fn suffix(mut self, suffix: String) -> Self {
+        self.suffix = Some(suffix);
+        self
+    }
+
+    fn reason(mut self, reason: Option<&'a str>) -> Self {
+        self.reason = reason;
+        self
+    }
+
+    fn reject(mut self, reject: Option<InputReject>) -> Self {
+        self.reject = reject;
+        self
+    }
+}
+
+/// What to tell the user about a keystroke the field refused. Phrased as the rule that
+/// was broken, since the character they typed is already gone from the screen.
+fn reject_message(reject: InputReject) -> String {
+    match reject {
+        InputReject::Character(CharClass::Digits) => "digits only".to_string(),
+        InputReject::Character(CharClass::Word) => "no spaces".to_string(),
+        InputReject::Character(CharClass::Text) => "unsupported character".to_string(),
+        InputReject::Full(max_len) => format!("{max_len} character limit"),
+    }
+}
+
+/// The frame every field is drawn with. One glyph in every state: focus is carried by
+/// colour alone, so a selected row does not change width or weight, and no terminal has
+/// to agree with us about how wide a heavy box-drawing character is.
+const FIELD_FRAME: &str = "│";
+/// Caret glyph shown inside the field while it is being edited.
+const FIELD_CARET: &str = "▏";
+/// Replaces the frame on whichever side the value continues past, so a scrolled or
+/// truncated value is visibly cut off rather than looking complete.
+const FIELD_OVERFLOW: &str = "…";
+/// Surface painted behind a value *only* while it is being edited. Idle fields stay
+/// unfilled so a column of stacked fields reads as separate rows rather than one slab.
+const FIELD_EDITING_SURFACE: Color = Color::Rgb(32, 32, 32);
+
+/// The leading `marker + label` span shared by every settings row. Padding both parts
+/// here is what puts each row's value chrome on [`FIELD_VALUE_COLUMN`], whether that
+/// chrome is a dropdown's `[`, a checkbox's `[x]`, or a text field's frame.
+fn field_label_span(marker: &str, label: &str, style: Style) -> Span<'static> {
+    let prefix = format!(
+        "{marker:<marker_width$}{label}",
+        marker_width = FIELD_MARKER_WIDTH
+    );
+    let padding = FIELD_VALUE_COLUMN.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    Span::styled(format!("{prefix}{blank:padding$}", blank = ""), style)
+}
+
+/// Takes characters from `start` while they fit in `budget` display columns. Returning
+/// the columns used lets the caller pad the field to a fixed width even when the value
+/// contains double-width glyphs, which is what keeps the closing frame in its column.
+fn take_columns(characters: &[char], start: usize, budget: usize) -> (String, usize) {
+    let mut taken = String::new();
+    let mut columns = 0;
+    for character in characters.iter().skip(start) {
+        let width = UnicodeWidthChar::width(*character).unwrap_or(0);
+        if columns + width > budget {
+            break;
+        }
+        taken.push(*character);
+        columns += width;
+    }
+    (taken, columns)
+}
+
+fn text_field_line(field: TextField<'_>) -> Line<'static> {
+    let TextField {
+        label,
+        value,
+        width,
+        selected,
+        changed,
+        chrome,
+        placeholder,
+        suffix,
+        reason,
+        reject,
+    } = field;
     let enabled = reason.is_none();
-    let input_style = if !enabled {
+    let editing = matches!(&value, FieldValue::Editing(input) if input.is_active);
+    let reject = reject.filter(|_| editing);
+
+    let mut value_style = if !enabled {
         Style::default().fg(Color::DarkGray)
     } else if changed {
         changed_style()
     } else {
         Style::default().fg(Color::White)
+    };
+    if editing {
+        value_style = value_style.bg(FIELD_EDITING_SURFACE);
     }
-    .bg(Color::Rgb(32, 32, 32));
-    let characters = input.value.chars().collect::<Vec<_>>();
-    let visible_width = width.saturating_sub(1);
-    let start = if input.is_active {
-        input.view_offset
+
+    // One column is always reserved for the caret so the value window does not shift
+    // when editing starts.
+    let budget = width.saturating_sub(1);
+    let (before, after, used, overflow) = match &value {
+        FieldValue::Editing(input) => {
+            let characters = input.value.chars().collect::<Vec<_>>();
+            let start = if input.is_active {
+                input.view_offset
+            } else {
+                0
+            }
+            .min(characters.len());
+            let (window, columns) = take_columns(&characters, start, budget);
+            let window = window.chars().collect::<Vec<_>>();
+            let caret = input.cursor.saturating_sub(start).min(window.len());
+            (
+                window[..caret].iter().collect::<String>(),
+                window[caret..].iter().collect::<String>(),
+                columns,
+                Overflow {
+                    before: start > 0,
+                    after: start + window.len() < characters.len(),
+                },
+            )
+        }
+        FieldValue::Static(text) => {
+            let characters = text.chars().collect::<Vec<_>>();
+            let (window, columns) = take_columns(&characters, 0, budget);
+            let overflow = Overflow {
+                before: false,
+                after: window.chars().count() < characters.len(),
+            };
+            (window, String::new(), columns, overflow)
+        }
+    };
+
+    let placeholder = placeholder.filter(|_| before.is_empty() && after.is_empty());
+
+    let mut spans = Vec::new();
+    let label_style = Style::default().fg(if selected { Color::Cyan } else { Color::Gray });
+    let mut frame_style = if reject.is_some() {
+        Style::default().fg(Color::Red).bold()
+    } else if selected && enabled {
+        Style::default().fg(Color::Cyan).bold()
     } else {
-        0
+        Style::default().fg(Color::DarkGray)
+    };
+    // The frames sit *on* the editing surface rather than beside it, so the filled
+    // band runs bar to bar with no unpainted cell at either end.
+    if editing {
+        frame_style = frame_style.bg(FIELD_EDITING_SURFACE);
     }
-    .min(characters.len());
-    let end = (start + visible_width).min(characters.len());
-    let caret = input
-        .cursor
-        .saturating_sub(start)
-        .min(end.saturating_sub(start));
-    let before = characters[start..start + caret].iter().collect::<String>();
-    let after = characters[start + caret..end].iter().collect::<String>();
-    let cursor_marker = if input.is_active { "▏" } else { "" };
-    let padding = " ".repeat(width.saturating_sub(
-        before.chars().count() + after.chars().count() + cursor_marker.chars().count(),
+    let frame = FIELD_FRAME;
+    // The overflow marker takes the frame's cell rather than a cell of its own, so a
+    // value that starts scrolling does not shift the column the frame sits in.
+    let opening = if overflow.before {
+        FIELD_OVERFLOW
+    } else {
+        frame
+    };
+    let closing = if overflow.after {
+        FIELD_OVERFLOW
+    } else {
+        frame
+    };
+
+    match chrome {
+        FieldChrome::Row => spans.push(field_label_span("", label, label_style)),
+        FieldChrome::Bar => spans.push(Span::styled(
+            format!("  {label} "),
+            Style::default().fg(Color::Cyan),
+        )),
+    }
+    spans.push(Span::styled(opening.to_string(), frame_style));
+    spans.push(Span::styled(" ".to_string(), value_style));
+
+    let caret_columns = if editing { 1 } else { 0 };
+    spans.push(Span::styled(before, value_style));
+    if editing {
+        spans.push(Span::styled(
+            FIELD_CARET.to_string(),
+            value_style.fg(Color::Cyan),
+        ));
+    }
+    spans.push(Span::styled(after, value_style));
+    let mut filled = used + caret_columns;
+    if let Some(placeholder) = placeholder {
+        let (text, columns) = take_columns(
+            &placeholder.chars().collect::<Vec<_>>(),
+            0,
+            width.saturating_sub(filled),
+        );
+        filled += columns;
+        spans.push(Span::styled(
+            text,
+            value_style.fg(Color::DarkGray).italic().not_bold(),
+        ));
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(filled)),
+        value_style,
     ));
-    let mut spans = vec![
-        Span::styled(
-            format!("{label:<12}"),
-            Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
-        ),
-        Span::styled(before, input_style),
-        Span::styled(cursor_marker.to_string(), input_style.fg(Color::Cyan)),
-        Span::styled(after, input_style),
-        Span::styled(padding, input_style),
-    ];
+    spans.push(Span::styled(" ".to_string(), value_style));
+    spans.push(Span::styled(closing.to_string(), frame_style));
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+    }
     if let Some(reason) = reason {
         spans.push(Span::styled(
             format!("  {reason}"),
             Style::default().fg(Color::DarkGray),
         ));
     }
+    if let Some(reject) = reject {
+        spans.push(Span::styled(
+            format!("  {}", reject_message(reject)),
+            Style::default().fg(Color::Red),
+        ));
+    }
     Line::from(spans)
+}
+
+/// Which sides of a field's value window have text the window does not show.
+struct Overflow {
+    before: bool,
+    after: bool,
+}
+
+/// Match-count suffix, worded identically by all three search bars.
+fn match_suffix(count: usize) -> String {
+    match count {
+        0 => " (no matches)".to_string(),
+        1 => " (1 match)".to_string(),
+        count => format!(" ({count} matches)"),
+    }
 }
 
 fn subtitle_checkbox_line(
@@ -2296,8 +2724,9 @@ fn subtitle_checkbox_line(
         Style::default().fg(Color::White)
     };
     let mut spans = vec![
-        Span::styled(
-            format!("{label:<width$}", width = SUBTITLE_CHECKBOX_LABEL_WIDTH),
+        field_label_span(
+            "",
+            label,
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(if checked { "[x]" } else { "[ ]" }, box_style),
@@ -2311,7 +2740,13 @@ fn subtitle_checkbox_line(
     Line::from(spans)
 }
 
-fn setting_line(label: &str, value: &str, selected: bool, changed: bool) -> Line<'static> {
+fn setting_line(
+    label: &str,
+    value: &str,
+    selected: bool,
+    changed: bool,
+    expanded: bool,
+) -> Line<'static> {
     let value_style = if selected {
         focused_style(changed)
     } else if changed {
@@ -2319,13 +2754,22 @@ fn setting_line(label: &str, value: &str, selected: bool, changed: bool) -> Line
     } else {
         Style::default()
     };
+    let marker = if expanded { "▿" } else { "▹" };
     Line::from(vec![
-        Span::styled(
-            format!("{label:<12}"),
+        field_label_span(
+            marker,
+            label,
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(format!("[ {value} ]"), value_style),
     ])
+}
+
+/// Tree-guide prefix for a row nested under an expanded dropdown field, matching the
+/// fold connectors used by `file_tree_lines` for sidecar subtitles.
+fn tree_guide_span(last: bool) -> Span<'static> {
+    let guide = if last { "  └── " } else { "  ├── " };
+    Span::styled(guide, Style::default().fg(Color::DarkGray))
 }
 
 fn subtitle_codec_line(
@@ -2333,19 +2777,16 @@ fn subtitle_codec_line(
     cursor: bool,
     staged: bool,
     enabled: bool,
-    current: bool,
+    last: bool,
 ) -> Line<'static> {
     let label_style = choice_style(cursor, staged, enabled);
-    let mut spans = vec![Span::styled(format!("    {label}"), label_style)];
-    if current {
-        let original_style = if cursor {
-            focused_style(false).add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(" (original)", original_style));
-    }
-    Line::from(spans)
+    let spans = vec![
+        tree_guide_span(last),
+        Span::styled(label.to_string(), label_style),
+    ];
+    // Base the line on the label's own style so the guide glyph inherits the cursor
+    // row's highlight background rather than leaving a gap at the start of the bar.
+    Line::from(spans).style(label_style)
 }
 
 fn dropdown_line(
@@ -2354,22 +2795,22 @@ fn dropdown_line(
     selected: bool,
     enabled: bool,
     staged: bool,
+    last: bool,
 ) -> Line<'static> {
     let marker = if selected { ">" } else { " " };
-    let line = Line::from(format!("  {marker} {label}"));
+    let line = Line::from(vec![
+        tree_guide_span(last),
+        Span::raw(format!("{marker} {label}")),
+    ]);
     line.style(choice_style(cursor, staged, enabled))
 }
 
 fn render_details_popup(frame: &mut Frame, app: &mut App) {
-    let Some((text, title, sizing)) = details_popup_content(app) else {
+    let Some((text, title)) = details_popup_content(app) else {
         return;
     };
     let text = padded_popup_text(text);
-    let area = match sizing {
-        DetailsPopupSizing::Content => content_popup_area(frame.area(), &text, &title),
-        DetailsPopupSizing::Subtitle => subtitle_popup_area(frame.area(), &text, &title),
-        DetailsPopupSizing::Large => popup_area(frame.area(), 90, 86),
-    };
+    let area = details_popup_area(frame.area(), &text, &title);
     app.set_details_max_scroll(max_scroll(&text, area));
 
     frame.render_widget(Clear, area);
@@ -2387,14 +2828,7 @@ fn render_details_popup(frame: &mut Frame, app: &mut App) {
     );
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DetailsPopupSizing {
-    Content,
-    Subtitle,
-    Large,
-}
-
-fn details_popup_content(app: &App) -> Option<(Text<'static>, String, DetailsPopupSizing)> {
+fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
     let info = app.media_info()?;
     match app.selected_track()? {
         TrackRef::Container => {
@@ -2404,9 +2838,10 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String, DetailsPop
                     info,
                     &file.path,
                     file.fingerprint.length,
+                    app.effective_container_metadata().as_ref(),
+                    &|field| app.container_field_changed(field),
                 )),
                 " Container information ".to_string(),
-                DetailsPopupSizing::Content,
             ))
         }
         TrackRef::Embedded(index) => {
@@ -2421,14 +2856,12 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String, DetailsPop
                 return Some((
                     Text::from(video_information_lines(stream, default)),
                     format!(" Video #{index_label} "),
-                    DetailsPopupSizing::Content,
                 ));
             }
             if kind == "audio" {
                 return Some((
                     Text::from(audio_information_lines(stream, default)),
                     format!(" Audio #{index_label} "),
-                    DetailsPopupSizing::Content,
                 ));
             }
             if kind == "subtitle" {
@@ -2444,16 +2877,11 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String, DetailsPop
                         state.as_ref(),
                     )),
                     format!(" Subtitle #{index_label} "),
-                    DetailsPopupSizing::Subtitle,
                 ));
             }
-            let mut lines = Vec::new();
-            append_map(&mut lines, stream, 0);
-            Some((
-                Text::from(lines),
-                format!(" Stream #{index_label} · {kind} "),
-                DetailsPopupSizing::Large,
-            ))
+            // `track_rows` only ever offers video, audio and subtitle rows, so there is
+            // no other kind to describe here.
+            None
         }
         TrackRef::Sidecar(index) => {
             let sidecar = app.sidecars.get(index)?;
@@ -2462,7 +2890,6 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String, DetailsPop
             Some((
                 Text::from(sidecar_subtitle_information_lines(sidecar, state.as_ref())),
                 " External subtitle ".to_string(),
-                DetailsPopupSizing::Subtitle,
             ))
         }
     }
@@ -2618,10 +3045,21 @@ fn video_scan_type(stream: &BTreeMap<String, Value>) -> Option<&'static str> {
 }
 
 fn video_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
-    let mut roles = disposition_flags(stream, default)
-        .into_iter()
-        .map(|role| title_case(role.trim_matches(['[', ']'])))
-        .collect::<Vec<_>>();
+    let mut roles = Vec::new();
+    if default {
+        roles.push("Default".to_string());
+    }
+    for (key, label) in [
+        ("forced", "Forced"),
+        ("hearing_impaired", "Hearing Impaired"),
+        ("visual_impaired", "Visual Impaired"),
+        ("comment", "Commentary"),
+        ("dub", "Dub"),
+    ] {
+        if disposition_enabled(stream, key) {
+            roles.push(label.to_string());
+        }
+    }
     if disposition_enabled(stream, "original") {
         roles.push("Original".to_string());
     }
@@ -2629,19 +3067,6 @@ fn video_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
         roles.push("Cover art".to_string());
     }
     roles
-}
-
-fn title_case(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|word| {
-            let mut characters = word.chars();
-            characters.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + characters.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn language_name(value: &str) -> Option<String> {
@@ -2869,7 +3294,7 @@ fn subtitle_information_lines(
     if visible(SubtitleSettingsField::Title) {
         append_information_group(
             &mut lines,
-            vec![subtitle_information_field_line(
+            vec![information_field_line(
                 "Title",
                 metadata.title.as_deref().unwrap_or("Not provided"),
                 changed(SubtitleSettingsField::Title),
@@ -2879,59 +3304,45 @@ fn subtitle_information_lines(
 
     let language = subtitle_language_description(&metadata.language)
         .unwrap_or_else(|| "Not provided".to_string());
-    let mut language_and_role = vec![subtitle_information_field_line(
+    let mut language_and_flags = vec![information_field_line(
         "Language",
         &language,
         changed(SubtitleSettingsField::Language),
     )];
+    // Every flag states itself, set or not, in the order the settings dialog lists
+    // them. A run of names told you what was on but never what was off, so "no
+    // Commentary" and "Commentary not applicable here" looked identical.
     for (field, label, enabled) in [
+        (SubtitleSettingsField::Default, "Default", default),
+        (SubtitleSettingsField::Forced, "Forced", metadata.forced),
         (SubtitleSettingsField::Cc, "Closed captions", metadata.cc),
         (
             SubtitleSettingsField::HearingImpaired,
             "Hearing impaired",
             metadata.hearing_impaired,
         ),
+        (
+            SubtitleSettingsField::Original,
+            "Original",
+            metadata.original,
+        ),
+        (
+            SubtitleSettingsField::Commentary,
+            "Commentary",
+            metadata.commentary,
+        ),
     ] {
         if visible(field) {
-            language_and_role.push(subtitle_information_field_line(
+            language_and_flags.push(information_field_line(
                 label,
                 if enabled { "Yes" } else { "No" },
                 changed(field),
             ));
         }
     }
-    let mut roles = Vec::new();
-    if visible(SubtitleSettingsField::Default) && default {
-        roles.push("Default".to_string());
-    }
-    if visible(SubtitleSettingsField::Forced) && metadata.forced {
-        roles.push("Forced".to_string());
-    }
-    if visible(SubtitleSettingsField::Original) && metadata.original {
-        roles.push("Original".to_string());
-    }
-    if visible(SubtitleSettingsField::Commentary) && metadata.commentary {
-        roles.push("Commentary".to_string());
-    }
-    if !roles.is_empty() {
-        let role_changed = [
-            SubtitleSettingsField::Default,
-            SubtitleSettingsField::Forced,
-            SubtitleSettingsField::Original,
-            SubtitleSettingsField::Commentary,
-        ]
-        .into_iter()
-        .filter(|field| visible(*field))
-        .any(changed);
-        language_and_role.push(subtitle_information_field_line(
-            "Role",
-            &roles.join(" · "),
-            role_changed,
-        ));
-    }
-    append_information_group(&mut lines, language_and_role);
+    append_information_group(&mut lines, language_and_flags);
 
-    let mut format_and_type = vec![subtitle_information_field_line(
+    let mut format_and_type = vec![information_field_line(
         "Format",
         &subtitle_information_format(format, codec),
         changed(SubtitleSettingsField::Codec),
@@ -2951,7 +3362,8 @@ fn subtitle_information_lines(
     lines
 }
 
-fn subtitle_information_field_line(key: &str, value: &str, changed: bool) -> Line<'static> {
+/// A `Key: Value` row whose value turns yellow when the edit is staged.
+fn information_field_line(key: &str, value: &str, changed: bool) -> Line<'static> {
     let value_style = if changed {
         Style::default()
             .fg(Color::Yellow)
@@ -3005,6 +3417,8 @@ fn container_information_lines(
     info: &MediaInfo,
     path: &Path,
     fallback_size: u64,
+    metadata: Option<&crate::edit::ContainerMetadata>,
+    changed: &dyn Fn(ContainerSettingsField) -> bool,
 ) -> Vec<Line<'static>> {
     let file_name = path
         .file_name()
@@ -3035,6 +3449,33 @@ fn container_information_lines(
         ],
     );
     append_information_group(&mut lines, vec![field_line(0, "Format", &format)]);
+
+    // The metadata the container settings dialog edits, shown whether or not it is set,
+    // so the panel answers "what would I be changing" as well as "what is there".
+    let metadata = metadata.cloned().unwrap_or_default();
+    append_information_group(
+        &mut lines,
+        [
+            (ContainerSettingsField::Title, "Title", &metadata.title),
+            (
+                ContainerSettingsField::Comment,
+                "Comment",
+                &metadata.comment,
+            ),
+            (ContainerSettingsField::Date, "Date", &metadata.date),
+            (ContainerSettingsField::Genre, "Genre", &metadata.genre),
+            (ContainerSettingsField::Artist, "Artist", &metadata.artist),
+        ]
+        .into_iter()
+        .map(|(field, label, value)| {
+            information_field_line(
+                label,
+                value.as_deref().unwrap_or("Not provided"),
+                changed(field),
+            )
+        })
+        .collect(),
+    );
     lines
 }
 
@@ -3097,35 +3538,12 @@ fn scroll_to_show_line(text: &Text<'_>, area: Rect, line_index: usize, current: 
     }
 }
 
-fn append_map(lines: &mut Vec<Line<'static>>, map: &BTreeMap<String, Value>, depth: usize) {
-    for (key, value) in map {
-        match value {
-            Value::Object(object) => {
-                lines.push(field_line(depth, key, ""));
-                let nested = object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                append_map(lines, &nested, depth + 1);
-            }
-            _ => lines.push(field_line(depth, key, &value_text(value))),
-        }
-    }
-}
-
 fn field_line(depth: usize, key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  ".repeat(depth)),
         Span::styled(format!("{key}: "), Style::default().fg(Color::Blue).bold()),
         Span::raw(value.to_string()),
     ])
-}
-
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        _ => value.to_string(),
-    }
 }
 
 fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -3143,21 +3561,14 @@ fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
-fn content_popup_area(area: Rect, text: &Text<'_>, title: &str) -> Rect {
-    let content_width = text.lines.iter().map(Line::width).max().unwrap_or(0);
-    let width = content_width
-        .saturating_add(4)
-        .max(title.chars().count().saturating_add(4));
-    let height = text.lines.len().saturating_add(2);
-    centered_fixed(
-        area,
-        u16::try_from(width).unwrap_or(u16::MAX),
-        u16::try_from(height).unwrap_or(u16::MAX),
-    )
-}
+/// Share of the terminal every `i` panel takes, whichever track it describes. One width
+/// for all of them: a panel that resized itself to its content made the container, video
+/// and subtitle panels three different shapes.
+const DETAILS_POPUP_WIDTH_PERCENT: u32 = 60;
 
-fn subtitle_popup_area(area: Rect, text: &Text<'_>, title: &str) -> Rect {
-    let target_width = ((u32::from(area.width) * 80) / 100) as u16;
+/// The `i` panel: a fixed share of the width, and whatever height its text wraps to.
+fn details_popup_area(area: Rect, text: &Text<'_>, title: &str) -> Rect {
+    let target_width = ((u32::from(area.width) * DETAILS_POPUP_WIDTH_PERCENT) / 100) as u16;
     let title_width = u16::try_from(title.chars().count().saturating_add(4)).unwrap_or(u16::MAX);
     let width = target_width.max(title_width);
     let content_width = width.saturating_sub(2).max(1) as usize;
@@ -3202,6 +3613,66 @@ fn focused_style(changed: bool) -> Style {
         style.add_modifier(Modifier::ITALIC)
     } else {
         style
+    }
+}
+
+/// What an overview row is currently saying about itself. Selection outranks deletion,
+/// deletion outranks a container conflict, and a conflict outranks an ordinary edit —
+/// one ranking, shared by the container, stream and sidecar rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TrackRowState {
+    selected: bool,
+    deleted: bool,
+    conflict: bool,
+    changed: bool,
+}
+
+impl TrackRowState {
+    /// The style of the row as a whole.
+    fn line_style(self) -> Style {
+        if self.selected {
+            // A deleted row is not also "edited" — the deletion is the edit.
+            focused_style(self.changed && !self.deleted)
+        } else if self.deleted {
+            Style::default().fg(Color::Red)
+        } else if self.conflict {
+            warning_style(self.changed)
+        } else if self.changed {
+            changed_style()
+        } else {
+            Style::default()
+        }
+    }
+
+    /// The style of the leading `×`/`⚠`/`~` marker. Bold, and never restyled while
+    /// selected so the selection colour stays uniform across the row.
+    fn marker_style(self) -> Style {
+        if self.selected {
+            Style::default()
+        } else if self.deleted {
+            Style::default().fg(Color::Red).bold()
+        } else if self.conflict {
+            warning_style(false).bold()
+        } else if self.changed {
+            changed_style().bold()
+        } else {
+            Style::default()
+        }
+    }
+
+    /// The style of the `#index` column, which is dimmed when nothing else applies.
+    fn index_style(self) -> Style {
+        if self.selected {
+            Style::default()
+        } else if self.deleted {
+            Style::default().fg(Color::Red)
+        } else if self.conflict {
+            warning_style(false)
+        } else if self.changed {
+            changed_style()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     }
 }
 
@@ -3252,32 +3723,41 @@ fn tag<'a>(stream: &'a std::collections::BTreeMap<String, Value>, key: &str) -> 
         .and_then(Value::as_str)
 }
 
-fn disposition_flags(
+/// A video or audio track's flags, written the way a subtitle track writes its own:
+/// one bracketed group of short codes rather than a run of separate `[word]` tags.
+fn disposition_flag_tag(
     stream: &std::collections::BTreeMap<String, Value>,
     default: bool,
-) -> Vec<String> {
-    const FLAGS: [(&str, &str); 6] = [
-        ("default", "default"),
-        ("forced", "forced"),
-        ("hearing_impaired", "hearing impaired"),
-        ("visual_impaired", "visual impaired"),
-        ("comment", "commentary"),
-        ("dub", "dub"),
+) -> Option<String> {
+    const FLAGS: [(&str, &str); 5] = [
+        ("forced", "F"),
+        ("hearing_impaired", "HI"),
+        ("visual_impaired", "VI"),
+        ("comment", "CM"),
+        ("dub", "DUB"),
     ];
 
-    let disposition = stream.get("disposition").and_then(Value::as_object);
-    let mut flags = disposition.map_or_else(Vec::new, |disposition| {
-        FLAGS
-            .iter()
-            .filter(|(key, _)| *key != "default")
-            .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
-            .map(|(_, label)| format!("[{label}]"))
-            .collect::<Vec<_>>()
-    });
+    let mut active = Vec::new();
     if default {
-        flags.insert(0, "[default]".to_string());
+        active.push("D");
     }
-    flags
+    if let Some(disposition) = stream.get("disposition").and_then(Value::as_object) {
+        active.extend(
+            FLAGS
+                .iter()
+                .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
+                .map(|(_, code)| *code),
+        );
+    }
+    (!active.is_empty()).then(|| format!("[{}]", active.join("/")))
+}
+
+/// A language tag written out, so an overview row reads "Korean" rather than "KOR".
+/// Codes the language table does not know fall back to the tag itself, upper-cased.
+fn language_display_name(code: &str) -> String {
+    crate::subtitle::language_choice(code)
+        .map(|choice| choice.name)
+        .unwrap_or_else(|| code.to_uppercase())
 }
 
 fn parse_number(value: String) -> Option<f64> {
@@ -3382,10 +3862,12 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn progress_dialog_should_use_a_standalone_loader_or_a_real_gauge() {
+    /// A scratch directory holding `files`, and an `App` pointed at it. Every render test
+    /// needs this and nothing else varies, so the incantation lives here once. The files
+    /// are written before the app is built because `App::new` scans on construction.
+    fn test_app(tag: &str, files: &[&str]) -> (App, std::path::PathBuf) {
         let directory = std::env::temp_dir().join(format!(
-            "reel-tui-progress-ui-{}-{}",
+            "reel-tui-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3393,9 +3875,839 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
+        for name in files {
+            std::fs::write(directory.join(name), b"media").unwrap();
+        }
         let (probe_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        (app, directory)
+    }
+
+    /// An app with a probed file: one video, one audio, two embedded subtitles and two
+    /// sidecars. Enough for every section of the overview to be non-empty.
+    fn probed_app(tag: &str) -> (App, std::path::PathBuf) {
+        let (mut app, directory) = test_app(tag, &["movie.mkv", "movie.eng.srt", "movie.nld.srt"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {
+                    "format_name": "matroska,webm",
+                    "duration": "3723.0",
+                    "size": "1572864"
+                },
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080, "avg_frame_rate": "24/1"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                     "channel_layout": "stereo", "tags": {"language": "eng"}},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng", "title": "English"}},
+                    {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "nld"}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1, 2, 3];
+        app.sidecars = vec![
+            SidecarEntry {
+                path: directory.join("movie.eng.srt"),
+                companion: Some(directory.join("movie.mkv")),
+                display_name: "movie.eng.srt".to_string(),
+                format: SubtitleFormat::SubRip,
+                language: "eng".to_string(),
+                forced: false,
+                hearing_impaired: false,
+                number: None,
+                fingerprint: crate::files::FileFingerprint {
+                    length: 2,
+                    modified: None,
+                },
+                companion_fingerprint: None,
+            },
+            SidecarEntry {
+                path: directory.join("movie.nld.srt"),
+                companion: Some(directory.join("movie.mkv")),
+                display_name: "movie.nld.srt".to_string(),
+                format: SubtitleFormat::SubRip,
+                language: "nld".to_string(),
+                forced: true,
+                hearing_impaired: false,
+                number: None,
+                fingerprint: crate::files::FileFingerprint {
+                    length: 2,
+                    modified: None,
+                },
+                companion_fingerprint: None,
+            },
+        ];
+        (app, directory)
+    }
+
+    /// Draws the whole application and returns the screen, one string per row.
+    fn draw(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Every dialog, and the state it needs to be worth drawing.
+    fn open_dialog(app: &mut App, dialog: Dialog) {
+        app.layer = Layer::Streams;
+        match dialog {
+            Dialog::Keybindings => {}
+            Dialog::ContainerSettings => {
+                app.container_settings_popup = Some(ContainerSettingsPopup {
+                    field: ContainerSettingsField::Title,
+                    mode: ContainerSettingsMode::Summary,
+                    help_visible: true,
+                    format_cursor: 0,
+                    text_input: TextInputState::new(String::new()),
+                });
+            }
+            Dialog::VideoSettings => {
+                app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+                    stream_index: 0,
+                    field: VideoSettingsField::Codec,
+                    mode: VideoSettingsMode::Summary,
+                    codec_cursor: 0,
+                    resolution_cursor: 0,
+                    custom_resolution: None,
+                });
+            }
+            Dialog::SubtitleSettings => {
+                app.subtitle_settings_popup = Some(SubtitleSettingsPopup {
+                    source: SubtitleSource::Embedded(2),
+                    source_format: SubtitleFormat::SubRip,
+                    field: SubtitleSettingsField::Language,
+                    mode: SubtitleSettingsMode::Summary,
+                    help_visible: true,
+                    codec_cursor: 0,
+                    language_cursor: 0,
+                    language_search: SearchState::default(),
+                    title_input: TextInputState::new(String::new()),
+                });
+            }
+            Dialog::ConfirmSave => {}
+            Dialog::Processing | Dialog::ConfirmCancel => {
+                app.edit_progress = Some(0.42);
+                app.edit_progress_label = Some("Remuxing movie.mkv".to_string());
+                app.edit_started = Some(std::time::Instant::now());
+            }
+            Dialog::Error => {
+                app.edit_error = Some("ffmpeg exited with status 1".to_string());
+            }
+        }
+        app.dialog = Some(dialog);
+    }
+
+    #[test]
+    fn render_should_draw_every_layer_and_dialog() {
+        // Arrange: the whole application, not a single widget — `render` is the only
+        // entry point the binary uses, and nothing below it was reachable from a test.
+        const DIALOGS: [(Dialog, &str); 8] = [
+            (Dialog::Keybindings, "Keybindings"),
+            (Dialog::ContainerSettings, "Container settings"),
+            (Dialog::VideoSettings, "Video track #0 settings"),
+            (Dialog::SubtitleSettings, "Subtitle track #2"),
+            (Dialog::ConfirmSave, "Replace original"),
+            (Dialog::Processing, "Remuxing movie.mkv"),
+            (Dialog::ConfirmCancel, "Are you sure you want to cancel"),
+            (Dialog::Error, "ffmpeg exited with status 1"),
+        ];
+
+        // Act / Assert: each dialog names itself on screen.
+        for (dialog, expected) in DIALOGS {
+            let (mut app, directory) = probed_app("render-dialogs");
+            open_dialog(&mut app, dialog);
+            let screen = draw(&mut app, 140, 40).join(" ");
+            assert!(
+                screen.contains(expected),
+                "{dialog:?} should show {expected:?}; screen was:\n{screen}",
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        // Act / Assert: each layer draws its own furniture, dialog or not.
+        for layer in [Layer::Files, Layer::Streams, Layer::StreamDetails] {
+            let (mut app, directory) = probed_app("render-layers");
+            app.layer = layer;
+            app.selected_stream = 1;
+            let screen = draw(&mut app, 140, 40).join(" ");
+            assert!(
+                screen.contains("Files (1)"),
+                "{layer:?} should keep the file pane"
+            );
+            assert!(
+                screen.contains("movie.mkv"),
+                "{layer:?} should name the file"
+            );
+            if layer == Layer::StreamDetails {
+                assert!(
+                    screen.contains("Video #0"),
+                    "{layer:?} should open the details popup",
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn render_should_survive_a_file_with_no_probe_result_and_a_scan_error() {
+        // Arrange / Act / Assert: the two states that reach `render` before any media
+        // information exists, both of which take different branches through the details
+        // pane than the probed case above.
+        let (mut empty, empty_directory) = test_app("render-none", &[]);
+        assert!(draw(&mut empty, 140, 40).join(" ").contains("Files (0)"));
+        std::fs::remove_dir_all(empty_directory).unwrap();
+
+        let (mut app, directory) = test_app("render-empty", &["movie.mkv"]);
+        app.loading = true;
+        assert!(draw(&mut app, 140, 40).join(" ").contains("Loading"));
+
+        app.loading = false;
+        app.scan_error = Some("permission denied".to_string());
+        assert!(
+            draw(&mut app, 140, 40)
+                .join(" ")
+                .contains("permission denied")
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn overview_should_mark_a_deleted_track_and_a_container_conflict() {
+        // Arrange: MP4 cannot store SubRip, so targeting it puts a conflict on both
+        // subtitle tracks; one video track is also marked for deletion.
+        let (mut app, directory) = probed_app("overview-marks");
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(0))
+            .unwrap();
+        app.toggle_delete_selected_stream();
+        app.container_target = Some(crate::edit::ContainerFormat::Mp4);
+
+        // Act
+        let screen = draw(&mut app, 160, 40).join("\n");
+
+        // Assert: the deletion marker and the conflict marker both reach the screen.
+        assert_that!(screen.as_str()).contains("×");
+        assert_that!(screen.as_str()).contains("compatibility conflict");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Builds the overview exactly as `render_details` does, but with the column layout
+    /// under the test's control. Returns the rendered lines and the line the selection
+    /// landed on, which is what drives auto-scrolling.
+    fn overview(app: &App, side_by_side: bool) -> (Vec<String>, Option<usize>) {
+        let info = match &app.outcome {
+            Some(ProbeOutcome::Video(info)) => info,
+            other => panic!("overview needs a probed video, got {other:?}"),
+        };
+        let changed = app.changed_streams();
+        let rows = app.track_rows();
+        let conflicting_streams = app.selected_container_conflict_streams();
+        let (text, selected_line) = media_text(
+            info,
+            details_selected_stream(app),
+            MediaTextState {
+                order: &app.stream_order,
+                rows: &rows,
+                sidecars: &app.sidecars,
+                deleted: &app.deleted_streams,
+                defaults: &app.default_streams,
+                default_sidecars: &app.default_sidecars,
+                changed: &changed,
+                subtitle_changes: &app.subtitle_changes,
+                source_container: app.source_container(),
+                container_target: app.container_target,
+                container_metadata_changed: app.container_metadata_changed(),
+                container_conflicts: app.selected_container_conflicts().len(),
+                conflicting_streams: &conflicting_streams,
+                subtitle_columns_side_by_side: side_by_side,
+                subtitle_column_width: 60,
+            },
+        );
+        let lines = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        (lines, selected_line)
+    }
+
+    /// Moves the selection onto `track` and returns its row index.
+    fn select_track(app: &mut App, track: TrackRef) -> usize {
+        let index = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == track)
+            .unwrap_or_else(|| panic!("{track:?} is not a selectable row"));
+        app.layer = Layer::Streams;
+        app.selected_stream = index;
+        index
+    }
+
+    /// Every combination of the four row states, and the style each of the three overview
+    /// row builders gives them. Pinned exhaustively because the cascades are the only
+    /// thing telling a user that a track is deleted, in conflict, or edited — and because
+    /// they were duplicated four times before being shared.
+    #[test]
+    fn track_row_styles_should_rank_selection_over_deletion_over_conflict_over_change() {
+        let stream = serde_json::json!({"index": 4, "codec_type": "audio", "codec_name": "aac"});
+        let stream = stream
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {"format_name": "matroska,webm"},
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+        }))
+        .unwrap();
+
+        for selected in [false, true] {
+            for deleted in [false, true] {
+                for conflict in [false, true] {
+                    for changed in [false, true] {
+                        let case = format!(
+                            "selected={selected} deleted={deleted} \
+                             conflict={conflict} changed={changed}"
+                        );
+                        let expected = if selected {
+                            focused_style(changed && !deleted)
+                        } else if deleted {
+                            Style::default().fg(Color::Red)
+                        } else if conflict {
+                            warning_style(changed)
+                        } else if changed {
+                            changed_style()
+                        } else {
+                            Style::default()
+                        };
+                        let line =
+                            stream_line(&stream, 4, selected, deleted, changed, conflict, false);
+                        assert_eq!(line.style, expected, "stream row, {case}");
+
+                        // The container row cannot be deleted, and the sidecar row can be
+                        // neither deleted nor in conflict; both otherwise rank the same.
+                        if !deleted {
+                            let expected = if selected {
+                                focused_style(changed)
+                            } else if conflict {
+                                warning_style(changed)
+                            } else if changed {
+                                changed_style()
+                            } else {
+                                Style::default()
+                            };
+                            let line = container_line(
+                                &info,
+                                None,
+                                changed.then_some(crate::edit::ContainerFormat::Mp4),
+                                changed,
+                                usize::from(conflict),
+                                selected,
+                            );
+                            assert_eq!(line.style, expected, "container row, {case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn stream_of(value: serde_json::Value) -> BTreeMap<String, Value> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn rendered(lines: Vec<Line<'static>>) -> String {
+        lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn video_information_should_describe_the_picture_from_the_probe_fields() {
+        // Arrange: the `i` panel is where a user decides whether a file is worth keeping,
+        // so the picture description has to read the probe fields it claims to.
+        let hdr = stream_of(serde_json::json!({
+            "index": 0, "codec_type": "video", "codec_name": "hevc",
+            "width": 3840, "height": 2160, "display_aspect_ratio": "16:9",
+            "color_transfer": "smpte2084", "bits_per_raw_sample": "10",
+            "field_order": "progressive", "avg_frame_rate": "24000/1001",
+            "bit_rate": "18000000",
+            "disposition": {"default": 1, "original": 1},
+            "tags": {"language": "eng", "title": "Main feature"}
+        }));
+
+        // Act
+        let panel = rendered(video_information_lines(&hdr, true));
+
+        // Assert
+        assert_that!(panel.as_str()).contains("HEVC (H.265)");
+        assert_that!(panel.as_str()).contains("3840×2160");
+        assert_that!(panel.as_str()).contains("16:9");
+        assert_that!(panel.as_str()).contains("4K");
+        assert_that!(panel.as_str()).contains("HDR10");
+        assert_that!(panel.as_str()).contains("10-bit");
+        assert_that!(panel.as_str()).contains("Progressive");
+        assert_that!(panel.as_str()).contains("Default");
+        assert_that!(panel.as_str()).contains("Main feature");
+
+        // And a plainer stream: bit depth inferred from the pixel format, SDR transfer,
+        // interlaced scan, and a height that matches no marketing tier.
+        let sdr = stream_of(serde_json::json!({
+            "index": 0, "codec_type": "video", "codec_name": "mpeg2video",
+            "width": 720, "height": 576, "pix_fmt": "yuv420p",
+            "color_transfer": "bt470bg", "field_order": "tt"
+        }));
+        let panel = rendered(video_information_lines(&sdr, false));
+        assert_that!(panel.as_str()).contains("MPEG-2 Video");
+        assert_that!(panel.as_str()).contains("576p");
+        assert_that!(panel.as_str()).contains("8-bit");
+        assert_that!(panel.as_str()).contains("Interlaced");
+        assert_that!(panel.as_str()).does_not_contain("Default");
+
+        // A codec with no friendly name falls back to its ffmpeg name, uppercased, and a
+        // stream with no picture fields at all still renders.
+        let bare = stream_of(serde_json::json!({"index": 0, "codec_type": "video"}));
+        let panel = rendered(video_information_lines(&bare, false));
+        assert_that!(panel.as_str()).contains("Unknown");
+    }
+
+    #[test]
+    fn audio_information_should_name_the_codec_profile_and_channel_layout() {
+        // Arrange / Act / Assert: DTS in particular is several formats behind one codec
+        // name, and the profile is the only thing telling them apart.
+        for (codec, profile, expected) in [
+            ("dts", Some("DTS-HD MA"), "DTS-HD Master Audio"),
+            ("dts", Some("DTS-HD HRA"), "DTS-HD High Resolution Audio"),
+            ("dts", None, "DTS"),
+            ("eac3", None, "Dolby Digital Plus (E-AC-3)"),
+            ("pcm_s24le", None, "PCM · Uncompressed"),
+            ("flac", None, "FLAC · Lossless"),
+            ("opus", None, "Opus"),
+        ] {
+            let mut stream = serde_json::json!({
+                "index": 1, "codec_type": "audio", "codec_name": codec,
+                "channel_layout": "5.1(side)", "sample_rate": "48000"
+            });
+            if let Some(profile) = profile {
+                stream["profile"] = serde_json::json!(profile);
+            }
+            let panel = rendered(audio_information_lines(&stream_of(stream), false));
+            assert!(
+                panel.contains(expected),
+                "{codec} {profile:?} should read as {expected:?}:\n{panel}",
+            );
+            assert!(
+                panel.contains("5.1 surround"),
+                "the channel layout should be spelled out:\n{panel}",
+            );
+        }
+
+        // Named layouts, and a fallback to the raw channel count when the layout is
+        // missing or unrecognised.
+        for (layout, channels, expected) in [
+            (Some("mono"), None, "Mono"),
+            (Some("stereo"), None, "Stereo"),
+            (Some("quad"), None, "Quadraphonic"),
+            (None, Some(2), "Stereo"),
+            (None, Some(8), "8 channels"),
+        ] {
+            let mut stream = serde_json::json!({
+                "index": 1, "codec_type": "audio", "codec_name": "aac"
+            });
+            if let Some(layout) = layout {
+                stream["channel_layout"] = serde_json::json!(layout);
+            }
+            if let Some(channels) = channels {
+                stream["channels"] = serde_json::json!(channels);
+            }
+            let panel = rendered(audio_information_lines(&stream_of(stream), false));
+            assert!(
+                panel.contains(expected),
+                "{layout:?}/{channels:?} should read as {expected:?}:\n{panel}",
+            );
+        }
+
+        // Every disposition the panel knows about is listed as a role.
+        let described = stream_of(serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "ac3", "channels": 2,
+            "disposition": {"visual_impaired": 1, "comment": 1, "dub": 1},
+            "tags": {"language": "nld"}
+        }));
+        let panel = rendered(audio_information_lines(&described, true));
+        assert_that!(panel.as_str()).contains("Default");
+        assert_that!(panel.as_str()).contains("Audio description");
+        assert_that!(panel.as_str()).contains("Commentary");
+        assert_that!(panel.as_str()).contains("Dubbed");
+        assert_that!(panel.as_str()).contains("Dutch");
+    }
+
+    #[test]
+    fn custom_resolution_dialog_should_show_the_source_size_the_draft_and_any_error() {
+        // Arrange: the custom-resolution editor, which is the only place a user types a
+        // resolution and so the only place a typo has to be caught before saving.
+        let (mut app, directory) = probed_app("custom-resolution");
+        app.layer = Layer::Streams;
+        app.selected_stream = 1;
+        app.open_video_settings();
+        app.move_video_settings_cursor(1);
+        app.activate_video_settings();
+        let custom = app.resolution_choices(0).len() - 1;
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = custom;
+        app.activate_video_settings();
+        assert!(
+            app.video_settings_popup
+                .as_ref()
+                .is_some_and(|popup| popup.custom_resolution.is_some()),
+            "the custom editor should be open",
+        );
+
+        // Act: as opened, prefilled from the source.
+        let screen = draw(&mut app, 120, 30).join("\n");
+
+        // Assert
+        assert_that!(screen.as_str()).contains("Original: 1920×1080");
+        assert_that!(screen.as_str()).contains("Width");
+        assert_that!(screen.as_str()).contains("Height");
+
+        // Act: an odd height, which no encoder will take.
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.height.clear();
+        for character in "1081".chars() {
+            draft.height.insert(character, TextInputConfig::RESOLUTION);
+        }
+        let screen = draw(&mut app, 120, 30).join("\n");
+
+        // Assert: the dialog says so rather than waiting for ffmpeg to fail.
+        assert!(
+            app.custom_resolution_error().is_some(),
+            "1081 is not a usable height",
+        );
+        assert!(
+            screen.contains(&app.custom_resolution_error().unwrap()),
+            "the dialog should show its own error:\n{screen}",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_selectable_row_should_have_an_information_panel() {
+        // Arrange: a file carrying an attachment and a data stream alongside the real
+        // tracks. Those extra streams are deliberately not selectable — and every row
+        // that *is* selectable must have something to show when the user presses `i`,
+        // or the key does nothing with no explanation.
+        let (mut app, directory) = probed_app("details-every-row");
+        let Some(ProbeOutcome::Video(info)) = app.outcome.as_mut() else {
+            unreachable!("probed_app always yields a video");
+        };
+        for (index, kind, codec) in [(4, "attachment", "ttf"), (5, "data", "bin")] {
+            info.streams.push(
+                serde_json::from_value(serde_json::json!({
+                    "index": index, "codec_type": kind, "codec_name": codec
+                }))
+                .unwrap(),
+            );
+        }
+        app.stream_order = vec![0, 1, 2, 3, 4, 5];
+
+        // Act / Assert
+        let rows = app.track_rows();
+        assert!(
+            !rows.contains(&TrackRef::Embedded(4)) && !rows.contains(&TrackRef::Embedded(5)),
+            "attachments and data streams are not selectable: {rows:?}",
+        );
+        for (index, row) in rows.iter().enumerate() {
+            app.layer = Layer::Streams;
+            app.selected_stream = index;
+            let (text, title) = details_popup_content(&app)
+                .unwrap_or_else(|| panic!("{row:?} has no information panel"));
+            assert!(!title.trim().is_empty(), "{row:?} has an untitled panel");
+            assert!(
+                text.lines
+                    .iter()
+                    .any(|line| !line.to_string().trim().is_empty()),
+                "{row:?} has an empty information panel",
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_dialogs_should_scroll_the_focused_field_into_view_and_honour_the_help_panel() {
+        // Arrange: both settings popups, focused on their last field, in a terminal too
+        // short to show the whole field list. The two dialogs share one renderer, so
+        // whatever is asserted here has to hold for both.
+        for (dialog, last_field, help_title) in [
+            (
+                Dialog::ContainerSettings,
+                "Artist",
+                "Information about Artist",
+            ),
+            (
+                Dialog::SubtitleSettings,
+                "Commentary",
+                "Information about Commentary",
+            ),
+        ] {
+            let (mut app, directory) = probed_app("settings-scroll");
+            open_dialog(&mut app, dialog);
+            if let Some(popup) = app.container_settings_popup.as_mut() {
+                popup.field = ContainerSettingsField::Artist;
+                popup.help_visible = false;
+            }
+            if let Some(popup) = app.subtitle_settings_popup.as_mut() {
+                popup.field = SubtitleSettingsField::Commentary;
+                popup.help_visible = false;
+            }
+
+            // Act
+            let short = draw(&mut app, 140, 16).join("\n");
+
+            // Assert: the field the user is on is on screen even though the dialog is
+            // taller than the terminal, and no help panel is drawn while it is closed.
+            assert!(
+                short.contains(last_field),
+                "{dialog:?} should scroll {last_field:?} into view:\n{short}",
+            );
+            assert!(
+                !short.contains(help_title),
+                "{dialog:?} should not show help while it is closed:\n{short}",
+            );
+
+            // Act: the same dialog with help open.
+            if let Some(popup) = app.container_settings_popup.as_mut() {
+                popup.help_visible = true;
+            }
+            if let Some(popup) = app.subtitle_settings_popup.as_mut() {
+                popup.help_visible = true;
+            }
+            let with_help = draw(&mut app, 140, 16).join("\n");
+
+            // Assert: the panel appears, titled for the focused field, without pushing
+            // that field off screen.
+            assert!(
+                with_help.contains(help_title),
+                "{dialog:?} should title the help panel for the focused field:\n{with_help}",
+            );
+            assert!(
+                with_help.contains(last_field),
+                "{dialog:?} should keep {last_field:?} visible beside the help:\n{with_help}",
+            );
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn overview_should_place_exported_and_imported_subtitles_in_opposite_columns() {
+        // Arrange: an embedded subtitle marked for export and a sidecar marked for
+        // import. Both cross over, so each column's count moves by one.
+        let (mut app, directory) = probed_app("overview-transfer");
+        let before = draw(&mut app, 160, 40).join("\n");
+        assert_that!(before.as_str()).contains("Embedded subtitles (2)");
+        assert_that!(before.as_str()).contains("External subtitles (2)");
+
+        select_track(&mut app, TrackRef::Embedded(2));
+        assert!(app.transfer_subtitle(1), "export should be accepted");
+        select_track(&mut app, TrackRef::Sidecar(0));
+        assert!(app.transfer_subtitle(-1), "import should be accepted");
+
+        // Act: read the stacked layout, where the two columns are separate sections and
+        // a track can be attributed to one of them unambiguously.
+        app.selected_stream = 0;
+        let (lines, _) = overview(&app, false);
+        let embedded = lines
+            .iter()
+            .position(|line| line.contains("Embedded subtitles (2)"))
+            .expect("embedded section");
+        let external = lines
+            .iter()
+            .position(|line| line.contains("External subtitles (2)"))
+            .expect("external section");
+
+        // Assert: the exported embedded track (#2) is now listed under External, and the
+        // imported sidecar under Embedded. Embedded tracks carry a `#index`, sidecars do
+        // not, so each section should now hold one of each.
+        let rows = |start: usize| {
+            lines[start + 1..]
+                .iter()
+                .take_while(|line| !line.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let embedded_rows = rows(embedded);
+        let external_rows = rows(external);
+        assert_eq!(
+            embedded_rows.iter().filter(|row| row.contains('#')).count(),
+            1,
+            "Embedded should hold one embedded track and the imported sidecar: {embedded_rows:?}",
+        );
+        assert!(
+            external_rows.iter().any(|row| row.contains("#2")),
+            "the exported track #2 should have moved to External: {external_rows:?}",
+        );
+        assert_eq!(
+            external_rows.iter().filter(|row| row.contains('#')).count(),
+            1,
+            "External should hold the exported track and one sidecar: {external_rows:?}",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn overview_should_reach_the_same_tracks_stacked_as_side_by_side() {
+        // Arrange
+        let (app, directory) = probed_app("overview-stacked");
+
+        // Act
+        let (columns, _) = overview(&app, true);
+        let (stacked, _) = overview(&app, false);
+
+        // Assert: the two layouts are alternative presentations of one model — both name
+        // every section and every track, and neither drops a row the other shows.
+        for layout in [&columns, &stacked] {
+            let joined = layout.join("\n");
+            for expected in [
+                "Container",
+                "Video (1)",
+                "Audio (1)",
+                "Embedded subtitles (2)",
+                "External subtitles (2)",
+                "#2",
+                "#3",
+            ] {
+                assert!(
+                    joined.contains(expected),
+                    "layout should contain {expected:?}; was:\n{joined}",
+                );
+            }
+        }
+        // Stacking is taller because each subtitle gets its own line.
+        assert!(
+            stacked.len() > columns.len(),
+            "stacked {} should exceed side-by-side {}",
+            stacked.len(),
+            columns.len(),
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn overview_should_report_the_line_of_the_focused_track_in_every_section() {
+        // Arrange: every selectable row, in both layouts. `selected_line` is what
+        // `render_details` scrolls to, so a row that reports `None` is a row the user
+        // can focus but never see.
+        let (mut app, directory) = probed_app("overview-selection");
+        let rows = app.track_rows();
+        // Container, video, audio, two embedded subtitles, two sidecars.
+        assert_that!(rows.len()).is_equal_to(7);
+
+        for side_by_side in [true, false] {
+            for (index, row) in rows.iter().enumerate() {
+                app.layer = Layer::Streams;
+                app.selected_stream = index;
+
+                // Act
+                let (lines, selected_line) = overview(&app, side_by_side);
+
+                // Assert: the reported line exists and is not a section heading.
+                let Some(line) = selected_line else {
+                    panic!("{row:?} reported no selected line (side_by_side={side_by_side})");
+                };
+                let text = lines
+                    .get(line)
+                    .unwrap_or_else(|| panic!("{row:?} pointed past the end of the overview"));
+                assert!(
+                    !text.trim().is_empty(),
+                    "{row:?} selected a blank line: {lines:?}",
+                );
+            }
+        }
+
+        // And with the file pane focused nothing is highlighted at all.
+        app.layer = Layer::Files;
+        assert_that!(overview(&app, true).1).is_none();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn render_should_fall_back_to_a_notice_when_the_terminal_is_too_small() {
+        // Arrange: side-by-side columns on, then a terminal that cannot hold them.
+        let (mut app, directory) = probed_app("render-small");
+        app.set_subtitle_columns_side_by_side(true);
+        assert_that!(app.subtitle_columns_side_by_side).is_true();
+
+        // Act
+        let screen = draw(&mut app, 49, 9).join(" ");
+
+        // Assert: the notice replaces the whole frame, and the columns are turned off so
+        // the app does not come back at a usable size still trying to draw two columns.
+        assert_that!(screen.as_str()).contains("Terminal too small");
+        assert_that!(screen.as_str()).does_not_contain("Files (");
+        assert_that!(app.subtitle_columns_side_by_side).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn render_should_dim_the_backdrop_behind_a_dialog_and_the_details_popup() {
+        // Arrange
+        let (mut app, directory) = probed_app("render-dim");
+
+        // Act: the plain overview, then the same screen with a dialog over it.
+        app.layer = Layer::Streams;
+        let plain = draw(&mut app, 140, 40);
+        open_dialog(&mut app, Dialog::Keybindings);
+        let dimmed = draw(&mut app, 140, 40);
+
+        // Assert: the backdrop is still drawn underneath rather than cleared, which is
+        // what makes the dialog read as an overlay.
+        assert!(plain.iter().any(|row| row.contains("movie.mkv")));
+        assert!(dimmed.iter().any(|row| row.contains("movie.mkv")));
+        assert!(dimmed.iter().any(|row| row.contains("Keybindings")));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn progress_dialog_should_use_a_standalone_loader_or_a_real_gauge() {
+        let (mut app, directory) = test_app("progress-ui", &[]);
         app.edit_progress_label = Some("Running OCR on movie.dan.sup → SRT (dan)".to_string());
         app.edit_started = Some(std::time::Instant::now());
         let mut terminal =
@@ -3443,6 +4755,418 @@ mod tests {
     }
 
     #[test]
+    fn container_settings_dialog_should_align_the_format_row_with_the_metadata_rows() {
+        // Arrange
+        let (mut app, directory) = test_app("container-alignment-ui", &[]);
+        // Select the Comment field so neither Format nor Title is highlighted,
+        // keeping their label styling identical for a fair column comparison.
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Comment,
+            mode: ContainerSettingsMode::Summary,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_container_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        // `String::find` returns a byte offset, not a column — the chevron and border
+        // glyphs are multi-byte, so columns must be counted over `.chars()` instead.
+        let border_column = |y: u16| -> usize {
+            row_text(y)
+                .chars()
+                .position(|character| character == '│')
+                .expect("row should have a left border")
+        };
+        let format_row = (0..buffer.area.height)
+            .find(|&y| row_text(y).contains("Format"))
+            .expect("Format row should be rendered");
+        let title_row = (0..buffer.area.height)
+            .find(|&y| row_text(y).contains("Title"))
+            .expect("Title row should be rendered");
+
+        // Format's value sits inside `[ ... ]`; Title's sits inside a field frame. The
+        // popup's own left border uses the same glyph as an idle frame, so skip it.
+        let format_value_column = row_text(format_row)
+            .chars()
+            .position(|character| character == '[')
+            .expect("Format row should show a value")
+            - border_column(format_row);
+        let title_value_column = row_text(title_row)
+            .chars()
+            .enumerate()
+            .filter(|(_, character)| FIELD_FRAME.starts_with(*character))
+            .map(|(column, _)| column)
+            .nth(1)
+            .expect("Title row should show its field frame")
+            - border_column(title_row);
+
+        assert_that!(format_value_column).is_equal_to(title_value_column);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_settings_dialog_should_show_the_same_format_label_as_the_dropdown_entry() {
+        // Arrange — a known .mkv source with no explicit target (target == None,
+        // i.e. "keep original"): the summary row must show the same short label
+        // ("MKV") the dropdown itself uses for that entry, not a separately-sourced
+        // verbose ffprobe string ("Original (matroska,webm)").
+        let (mut app, directory) = test_app("container-format-label-ui", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {
+                    "format_name": "matroska,webm",
+                    "format_long_name": "Matroska / WebM"
+                },
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap(),
+        ));
+        app.container_target = None;
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::Summary,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 15)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_container_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_that!(&text).contains("MKV");
+        assert_that!(&text).does_not_contain("matroska");
+        assert_that!(&text).does_not_contain("Original (");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_settings_format_dropdown_should_show_tree_guides_connecting_to_the_field() {
+        // Arrange
+        let (mut app, directory) = test_app("container-format-dropdown-ui", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap(),
+        ));
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::FormatDropdown,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_container_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert — the expanded chevron marks the Format row, and every option below
+        // it hangs off a tree guide, with the final option closed off by "└──".
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_that!(&text).contains("▿ Format");
+        assert_that!(&text).contains("├── ");
+        // Trailing space distinguishes a real closing guide from the popup's own
+        // unbroken border corner ("└────...┘"), which also contains a bare "└──".
+        assert_that!(&text).contains("└── ");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_settings_format_dropdown_should_leave_exactly_one_blank_line_before_title() {
+        // Arrange — a single blank line should separate the option list from the
+        // Title field below it, same as when the dropdown is collapsed.
+        let (mut app, directory) = test_app("container-format-dropdown-spacing-ui", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap(),
+        ));
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::FormatDropdown,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_container_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert — the row right after the last option (closed off by "└──") is
+        // blank, and the row after that is "Title" itself.
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let last_option_row = (0..buffer.area.height)
+            .find(|&y| row_text(y).contains("└── "))
+            .expect("closing tree guide should be rendered");
+        assert_that!(row_text(last_option_row + 1)).does_not_contain("Title");
+        assert_that!(row_text(last_option_row + 2)).contains("Title");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn container_settings_format_dropdown_should_not_leave_a_blank_line_before_the_first_option() {
+        // Arrange — the tree guide on the first option already connects it visually
+        // to the Format row above; a blank line in between would defeat that.
+        let (mut app, directory) =
+            test_app("container-format-dropdown-first-option-ui", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap(),
+        ));
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Format,
+            mode: ContainerSettingsMode::FormatDropdown,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_container_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert — the row right after "Format" is the first option itself.
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let format_row = (0..buffer.area.height)
+            .find(|&y| row_text(y).contains("Format"))
+            .expect("Format row should be rendered");
+        assert_that!(row_text(format_row + 1)).contains("├──");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_language_dropdown_empty_state_should_show_a_closing_tree_guide() {
+        // Arrange — search for a language that matches nothing.
+        let (mut app, directory) = test_app("subtitle-language-empty-ui", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {
+                        "index": 1,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        ));
+        let source = SubtitleSource::Embedded(1);
+        let language_search = SearchState {
+            input: TextInputState::new("zzznotalanguage".to_string()),
+            ..SearchState::default()
+        };
+        app.subtitle_settings_popup = Some(crate::app::SubtitleSettingsPopup {
+            source: source.clone(),
+            source_format: SubtitleFormat::SubRip,
+            field: SubtitleSettingsField::Language,
+            mode: SubtitleSettingsMode::LanguageDropdown,
+            help_visible: false,
+            codec_cursor: 0,
+            language_cursor: 0,
+            language_search,
+            title_input: TextInputState::default(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_subtitle_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_that!(&text).contains("No matching languages");
+        assert_that!(&text).contains("└── ");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_settings_codec_dropdown_should_leave_a_blank_line_before_language() {
+        // Arrange
+        let (mut app, directory) = test_app("subtitle-codec-dropdown-spacing-ui", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {
+                        "index": 1,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        ));
+        let source = SubtitleSource::Embedded(1);
+        app.subtitle_settings_popup = Some(crate::app::SubtitleSettingsPopup {
+            source: source.clone(),
+            source_format: SubtitleFormat::SubRip,
+            field: SubtitleSettingsField::Codec,
+            mode: SubtitleSettingsMode::CodecDropdown,
+            help_visible: false,
+            codec_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_subtitle_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert — the row right after the last option is blank, and the row after
+        // that is "Language" itself.
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let last_option_row = (0..buffer.area.height)
+            .find(|&y| row_text(y).contains("└── "))
+            .expect("closing tree guide should be rendered");
+        assert_that!(row_text(last_option_row + 1)).does_not_contain("Language");
+        assert_that!(row_text(last_option_row + 2)).contains("Language");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_settings_language_dropdown_should_leave_a_blank_line_before_title() {
+        // Arrange
+        let (mut app, directory) = test_app("subtitle-language-dropdown-spacing-ui", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {
+                        "index": 1,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng", "title": "English dialogue"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        ));
+        let source = SubtitleSource::Embedded(1);
+        app.subtitle_settings_popup = Some(crate::app::SubtitleSettingsPopup {
+            source: source.clone(),
+            source_format: SubtitleFormat::SubRip,
+            field: SubtitleSettingsField::Language,
+            mode: SubtitleSettingsMode::LanguageDropdown,
+            help_visible: false,
+            codec_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new("English dialogue".to_string()),
+        });
+        // Tall enough that the full (windowed, up-to-10-row) language list, its
+        // search box, and the fields below it all fit without internal scrolling.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 45)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_subtitle_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert — the row right after the last option is blank, and the row after
+        // that is "Title" itself.
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        // Trailing space distinguishes a real tree guide ("├── "/"└── ") from the
+        // popup's own unbroken border ("└────...┘"), which would otherwise also
+        // match a bare "└──" search.
+        let last_option_row = (0..buffer.area.height)
+            .rev()
+            .find(|&y| row_text(y).contains("├── ") || row_text(y).contains("└── "))
+            .expect("at least one language option should be rendered");
+        assert_that!(row_text(last_option_row + 1)).does_not_contain("Title");
+        assert_that!(row_text(last_option_row + 2)).contains("Title");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn loader_should_move_one_bright_cell_without_changing_its_width() {
         let first = loader_line(0);
         let second = loader_line(2);
@@ -3478,18 +5202,7 @@ mod tests {
 
     #[test]
     fn subtitle_settings_dialog_should_group_fields_and_hide_embedded_only_fields_when_exported() {
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-subtitle-settings-ui-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app("subtitle-settings-ui", &[]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "streams": [
@@ -3635,18 +5348,7 @@ mod tests {
 
     #[test]
     fn details_selection_should_not_bleed_around_an_open_dialog() {
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-dialog-selection-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app("dialog-selection", &[]);
         app.layer = Layer::Streams;
         app.selected_stream = 8;
 
@@ -3659,18 +5361,7 @@ mod tests {
 
     #[test]
     fn subtitle_field_help_should_change_with_the_field_and_explain_sidecar_effects() {
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-subtitle-field-help-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app("subtitle-field-help", &[]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "streams": [
@@ -3725,14 +5416,16 @@ mod tests {
         let original = subtitle_field_help_text(&app, &popup).to_string();
         assert_that!(original)
             .contains("original language")
-            .contains("not an untouched or source file")
+            .contains("originally recorded in")
             .does_not_contain("canonical .sdh");
 
         popup.field = SubtitleSettingsField::Codec;
         let codec = subtitle_field_help_text(&app, &popup).to_string();
         assert_that!(codec)
-            .contains("image subtitle to text requires OCR")
-            .contains("stored as SubRip / SRT in MKV");
+            .contains("requires seconv and tesseract")
+            // The Codec field restates the chosen output format everywhere else on
+            // screen, so its help panel no longer repeats it.
+            .does_not_contain("stored as SubRip / SRT in MKV");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3825,25 +5518,14 @@ mod tests {
     #[test]
     fn render_files_should_reveal_only_matching_sidecars_during_search() {
         // Arrange
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-file-search-ui-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        for name in ["movie.mkv", "movie.eng.srt", "movie.nld.srt"] {
-            std::fs::write(directory.join(name), b"media").unwrap();
-        }
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app(
+            "file-search-ui",
+            &["movie.mkv", "movie.eng.srt", "movie.nld.srt"],
+        );
         let movie_path = directory.join("movie.mkv");
         app.start_file_search();
         for ch in "eng".chars() {
-            app.file_search_push(ch);
+            app.input_text_char(ch);
         }
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12)).unwrap();
@@ -3864,7 +5546,8 @@ mod tests {
         assert_that!(&content)
             .contains("movie.mkv")
             .contains("movie.eng.srt")
-            .contains("Search: eng▏ (1 match)")
+            .contains("Search │ eng▏")
+            .contains("│ (1 match)")
             .does_not_contain("movie.nld.srt");
         assert_that!(app.is_file_folded(&movie_path)).is_true();
 
@@ -4000,6 +5683,7 @@ mod tests {
             &info,
             Some(crate::edit::ContainerFormat::Matroska),
             Some(crate::edit::ContainerFormat::Mp4),
+            false,
             1,
             true,
         );
@@ -4009,12 +5693,35 @@ mod tests {
             .contains("MKV → MP4")
             .contains("1:02:03")
             .contains("1.5 MiB")
-            .contains("4.2 Mb/s")
+            // Bit rate is `i`-panel detail, not overview.
+            .does_not_contain("4.2 Mb/s")
             .contains("1 compatibility conflict");
         assert_eq!(line.style.fg, Some(Color::White));
         assert_eq!(line.style.bg, Some(Color::Cyan));
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert!(line.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn container_line_should_not_be_marked_changed_when_metadata_is_not_changed() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": { "title": "Existing Title" }
+            },
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]
+        }))
+        .unwrap();
+        // Act
+        let line = container_line(&info, None, None, false, 0, false);
+
+        // Assert: the overview row carries format, duration and size only. The title
+        // lives in the `i` panel, so an unchanged file is styled plainly.
+        assert_that!(line.to_string()).does_not_contain("Existing Title");
+        assert_eq!(line.style.fg, None);
     }
 
     #[test]
@@ -4048,14 +5755,20 @@ mod tests {
         // Act
         let line = stream_line(&stream, 0, false, false, false, false, true).to_string();
 
-        // Assert
+        // Assert: format, channels, language written out, then flags in the same
+        // bracketed shorthand a subtitle row uses.
         assert_that!(&line)
             .contains("#2")
             .contains("OPUS")
             .contains("5.1")
-            .contains("ENG")
-            .contains("[default]")
-            .does_not_contain("[original]");
+            .contains("English")
+            .does_not_contain("ENG")
+            .contains("[D]")
+            // Title and sample rate are `i`-panel detail; `original` has never been
+            // shown on an audio row.
+            .does_not_contain("Main")
+            .does_not_contain("48")
+            .does_not_contain("OG");
     }
 
     #[test]
@@ -4491,6 +6204,125 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_rows_should_hide_the_flags_the_target_container_cannot_store() {
+        // Arrange: every flag set on both an embedded track and a sidecar being imported,
+        // against each container. The overview must promise only what will survive the
+        // remux — a `[CM]` on a row headed into MP4 is a lie the user acts on.
+        let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                "tags": {"language": "eng"}
+            }),
+        )
+        .unwrap();
+        let metadata = crate::subtitle::SubtitleMetadata {
+            language: "eng".to_string(),
+            title: None,
+            forced: true,
+            cc: true,
+            hearing_impaired: true,
+            original: true,
+            commentary: true,
+        };
+        let sidecar = SidecarEntry {
+            path: std::path::PathBuf::from("/media/movie.eng.srt"),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: true,
+            hearing_impaired: true,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 2,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        };
+
+        for container in [
+            ContainerFormat::Matroska,
+            ContainerFormat::Mp4,
+            ContainerFormat::Mov,
+            ContainerFormat::WebM,
+        ] {
+            let expected = |flag: SubtitleFlag, tag: &str| {
+                container
+                    .supports_subtitle_flag(flag)
+                    .then(|| tag.to_string())
+            };
+
+            // Act: the embedded track, staying embedded.
+            let change = SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: Some(metadata.clone()),
+            };
+            let embedded = stream_line_with_subtitle_context(
+                &stream,
+                0,
+                false,
+                false,
+                true,
+                false,
+                false,
+                Some(&change),
+                Some(container),
+                None,
+            )
+            .to_string();
+
+            // Act: the sidecar, being imported into the same container.
+            let change = SubtitleChange {
+                source: SubtitleSource::Sidecar(sidecar.path.clone()),
+                import_into_media: true,
+                metadata: Some(metadata.clone()),
+                ..change
+            };
+            let imported = sidecar_line_with_subtitle_context(
+                &sidecar,
+                false,
+                true,
+                false,
+                Some(&change),
+                Some(container),
+                None,
+            )
+            .to_string();
+
+            // Assert: each flag appears exactly when the container can hold it. Sidecars
+            // have no CC of their own — an imported CC track reads as hearing impaired.
+            for (flag, tag) in [
+                (SubtitleFlag::Forced, "F"),
+                (SubtitleFlag::HearingImpaired, "HI"),
+                (SubtitleFlag::Original, "O"),
+                (SubtitleFlag::Commentary, "CM"),
+            ] {
+                let supported = expected(flag, tag).is_some();
+                assert_eq!(
+                    embedded.contains(tag),
+                    supported,
+                    "{container:?} / {flag:?}: embedded row was {embedded:?}",
+                );
+                assert_eq!(
+                    imported.contains(tag),
+                    supported,
+                    "{container:?} / {flag:?}: imported row was {imported:?}",
+                );
+            }
+            assert_eq!(
+                embedded.contains("CC"),
+                container.supports_subtitle_flag(SubtitleFlag::Cc),
+                "{container:?}: embedded row was {embedded:?}",
+            );
+        }
+    }
+
+    #[test]
     fn stream_line_should_omit_original_title_when_staged_title_was_removed() {
         // Arrange
         let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
@@ -4591,7 +6423,8 @@ mod tests {
         .unwrap();
 
         // Act
-        let lines = container_information_lines(&info, Path::new("/videos/movie.mkv"), 0);
+        let lines =
+            container_information_lines(&info, Path::new("/videos/movie.mkv"), 0, None, &|_| false);
         let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let text = text.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -4604,6 +6437,14 @@ mod tests {
             "Size: 1.5 MiB",
             "",
             "Format: MKV (Matroska / WebM)",
+            "",
+            // The fields the container settings dialog edits, listed whether or not
+            // they are set.
+            "Title: Not provided",
+            "Comment: Not provided",
+            "Date: Not provided",
+            "Genre: Not provided",
+            "Artist: Not provided",
         ]);
     }
 
@@ -4771,9 +6612,14 @@ mod tests {
             "Title: English SDH".to_string(),
             "".to_string(),
             "Language: English".to_string(),
+            // Every flag says where it stands, so an unset one is distinguishable from
+            // one that does not apply to this track at all.
+            "Default: Yes".to_string(),
+            "Forced: Yes".to_string(),
             "Closed captions: No".to_string(),
             "Hearing impaired: Yes".to_string(),
-            "Role: Default · Forced · Original".to_string(),
+            "Original: Yes".to_string(),
+            "Commentary: No".to_string(),
             "".to_string(),
             "Format: SubRip (SRT)".to_string(),
             "Type: Text-based".to_string(),
@@ -4832,8 +6678,10 @@ mod tests {
             "File: movie.nld.forced.cc.sup".to_string(),
             "".to_string(),
             "Language: Dutch".to_string(),
+            // An external sidecar can carry only these two, so the rest are absent
+            // rather than listed as "No".
+            "Forced: Yes".to_string(),
             "Hearing impaired: Yes".to_string(),
-            "Role: Forced".to_string(),
             "".to_string(),
             "Format: PGS / SUP".to_string(),
             "Type: Image-based".to_string(),
@@ -4843,18 +6691,7 @@ mod tests {
     #[test]
     fn subtitle_information_should_follow_staged_values_and_effective_container_role() {
         // Arrange
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-staged-subtitle-information-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app("staged-subtitle-information", &[]);
         let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
             "index": 1,
             "codec_type": "subtitle",
@@ -4958,7 +6795,9 @@ mod tests {
                 .contains("Language: Dutch")
                 .contains("Closed captions: Yes")
                 .contains("Hearing impaired: Yes")
-                .contains("Role: Default · Forced · Commentary")
+                .contains("Default: Yes")
+                .contains("Forced: Yes")
+                .contains("Commentary: Yes")
                 .contains("Format: ASS")
                 .contains("Type: Text-based");
         }
@@ -5010,7 +6849,7 @@ mod tests {
             assert_that!(text)
                 .contains("Language: Dutch")
                 .contains("Hearing impaired: Yes")
-                .contains("Role: Forced")
+                .contains("Forced: Yes")
                 .contains("Format: WebVTT")
                 .does_not_contain("Closed captions:")
                 .does_not_contain("Title:")
@@ -5025,19 +6864,7 @@ mod tests {
     #[test]
     fn stream_details_popup_should_show_friendly_video_audio_and_subtitle_information() {
         // Arrange
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-video-details-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel();
-        let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let (mut app, directory) = test_app("video-details-test", &["movie.mkv"]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "streams": [{
@@ -5089,37 +6916,33 @@ mod tests {
 
         // Act
         app.selected_stream = 0;
-        let (container, container_title, container_compact) = details_popup_content(&app).unwrap();
+        let (container, container_title) = details_popup_content(&app).unwrap();
         app.selected_stream = 1;
-        let (video, video_title, video_compact) = details_popup_content(&app).unwrap();
+        let (video, video_title) = details_popup_content(&app).unwrap();
         app.selected_stream = 2;
-        let (audio, audio_title, audio_compact) = details_popup_content(&app).unwrap();
+        let (audio, audio_title) = details_popup_content(&app).unwrap();
         app.selected_stream = 3;
-        let (subtitle, subtitle_title, subtitle_compact) = details_popup_content(&app).unwrap();
+        let (subtitle, subtitle_title) = details_popup_content(&app).unwrap();
         app.selected_stream = 4;
-        let (external, external_title, external_compact) = details_popup_content(&app).unwrap();
+        let (external, external_title) = details_popup_content(&app).unwrap();
 
         // Assert
         assert_that!(container_title).is_equal_to(" Container information ".to_string());
-        assert_that!(container_compact).is_equal_to(DetailsPopupSizing::Content);
         assert_that!(container.to_string())
             .contains("File name: movie.mkv")
             .contains("Format: MKV");
         assert_that!(video_title).is_equal_to(" Video #0 ".to_string());
-        assert_that!(video_compact).is_equal_to(DetailsPopupSizing::Content);
         assert_that!(video.to_string())
             .contains("Format: H.264 (AVC)")
             .contains("Resolution: 1920×1080 · 1080p")
             .does_not_contain("time_base");
         assert_that!(audio_title).is_equal_to(" Audio #1 ".to_string());
-        assert_that!(audio_compact).is_equal_to(DetailsPopupSizing::Content);
         assert_that!(audio.to_string())
             .contains("Format: Dolby Digital (AC-3)")
             .contains("Channels: Stereo")
             .contains("Language: Dutch")
             .does_not_contain("time_base");
         assert_that!(subtitle_title).is_equal_to(" Subtitle #2 ".to_string());
-        assert_that!(subtitle_compact).is_equal_to(DetailsPopupSizing::Subtitle);
         assert_that!(subtitle.to_string())
             .contains("Title: Not provided")
             .contains("Format: PGS / SUP")
@@ -5127,7 +6950,6 @@ mod tests {
             .does_not_contain("Source:")
             .does_not_contain("time_base");
         assert_that!(external_title).is_equal_to(" External subtitle ".to_string());
-        assert_that!(external_compact).is_equal_to(DetailsPopupSizing::Subtitle);
         assert_that!(external.to_string())
             .contains("Format: SubRip (SRT)")
             .contains("Language: Dutch")
@@ -5139,41 +6961,88 @@ mod tests {
     }
 
     #[test]
-    fn content_popup_area_should_fit_short_information_instead_of_using_most_of_the_screen() {
-        // Arrange
+    fn every_details_popup_should_be_the_same_width_whatever_it_describes() {
+        // Arrange: a short panel and a long one. Sizing to content used to make these
+        // two different shapes, which is what made the `i` panels look inconsistent.
         let terminal = Rect::new(0, 0, 120, 40);
-        let text = padded_popup_text(Text::from(vec![
+        let short = padded_popup_text(Text::from(vec![
             Line::from("Title: English SDH"),
-            Line::from(""),
-            Line::from("Language: English · CC"),
-            Line::from("Role: Default · SDH"),
-            Line::from(""),
             Line::from("Format: SubRip (SRT)"),
-            Line::from("Type: Text-based"),
         ]));
+        let long = padded_popup_text(Text::from(Line::from("x".repeat(190))));
 
         // Act
-        let area = content_popup_area(terminal, &text, " Subtitle #2 ");
+        let short_area = details_popup_area(terminal, &short, " Subtitle #2 ");
+        let long_area = details_popup_area(terminal, &long, " Container information ");
 
-        // Assert
-        assert_that!(area.width).is_less_than(60);
-        assert_that!(area.height).is_equal_to(11);
+        // Assert: one width, centred, and only the height follows the content.
+        assert_that!(short_area.width).is_equal_to(72);
+        assert_that!(long_area.width).is_equal_to(short_area.width);
+        assert_that!(short_area.x).is_equal_to(long_area.x);
+        assert_that!(short_area.height).is_equal_to(6);
+        assert_that!(long_area.height).is_equal_to(7);
     }
 
     #[test]
-    fn subtitle_popup_area_should_be_eighty_percent_wide_and_wrap_height_to_content() {
-        // Arrange
-        let terminal = Rect::new(0, 0, 120, 40);
-        let text = padded_popup_text(Text::from(Line::from("x".repeat(190))));
+    fn a_details_popup_should_still_fit_its_own_title() {
+        // Arrange: a terminal narrow enough that 60% is shorter than the title.
+        let terminal = Rect::new(0, 0, 40, 20);
+        let text = padded_popup_text(Text::from(Line::from("short")));
 
         // Act
-        let area = subtitle_popup_area(terminal, &text, " Subtitle #2 ");
+        let area = details_popup_area(terminal, &text, " Container information ");
 
-        // Assert
-        assert_that!(area.width).is_equal_to(96);
-        assert_that!(area.height).is_equal_to(7);
-        assert_that!(area.x).is_equal_to(12);
-        assert_that!(area.y).is_equal_to(16);
+        // Assert: the title is never clipped by the percentage.
+        assert_that!(area.width as usize)
+            .is_greater_than_or_equal_to(" Container information ".chars().count());
+    }
+
+    #[test]
+    fn container_information_lines_should_follow_staged_metadata_and_mark_it_changed() {
+        // Arrange: what is stored, and what the settings dialog has staged over it.
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": {"title": "Stored title", "genre": "Drama"}
+            },
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+        }))
+        .unwrap();
+        let staged = crate::edit::ContainerMetadata {
+            title: Some("Staged title".to_string()),
+            genre: Some("Drama".to_string()),
+            ..Default::default()
+        };
+
+        // Act
+        let lines = container_information_lines(
+            &info,
+            Path::new("/videos/movie.mkv"),
+            0,
+            Some(&staged),
+            &|field| field == ContainerSettingsField::Title,
+        );
+
+        // Assert: the panel shows what would be written, not what is on disk.
+        let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert_that!(text.iter().map(String::as_str).collect::<Vec<_>>())
+            .contains("Title: Staged title")
+            .contains("Genre: Drama")
+            .contains("Comment: Not provided")
+            .does_not_contain("Title: Stored title");
+
+        // Assert: only the staged field is coloured, the same yellow the settings row
+        // and the subtitle panel use.
+        let value_style = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| line.to_string().starts_with(needle))
+                .and_then(|line| line.spans.last())
+                .map(|span| span.style.fg)
+                .expect("the field should be rendered")
+        };
+        assert_that!(value_style("Title:")).is_equal_to(Some(Color::Yellow));
+        assert_that!(value_style("Genre:")).is_not_equal_to(Some(Color::Yellow));
     }
 
     #[test]
@@ -5191,7 +7060,8 @@ mod tests {
         .unwrap();
 
         // Act
-        let lines = container_information_lines(&info, Path::new("/videos/movie.mp4"), 0);
+        let lines =
+            container_information_lines(&info, Path::new("/videos/movie.mp4"), 0, None, &|_| false);
         let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
 
         // Assert
@@ -5408,64 +7278,60 @@ mod tests {
         };
 
         // Act
-        let line = container_choice_line(&choice, false);
-        let focused = container_choice_line(&choice, true);
+        let line = container_choice_line(&choice, false, true);
+        let focused = container_choice_line(&choice, true, true);
 
         // Assert
         assert_that!(line.to_string())
             .contains("MP4  ⚠ can't contain SubRip/SRT or ASS subtitles.");
-        assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
-        assert_eq!(focused.spans[1].style.fg, Some(Color::White));
-        assert_eq!(focused.spans[1].style.bg, Some(Color::Cyan));
+        assert_eq!(line.spans[0].content, "  └── ");
+        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
+        assert_eq!(focused.spans[2].style.fg, Some(Color::White));
+        assert_eq!(focused.spans[2].style.bg, Some(Color::Cyan));
     }
 
     #[test]
-    fn subtitle_codec_line_should_distinguish_original_staged_and_available_codecs() {
+    fn subtitle_codec_line_should_distinguish_staged_and_available_codecs() {
         // Act
-        let original = subtitle_codec_line("SubRip / SRT", false, false, true, true);
-        let staged = subtitle_codec_line("ASS", false, true, true, false);
         let available = subtitle_codec_line("WebVTT", false, false, true, false);
-        let staged_original = subtitle_codec_line("SubRip / SRT", false, true, true, true);
-        let staged_cursor = subtitle_codec_line("ASS", true, true, true, false);
+        let staged = subtitle_codec_line("ASS", false, true, true, false);
+        let staged_cursor = subtitle_codec_line("ASS", true, true, true, true);
 
-        // Assert
-        assert_that!(original.to_string())
-            .contains("(original)")
-            .does_not_contain("●");
-        assert_eq!(original.spans[0].style.fg, Some(Color::White));
-        assert_eq!(original.spans[1].style.fg, Some(Color::DarkGray));
+        // Assert — no "(original)" tag is ever shown, regardless of state.
+        assert_that!(available.to_string())
+            .does_not_contain("●")
+            .does_not_contain("(original)");
+        assert_eq!(available.spans[1].style.fg, Some(Color::White));
+        assert_eq!(staged.spans[1].style.fg, Some(Color::Yellow));
         assert!(
-            !original.spans[1]
+            staged.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::ITALIC)
         );
-        assert_eq!(staged.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(staged_cursor.spans[1].style.fg, Some(Color::White));
+        assert_eq!(staged_cursor.spans[1].style.bg, Some(Color::Cyan));
         assert!(
-            staged.spans[0]
+            staged_cursor.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::ITALIC)
         );
-        assert_eq!(available.spans[0].style.fg, Some(Color::White));
-        assert_eq!(staged_original.spans[0].style.fg, Some(Color::Yellow));
-        assert_eq!(staged_original.spans[1].style.fg, Some(Color::DarkGray));
-        assert_eq!(staged_cursor.spans[0].style.fg, Some(Color::White));
-        assert_eq!(staged_cursor.spans[0].style.bg, Some(Color::Cyan));
-        assert!(
-            staged_cursor.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
+
+        // The guide glyph flips between the two tree connectors based on `last`.
+        assert_eq!(available.spans[0].content, "  ├── ");
+        assert_eq!(available.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(staged_cursor.spans[0].content, "  └── ");
     }
 
     #[test]
     fn setting_line_should_italicize_only_a_changed_value() {
         // Act
-        let unchanged = setting_line("Codec", "SubRip / SRT", false, false);
-        let changed = setting_line("Codec", "ASS", false, true);
-        let focused_changed = setting_line("Codec", "ASS", true, true);
+        let unchanged = setting_line("Codec", "SubRip / SRT", false, false, false);
+        let changed = setting_line("Codec", "ASS", false, true, false);
+        let focused_changed = setting_line("Codec", "ASS", true, true, false);
+        let expanded = setting_line("Codec", "ASS", false, false, true);
 
         // Assert
         assert!(
@@ -5489,6 +7355,10 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::ITALIC)
         );
+
+        // The chevron flips between collapsed and expanded markers.
+        assert_that!(unchanged.to_string()).contains("▹ Codec");
+        assert_that!(expanded.to_string()).contains("▿ Codec");
     }
 
     #[test]
@@ -5504,14 +7374,723 @@ mod tests {
             let line = subtitle_checkbox_line(label, false, false, false, None);
 
             assert_eq!(
-                line.spans[0].content.chars().count(),
-                SUBTITLE_CHECKBOX_LABEL_WIDTH
-            );
-            assert_eq!(
-                line.to_string().find('['),
-                Some(SUBTITLE_CHECKBOX_LABEL_WIDTH)
+                line.to_string().chars().position(|glyph| glyph == '['),
+                Some(FIELD_VALUE_COLUMN),
+                "checkbox {label} should put its box on the shared value column",
             );
         }
+    }
+
+    #[test]
+    fn every_field_row_should_place_its_value_chrome_in_the_same_column() {
+        // Arrange: one row of each kind, using the widest label the popup can show.
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+        let rows = [
+            setting_line("Codec", "SubRip / SRT", false, false, false),
+            setting_line("Hearing impaired", "value", false, false, true),
+            subtitle_checkbox_line("Hearing impaired", true, false, false, None),
+            text_field_line(TextField::new(
+                "Title",
+                FieldValue::Editing(&input),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )),
+            text_field_line(TextField::new(
+                "Hearing impaired",
+                FieldValue::Static("value"),
+                TextInputConfig::CONTAINER_METADATA.width,
+            )),
+        ];
+
+        // Assert: every row's chrome starts on the one shared column.
+        for row in rows {
+            let rendered = row.to_string();
+            let chrome = rendered
+                .chars()
+                .position(|glyph| glyph == '[' || FIELD_FRAME.starts_with(glyph))
+                .unwrap_or_else(|| panic!("row {rendered:?} should show value chrome"));
+            assert_eq!(chrome, FIELD_VALUE_COLUMN, "row {rendered:?} is off-grid");
+        }
+    }
+
+    #[test]
+    fn stacked_fields_should_frame_only_the_selected_row() {
+        // Arrange: the container popup's five metadata fields, Comment selected.
+        let idle = TextInputState::new("Big Buck Bunny".to_string());
+        let selected = TextInputState::new(String::new());
+        let rows = [
+            text_field_line(
+                TextField::new(
+                    "Title",
+                    FieldValue::Editing(&idle),
+                    TextInputConfig::CONTAINER_METADATA.width,
+                )
+                .selected(false),
+            ),
+            text_field_line(
+                TextField::new(
+                    "Comment",
+                    FieldValue::Editing(&selected),
+                    TextInputConfig::CONTAINER_METADATA.width,
+                )
+                .selected(true),
+            ),
+            text_field_line(
+                TextField::new(
+                    "Date",
+                    FieldValue::Editing(&idle),
+                    TextInputConfig::CONTAINER_METADATA.width,
+                )
+                .selected(false),
+            ),
+        ];
+
+        // Assert: every row is framed with the same glyph and only its colour marks
+        // the selection, so selecting a row never changes the width of anything. No row
+        // is filled, so stacked fields cannot merge into one block.
+        for (index, row) in rows.iter().enumerate() {
+            let frames = row
+                .spans
+                .iter()
+                .filter(|span| span.content.as_ref() == FIELD_FRAME)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                frames.len(),
+                2,
+                "row {index} should be framed on both sides"
+            );
+            for frame in frames {
+                if index == 1 {
+                    assert_eq!(frame.style.fg, Some(Color::Cyan));
+                    assert!(frame.style.add_modifier.contains(Modifier::BOLD));
+                } else {
+                    assert_eq!(frame.style.fg, Some(Color::DarkGray));
+                }
+            }
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|span| span.style.bg != Some(FIELD_EDITING_SURFACE)),
+                "row {index} should stay unfilled while no field is being edited",
+            );
+        }
+    }
+
+    #[test]
+    fn an_editing_field_should_brighten_its_background_and_show_a_caret() {
+        // Arrange
+        let mut editing = TextInputState::new("Movie".to_string());
+        editing.activate();
+        let idle = TextInputState::new("Movie".to_string());
+
+        // Act
+        let active = text_field_line(
+            TextField::new(
+                "Title",
+                FieldValue::Editing(&editing),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )
+            .selected(true),
+        );
+        let inactive = text_field_line(
+            TextField::new(
+                "Title",
+                FieldValue::Editing(&idle),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )
+            .selected(true),
+        );
+
+        // Assert: selection alone shows the focused frame; only editing fills and
+        // shows the caret.
+        assert_that!(active.to_string()).contains(FIELD_CARET);
+        assert!(
+            active
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(FIELD_EDITING_SURFACE))
+        );
+        assert_that!(inactive.to_string())
+            .does_not_contain(FIELD_CARET)
+            .contains(FIELD_FRAME);
+        assert!(
+            inactive
+                .spans
+                .iter()
+                .all(|span| span.style.bg != Some(FIELD_EDITING_SURFACE))
+        );
+    }
+
+    #[test]
+    fn an_editing_field_should_fill_every_cell_from_bar_to_bar() {
+        // Arrange: a short value, so most of the field is padding.
+        let mut editing = TextInputState::new("Movie".to_string());
+        editing.activate();
+
+        // Act
+        let line = text_field_line(
+            TextField::new(
+                "Title",
+                FieldValue::Editing(&editing),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )
+            .selected(true),
+        );
+
+        // Assert: the filled band starts at the opening bar and ends at the closing
+        // one, with no unpainted cell anywhere between them — a gap there reads as two
+        // shapes rather than one box.
+        let filled = line
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.style.bg == Some(FIELD_EDITING_SURFACE))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let (first, last) = (filled[0], filled[filled.len() - 1]);
+        assert_eq!(
+            line.spans[first].content.as_ref(),
+            FIELD_FRAME,
+            "the fill should start on the opening bar"
+        );
+        assert_eq!(
+            line.spans[last].content.as_ref(),
+            FIELD_FRAME,
+            "the fill should end on the closing bar"
+        );
+        assert_eq!(
+            filled,
+            (first..=last).collect::<Vec<_>>(),
+            "every span between the bars should be filled"
+        );
+
+        // Assert: and the label outside the box is not dragged into the fill.
+        assert_that!(
+            line.spans[..first]
+                .iter()
+                .any(|span| span.style.bg.is_some())
+        )
+        .is_false();
+    }
+
+    #[test]
+    fn field_width_should_come_from_the_input_config() {
+        // Arrange: a value long enough to fill each field completely.
+        let long = "x".repeat(200);
+
+        // Act / Assert: the drawn value window matches the config the cursor scrolls
+        // against, so the two can never drift apart again.
+        for config in [
+            TextInputConfig::CONTAINER_METADATA,
+            TextInputConfig::SUBTITLE_TITLE,
+            TextInputConfig::RESOLUTION,
+        ] {
+            let line = text_field_line(TextField::new(
+                "Title",
+                FieldValue::Static(&long),
+                config.width,
+            ));
+            let value = line
+                .to_string()
+                .chars()
+                .filter(|glyph| *glyph == 'x')
+                .count();
+            assert_eq!(value, config.visible_width());
+        }
+    }
+
+    #[test]
+    fn a_wide_character_value_should_not_push_the_closing_frame() {
+        // Arrange: CJK glyphs occupy two terminal columns each.
+        let ascii = TextInputState::new("ab".to_string());
+        let wide = TextInputState::new("日本語字幕".to_string());
+
+        // Act
+        let ascii_row = text_field_line(TextField::new(
+            "Title",
+            FieldValue::Editing(&ascii),
+            TextInputConfig::SUBTITLE_TITLE.width,
+        ));
+        let wide_row = text_field_line(TextField::new(
+            "Title",
+            FieldValue::Editing(&wide),
+            TextInputConfig::SUBTITLE_TITLE.width,
+        ));
+
+        // Assert: both rows occupy the same columns, so the grid survives wide values.
+        assert_eq!(ascii_row.width(), wide_row.width());
+    }
+
+    #[test]
+    fn a_framed_row_should_never_exceed_the_popup_inner_width() {
+        // Arrange: the widest content each settings popup can produce.
+        let title = TextInputState::new("x".repeat(200));
+        let inner = SUBTITLE_SETTINGS_WIDTH as usize - 2;
+
+        // Act
+        let rows = [
+            text_field_line(TextField::new(
+                "Title",
+                FieldValue::Editing(&title),
+                TextInputConfig::SUBTITLE_TITLE.width,
+            )),
+            text_field_line(
+                TextField::new(
+                    "Search",
+                    FieldValue::Editing(&title),
+                    TextInputConfig::LANGUAGE_SEARCH.width,
+                )
+                .suffix(match_suffix(999)),
+            ),
+            subtitle_checkbox_line("Hearing impaired", false, false, false, None),
+        ];
+
+        // Assert: nothing wraps, which would desynchronise the popup's line-based
+        // scrolling from what is actually drawn.
+        for row in rows {
+            assert!(
+                row.width() <= inner,
+                "row {:?} is {} wide, over the {inner}-column popup",
+                row.to_string(),
+                row.width(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_help_text_should_break_into_paragraphs_on_a_blank_line() {
+        // Arrange / Act: one string carrying a break, and a second styled entry.
+        let text = help_paragraphs(vec![
+            (
+                "First paragraph.\n\nSecond paragraph.".to_string(),
+                Style::default().fg(Color::White),
+            ),
+            ("Third.".to_string(), Style::default().fg(Color::Yellow)),
+        ]);
+
+        // Assert: a blank line separates all three, and each keeps its own style, so a
+        // field can add a caveat without the caller counting paragraphs.
+        let bodies = text
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        // Two separators, plus the blank line `padded_popup_text` puts above and below.
+        assert_that!(bodies.iter().filter(|line| line.trim().is_empty()).count()).is_equal_to(4);
+        assert_that!(
+            bodies
+                .iter()
+                .position(|line| line.contains("Second paragraph"))
+                .unwrap()
+                - bodies
+                    .iter()
+                    .position(|line| line.contains("First paragraph"))
+                    .unwrap()
+        )
+        .is_equal_to(2);
+    }
+
+    #[test]
+    fn every_help_text_should_fit_the_panel_it_is_drawn_in() {
+        // Arrange: side by side, the help panel is given the dialog's height, so a text
+        // that wraps past it is silently cut off at the bottom. Both panels are drawn
+        // for real and the panel's inner rows are counted off the buffer, then compared
+        // with the rows the text actually needs at that width.
+        let (mut app, directory) = test_app("help-fit", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}}
+                ]
+            }))
+            .unwrap(),
+        ));
+
+        /// Inner rows of the help panel, found by its title and its own bottom border.
+        fn panel_rows(draw: &dyn Fn(&mut Frame)) -> u16 {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+            terminal.draw(|frame| draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let symbols = |y: u16| -> Vec<&str> {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            };
+            let title = (0..buffer.area.height)
+                .find(|&y| symbols(y).concat().contains("Information about"))
+                .expect("the help panel should be titled");
+            // Located by cell, not by byte: the row is full of multi-byte borders, so a
+            // string offset is not a column.
+            let row = symbols(title);
+            let title_x = (0..row.len())
+                .find(|&x| row[x..].concat().starts_with("Information about"))
+                .expect("the help panel title should be on its own row")
+                as u16;
+            let left = title_x - 2;
+            let bottom = (title + 1..buffer.area.height)
+                .find(|&y| buffer[(left, y)].symbol() == "└")
+                .expect("the help panel should be closed");
+            bottom - title - 1
+        }
+
+        let fits = |label: String, help: &Text<'_>, draw: &dyn Fn(&mut Frame)| {
+            // `wrapped_popup_height` counts the borders, `panel_rows` counts between
+            // them.
+            let needed = wrapped_popup_height(help, SUBTITLE_HELP_WIDTH).saturating_sub(2);
+            let available = panel_rows(draw);
+            assert!(
+                needed <= available,
+                "{label} help needs {needed} rows and the panel has {available}",
+            );
+        };
+
+        // Act / Assert: container fields.
+        for field in [
+            ContainerSettingsField::Format,
+            ContainerSettingsField::Title,
+            ContainerSettingsField::Comment,
+            ContainerSettingsField::Date,
+            ContainerSettingsField::Genre,
+            ContainerSettingsField::Artist,
+        ] {
+            app.container_settings_popup = Some(ContainerSettingsPopup {
+                field,
+                mode: ContainerSettingsMode::Summary,
+                help_visible: true,
+                format_cursor: 0,
+                text_input: TextInputState::new(String::new()),
+            });
+            let popup = app.container_settings_popup.as_ref().unwrap();
+            let help = container_field_help_text(&app, popup);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_container_settings_dialog(frame, &app)
+            });
+        }
+        app.container_settings_popup = None;
+
+        // Act / Assert: subtitle fields.
+        for field in [
+            SubtitleSettingsField::Codec,
+            SubtitleSettingsField::Language,
+            SubtitleSettingsField::Title,
+            SubtitleSettingsField::Default,
+            SubtitleSettingsField::Forced,
+            SubtitleSettingsField::Cc,
+            SubtitleSettingsField::HearingImpaired,
+            SubtitleSettingsField::Original,
+            SubtitleSettingsField::Commentary,
+        ] {
+            app.subtitle_settings_popup = Some(SubtitleSettingsPopup {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                field,
+                mode: SubtitleSettingsMode::Summary,
+                help_visible: true,
+                codec_cursor: 0,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::new(String::new()),
+            });
+            let popup = app.subtitle_settings_popup.as_ref().unwrap();
+            let help = subtitle_field_help_text(&app, popup);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_subtitle_settings_dialog(frame, &app)
+            });
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_expanded_dropdown_should_list_its_options_under_its_own_row() {
+        // Arrange: the video popup has two collapsible rows, so an expanded Codec list
+        // appended after both rows would hang underneath Resolution instead.
+        let (mut app, directory) = test_app("video-dropdown-order", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{
+                    "index": 0, "codec_type": "video", "codec_name": "hevc",
+                    "width": 1920, "height": 1080
+                }]
+            }))
+            .unwrap(),
+        ));
+        app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Codec,
+            mode: VideoSettingsMode::Dropdown,
+            codec_cursor: 0,
+            resolution_cursor: 0,
+            custom_resolution: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_video_settings_dialog(frame, &app))
+            .unwrap();
+
+        // Assert: every option sits between Codec and Resolution.
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let row_of = |needle: &str| {
+            (0..buffer.area.height)
+                .find(|&y| row_text(y).contains(needle))
+                .unwrap_or_else(|| panic!("{needle} should be on screen"))
+        };
+        let codec_row = row_of("Codec");
+        let resolution_row = row_of("Resolution");
+        for option in ["H.264", "AV1"] {
+            let option_row = row_of(option);
+            assert!(
+                option_row > codec_row && option_row < resolution_row,
+                "{option} is on row {option_row}, outside Codec ({codec_row})..Resolution ({resolution_row})",
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_framed_field_except_the_resolution_boxes_should_end_in_one_column() {
+        // Arrange: one row per fixed-width site, all with the same short value.
+        let value = TextInputState::new("ab".to_string());
+        let rows = [
+            TextInputConfig::CONTAINER_METADATA,
+            TextInputConfig::SUBTITLE_TITLE,
+            TextInputConfig::LANGUAGE_SEARCH,
+        ]
+        .map(|config| {
+            text_field_line(TextField::new(
+                "Title",
+                FieldValue::Editing(&value),
+                config.width,
+            ))
+            .width()
+        });
+
+        // Assert: the popups line up on their right edge, not only their labels.
+        assert_that!(rows.iter().collect::<std::collections::BTreeSet<_>>().len()).is_equal_to(1);
+
+        // Assert: the resolution boxes are the deliberate exception.
+        assert_that!(TextInputConfig::RESOLUTION.width)
+            .is_not_equal_to(TextInputConfig::DEFAULT_WIDTH);
+    }
+
+    #[test]
+    fn a_value_that_continues_past_the_field_should_be_marked_on_that_side() {
+        // Arrange: a value far longer than the field, scrolled into its middle.
+        let config = TextInputConfig::SUBTITLE_TITLE;
+        let mut input = TextInputState::new("x".repeat(200));
+        input.activate();
+        input.cursor = 100;
+        input.keep_cursor_visible(config.visible_width());
+
+        // Act
+        let scrolled = text_field_line(TextField::new(
+            "Title",
+            FieldValue::Editing(&input),
+            config.width,
+        ));
+        let short = text_field_line(TextField::new(
+            "Title",
+            FieldValue::Editing(&TextInputState::new("ab".to_string())),
+            config.width,
+        ));
+
+        // Assert: both ends are marked as continuing, and the marker takes the frame's
+        // cell rather than a cell of its own.
+        let text = scrolled.to_string();
+        assert_that!(text.as_str()).contains(FIELD_OVERFLOW);
+        assert_that!(text.matches(FIELD_OVERFLOW).count()).is_equal_to(2);
+        assert_that!(text.as_str()).does_not_contain(FIELD_FRAME);
+        assert_that!(scrolled.width()).is_equal_to(short.width());
+
+        // Assert: a value that fits is not marked at all.
+        assert_that!(short.to_string().as_str()).does_not_contain(FIELD_OVERFLOW);
+    }
+
+    #[test]
+    fn a_truncated_static_value_should_be_marked_only_on_its_right() {
+        // Arrange: an idle row whose stored value is wider than the box.
+        let config = TextInputConfig::CONTAINER_METADATA;
+
+        // Act
+        let line = text_field_line(TextField::new(
+            "Title",
+            FieldValue::Static(&"x".repeat(200)),
+            config.width,
+        ));
+
+        // Assert: the opening frame stays, the closing one becomes the marker.
+        let text = line.to_string();
+        assert_that!(text.matches(FIELD_OVERFLOW).count()).is_equal_to(1);
+        assert_that!(text.trim_end().ends_with(FIELD_OVERFLOW)).is_true();
+        assert_that!(text.as_str()).contains(FIELD_FRAME);
+    }
+
+    #[test]
+    fn a_refused_keystroke_should_redden_the_frame_and_say_why() {
+        // Arrange: a field being edited, whose last keystroke was refused.
+        let mut input = TextInputState::new("192".to_string());
+        input.activate();
+
+        // Act
+        let refused = text_field_line(
+            TextField::new(
+                "Width",
+                FieldValue::Editing(&input),
+                TextInputConfig::RESOLUTION.width,
+            )
+            .selected(true)
+            .reject(Some(InputReject::Character(CharClass::Digits))),
+        );
+
+        // Assert: the rule that was broken is spelled out, since the refused character
+        // never appeared on screen to explain itself.
+        assert_that!(refused.to_string().as_str()).contains("digits only");
+        let frame = refused
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == FIELD_FRAME)
+            .expect("a selected field should be framed");
+        assert_that!(frame.style.fg).is_equal_to(Some(Color::Red));
+
+        // Assert: the cap reports the number, which the user cannot count themselves.
+        let full = text_field_line(
+            TextField::new(
+                "Width",
+                FieldValue::Editing(&input),
+                TextInputConfig::RESOLUTION.width,
+            )
+            .reject(Some(InputReject::Full(512))),
+        );
+        assert_that!(full.to_string().as_str()).contains("512 character limit");
+    }
+
+    #[test]
+    fn a_refusal_aimed_at_an_idle_field_should_not_be_drawn() {
+        // Arrange: the same rejection, but the row is not the one being edited.
+        let idle = TextInputState::new("192".to_string());
+
+        // Act
+        let line = text_field_line(
+            TextField::new(
+                "Width",
+                FieldValue::Editing(&idle),
+                TextInputConfig::RESOLUTION.width,
+            )
+            .reject(Some(InputReject::Character(CharClass::Digits))),
+        );
+
+        // Assert: five stacked rows share one popup-wide rejection, so only the row
+        // actually in edit mode may show it.
+        assert_that!(line.to_string().as_str()).does_not_contain("digits only");
+    }
+
+    #[test]
+    fn an_empty_field_should_hint_at_its_value_and_drop_the_hint_when_typed_into() {
+        // Arrange
+        let config = TextInputConfig::CONTAINER_METADATA;
+        let empty = TextInputState::new(String::new());
+        let typed = TextInputState::new("B".to_string());
+
+        // Act
+        let hinted = text_field_line(
+            TextField::new("Title", FieldValue::Editing(&empty), config.width)
+                .placeholder("e.g. Big Buck Bunny"),
+        );
+        let filled = text_field_line(
+            TextField::new("Title", FieldValue::Editing(&typed), config.width)
+                .placeholder("e.g. Big Buck Bunny"),
+        );
+
+        // Assert: the hint reads as an example rather than as a stored value, and it
+        // does not change the row's width.
+        assert_that!(hinted.to_string().as_str()).contains("e.g. Big Buck Bunny");
+        assert_that!(filled.to_string().as_str()).does_not_contain("e.g.");
+        assert_that!(hinted.width()).is_equal_to(filled.width());
+        let hint = hinted
+            .spans
+            .iter()
+            .find(|span| span.content.contains("e.g."))
+            .expect("the hint should be rendered");
+        assert_that!(hint.style.fg).is_equal_to(Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn a_search_bar_should_be_framed_like_a_settings_row() {
+        // Arrange
+        let mut search = SearchState::default();
+        search.activate();
+        search.input.insert('a', TextInputConfig::search(20));
+        let area = Rect::new(0, 0, 60, 1);
+
+        // Act
+        let bar = search_line(&mut search, area, None);
+
+        // Assert: one presentation across the application — the bar carries the same
+        // focus frame a settings field does, and still fits its pane.
+        let text = bar.to_string();
+        assert_that!(text.matches(FIELD_FRAME).count()).is_equal_to(2);
+        assert_that!(bar.width()).is_less_than_or_equal_to(area.width as usize);
+    }
+
+    #[test]
+    fn a_search_bar_should_reserve_room_for_the_widest_match_count() {
+        // Arrange: the same bar at both ends of the count's width.
+        let area = Rect::new(0, 0, 60, 1);
+        let mut one = SearchState::default();
+        one.activate();
+        one.match_count = 1;
+        let mut many = SearchState::default();
+        many.activate();
+        many.match_count = 999;
+
+        // Act
+        let narrow = search_line(&mut one, area, None);
+        let wide = search_line(&mut many, area, None);
+
+        // Assert: the value window does not move when the count gains a digit, and the
+        // longest count still fits the pane.
+        assert_that!(one.field_width).is_equal_to(many.field_width);
+        assert_that!(wide.width()).is_less_than_or_equal_to(area.width as usize);
+        assert_that!(narrow.width()).is_less_than_or_equal_to(area.width as usize);
+    }
+
+    #[test]
+    fn all_three_search_bars_should_word_the_match_count_identically() {
+        assert_eq!(match_suffix(0), " (no matches)");
+        assert_eq!(match_suffix(1), " (1 match)");
+        assert_eq!(match_suffix(2), " (2 matches)");
+    }
+
+    #[test]
+    fn an_idle_empty_search_bar_should_show_its_placeholder() {
+        // Arrange
+        let mut search = SearchState::default();
+        let area = Rect::new(0, 0, 60, 1);
+
+        // Act
+        let idle = search_line(&mut search, area, None).to_string();
+        search.activate();
+        let active = search_line(&mut search, area, None).to_string();
+
+        // Assert
+        assert_that!(idle.as_str())
+            .contains("type to filter")
+            .does_not_contain(FIELD_CARET);
+        assert_that!(active.as_str())
+            .contains("type to filter")
+            .contains(FIELD_CARET);
     }
 
     #[test]
@@ -5519,30 +8098,43 @@ mod tests {
         // Act
         let mut input = TextInputState::new("1280".to_string());
         input.activate();
-        let line = custom_input_line("Width", &input, true, false);
+        let line = custom_input_line("Width", &input, true, false, "e.g. 1920", None);
 
         // Assert
         assert_that!(line.to_string())
             .contains("1280")
-            .contains("▏")
+            .contains(FIELD_CARET)
+            .contains(FIELD_FRAME)
             .does_not_contain("NORMAL")
             .does_not_contain("INSERT")
             .does_not_contain("╭")
             .does_not_contain("╰");
         assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
-        assert_eq!(line.spans[1].style.bg, Some(Color::Rgb(32, 32, 32)));
+        let value = value_span(&line, "1280");
+        assert_eq!(value.style.bg, Some(FIELD_EDITING_SURFACE));
     }
 
     #[test]
     fn custom_input_should_mark_a_changed_value_yellow_and_italic() {
         // Act
         let input = TextInputState::new("1280".to_string());
-        let line = custom_input_line("Width", &input, false, true);
+        let line = custom_input_line("Width", &input, false, true, "e.g. 1920", None);
 
         // Assert
-        assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(line.spans[1].style.bg, Some(Color::Rgb(32, 32, 32)));
+        let value = value_span(&line, "1280");
+        assert_eq!(value.style.fg, Some(Color::Yellow));
+        assert!(value.style.add_modifier.contains(Modifier::ITALIC));
+        // An idle field carries no surface; only the one being edited is filled.
+        assert_eq!(value.style.bg, None);
+    }
+
+    /// The span carrying a field's value, located by content rather than by index so
+    /// these assertions survive changes to the surrounding chrome.
+    fn value_span<'a>(line: &'a Line<'a>, value: &str) -> &'a Span<'a> {
+        line.spans
+            .iter()
+            .find(|span| span.content.contains(value))
+            .unwrap_or_else(|| panic!("line {line:?} should render {value:?}"))
     }
 
     #[test]
@@ -5570,8 +8162,8 @@ mod tests {
             .contains("Fit & pad")
             .contains("Stretch")
             .does_not_contain("Fit inside");
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[3].style.bg, Some(Color::Cyan));
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].style.bg, Some(Color::Cyan));
     }
 
     #[test]
@@ -5602,16 +8194,17 @@ mod tests {
     #[test]
     fn dropdown_line_should_mark_the_selected_value_with_a_greater_than_sign() {
         // Act
-        let selected = dropdown_line("1920×1080 / 16:9", false, true, true, false);
-        let available = dropdown_line("1280×720 / 16:9", false, false, true, false);
+        let selected = dropdown_line("1920×1080 / 16:9", false, true, true, false, false);
+        let available = dropdown_line("1280×720 / 16:9", false, false, true, false, true);
 
         // Assert
         assert_that!(selected.to_string())
-            .starts_with("  > 1920×1080 / 16:9")
+            .starts_with("  ├── > 1920×1080 / 16:9")
             .does_not_contain("●");
         assert_that!(available.to_string())
-            .starts_with("    1280×720 / 16:9")
+            .starts_with("  └──   1280×720 / 16:9")
             .does_not_contain("●");
+        assert_eq!(selected.spans[0].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
