@@ -56,12 +56,16 @@ impl MediaInfo {
     }
 
     pub(crate) fn from_json_unchecked(value: Value) -> Result<Self, String> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| "ffprobe returned an invalid JSON document".to_string())?;
-        let format = object_map(object.get("format"));
-        let streams = object_array(object.get("streams"));
-        let chapters = object_array(object.get("chapters"));
+        // `value` is owned and discarded right after this call, so `format`/`streams`/
+        // `chapters` are moved out of it via `remove` rather than cloned — the previous
+        // version cloned the entire parsed ffprobe JSON tree a second time on every
+        // probe for no reason.
+        let Value::Object(mut object) = value else {
+            return Err("ffprobe returned an invalid JSON document".to_string());
+        };
+        let format = object_map(object.remove("format"));
+        let streams = object_array(object.remove("streams"));
+        let chapters = object_array(object.remove("chapters"));
         Ok(Self {
             format,
             streams,
@@ -110,7 +114,7 @@ impl MediaInfo {
     }
 }
 
-pub(crate) fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
+pub fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
     let is_network = crate::mount::is_network_mount(path);
     let mut command = Command::new("ffprobe");
     command.args([
@@ -145,24 +149,24 @@ pub(crate) fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
     MediaInfo::from_json_unchecked(value)
 }
 
-fn object_map(value: Option<&Value>) -> BTreeMap<String, Value> {
-    value
-        .and_then(Value::as_object)
-        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default()
+fn object_map(value: Option<Value>) -> BTreeMap<String, Value> {
+    match value {
+        Some(Value::Object(map)) => map.into_iter().collect(),
+        _ => BTreeMap::new(),
+    }
 }
 
-fn object_array(value: Option<&Value>) -> Vec<BTreeMap<String, Value>> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_object)
-                .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .collect()
-        })
-        .unwrap_or_default()
+fn object_array(value: Option<Value>) -> Vec<BTreeMap<String, Value>> {
+    match value {
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::Object(map) => Some(map.into_iter().collect()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 pub(crate) fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {

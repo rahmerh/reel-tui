@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ops::Deref,
     path::{Path, PathBuf},
@@ -16,12 +17,14 @@ use ratatui::widgets::ListState;
 use crate::{
     edit::{
         ContainerFormat, ContainerMetadata, CustomResolution, CustomScaling, EditEvent,
-        EditOutcome, EditRequest, SaveDestination, VideoCodec, VideoResolution, VideoSettings,
-        container_conflict_streams, container_conflicts, imported_subtitle_conflicts, stream_index,
+        EditOutcome, EditRequest, MINIMUM_CUSTOM_DIMENSION, SaveDestination, VideoCodec,
+        VideoResolution, VideoSettings, container_conflict_streams, container_conflicts,
+        imported_subtitle_conflicts, plan_requires_transcode, stream_index,
         subtitle_metadata_conflicts, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
+    staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
         FormatChoice, LanguageChoice, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat,
         SubtitleMetadata, SubtitleSource, ToolCapabilities, canonical_language_code,
@@ -384,6 +387,16 @@ pub struct FilePanelEntry {
     pub sidecar_indices: Vec<usize>,
 }
 
+/// Memoized `App::file_panel_entries()` result along with the inputs it was built
+/// from, so a cache hit can be verified by direct comparison rather than a dirty
+/// flag (see the `file_panel_cache` field doc comment for why).
+struct FilePanelCache {
+    files: Vec<FileEntry>,
+    sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
+    query: String,
+    entries: Vec<FilePanelEntry>,
+}
+
 impl SearchState {
     pub fn activate(&mut self) {
         self.input.activate();
@@ -414,10 +427,58 @@ pub enum Dialog {
     ContainerSettings,
     VideoSettings,
     SubtitleSettings,
-    ConfirmSave,
-    Processing,
+    /// A confirm-cancel prompt over whichever processing view is showing
+    /// (`Dialog::BatchProcessing`, one item or many) — see `App::request_cancel_edit`.
     ConfirmCancel,
     Error,
+    /// Confirms "process all staged files" before dispatching a batch — see
+    /// `App::request_process_all`/`confirm_process_all`.
+    ConfirmProcessAll,
+    /// The processing popup for an in-flight batch — a single centered box (the
+    /// original single-file design) when there's exactly one item, or a table with
+    /// one row per file otherwise. See `App::active_batch`.
+    BatchProcessing,
+    /// "Are you sure?" before an `r`/`R` reset that discards more than a single
+    /// field's value — see `App::pending_reset`/`ResetScope`.
+    ConfirmReset,
+}
+
+/// What an in-progress `Dialog::ConfirmReset` would discard if confirmed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResetScope {
+    /// The `r` keybind on a file row in the Files panel — unstages one file.
+    File(PathBuf),
+    /// The `R` keybind anywhere outside the Files panel — resets the whole
+    /// currently-open file back to its probed baseline.
+    CurrentFile,
+    /// The `R` keybind in the Files panel — unstages every staged file.
+    AllFiles,
+}
+
+impl ResetScope {
+    /// The confirm dialog's title and the file-list bullet text it should show.
+    pub fn label(&self) -> String {
+        match self {
+            ResetScope::File(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("this file");
+                format!("Reset {name}?")
+            }
+            ResetScope::CurrentFile => "Reset this file's edits?".to_string(),
+            ResetScope::AllFiles => "Reset every staged file?".to_string(),
+        }
+    }
+}
+
+/// The two-option cursor for `Dialog::ConfirmReset`, mirroring `CancelEditChoice`'s
+/// "default to the safe choice" pattern.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResetChoice {
+    #[default]
+    KeepEdits,
+    ResetEdits,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -427,11 +488,33 @@ pub enum CancelEditChoice {
     CancelProcessing,
 }
 
+/// The two-option cursor for `Dialog::ConfirmProcessAll`'s Start/Cancel button bar.
+/// Defaults to `Start` (rather than the "safe choice" every other two-option dialog
+/// defaults to) so a bare Enter keeps starting the batch immediately, matching the
+/// dialog's behavior before it grew a visible button bar.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConfirmProcessAllChoice {
+    #[default]
+    Start,
+    Cancel,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrackRef {
     Container,
     Embedded(u64),
     Sidecar(usize),
+}
+
+/// Whether a file (open or staged elsewhere) has pending edits and, if so, whether
+/// they'd currently pass validation. Drives the file-list yellow/warning-triangle
+/// markers and gates Ctrl+S's "process all staged files" action. See
+/// `App::staged_file_status`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StagedFileStatus {
+    Unstaged,
+    Valid,
+    Invalid(String),
 }
 
 #[derive(Clone, Debug)]
@@ -571,13 +654,6 @@ pub enum VideoSettingsField {
     #[default]
     Codec,
     Resolution,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SaveDialogField {
-    Destination,
-    #[default]
-    Start,
 }
 
 #[derive(Clone, Debug)]
@@ -787,10 +863,10 @@ pub struct VideoCodecChoice {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CacheKey {
-    path: PathBuf,
-    length: u64,
-    modified: Option<std::time::SystemTime>,
+pub(crate) struct CacheKey {
+    pub(crate) path: PathBuf,
+    pub(crate) length: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
 }
 
 impl CacheKey {
@@ -800,12 +876,6 @@ impl CacheKey {
             length: file.fingerprint.length,
             modified: file.fingerprint.modified,
         }
-    }
-
-    fn matches_file(&self, file: &FileEntry) -> bool {
-        self.path == file.path
-            && self.length == file.fingerprint.length
-            && self.modified == file.fingerprint.modified
     }
 }
 
@@ -819,6 +889,15 @@ pub struct App {
     pub details_max_scroll: u16,
     pub keybindings_scroll: u16,
     pub keybindings_max_scroll: u16,
+    /// Scroll offset (in rows, one `BatchItem` per row) for `Dialog::BatchProcessing`
+    /// when more staged files are being processed than fit in the popup at once.
+    /// Derived from `batch_cursor` at render time by `sync_batch_scroll`.
+    pub batch_scroll: u16,
+    /// Highlighted row in `Dialog::BatchProcessing`. Purely navigational: it never
+    /// follows the file currently being processed, only the user's own movement.
+    pub batch_cursor: usize,
+    pub confirm_process_all_scroll: u16,
+    pub confirm_process_all_max_scroll: u16,
     pub layer: Layer,
     pub selected_stream: usize,
     pub stream_order: Vec<u64>,
@@ -837,26 +916,46 @@ pub struct App {
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
-    pub save_destination: SaveDestination,
-    pub save_dialog_field: SaveDialogField,
     pub dialog: Option<Dialog>,
     pub notice: Option<String>,
     pub edit_error: Option<String>,
-    pub edit_progress: Option<f64>,
-    pub edit_progress_label: Option<String>,
-    pub edit_started: Option<Instant>,
     pub cancel_edit_choice: CancelEditChoice,
+    pub confirm_process_all_choice: ConfirmProcessAllChoice,
     pub scan_error: Option<String>,
     request_tx: Sender<ProbeRequest>,
-    edit_tx: Sender<EditRequest>,
-    edit_cancel: Option<Arc<AtomicBool>>,
+    /// Every staged file's `EditRequest` is classified by `plan_requires_transcode`
+    /// (in `confirm_process_all`) and sent to whichever of these matches.
+    transcode_tx: Sender<EditRequest>,
+    remux_tx: Sender<EditRequest>,
+    /// State for an in-flight "process all staged files" batch
+    /// (`Dialog::BatchProcessing`/`ConfirmCancel`) — the sole edit-processing path;
+    /// even a single staged file goes through a one-item batch, so `App` no longer
+    /// tracks separate single-file progress/cancellation fields.
+    pub active_batch: Option<crate::staging::BatchState>,
+    /// What an in-progress `Dialog::ConfirmReset` would discard if confirmed.
+    pending_reset: Option<ResetScope>,
+    pub reset_choice: ResetChoice,
     generation: u64,
     pending_since: Option<Instant>,
-    cache: HashMap<CacheKey, ProbeOutcome>,
+    pub(crate) cache: HashMap<CacheKey, ProbeOutcome>,
     original_stream_order: Vec<u64>,
     original_default_streams: BTreeSet<u64>,
     sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
     unfolded_files: BTreeSet<PathBuf>,
+    /// Memoized `file_panel_entries()` result. Rebuilding that Vec re-lowercases every
+    /// file/sidecar display name, which is wasteful when called repeatedly (every
+    /// render frame plus several call sites per keystroke) with nothing having
+    /// changed. Validity is checked by comparing full snapshots (not a dirty flag)
+    /// because `files` is a `pub` field callers — including tests — assign to
+    /// directly, bypassing `reconcile_files`; a counter bumped only there would go
+    /// stale against that kind of external mutation.
+    file_panel_cache: RefCell<Option<FilePanelCache>>,
+    /// Edits staged on files other than (or including, transiently, before a
+    /// selection change is finalized) the one currently open. Lets a user edit file
+    /// A, switch to file B, edit it too, and process both instead of losing A's
+    /// edits the moment the selection moves. See `snapshot_current_edits` and
+    /// `load_staged_or_reset`.
+    pub staged_edits: HashMap<PathBuf, StagedEdit>,
     pub is_network_mount: bool,
     pub disk_cache: crate::cache::DiskCache,
     pub keybindings_search: SearchState,
@@ -872,19 +971,17 @@ impl App {
     pub fn new(
         directory: PathBuf,
         request_tx: Sender<ProbeRequest>,
-        edit_tx: Sender<EditRequest>,
+        transcode_tx: Sender<EditRequest>,
+        remux_tx: Sender<EditRequest>,
     ) -> Result<Self> {
         let is_network_mount = crate::mount::is_network_mount(&directory);
+        // `disk_cache` can span every directory the user has ever browsed, so eagerly
+        // cloning all of it into the in-memory lookup here would do O(total cached
+        // entries) work — and `reconcile_files` would immediately prune almost all of
+        // it right back out again once the first directory scan narrows `self.files`
+        // down to what's actually in `directory`. Instead `cache` starts empty and
+        // `reconcile_files` populates it on demand, per file, from `disk_cache`.
         let disk_cache = crate::cache::DiskCache::load();
-        let mut in_memory_cache = HashMap::new();
-        for (path, entry) in &disk_cache.entries {
-            let key = CacheKey {
-                path: path.clone(),
-                length: entry.length,
-                modified: entry.modified,
-            };
-            in_memory_cache.insert(key, entry.outcome.clone());
-        }
 
         let mut app = Self {
             directory,
@@ -896,6 +993,10 @@ impl App {
             details_max_scroll: 0,
             keybindings_scroll: 0,
             keybindings_max_scroll: 0,
+            batch_scroll: 0,
+            batch_cursor: 0,
+            confirm_process_all_scroll: 0,
+            confirm_process_all_max_scroll: 0,
             layer: Layer::Files,
             selected_stream: 0,
             stream_order: Vec::new(),
@@ -914,26 +1015,27 @@ impl App {
             container_target: None,
             container_metadata: None,
             container_settings_popup: None,
-            save_destination: SaveDestination::ReplaceOriginal,
-            save_dialog_field: SaveDialogField::Start,
             dialog: None,
             notice: None,
             edit_error: None,
-            edit_progress: None,
-            edit_progress_label: None,
-            edit_started: None,
             cancel_edit_choice: CancelEditChoice::KeepProcessing,
+            confirm_process_all_choice: ConfirmProcessAllChoice::Start,
             scan_error: None,
             request_tx,
-            edit_tx,
-            edit_cancel: None,
+            transcode_tx,
+            remux_tx,
+            active_batch: None,
+            pending_reset: None,
+            reset_choice: ResetChoice::default(),
             generation: 0,
             pending_since: None,
-            cache: in_memory_cache,
+            cache: HashMap::new(),
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
             sidecars_by_media: HashMap::new(),
             unfolded_files: BTreeSet::new(),
+            file_panel_cache: RefCell::new(None),
+            staged_edits: HashMap::new(),
             is_network_mount,
             disk_cache,
             keybindings_search: SearchState::default(),
@@ -949,10 +1051,17 @@ impl App {
         Ok(app)
     }
 
-    pub fn receive_directory_snapshots(&mut self, receiver: &Receiver<DirectorySnapshot>) {
+    /// Returns whether any snapshot was applied, so the main loop can skip redrawing
+    /// when nothing arrived. `spawn_directory_monitor` only sends a snapshot when its
+    /// content actually differs from the previous one, so this is rarely a false
+    /// positive.
+    pub fn receive_directory_snapshots(&mut self, receiver: &Receiver<DirectorySnapshot>) -> bool {
+        let mut changed = false;
         while let Ok(snapshot) = receiver.try_recv() {
             self.apply_directory_snapshot(snapshot);
+            changed = true;
         }
+        changed
     }
 
     fn apply_directory_snapshot(&mut self, snapshot: DirectorySnapshot) {
@@ -987,7 +1096,7 @@ impl App {
         let selected_removed = old_path.is_some() && source_position.is_none();
         let was_processing = matches!(
             self.dialog,
-            Some(Dialog::Processing | Dialog::ConfirmCancel)
+            Some(Dialog::BatchProcessing | Dialog::ConfirmCancel)
         );
         if selected_removed && was_processing {
             return;
@@ -995,11 +1104,41 @@ impl App {
 
         self.files = files;
         self.sidecars_by_media = sidecars_by_media;
-        self.unfolded_files
-            .retain(|path| self.files.iter().any(|file| &file.path == path));
-        self.cache
-            .retain(|key, _| self.files.iter().any(|file| key.matches_file(file)));
 
+        let current_paths: std::collections::HashSet<&Path> =
+            self.files.iter().map(|file| file.path.as_path()).collect();
+        let current_keys: std::collections::HashSet<CacheKey> =
+            self.files.iter().map(CacheKey::for_file).collect();
+        self.unfolded_files
+            .retain(|path| current_paths.contains(path.as_path()));
+        self.cache.retain(|key, _| current_keys.contains(key));
+        // Only truly-gone files lose their staged entry; a file that's still present
+        // just gets flagged stale below if its fingerprint no longer matches what was
+        // staged against, so the user can see and resolve it rather than losing the
+        // staged work silently.
+        self.staged_edits
+            .retain(|path, _| current_paths.contains(path.as_path()));
+        for file in &self.files {
+            if let Some(staged) = self.staged_edits.get_mut(&file.path) {
+                staged.stale = staged.fingerprint != file.fingerprint;
+            }
+        }
+        // Pull in any disk-cached outcome for files that just appeared and aren't in
+        // the in-memory lookup yet (typically every file, on startup) instead of
+        // eagerly cloning the whole (potentially much larger, multi-directory) disk
+        // cache up front.
+        for file in &self.files {
+            let key = CacheKey::for_file(file);
+            if self.cache.contains_key(&key) {
+                continue;
+            }
+            if let Some(entry) = self.disk_cache.entries.get(&file.path)
+                && entry.length == file.fingerprint.length
+                && entry.modified == file.fingerprint.modified
+            {
+                self.cache.insert(key, entry.outcome.clone());
+            }
+        }
         if was_processing
             && source_position.is_some()
             && old_path
@@ -1052,8 +1191,8 @@ impl App {
             .unwrap_or_default();
 
         if selected_removed {
-            if let Some(cancelled) = self.edit_cancel.take() {
-                cancelled.store(true, Ordering::Relaxed);
+            if let Some(batch) = &self.active_batch {
+                batch.cancelled.store(true, Ordering::Relaxed);
             }
             self.clear_edit_state();
             self.notice = Some(
@@ -1080,8 +1219,38 @@ impl App {
             .and_then(|entry| self.files.get(entry.file_index))
     }
 
+    /// Builds the filtered/searchable file-panel listing. This rebuilds from scratch
+    /// (re-lowercasing every file and sidecar display name) only when `files`,
+    /// `sidecars_by_media`, or the search query differ from the last call; otherwise
+    /// it returns a cheap clone of the memoized result. Validity is checked by
+    /// comparing full snapshots rather than a dirty flag/counter, since `files` is a
+    /// `pub` field some callers (including tests) assign to directly. This method is
+    /// called on every render frame plus several times per keystroke/reconcile, so the
+    /// cache matters even though the returned `Vec` itself is still cloned per call.
     pub fn file_panel_entries(&self) -> Vec<FilePanelEntry> {
         let query = self.file_search.value.trim().to_lowercase();
+        {
+            let cache = self.file_panel_cache.borrow();
+            if let Some(cached) = cache.as_ref()
+                && cached.query == query
+                && cached.files == self.files
+                && cached.sidecars_by_media == self.sidecars_by_media
+            {
+                return cached.entries.clone();
+            }
+        }
+
+        let entries = self.compute_file_panel_entries(&query);
+        *self.file_panel_cache.borrow_mut() = Some(FilePanelCache {
+            files: self.files.clone(),
+            sidecars_by_media: self.sidecars_by_media.clone(),
+            query,
+            entries: entries.clone(),
+        });
+        entries
+    }
+
+    fn compute_file_panel_entries(&self, query: &str) -> Vec<FilePanelEntry> {
         self.files
             .iter()
             .enumerate()
@@ -1097,13 +1266,13 @@ impl App {
                             sidecar
                                 .display_name
                                 .to_lowercase()
-                                .contains(&query)
+                                .contains(query)
                                 .then_some(index)
                         })
                         .collect::<Vec<_>>()
                 };
                 let file_matches =
-                    query.is_empty() || file.display_name.to_lowercase().contains(&query);
+                    query.is_empty() || file.display_name.to_lowercase().contains(query);
                 (file_matches || !sidecar_indices.is_empty()).then_some(FilePanelEntry {
                     file_index,
                     sidecar_indices,
@@ -1293,7 +1462,10 @@ impl App {
 
     fn select_file_position_with_force(&mut self, position: Option<usize>, force: bool) {
         if force || self.list_state.selected() != position {
-            self.clear_edit_state();
+            self.snapshot_current_edits();
+            self.dialog = None;
+            self.notice = None;
+            self.edit_error = None;
             self.list_state.select(position);
             self.sidecars = self
                 .selected_file()
@@ -1320,7 +1492,7 @@ impl App {
             self.outcome = Some(cached.clone());
             self.loading = false;
             self.pending_since = None;
-            self.reset_track_edits();
+            self.load_staged_or_reset();
         }
     }
 
@@ -1344,14 +1516,26 @@ impl App {
         self.pending_since = None;
     }
 
-    pub fn receive_probe_results(&mut self, receiver: &Receiver<ProbeResponse>) {
+    /// Returns whether any probe response was drained, so the main loop can skip
+    /// redrawing when none arrived.
+    pub fn receive_probe_results(&mut self, receiver: &Receiver<ProbeResponse>) -> bool {
+        // Built once per drain rather than re-scanning `self.files` per response, and
+        // the disk cache is flushed at most once per batch instead of once per
+        // response — `DiskCache::save` rewrites the entire cache file, so saving once
+        // per drained probe result turned opening an uncached directory into an
+        // O(files x cache size) blocking-write storm on the UI thread.
+        let current_keys: std::collections::HashSet<CacheKey> =
+            self.files.iter().map(CacheKey::for_file).collect();
+        let mut disk_cache_dirty = false;
+        let mut received = false;
         while let Ok(response) = receiver.try_recv() {
+            received = true;
             let key = CacheKey {
                 path: response.path.clone(),
                 length: response.fingerprint.length,
                 modified: response.fingerprint.modified,
             };
-            if self.files.iter().any(|file| key.matches_file(file)) {
+            if current_keys.contains(&key) {
                 self.cache.insert(key, response.outcome.clone());
                 self.disk_cache.insert(
                     response.path.clone(),
@@ -1359,7 +1543,7 @@ impl App {
                     response.fingerprint.modified,
                     response.outcome.clone(),
                 );
-                let _ = self.disk_cache.save();
+                disk_cache_dirty = true;
             }
             if response.generation == self.generation
                 && self.selected_file().is_some_and(|file| {
@@ -1369,106 +1553,187 @@ impl App {
                 self.outcome = Some(response.outcome);
                 self.loading = false;
                 self.selected_stream = 0;
-                self.reset_track_edits();
+                self.load_staged_or_reset();
+            }
+        }
+        if disk_cache_dirty {
+            let _ = self.disk_cache.save();
+        }
+        received
+    }
+
+    /// Returns whether any edit event was drained, so the main loop can skip
+    /// redrawing when none arrived. Every `EditRequest` is now dispatched as part of
+    /// a batch (even a single staged file becomes a one-item batch), so an event with
+    /// no `active_batch` to attribute it to is a stale leftover — discarded, not
+    /// applied to anything.
+    pub fn receive_edit_results(&mut self, receiver: &Receiver<EditEvent>) -> bool {
+        let mut received = false;
+        while let Ok(event) = receiver.try_recv() {
+            received = true;
+            if self.active_batch.is_some() {
+                self.apply_batch_event(event);
+            }
+        }
+        received
+    }
+
+    /// Routes one `EditEvent` to the matching row in `active_batch` by path.
+    fn apply_batch_event(&mut self, event: EditEvent) {
+        match event {
+            EditEvent::Progress { path, progress } => {
+                if let Some(batch) = &mut self.active_batch
+                    && let Some(item) = batch.item_mut(&path)
+                {
+                    item.status = BatchItemStatus::Running;
+                    item.fraction = progress.fraction;
+                    item.label = Some(progress.label());
+                }
+            }
+            EditEvent::Finished { path, outcome } => {
+                let mut output_path = None;
+                let status = match outcome {
+                    EditOutcome::Completed {
+                        output_path: output,
+                        ..
+                    } => {
+                        self.staged_edits.remove(&path);
+                        output_path = Some(output);
+                        BatchItemStatus::Completed
+                    }
+                    EditOutcome::Cancelled => BatchItemStatus::Cancelled,
+                    EditOutcome::SourceChanged(error) => {
+                        // The attempted edit was against stale data; the staged
+                        // edits are no longer meaningful and must be redone.
+                        self.staged_edits.remove(&path);
+                        BatchItemStatus::Failed(error)
+                    }
+                    EditOutcome::Failed(error) => BatchItemStatus::Failed(error),
+                };
+                if let Some(batch) = &mut self.active_batch
+                    && let Some(item) = batch.item_mut(&path)
+                {
+                    item.status = status;
+                    item.fraction = None;
+                    item.output_path = output_path;
+                }
+                self.finish_batch_if_done();
             }
         }
     }
 
-    pub fn receive_edit_results(&mut self, receiver: &Receiver<EditEvent>) {
-        while let Ok(event) = receiver.try_recv() {
-            if !matches!(
-                self.dialog,
-                Some(Dialog::Processing | Dialog::ConfirmCancel)
-            ) {
-                continue;
-            }
-            match event {
-                EditEvent::Progress(progress) => {
-                    self.edit_progress = progress.fraction;
-                    self.edit_progress_label = Some(progress.label());
-                }
-                EditEvent::Finished { path, outcome } => match outcome {
-                    EditOutcome::Completed {
-                        output_path,
-                        media_changed,
-                    } => {
-                        self.edit_cancel = None;
-                        self.dialog = None;
-                        if let Ok(files) = scan_directory(&self.directory) {
-                            self.reconcile_files(files);
-                        }
-                        if self.files.iter().any(|file| file.path == output_path)
-                            && self.file_panel_position(&output_path).is_none()
-                        {
-                            self.file_search.clear();
-                            self.file_search_origin = None;
-                        }
-                        if let Some(position) = self.file_panel_position(&output_path) {
-                            self.list_state.select(Some(position));
-                            self.sidecars = self
-                                .selected_file()
-                                .and_then(|file| self.sidecars_by_media.get(&file.path))
-                                .cloned()
-                                .unwrap_or_default();
-                        }
-                        self.clear_track_edits();
-                        self.edit_error = None;
-                        self.edit_progress = None;
-                        self.edit_progress_label = None;
-                        self.edit_started = None;
-                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-                        self.notice = Some(if !media_changed {
-                            "Subtitle changes saved.".to_string()
-                        } else if output_path == path {
-                            "Media edits saved.".to_string()
-                        } else {
-                            format!(
-                                "Media edits saved to {}.",
-                                output_path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or("edited copy")
-                            )
-                        });
-                        self.cache
-                            .retain(|key, _| key.path != path && key.path != output_path);
-                        self.queue_probe();
-                        self.layer = Layer::Streams;
-                    }
-                    EditOutcome::Cancelled => {
-                        self.edit_cancel = None;
-                        self.dialog = None;
-                        self.edit_progress = None;
-                        self.edit_progress_label = None;
-                        self.edit_started = None;
-                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-                        self.notice = Some("Media edit cancelled.".to_string());
-                        self.layer = Layer::Streams;
-                    }
-                    EditOutcome::SourceChanged(error) => {
-                        self.edit_cancel = None;
-                        self.dialog = None;
-                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-                        let snapshot = match scan_directory(&self.directory) {
-                            Ok(files) => DirectorySnapshot::Files(files),
-                            Err(error) => DirectorySnapshot::Error(error.to_string()),
-                        };
-                        self.apply_directory_snapshot(snapshot);
-                        self.clear_edit_state();
-                        self.notice = Some(error);
-                        self.queue_probe();
-                    }
-                    EditOutcome::Failed(error) => {
-                        self.edit_cancel = None;
-                        self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-                        self.dialog = Some(Dialog::Error);
-                        self.edit_error = Some(error);
-                        self.edit_progress = None;
-                        self.edit_progress_label = None;
-                        self.edit_started = None;
-                    }
+    /// Once every item in the active batch has reached a terminal state, closes the
+    /// dialog, summarizes the outcome as a notice, and re-scans the directory so
+    /// renamed/converted output files and refreshed staged-status markers show up.
+    fn finish_batch_if_done(&mut self) {
+        let Some(batch) = &self.active_batch else {
+            return;
+        };
+        if !batch.is_finished() {
+            return;
+        }
+        // With exactly one file, the specific reason is more useful than an aggregate
+        // count — matches the wording the single-file flow always used.
+        let notice = if let [item] = batch.items.as_slice() {
+            match &item.status {
+                BatchItemStatus::Completed => match &item.output_path {
+                    Some(output) if *output != item.path => format!(
+                        "Media edits saved to {}.",
+                        output
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("edited copy")
+                    ),
+                    _ => "Media edits saved.".to_string(),
                 },
+                BatchItemStatus::Cancelled => "Media edit cancelled.".to_string(),
+                BatchItemStatus::Failed(reason) => reason.clone(),
+                BatchItemStatus::Pending | BatchItemStatus::Running => unreachable!(),
             }
+        } else {
+            let total = batch.items.len();
+            let completed = batch
+                .items
+                .iter()
+                .filter(|item| item.status == BatchItemStatus::Completed)
+                .count();
+            let failed = batch
+                .items
+                .iter()
+                .filter(|item| matches!(item.status, BatchItemStatus::Failed(_)))
+                .count();
+            let cancelled = batch
+                .items
+                .iter()
+                .filter(|item| item.status == BatchItemStatus::Cancelled)
+                .count();
+            summarize_batch_outcome(total, completed, failed, cancelled)
+        };
+        // With exactly one file, explicitly reselect what it became (its
+        // `output_path` can differ from the source, e.g. a container conversion
+        // renaming `movie.mkv` to `movie.mp4`) — `reconcile_files`'s generic
+        // "old selection vanished, pick a fallback" path has no way to know which of
+        // possibly many files is "the" output for a multi-file batch, so this only
+        // applies to the single-item case.
+        let reselect = match batch.items.as_slice() {
+            [item] => item.output_path.clone(),
+            _ => None,
+        };
+        // For a single-item batch, whichever path the file should now be found under
+        // (its `output_path`, or its original path if nothing renamed it) — used below
+        // to tell "the file is still around, drop back into its Streams view" apart
+        // from "the file genuinely vanished, `reconcile_files` already picked a
+        // sensible fallback in the Files panel and that should stand."
+        let expected_selection = match batch.items.as_slice() {
+            [item] => Some(
+                item.output_path
+                    .clone()
+                    .unwrap_or_else(|| item.path.clone()),
+            ),
+            _ => None,
+        };
+        // A rescan is only needed to pick up filesystem changes an item's outcome may
+        // have caused (a new/renamed output file, or a source that got removed out
+        // from under a failed edit) — a purely cancelled batch touches nothing on
+        // disk, so skip it and go straight back to the Streams view, matching the
+        // single-file flow this replaces.
+        let needs_rescan = batch.items.iter().any(|item| {
+            matches!(
+                item.status,
+                BatchItemStatus::Completed | BatchItemStatus::Failed(_)
+            )
+        });
+        self.active_batch = None;
+        self.dialog = None;
+        if needs_rescan && let Ok(files) = scan_directory(&self.directory) {
+            self.reconcile_files(files);
+        }
+        if let Some(output_path) = &reselect {
+            if self.files.iter().any(|file| file.path == *output_path)
+                && self.file_panel_position(output_path).is_none()
+            {
+                self.file_search.clear();
+                self.file_search_origin = None;
+            }
+            if let Some(position) = self.file_panel_position(output_path) {
+                self.list_state.select(Some(position));
+                self.sidecars = self
+                    .selected_file()
+                    .and_then(|file| self.sidecars_by_media.get(&file.path))
+                    .cloned()
+                    .unwrap_or_default();
+                self.queue_probe();
+            }
+        }
+        // Set last, after `reconcile_files` — which may have set its own notice for
+        // an unrelated reason (e.g. the source path momentarily "disappearing" mid
+        // rename) — so the batch's own outcome always wins as the final word.
+        self.notice = Some(notice);
+        if !needs_rescan
+            || expected_selection
+                .is_some_and(|path| self.selected_file().is_some_and(|file| file.path == path))
+        {
+            self.layer = Layer::Streams;
         }
     }
 
@@ -1904,8 +2169,8 @@ impl App {
                     .map(|_| TrackRef::Embedded(*index))
             }));
         }
-        rows.extend(self.active_left_subtitle_tracks());
         let active_left = self.active_left_subtitle_tracks();
+        rows.extend(active_left.iter().cloned());
         rows.extend((0..self.sidecars.len()).filter_map(|sidecar_index| {
             let track = TrackRef::Sidecar(sidecar_index);
             (!active_left.contains(&track)).then_some(track)
@@ -2090,8 +2355,12 @@ impl App {
     }
 
     pub fn source_container(&self) -> Option<ContainerFormat> {
-        self.selected_file()
-            .and_then(|file| ContainerFormat::from_path(&file.path))
+        let file = self.selected_file()?;
+        let format_name = self
+            .media_info()
+            .and_then(|info| info.format.get("format_name"))
+            .and_then(serde_json::Value::as_str);
+        ContainerFormat::detect(&file.path, format_name)
     }
 
     pub fn effective_container(&self) -> Option<ContainerFormat> {
@@ -2112,76 +2381,30 @@ impl App {
     }
 
     pub fn container_conflicts_for(&self, target: ContainerFormat) -> Vec<String> {
-        let mut conflicts = Vec::new();
-        if !self.subtitle_capabilities.ffmpeg {
-            conflicts.push("FFmpeg is not available in PATH.".to_string());
-        } else if !self
-            .subtitle_capabilities
-            .ffmpeg_muxers
-            .contains(target.muxer())
-        {
-            conflicts.push(format!(
-                "The installed FFmpeg build does not provide the {} muxer.",
-                target.label()
-            ));
-        }
-        let Some(info) = self.media_info() else {
-            return conflicts;
-        };
-        let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
-        let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
-        conflicts.extend(container_conflicts(
-            info,
-            &stream_order,
+        container_conflicts_for_plan(
+            &self.subtitle_capabilities,
+            self.media_info(),
+            &self.stream_order,
+            &self.deleted_streams,
             &self.video_settings,
-            &subtitle_changes,
-            target,
-        ));
-        conflicts.extend(imported_subtitle_conflicts(
-            &subtitle_changes,
+            &self.subtitle_changes,
             &self.sidecars,
             target,
-        ));
-        conflicts.extend(subtitle_metadata_conflicts(
-            info,
-            &subtitle_changes,
-            &self.sidecars,
-            target,
-            true,
-        ));
-        conflicts
+        )
     }
 
     pub fn selected_container_conflicts(&self) -> Vec<String> {
-        if let Some(target) = self.container_target {
-            return self.container_conflicts_for(target);
-        }
-        let Some(target) = self.source_container() else {
-            return if self
-                .subtitle_changes
-                .values()
-                .any(|change| change.import_into_media)
-            {
-                vec![
-                    "The current container is unknown; choose a container before importing subtitles."
-                        .to_string(),
-                ]
-            } else {
-                Vec::new()
-            };
-        };
-        let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
-        let mut conflicts = imported_subtitle_conflicts(&subtitle_changes, &self.sidecars, target);
-        if let Some(info) = self.media_info() {
-            conflicts.extend(subtitle_metadata_conflicts(
-                info,
-                &subtitle_changes,
-                &self.sidecars,
-                target,
-                false,
-            ));
-        }
-        conflicts
+        staged_container_conflicts(
+            &self.subtitle_capabilities,
+            self.media_info(),
+            self.source_container(),
+            self.container_target,
+            &self.stream_order,
+            &self.deleted_streams,
+            &self.video_settings,
+            &self.subtitle_changes,
+            &self.sidecars,
+        )
     }
 
     pub fn selected_container_conflict_streams(&self) -> BTreeSet<u64> {
@@ -2197,6 +2420,135 @@ impl App {
             &subtitle_changes,
             target,
         )
+    }
+
+    /// Whether a file has staged edits and, if so, whether they'd currently pass the
+    /// same gates `request_save` runs before allowing a save — used to drive the
+    /// file-list yellow/warning-triangle markers and to block Ctrl+S's "process all
+    /// staged files" until every staged file is `Valid`.
+    pub fn staged_file_status(&self, path: &Path) -> StagedFileStatus {
+        // The currently-open file's live edit fields count as "staged" here even
+        // before `snapshot_current_edits` has captured them into `staged_edits` on a
+        // selection change, so the file list reflects in-progress edits immediately.
+        if self.selected_file().is_some_and(|file| file.path == path) {
+            if !self.has_track_edits() {
+                return StagedFileStatus::Unstaged;
+            }
+            return self.validate_live_edits();
+        }
+
+        let Some(staged) = self.staged_edits.get(path) else {
+            return StagedFileStatus::Unstaged;
+        };
+        if staged.stale {
+            return StagedFileStatus::Invalid(
+                "File changed on disk since edits were staged.".to_string(),
+            );
+        }
+        let key = CacheKey {
+            path: path.to_path_buf(),
+            length: staged.fingerprint.length,
+            modified: staged.fingerprint.modified,
+        };
+        let Some(ProbeOutcome::Video(info)) = self.cache.get(&key) else {
+            return StagedFileStatus::Invalid(
+                "This file hasn't been probed yet; open it once before processing.".to_string(),
+            );
+        };
+        let sidecars = self
+            .sidecars_by_media
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        let order = final_stream_order(info, &staged.stream_order, &staged.deleted_streams);
+        let defaults = staged
+            .default_streams
+            .difference(&staged.deleted_streams)
+            .copied()
+            .collect();
+        if let Err(error) = validate_edit(
+            info,
+            &order,
+            &staged.deleted_streams,
+            &defaults,
+            &staged.video_settings,
+        ) {
+            return StagedFileStatus::Invalid(error);
+        }
+        if let Some(error) = subtitle_language_error_for(
+            Some(info),
+            &staged.deleted_streams,
+            &staged.subtitle_changes,
+            &sidecars,
+        ) {
+            return StagedFileStatus::Invalid(error);
+        }
+        let conflicts = staged_container_conflicts(
+            &self.subtitle_capabilities,
+            Some(info),
+            ContainerFormat::from_path(path),
+            staged.container_target,
+            &staged.stream_order,
+            &staged.deleted_streams,
+            &staged.video_settings,
+            &staged.subtitle_changes,
+            &sidecars,
+        );
+        if !conflicts.is_empty() {
+            return StagedFileStatus::Invalid(conflicts.join("\n"));
+        }
+        StagedFileStatus::Valid
+    }
+
+    /// The human-readable list of changes staged for `path`, shown per-file in the
+    /// `ConfirmProcessAll` dialog. Only meaningful once `request_process_all` has run
+    /// `snapshot_current_edits` (which it always does before opening that dialog), so
+    /// even the currently-open file's live edits are already in `staged_edits` by the
+    /// time this is called.
+    pub fn staged_file_summary(&self, path: &Path) -> Vec<String> {
+        let Some(staged) = self.staged_edits.get(path) else {
+            return Vec::new();
+        };
+        let key = CacheKey {
+            path: path.to_path_buf(),
+            length: staged.fingerprint.length,
+            modified: staged.fingerprint.modified,
+        };
+        let Some(ProbeOutcome::Video(info)) = self.cache.get(&key) else {
+            return vec!["(changes staged)".to_string()];
+        };
+        staged_edit_summary(path, info, staged)
+    }
+
+    /// The `staged_file_status` gates run against the currently-open file's live edit
+    /// fields (as opposed to a `StagedEdit` snapshot for a non-open staged file).
+    fn validate_live_edits(&self) -> StagedFileStatus {
+        let Some(info) = self.media_info() else {
+            return StagedFileStatus::Invalid("Media metadata isn't loaded yet.".to_string());
+        };
+        let order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
+        let defaults = self
+            .default_streams
+            .difference(&self.deleted_streams)
+            .copied()
+            .collect();
+        if let Err(error) = validate_edit(
+            info,
+            &order,
+            &self.deleted_streams,
+            &defaults,
+            &self.video_settings,
+        ) {
+            return StagedFileStatus::Invalid(error);
+        }
+        if let Some(error) = self.subtitle_language_error() {
+            return StagedFileStatus::Invalid(error);
+        }
+        let conflicts = self.selected_container_conflicts();
+        if !conflicts.is_empty() {
+            return StagedFileStatus::Invalid(conflicts.join("\n"));
+        }
+        StagedFileStatus::Valid
     }
 
     pub fn container_choices(&self) -> Vec<ContainerChoice> {
@@ -2484,6 +2836,22 @@ impl App {
     pub fn close_container_settings(&mut self) {
         self.container_settings_popup = None;
         self.dialog = None;
+    }
+
+    /// Ctrl+S from inside the Container Settings dialog — commits a field being
+    /// text-edited, closes the popup, then hands off to the same unified
+    /// `request_process_all` entry point Ctrl+S uses everywhere else. Mirrors
+    /// `save_from_video_settings`/`save_from_subtitle_settings`.
+    pub fn save_from_container_settings(&mut self) {
+        if self
+            .container_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == ContainerSettingsMode::TextEdit)
+        {
+            self.save_container_text_input();
+        }
+        self.close_container_settings();
+        self.request_process_all();
     }
 
     /// Which text field the generic editing keys currently drive. The guards mirror
@@ -2911,41 +3279,16 @@ impl App {
     }
 
     fn original_subtitle_metadata(&self, source: &SubtitleSource) -> Option<SubtitleMetadata> {
-        match source {
-            SubtitleSource::Embedded(index) => {
-                let stream = self
-                    .media_info()
-                    .and_then(|info| stream_by_index(info, *index))?;
-                Some(SubtitleMetadata {
-                    language: stream_language(stream),
-                    title: stream_title(stream),
-                    forced: stream_forced(stream),
-                    cc: stream_cc(stream),
-                    hearing_impaired: stream_hearing_impaired(stream),
-                    original: stream_original(stream),
-                    commentary: stream_commentary(stream),
-                })
-            }
-            SubtitleSource::Sidecar(path) => {
-                let sidecar = self.sidecars.iter().find(|sidecar| &sidecar.path == path)?;
-                Some(SubtitleMetadata {
-                    language: sidecar.language.clone(),
-                    title: None,
-                    forced: sidecar.forced,
-                    cc: false,
-                    hearing_impaired: sidecar.hearing_impaired,
-                    original: false,
-                    commentary: false,
-                })
-            }
-        }
+        original_subtitle_metadata_for(self.media_info(), &self.sidecars, source)
     }
 
     pub fn subtitle_metadata_for(&self, source: &SubtitleSource) -> Option<SubtitleMetadata> {
-        self.subtitle_changes
-            .get(source)
-            .and_then(|change| change.metadata.clone())
-            .or_else(|| self.original_subtitle_metadata(source))
+        subtitle_metadata_for_plan(
+            &self.subtitle_changes,
+            self.media_info(),
+            &self.sidecars,
+            source,
+        )
     }
 
     pub fn subtitle_display_state(
@@ -3512,7 +3855,7 @@ impl App {
             self.commit_subtitle_title();
         }
         self.close_subtitle_settings();
-        self.request_save();
+        self.request_process_all();
     }
 
     pub fn move_video_settings_cursor(&mut self, direction: isize) {
@@ -3802,7 +4145,7 @@ impl App {
             }
         }
         self.close_video_settings();
-        self.request_save();
+        self.request_process_all();
     }
 
     pub fn custom_resolution_input_active(&self) -> bool {
@@ -3958,6 +4301,11 @@ impl App {
             .ok_or_else(|| "Width and height must be positive whole numbers.".to_string())?;
         if width % 2 != 0 || height % 2 != 0 {
             return Err("Width and height must be even.".to_string());
+        }
+        if width < MINIMUM_CUSTOM_DIMENSION || height < MINIMUM_CUSTOM_DIMENSION {
+            return Err(format!(
+                "Width and height must be at least {MINIMUM_CUSTOM_DIMENSION} pixels."
+            ));
         }
         let Some((source_width, source_height)) = self.video_source_dimensions(popup.stream_index)
         else {
@@ -4124,221 +4472,336 @@ impl App {
         }
     }
 
-    pub fn request_save(&mut self) {
-        if self.layer != Layer::Streams || self.dialog.is_some() {
-            return;
-        }
-        if !self.has_track_edits() {
-            self.notice = Some("No media changes to save.".to_string());
-            return;
-        }
-        let Some(info) = self.media_info() else {
-            return;
-        };
-        let order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
-        let defaults = self
-            .default_streams
-            .difference(&self.deleted_streams)
-            .copied()
-            .collect();
-        if let Err(error) = validate_edit(
-            info,
-            &order,
+    fn subtitle_language_error(&self) -> Option<String> {
+        subtitle_language_error_for(
+            self.media_info(),
             &self.deleted_streams,
-            &defaults,
-            &self.video_settings,
-        ) {
-            self.show_error(error);
+            &self.subtitle_changes,
+            &self.sidecars,
+        )
+    }
+
+    /// The Ctrl+S entry point everywhere (Files panel, Streams layer, and the
+    /// Container/Video/Subtitle Settings dialogs' own Ctrl+S shortcuts) — snapshots
+    /// the currently-open file's live edits (if any) so it's included, then requires
+    /// every staged file to be `StagedFileStatus::Valid` before opening the confirm
+    /// dialog; otherwise it names what's wrong rather than silently refusing. Even a
+    /// single staged file goes through this batch flow now.
+    pub fn request_process_all(&mut self) {
+        if self.dialog.is_some() {
             return;
         }
-        if let Some(error) = self.subtitle_language_error() {
-            self.show_error(error);
+        self.snapshot_current_edits();
+        let paths: Vec<PathBuf> = self.staged_edits.keys().cloned().collect();
+        if paths.is_empty() {
+            self.notice = Some("No staged changes to process.".to_string());
             return;
         }
-        let conflicts = self.selected_container_conflicts();
-        if !conflicts.is_empty() {
+        let mut problems = Vec::new();
+        for path in &paths {
+            if let StagedFileStatus::Invalid(reason) = self.staged_file_status(path) {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file");
+                problems.push(format!("{name}: {reason}"));
+            }
+        }
+        if !problems.is_empty() {
             self.show_error(format!(
-                "Resolve the container compatibility issues before saving:\n{}",
-                conflicts.join("\n")
+                "Resolve the following before processing:\n{}",
+                problems.join("\n")
             ));
             return;
         }
         self.notice = None;
-        self.save_destination = SaveDestination::ReplaceOriginal;
-        self.save_dialog_field = SaveDialogField::Start;
-        self.dialog = Some(Dialog::ConfirmSave);
+        self.confirm_process_all_scroll = 0;
+        self.confirm_process_all_choice = ConfirmProcessAllChoice::Start;
+        self.dialog = Some(Dialog::ConfirmProcessAll);
     }
 
-    fn subtitle_language_error(&self) -> Option<String> {
-        if let Some(info) = self.media_info() {
-            for stream in info
-                .streams
-                .iter()
-                .filter(|stream| stream_kind(stream) == Some("subtitle"))
-            {
-                let index = stream_index(stream)?;
-                if self.deleted_streams.contains(&index) {
-                    continue;
-                }
-                let source = SubtitleSource::Embedded(index);
-                let language = self
-                    .subtitle_metadata_for(&source)
-                    .map(|metadata| metadata.language)
-                    .unwrap_or_else(|| stream_language(stream));
-                if language_choice(&language).is_none() {
-                    return Some(format!(
-                        "Choose a language for subtitle track #{index}; Undetermined is not allowed."
-                    ));
-                }
-            }
-        }
-        for sidecar in &self.sidecars {
-            let source = SubtitleSource::Sidecar(sidecar.path.clone());
-            let language = self
-                .subtitle_metadata_for(&source)
-                .map(|metadata| metadata.language)
-                .unwrap_or_else(|| sidecar.language.clone());
-            if language_choice(&language).is_none() {
-                return Some(format!(
-                    "Choose a language for {}; Undetermined is not allowed.",
-                    sidecar.display_name
-                ));
-            }
-        }
-        None
-    }
-
-    pub fn move_save_dialog_cursor(&mut self, direction: isize) {
-        if self.dialog != Some(Dialog::ConfirmSave) || direction == 0 {
+    pub fn choose_confirm_process_all(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmProcessAll) || direction == 0 {
             return;
         }
-        if !self.media_will_change() {
-            self.save_dialog_field = SaveDialogField::Start;
-            return;
-        }
-        self.save_dialog_field = match (self.save_dialog_field, direction.is_positive()) {
-            (SaveDialogField::Destination, true) => SaveDialogField::Start,
-            (SaveDialogField::Start, false) => SaveDialogField::Destination,
-            (field, _) => field,
-        };
-    }
-
-    pub fn move_save_dialog_to_endpoint(&mut self, end: bool) {
-        if self.dialog != Some(Dialog::ConfirmSave) {
-            return;
-        }
-        self.save_dialog_field = if end || !self.media_will_change() {
-            SaveDialogField::Start
+        self.confirm_process_all_choice = if direction.is_positive() {
+            ConfirmProcessAllChoice::Cancel
         } else {
-            SaveDialogField::Destination
+            ConfirmProcessAllChoice::Start
         };
     }
 
-    pub fn choose_save_destination(&mut self, direction: isize) {
-        if self.dialog != Some(Dialog::ConfirmSave)
-            || !self.media_will_change()
-            || self.save_dialog_field != SaveDialogField::Destination
-            || direction == 0
-        {
+    /// Activates whichever button is currently focused — reached by Enter, so a bare
+    /// Enter still starts the batch immediately (matching the dialog's behavior
+    /// before it grew a visible button bar), while Right/Left-ing over to Cancel and
+    /// pressing Enter dismisses instead.
+    pub fn activate_confirm_process_all(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmProcessAll) {
             return;
         }
-        self.save_destination = if direction.is_positive() {
-            SaveDestination::CreateCopy
-        } else {
-            SaveDestination::ReplaceOriginal
-        };
-    }
-
-    pub fn activate_save_dialog(&mut self) {
-        if self.dialog != Some(Dialog::ConfirmSave) {
-            return;
-        }
-        match self.save_dialog_field {
-            SaveDialogField::Destination => {
-                if !self.media_will_change() {
-                    self.save_dialog_field = SaveDialogField::Start;
-                    return;
-                }
-                self.save_destination = match self.save_destination {
-                    SaveDestination::ReplaceOriginal => SaveDestination::CreateCopy,
-                    SaveDestination::CreateCopy => SaveDestination::ReplaceOriginal,
-                };
-            }
-            SaveDialogField::Start => self.confirm_save(),
+        match self.confirm_process_all_choice {
+            ConfirmProcessAllChoice::Start => self.confirm_process_all(),
+            ConfirmProcessAllChoice::Cancel => self.dismiss_dialog(),
         }
     }
 
-    pub fn confirm_save(&mut self) {
-        if self.dialog != Some(Dialog::ConfirmSave) {
+    /// Builds one `EditRequest` per staged file — classified into the transcode or
+    /// remux pool via `plan_requires_transcode` — and dispatches them all sharing one
+    /// batch-wide cancellation flag (`BatchState::cancelled`), so cancelling stops
+    /// every request not yet finished, queued or running, with a single flag flip.
+    pub fn confirm_process_all(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmProcessAll) {
             return;
         }
-        let Some(path) = self.selected_file().map(|file| file.path.clone()) else {
-            self.dialog = Some(Dialog::Error);
-            self.edit_error = Some("The selected file is no longer available.".to_string());
-            return;
-        };
-        let Some(info) = self.media_info() else {
-            self.show_error("The selected file no longer has track information.");
-            return;
-        };
-        let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
-        let default_streams = self
-            .default_streams
-            .difference(&self.deleted_streams)
-            .copied()
-            .collect();
+        let paths: Vec<PathBuf> = self.staged_edits.keys().cloned().collect();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let request = EditRequest {
-            path,
-            destination: self.save_destination,
-            container: self.container_target,
-            container_metadata: self.container_metadata.clone(),
-            stream_order,
-            deleted_streams: self.deleted_streams.clone(),
-            default_streams,
-            default_sidecars: self.default_sidecars.clone(),
-            video_settings: self.video_settings.clone(),
-            subtitle_changes: self.subtitle_changes.values().cloned().collect(),
-            left_subtitle_order: self.active_left_subtitle_tracks(),
-            sidecars: self.sidecars.clone(),
-            cancelled: cancelled.clone(),
-        };
-        match self.edit_tx.send(request) {
-            Ok(()) => {
-                self.dialog = Some(Dialog::Processing);
-                self.edit_error = None;
-                self.edit_progress = None;
-                self.edit_progress_label = None;
-                self.edit_started = Some(Instant::now());
-                self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-                self.edit_cancel = Some(cancelled);
+        let mut items = Vec::new();
+        for path in paths {
+            // Re-checked defensively: `request_process_all` already required every
+            // staged file to be `Valid`, but time (and a background reconcile) can
+            // pass between opening the confirm dialog and this actually running.
+            if !matches!(self.staged_file_status(&path), StagedFileStatus::Valid) {
+                continue;
             }
-            Err(error) => {
-                self.dialog = Some(Dialog::Error);
-                self.edit_error = Some(format!("Could not start the edit worker: {error}"));
+            let Some(staged) = self.staged_edits.get(&path) else {
+                continue;
+            };
+            let key = CacheKey {
+                path: path.clone(),
+                length: staged.fingerprint.length,
+                modified: staged.fingerprint.modified,
+            };
+            let Some(ProbeOutcome::Video(info)) = self.cache.get(&key) else {
+                continue;
+            };
+            let sidecars = self
+                .sidecars_by_media
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            // `staged.stream_order` is the raw display order and still contains
+            // deleted tracks (`final_stream_order` is what actually drops them and
+            // reconciles group positions) — sending it as-is made `validate_edit`
+            // see a track as both kept and deleted the moment anything got deleted.
+            let stream_order =
+                final_stream_order(info, &staged.stream_order, &staged.deleted_streams);
+            let default_streams = staged
+                .default_streams
+                .difference(&staged.deleted_streams)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let transcode = plan_requires_transcode(info, &stream_order, &staged.video_settings);
+            let request = EditRequest {
+                path: path.clone(),
+                destination: SaveDestination::ReplaceOriginal,
+                container: staged.container_target,
+                container_metadata: staged.container_metadata.clone(),
+                stream_order,
+                deleted_streams: staged.deleted_streams.clone(),
+                default_streams,
+                default_sidecars: staged.default_sidecars.clone(),
+                video_settings: staged.video_settings.clone(),
+                subtitle_changes: staged.subtitle_changes.values().cloned().collect(),
+                left_subtitle_order: staged.left_subtitle_order.clone(),
+                sidecars,
+                cancelled: cancelled.clone(),
+            };
+            let sender = if transcode {
+                &self.transcode_tx
+            } else {
+                &self.remux_tx
+            };
+            if sender.send(request).is_ok() {
+                items.push(BatchItem {
+                    path,
+                    label: None,
+                    fraction: None,
+                    status: BatchItemStatus::Pending,
+                    output_path: None,
+                });
             }
         }
+        if items.is_empty() {
+            self.dialog = None;
+            self.notice =
+                Some("Nothing could be started; the staged files may have changed.".to_string());
+            return;
+        }
+        self.active_batch = Some(BatchState {
+            cancelled,
+            items,
+            started: Instant::now(),
+        });
+        self.batch_scroll = 0;
+        self.batch_cursor = 0;
+        self.dialog = Some(Dialog::BatchProcessing);
     }
 
+    /// Moves the `Dialog::BatchProcessing` highlight by `amount` rows; the viewport
+    /// catches up later, in `sync_batch_scroll`.
+    pub fn move_batch_cursor_down(&mut self, amount: usize) {
+        let Some(last) = self.batch_cursor_last_row() else {
+            return;
+        };
+        self.batch_cursor = self.batch_cursor.saturating_add(amount).min(last);
+    }
+
+    pub fn move_batch_cursor_up(&mut self, amount: usize) {
+        if self.batch_cursor_last_row().is_none() {
+            return;
+        }
+        self.batch_cursor = self.batch_cursor.saturating_sub(amount);
+    }
+
+    /// The highest selectable row index, or `None` when the batch popup is not the
+    /// active dialog or holds no items — both cases where the cursor must not move.
+    fn batch_cursor_last_row(&self) -> Option<usize> {
+        if self.dialog != Some(Dialog::BatchProcessing) {
+            return None;
+        }
+        self.active_batch
+            .as_ref()
+            .map(|batch| batch.items.len())
+            .filter(|len| *len > 0)
+            .map(|len| len - 1)
+    }
+
+    /// Slides the viewport the minimum distance needed to keep `batch_cursor` visible.
+    /// Called from the renderer, the only place that knows how many rows fit.
+    pub fn sync_batch_scroll(&mut self, visible_rows: usize) {
+        let total = self
+            .active_batch
+            .as_ref()
+            .map_or(0, |batch| batch.items.len());
+        let visible_rows = visible_rows.max(1);
+        let mut scroll = self.batch_scroll as usize;
+        if self.batch_cursor < scroll {
+            scroll = self.batch_cursor;
+        } else if self.batch_cursor >= scroll + visible_rows {
+            scroll = self.batch_cursor + 1 - visible_rows;
+        }
+        self.batch_scroll = scroll.min(total.saturating_sub(visible_rows)) as u16;
+    }
+
+    /// `r` on a file row in the Files panel — the one `r` case that needs a confirm,
+    /// since it discards a whole file's staged edits rather than one field.
+    pub fn request_reset_file(&mut self, path: PathBuf) {
+        if self.dialog.is_some() {
+            return;
+        }
+        self.pending_reset = Some(ResetScope::File(path));
+        self.reset_choice = ResetChoice::KeepEdits;
+        self.dialog = Some(Dialog::ConfirmReset);
+    }
+
+    /// `R` anywhere outside the Files panel — resets the whole currently-open file.
+    pub fn request_reset_current_file(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        self.pending_reset = Some(ResetScope::CurrentFile);
+        self.reset_choice = ResetChoice::KeepEdits;
+        self.dialog = Some(Dialog::ConfirmReset);
+    }
+
+    /// `R` in the Files panel — resets every staged file in the directory.
+    pub fn request_reset_all_files(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        self.pending_reset = Some(ResetScope::AllFiles);
+        self.reset_choice = ResetChoice::KeepEdits;
+        self.dialog = Some(Dialog::ConfirmReset);
+    }
+
+    pub fn pending_reset(&self) -> Option<&ResetScope> {
+        self.pending_reset.as_ref()
+    }
+
+    pub fn choose_reset(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmReset) || direction == 0 {
+            return;
+        }
+        self.reset_choice = if direction.is_positive() {
+            ResetChoice::ResetEdits
+        } else {
+            ResetChoice::KeepEdits
+        };
+    }
+
+    pub fn dismiss_reset(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmReset) {
+            return;
+        }
+        self.pending_reset = None;
+        self.reset_choice = ResetChoice::default();
+        self.dialog = None;
+    }
+
+    /// Carries out `pending_reset` if the user chose `ResetEdits`, otherwise just
+    /// dismisses like `dismiss_reset`.
+    pub fn activate_reset(&mut self) {
+        if self.dialog != Some(Dialog::ConfirmReset) {
+            return;
+        }
+        let Some(scope) = self.pending_reset.take() else {
+            self.dialog = None;
+            return;
+        };
+        if self.reset_choice != ResetChoice::ResetEdits {
+            self.reset_choice = ResetChoice::default();
+            self.dialog = None;
+            return;
+        }
+        match scope {
+            ResetScope::File(path) => {
+                self.staged_edits.remove(&path);
+                if self.selected_file().is_some_and(|file| file.path == path) {
+                    self.reset_track_edits();
+                }
+            }
+            ResetScope::CurrentFile => {
+                if let Some(path) = self.selected_file().map(|file| file.path.clone()) {
+                    self.staged_edits.remove(&path);
+                }
+                self.reset_track_edits();
+            }
+            ResetScope::AllFiles => {
+                self.staged_edits.clear();
+                if self.selected_file().is_some() {
+                    self.reset_track_edits();
+                }
+            }
+        }
+        self.reset_choice = ResetChoice::default();
+        self.dialog = None;
+        self.notice = Some("Staged edits reset.".to_string());
+    }
+
+    /// Actually stops the batch: flips the shared cancellation flag, so every request
+    /// not yet finished (queued or running, across both pools) aborts at its next
+    /// checkpoint. Reached only via `activate_cancel_edit`'s confirm step.
     pub fn cancel_edit(&mut self) {
         if !matches!(
             self.dialog,
-            Some(Dialog::Processing | Dialog::ConfirmCancel)
+            Some(Dialog::BatchProcessing | Dialog::ConfirmCancel)
         ) {
             return;
         }
-        if let Some(cancelled) = &self.edit_cancel {
-            cancelled.store(true, Ordering::Relaxed);
+        if let Some(batch) = &self.active_batch {
+            batch.cancelled.store(true, Ordering::Relaxed);
         }
-        self.dialog = Some(Dialog::Processing);
+        self.dialog = Some(Dialog::BatchProcessing);
         self.edit_error = None;
-        self.edit_progress = None;
-        self.edit_progress_label = Some("Stopping active tools".to_string());
         self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
     }
 
+    /// Opens the "are you sure you want to cancel?" prompt over the batch progress
+    /// view, rather than cancelling immediately — the batch keeps running
+    /// (unpaused) while the prompt is up; nothing is actually stopped until
+    /// `activate_cancel_edit` confirms it.
     pub fn request_cancel_edit(&mut self) {
-        if self.dialog != Some(Dialog::Processing) {
+        if self.dialog != Some(Dialog::BatchProcessing) {
             return;
         }
         self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
@@ -4379,23 +4842,19 @@ impl App {
     pub fn dismiss_cancel_edit(&mut self) {
         if self.dialog == Some(Dialog::ConfirmCancel) {
             self.cancel_edit_choice = CancelEditChoice::KeepProcessing;
-            self.dialog = Some(Dialog::Processing);
+            self.dialog = Some(Dialog::BatchProcessing);
         }
     }
 
     pub fn dismiss_dialog(&mut self) {
         if matches!(
             self.dialog,
-            Some(Dialog::Processing | Dialog::ConfirmCancel)
+            Some(Dialog::BatchProcessing | Dialog::ConfirmCancel)
         ) {
             return;
         }
         self.dialog = None;
         self.edit_error = None;
-        self.edit_progress = None;
-        self.edit_progress_label = None;
-        self.edit_started = None;
-        self.edit_cancel = None;
         self.keybindings_search.clear();
     }
 
@@ -4460,10 +4919,10 @@ impl App {
         let preferred_position = preferred_path
             .as_deref()
             .and_then(|path| self.file_panel_position(path));
-        let selection =
-            preferred_position.or_else(|| (!self.file_panel_entries().is_empty()).then_some(0));
+        let entries = self.file_panel_entries();
+        let selection = preferred_position.or_else(|| (!entries.is_empty()).then_some(0));
         let next_path = selection
-            .and_then(|position| self.file_panel_entries().get(position).cloned())
+            .and_then(|position| entries.get(position).cloned())
             .and_then(|entry| self.files.get(entry.file_index))
             .map(|file| file.path.clone());
         let force = previous_path != next_path;
@@ -4490,6 +4949,31 @@ impl App {
     pub fn set_keybindings_max_scroll(&mut self, maximum: u16) {
         self.keybindings_max_scroll = maximum;
         self.keybindings_scroll = self.keybindings_scroll.min(maximum);
+    }
+
+    pub fn scroll_confirm_process_all_down(&mut self, amount: u16) {
+        self.confirm_process_all_scroll = scroll_forward(
+            self.confirm_process_all_scroll,
+            self.confirm_process_all_max_scroll,
+            amount,
+        );
+    }
+
+    pub fn scroll_confirm_process_all_up(&mut self, amount: u16) {
+        self.confirm_process_all_scroll = scroll_backward(self.confirm_process_all_scroll, amount);
+    }
+
+    pub fn scroll_confirm_process_all_to_start(&mut self) {
+        self.confirm_process_all_scroll = 0;
+    }
+
+    pub fn scroll_confirm_process_all_to_end(&mut self) {
+        self.confirm_process_all_scroll = self.confirm_process_all_max_scroll;
+    }
+
+    pub fn set_confirm_process_all_max_scroll(&mut self, maximum: u16) {
+        self.confirm_process_all_max_scroll = maximum;
+        self.confirm_process_all_scroll = self.confirm_process_all_scroll.min(maximum);
     }
 
     pub fn scroll_down(&mut self) {
@@ -4552,9 +5036,306 @@ impl App {
         self.dialog = None;
         self.notice = None;
         self.edit_error = None;
-        self.edit_progress = None;
-        self.edit_progress_label = None;
-        self.edit_started = None;
+    }
+
+    /// Saves the currently-open file's live edit fields into `staged_edits` if it has
+    /// any (`has_track_edits()`), or removes any prior staged entry for it if it no
+    /// longer does (e.g. the user reset every edit before switching away). Must be
+    /// called while the file being left is still the selected file, so `media_info()`
+    /// still resolves to its probe data.
+    fn snapshot_current_edits(&mut self) {
+        let Some(file) = self.selected_file() else {
+            return;
+        };
+        let path = file.path.clone();
+        let fingerprint = file.fingerprint;
+        if self.has_track_edits() {
+            self.staged_edits.insert(
+                path,
+                StagedEdit {
+                    fingerprint,
+                    stale: false,
+                    stream_order: self.stream_order.clone(),
+                    moved_streams: self.moved_streams.clone(),
+                    deleted_streams: self.deleted_streams.clone(),
+                    default_streams: self.default_streams.clone(),
+                    default_sidecars: self.default_sidecars.clone(),
+                    video_settings: self.video_settings.clone(),
+                    subtitle_changes: self.subtitle_changes.clone(),
+                    left_subtitle_order: self.left_subtitle_order.clone(),
+                    container_target: self.container_target,
+                    container_metadata: self.container_metadata.clone(),
+                    original_stream_order: self.original_stream_order.clone(),
+                    original_default_streams: self.original_default_streams.clone(),
+                },
+            );
+        } else {
+            self.staged_edits.remove(&path);
+        }
+    }
+
+    /// Loads the newly-selected file's previously staged edits (if any) into the live
+    /// edit fields, or falls back to deriving a fresh baseline from its probe data
+    /// (`reset_track_edits`) if nothing was staged for it. Replaces the two call sites
+    /// that used to call `reset_track_edits()` unconditionally whenever a file became
+    /// selected. Staged edits are loaded even if flagged `stale`, so the user can see
+    /// and manually resolve them rather than having them silently vanish.
+    fn load_staged_or_reset(&mut self) {
+        let Some(path) = self.selected_file().map(|file| file.path.clone()) else {
+            self.clear_track_edits();
+            return;
+        };
+        let Some(staged) = self.staged_edits.get(&path).cloned() else {
+            self.reset_track_edits();
+            return;
+        };
+        self.stream_order = staged.stream_order;
+        self.moved_streams = staged.moved_streams;
+        self.deleted_streams = staged.deleted_streams;
+        self.default_streams = staged.default_streams;
+        self.default_sidecars = staged.default_sidecars;
+        self.video_settings = staged.video_settings;
+        self.subtitle_changes = staged.subtitle_changes;
+        self.left_subtitle_order = staged.left_subtitle_order;
+        self.container_target = staged.container_target;
+        self.container_metadata = staged.container_metadata;
+        self.original_stream_order = staged.original_stream_order;
+        self.original_default_streams = staged.original_default_streams;
+        self.video_settings_popup = None;
+        self.subtitle_settings_popup = None;
+        self.container_settings_popup = None;
+    }
+
+    /// Restores one embedded track's position in `stream_order` to where it sat
+    /// relative to the *other* tracks' current (possibly also individually staged)
+    /// arrangement, without disturbing their positions. Concretely: take the current
+    /// order minus this track, then reinsert it immediately after the last track that
+    /// preceded it in `original_stream_order` (or at the front if none did). This is
+    /// well-defined for any permutation of survivors and only perturbs the one track
+    /// being reset — used by `reset_track` (the `r`-on-a-track-row keybind).
+    fn reset_track_position(&mut self, track: u64) {
+        if !self.stream_order.contains(&track) {
+            return;
+        }
+        let others: Vec<u64> = self
+            .stream_order
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != track)
+            .collect();
+        let before: BTreeSet<u64> = self
+            .original_stream_order
+            .iter()
+            .copied()
+            .take_while(|candidate| *candidate != track)
+            .filter(|candidate| others.contains(candidate))
+            .collect();
+        let insert_at = others
+            .iter()
+            .rposition(|candidate| before.contains(candidate))
+            .map_or(0, |position| position + 1);
+        let mut new_order = others;
+        new_order.insert(insert_at, track);
+        self.stream_order = new_order;
+        self.moved_streams = self
+            .moved_streams
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                stream_position_changed(
+                    &self.original_stream_order,
+                    &self.stream_order,
+                    &self.deleted_streams,
+                    self.media_info(),
+                    *candidate,
+                )
+            })
+            .collect();
+    }
+
+    /// Resets every staged edit type for a single track (the `r` keybind on a track
+    /// row in the Streams list): delete flag, default flag, video settings, subtitle
+    /// change, and — for embedded tracks — position (via `reset_track_position`),
+    /// while leaving every other track's staged edits untouched. For the container
+    /// row, resets the staged container format/metadata.
+    pub fn reset_track(&mut self, track: TrackRef) {
+        match track {
+            TrackRef::Container => {
+                self.container_target = None;
+                self.container_metadata = None;
+            }
+            TrackRef::Embedded(index) => {
+                self.deleted_streams.remove(&index);
+                self.video_settings.remove(&index);
+                let originally_default = self.original_default_streams.contains(&index);
+                if originally_default {
+                    self.default_streams.insert(index);
+                } else {
+                    self.default_streams.remove(&index);
+                }
+                self.subtitle_changes
+                    .remove(&SubtitleSource::Embedded(index));
+                self.reset_track_position(index);
+            }
+            TrackRef::Sidecar(sidecar_index) => {
+                self.default_sidecars.remove(&sidecar_index);
+                if let Some(sidecar) = self.sidecars.get(sidecar_index) {
+                    let source = SubtitleSource::Sidecar(sidecar.path.clone());
+                    self.subtitle_changes.remove(&source);
+                }
+            }
+        }
+    }
+
+    /// The `r` keybind's dispatch when nothing needs a confirm: inside a settings
+    /// popup (in its field-navigation mode, not while text-editing — those modes have
+    /// their own key handling in `main.rs` and never reach this), resets just the
+    /// currently focused field; in the Streams track list, resets the whole
+    /// highlighted track (`reset_track`). A no-op everywhere else.
+    pub fn reset_focused_field(&mut self) {
+        match self.dialog {
+            Some(Dialog::ContainerSettings) => {
+                if let Some(field) = self
+                    .container_settings_popup
+                    .as_ref()
+                    .map(|popup| popup.field)
+                {
+                    self.reset_container_field(field);
+                }
+            }
+            Some(Dialog::VideoSettings) => {
+                if let Some(field) = self.video_settings_popup.as_ref().map(|popup| popup.field) {
+                    self.reset_video_field(field);
+                }
+            }
+            Some(Dialog::SubtitleSettings) => {
+                if let Some(field) = self
+                    .subtitle_settings_popup
+                    .as_ref()
+                    .map(|popup| popup.field)
+                {
+                    self.reset_subtitle_field(field);
+                }
+            }
+            None if self.layer == Layer::Streams => {
+                if let Some(track) = self.selected_track() {
+                    self.reset_track(track);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resets one `ContainerSettings` field to its original value: `Format` clears
+    /// the staged container target entirely; every metadata field reverts just that
+    /// one property, leaving any other staged metadata field untouched — mirrors
+    /// `save_container_text_input`'s "compare to original, store `Some`/`None`" logic.
+    fn reset_container_field(&mut self, field: ContainerSettingsField) {
+        if field == ContainerSettingsField::Format {
+            self.container_target = None;
+            return;
+        }
+        let mut metadata = self.effective_container_metadata().unwrap_or_default();
+        let original = self.original_container_metadata().unwrap_or_default();
+        match field {
+            ContainerSettingsField::Title => metadata.title = original.title.clone(),
+            ContainerSettingsField::Comment => metadata.comment = original.comment.clone(),
+            ContainerSettingsField::Date => metadata.date = original.date.clone(),
+            ContainerSettingsField::Genre => metadata.genre = original.genre.clone(),
+            ContainerSettingsField::Artist => metadata.artist = original.artist.clone(),
+            ContainerSettingsField::Format => unreachable!(),
+        }
+        self.container_metadata = (metadata != original).then_some(metadata);
+    }
+
+    /// Resets one `VideoSettings` field (`Codec` or `Resolution`) to `Original`,
+    /// leaving the other field's staged value (if any) alone — mirrors the
+    /// store-or-remove logic in `choose_video_codec`/`choose_video_resolution` (via
+    /// `settings_change_stream`).
+    fn reset_video_field(&mut self, field: VideoSettingsField) {
+        let Some(index) = self
+            .video_settings_popup
+            .as_ref()
+            .map(|popup| popup.stream_index)
+        else {
+            return;
+        };
+        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        match field {
+            VideoSettingsField::Codec => settings.codec = VideoCodec::Original,
+            VideoSettingsField::Resolution => settings.resolution = VideoResolution::Original,
+        }
+        if self.settings_change_stream(index, settings) {
+            self.video_settings.insert(index, settings);
+        } else {
+            self.video_settings.remove(&index);
+        }
+    }
+
+    /// Resets one `SubtitleSettings` field to its original value. `Codec` clears
+    /// whichever of `embedded_target`/`export_target` is currently active (mirroring
+    /// the same "exporting vs. embedding" branch `activate_subtitle_settings`'s
+    /// `CodecDropdown` case uses when *staging* a choice) — it does not touch
+    /// `import_into_media`, which is a separate action (`transfer_subtitle`, Ctrl-h/l)
+    /// not driven by this field at all. `Default` reverts the mutually-exclusive
+    /// default-subtitle marking for this source specifically. The seven
+    /// metadata-backed fields (language/title/forced/cc/hearing-impaired/original/
+    /// commentary) each revert just that one property via `store_subtitle_metadata`'s
+    /// "compare to original" logic. In every case, any other staged field on the same
+    /// subtitle is left untouched.
+    fn reset_subtitle_field(&mut self, field: SubtitleSettingsField) {
+        let Some(popup) = self.subtitle_settings_popup.as_ref() else {
+            return;
+        };
+        let source = popup.source.clone();
+        let source_format = popup.source_format;
+        match field {
+            SubtitleSettingsField::Codec => {
+                let mut change = self.subtitle_change(&source, source_format);
+                if change.export_target.is_some() {
+                    change.export_target = None;
+                } else {
+                    change.embedded_target = None;
+                }
+                self.store_subtitle_change(source, change);
+            }
+            SubtitleSettingsField::Default => match &source {
+                SubtitleSource::Embedded(index) => {
+                    self.default_streams.remove(index);
+                    if self.original_default_streams.contains(index) {
+                        self.default_streams.insert(*index);
+                    }
+                }
+                SubtitleSource::Sidecar(_) => {
+                    if let Some(index) = self.subtitle_sidecar_index(&source) {
+                        self.default_sidecars.remove(&index);
+                    }
+                }
+            },
+            _ => {
+                let (Some(mut metadata), Some(original)) = (
+                    self.subtitle_metadata_for(&source),
+                    self.original_subtitle_metadata(&source),
+                ) else {
+                    return;
+                };
+                match field {
+                    SubtitleSettingsField::Language => {
+                        metadata.language = original.language.clone()
+                    }
+                    SubtitleSettingsField::Title => metadata.title = original.title.clone(),
+                    SubtitleSettingsField::Forced => metadata.forced = original.forced,
+                    SubtitleSettingsField::Cc => metadata.cc = original.cc,
+                    SubtitleSettingsField::HearingImpaired => {
+                        metadata.hearing_impaired = original.hearing_impaired;
+                    }
+                    SubtitleSettingsField::Original => metadata.original = original.original,
+                    SubtitleSettingsField::Commentary => metadata.commentary = original.commentary,
+                    SubtitleSettingsField::Codec | SubtitleSettingsField::Default => unreachable!(),
+                }
+                self.store_subtitle_metadata(source, source_format, metadata);
+            }
+        }
     }
 
     fn reset_track_edits(&mut self) {
@@ -4658,253 +5439,6 @@ impl App {
                 .subtitle_changes
                 .values()
                 .any(SubtitleChange::has_effect)
-    }
-
-    pub fn media_will_change(&self) -> bool {
-        self.container_target.is_some()
-            || self.container_metadata.is_some()
-            || !self.deleted_streams.is_empty()
-            || !self.default_sidecars.is_empty()
-            || !changed_streams(
-                &self.original_stream_order,
-                &self.stream_order,
-                &self.deleted_streams,
-                &self.original_default_streams,
-                &self.default_streams,
-                self.media_info(),
-            )
-            .is_empty()
-            || !self.video_settings.is_empty()
-            || self
-                .subtitle_changes
-                .values()
-                .any(SubtitleChange::changes_media)
-    }
-
-    pub fn processing_description(&self) -> String {
-        let mut descriptions = Vec::new();
-
-        if let Some(target) = self.container_target {
-            descriptions.push(match self.source_container() {
-                Some(source) => {
-                    format!("Converting {} to {}", source.label(), target.label())
-                }
-                None => format!("Converting container to {}", target.label()),
-            });
-        }
-
-        let imported_subtitles = self
-            .subtitle_changes
-            .values()
-            .filter(|change| change.import_into_media)
-            .count();
-        if imported_subtitles > 0 {
-            descriptions.push(format!(
-                "Importing {imported_subtitles} subtitle{}",
-                if imported_subtitles == 1 { "" } else { "s" }
-            ));
-        }
-
-        let exported_subtitles = self
-            .subtitle_changes
-            .values()
-            .filter(|change| change.export_target.is_some())
-            .count();
-        if exported_subtitles > 0 {
-            descriptions.push(format!(
-                "Exporting {exported_subtitles} subtitle{}",
-                if exported_subtitles == 1 { "" } else { "s" }
-            ));
-        }
-
-        if descriptions.len() < 2 && !self.video_settings.is_empty() {
-            descriptions.push(format!(
-                "Transcoding {} video track{}",
-                self.video_settings.len(),
-                if self.video_settings.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-        }
-
-        let converted_subtitles = self
-            .subtitle_changes
-            .values()
-            .filter(|change| {
-                change
-                    .embedded_target
-                    .is_some_and(|target| target != change.source_format)
-            })
-            .count();
-        if descriptions.len() < 2
-            && imported_subtitles == 0
-            && exported_subtitles == 0
-            && converted_subtitles > 0
-        {
-            descriptions.push(format!(
-                "Converting {converted_subtitles} subtitle{}",
-                if converted_subtitles == 1 { "" } else { "s" }
-            ));
-        }
-
-        let metadata_edits = self
-            .subtitle_changes
-            .values()
-            .filter(|change| change.metadata.is_some())
-            .count();
-        if descriptions.len() < 2 && metadata_edits > 0 {
-            descriptions.push(format!(
-                "Updating {metadata_edits} subtitle metadata record{}",
-                if metadata_edits == 1 { "" } else { "s" }
-            ));
-        }
-
-        if descriptions.len() < 2
-            && let Some(info) = self.media_info()
-        {
-            descriptions.extend(
-                edit_summary(
-                    info,
-                    &self.original_stream_order,
-                    &self.stream_order,
-                    &self.moved_streams,
-                    &self.deleted_streams,
-                    &self.original_default_streams,
-                    &self.default_streams,
-                )
-                .into_iter()
-                .take(2 - descriptions.len()),
-            );
-        }
-
-        if descriptions.is_empty() {
-            if self.container_metadata_changed() {
-                "Updating container metadata".to_string()
-            } else {
-                "Remuxing media".to_string()
-            }
-        } else {
-            descriptions.join(" · ")
-        }
-    }
-
-    pub fn save_summary(&self) -> Vec<String> {
-        let Some(info) = self.media_info() else {
-            return Vec::new();
-        };
-        let mut lines = edit_summary(
-            info,
-            &self.original_stream_order,
-            &self.stream_order,
-            &self.moved_streams,
-            &self.deleted_streams,
-            &self.original_default_streams,
-            &self.default_streams,
-        );
-        if let Some(target) = self.container_target {
-            let source = self
-                .source_container()
-                .map(ContainerFormat::label)
-                .unwrap_or("original");
-            lines.insert(
-                0,
-                format!("Changing container from {source} to {}", target.label()),
-            );
-        }
-        if self.container_metadata_changed() {
-            let orig = self.original_container_metadata().unwrap_or_default();
-            let eff = self.effective_container_metadata().unwrap_or_default();
-            let fields = [
-                ("title", &orig.title, &eff.title),
-                ("comment", &orig.comment, &eff.comment),
-                ("date", &orig.date, &eff.date),
-                ("genre", &orig.genre, &eff.genre),
-                ("artist", &orig.artist, &eff.artist),
-            ];
-            let changed: Vec<&str> = fields
-                .iter()
-                .filter(|(_, o, e)| o != e)
-                .map(|(name, _, _)| *name)
-                .collect();
-            if !changed.is_empty() {
-                lines.push(format!(
-                    "Updating container metadata: {}",
-                    changed.join(", ")
-                ));
-            }
-        }
-        for (index, settings) in &self.video_settings {
-            let codec = match settings.codec {
-                VideoCodec::Original => self
-                    .media_info()
-                    .and_then(|info| stream_by_index(info, *index))
-                    .and_then(|stream| stream.get("codec_name"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(|codec| codec.to_uppercase())
-                    .unwrap_or_else(|| "original codec".to_string()),
-                codec => codec.label().to_string(),
-            };
-            let resolution = settings.resolution.label();
-            lines.push(match settings.resolution {
-                VideoResolution::Original => {
-                    format!("Encoding video track #{index} as {codec}")
-                }
-                _ => format!("Encoding video track #{index} as {codec} at {resolution}"),
-            });
-        }
-        for change in self.subtitle_changes.values() {
-            let source = match &change.source {
-                SubtitleSource::Embedded(index) => format!("subtitle track #{index}"),
-                SubtitleSource::Sidecar(path) => path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("subtitle sidecar")
-                    .to_string(),
-            };
-            if change.import_into_media {
-                let target = change.embedded_target.unwrap_or(change.source_format);
-                lines.push(format!("Importing {source} as {}", target.label()));
-                continue;
-            }
-            if let Some(target) = change
-                .embedded_target
-                .filter(|_| change.export_target.is_none())
-            {
-                lines.push(match change.source {
-                    SubtitleSource::Embedded(_) => {
-                        format!("Converting {source} in the media to {}", target.label())
-                    }
-                    SubtitleSource::Sidecar(_) => {
-                        format!("Converting {source} to {}", target.label())
-                    }
-                });
-            }
-            if let Some(target) = change.export_target {
-                lines.push(format!("Exporting {source} as {}", target.label()));
-            }
-            if let Some(metadata) = &change.metadata {
-                let mut values = vec![format!("language {}", metadata.language.to_uppercase())];
-                values.push(match &metadata.title {
-                    Some(title) => format!("title “{title}”"),
-                    None => "no title".to_string(),
-                });
-                for (enabled, label) in [
-                    (metadata.forced, "Forced"),
-                    (metadata.cc, "CC"),
-                    (metadata.hearing_impaired, "Hearing impaired"),
-                    (metadata.original, "Original"),
-                    (metadata.commentary, "Commentary"),
-                ] {
-                    if enabled {
-                        values.push(label.to_string());
-                    }
-                }
-                lines.push(format!("Updating {source} metadata: {}", values.join(", ")));
-            }
-        }
-        lines
     }
 
     fn show_error(&mut self, error: impl Into<String>) {
@@ -5032,6 +5566,223 @@ fn is_default(stream: &std::collections::BTreeMap<String, serde_json::Value>) ->
         == Some(1)
 }
 
+/// Free-function core of `App::original_subtitle_metadata` — see
+/// `container_conflicts_for_plan` for why this is parameterized rather than reading
+/// `self.*` directly.
+fn original_subtitle_metadata_for(
+    info: Option<&MediaInfo>,
+    sidecars: &[SidecarEntry],
+    source: &SubtitleSource,
+) -> Option<SubtitleMetadata> {
+    match source {
+        SubtitleSource::Embedded(index) => {
+            let stream = info.and_then(|info| stream_by_index(info, *index))?;
+            Some(SubtitleMetadata {
+                language: stream_language(stream),
+                title: stream_title(stream),
+                forced: stream_forced(stream),
+                cc: stream_cc(stream),
+                hearing_impaired: stream_hearing_impaired(stream),
+                original: stream_original(stream),
+                commentary: stream_commentary(stream),
+            })
+        }
+        SubtitleSource::Sidecar(path) => {
+            let sidecar = sidecars.iter().find(|sidecar| &sidecar.path == path)?;
+            Some(SubtitleMetadata {
+                language: sidecar.language.clone(),
+                title: None,
+                forced: sidecar.forced,
+                cc: false,
+                hearing_impaired: sidecar.hearing_impaired,
+                original: false,
+                commentary: false,
+            })
+        }
+    }
+}
+
+/// Free-function core of `App::subtitle_metadata_for` — see
+/// `container_conflicts_for_plan`.
+fn subtitle_metadata_for_plan(
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    info: Option<&MediaInfo>,
+    sidecars: &[SidecarEntry],
+    source: &SubtitleSource,
+) -> Option<SubtitleMetadata> {
+    subtitle_changes
+        .get(source)
+        .and_then(|change| change.metadata.clone())
+        .or_else(|| original_subtitle_metadata_for(info, sidecars, source))
+}
+
+/// A one-line summary notice shown once every file in a batch reaches a terminal
+/// state — e.g. "Processed 3 of 4 files (1 failed)." Singular/plural and the omission
+/// of a breakdown when everything succeeded are handled so the common case reads
+/// cleanly rather than "Processed 1 of 1 files (0 failed, 0 cancelled)."
+fn summarize_batch_outcome(
+    total: usize,
+    completed: usize,
+    failed: usize,
+    cancelled: usize,
+) -> String {
+    let file_word = if total == 1 { "file" } else { "files" };
+    if completed == total {
+        return format!("Processed {total} {file_word}.");
+    }
+    let mut detail = Vec::new();
+    if failed > 0 {
+        detail.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        detail.push(format!("{cancelled} cancelled"));
+    }
+    if detail.is_empty() {
+        format!("Processed {completed} of {total} {file_word}.")
+    } else {
+        format!(
+            "Processed {completed} of {total} {file_word} ({}).",
+            detail.join(", ")
+        )
+    }
+}
+
+/// Free-function core of `App::subtitle_language_error` — see
+/// `container_conflicts_for_plan`.
+fn subtitle_language_error_for(
+    info: Option<&MediaInfo>,
+    deleted_streams: &BTreeSet<u64>,
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    sidecars: &[SidecarEntry],
+) -> Option<String> {
+    if let Some(info) = info {
+        for stream in info
+            .streams
+            .iter()
+            .filter(|stream| stream_kind(stream) == Some("subtitle"))
+        {
+            let index = stream_index(stream)?;
+            if deleted_streams.contains(&index) {
+                continue;
+            }
+            let source = SubtitleSource::Embedded(index);
+            let language =
+                subtitle_metadata_for_plan(subtitle_changes, Some(info), sidecars, &source)
+                    .map(|metadata| metadata.language)
+                    .unwrap_or_else(|| stream_language(stream));
+            if language_choice(&language).is_none() {
+                return Some(format!(
+                    "Choose a language for subtitle track #{index}; Undetermined is not allowed."
+                ));
+            }
+        }
+    }
+    for sidecar in sidecars {
+        let source = SubtitleSource::Sidecar(sidecar.path.clone());
+        let language = subtitle_metadata_for_plan(subtitle_changes, info, sidecars, &source)
+            .map(|metadata| metadata.language)
+            .unwrap_or_else(|| sidecar.language.clone());
+        if language_choice(&language).is_none() {
+            return Some(format!(
+                "Choose a language for {}; Undetermined is not allowed.",
+                sidecar.display_name
+            ));
+        }
+    }
+    None
+}
+
+/// Free-function core of `App::container_conflicts_for`, taking explicit edit-state
+/// parameters instead of implicit `self.*` fields so it can be run against a staged
+/// (not currently open) file's `StagedEdit` data — see `App::staged_file_status`.
+#[allow(clippy::too_many_arguments)]
+fn container_conflicts_for_plan(
+    subtitle_capabilities: &ToolCapabilities,
+    info: Option<&MediaInfo>,
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    sidecars: &[SidecarEntry],
+    target: ContainerFormat,
+) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    if !subtitle_capabilities.ffmpeg {
+        conflicts.push("FFmpeg is not available in PATH.".to_string());
+    } else if !subtitle_capabilities.ffmpeg_muxers.contains(target.muxer()) {
+        conflicts.push(format!(
+            "The installed FFmpeg build does not provide the {} muxer.",
+            target.label()
+        ));
+    }
+    let Some(info) = info else {
+        return conflicts;
+    };
+    let order = final_stream_order(info, stream_order, deleted_streams);
+    let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
+    conflicts.extend(container_conflicts(
+        info,
+        &order,
+        video_settings,
+        &changes,
+        target,
+    ));
+    conflicts.extend(imported_subtitle_conflicts(&changes, sidecars, target));
+    conflicts.extend(subtitle_metadata_conflicts(
+        info, &changes, sidecars, target, true,
+    ));
+    conflicts
+}
+
+/// Free-function core of `App::selected_container_conflicts` — see
+/// `container_conflicts_for_plan`.
+#[allow(clippy::too_many_arguments)]
+fn staged_container_conflicts(
+    subtitle_capabilities: &ToolCapabilities,
+    info: Option<&MediaInfo>,
+    source_container: Option<ContainerFormat>,
+    container_target: Option<ContainerFormat>,
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    sidecars: &[SidecarEntry],
+) -> Vec<String> {
+    if let Some(target) = container_target {
+        return container_conflicts_for_plan(
+            subtitle_capabilities,
+            info,
+            stream_order,
+            deleted_streams,
+            video_settings,
+            subtitle_changes,
+            sidecars,
+            target,
+        );
+    }
+    let Some(target) = source_container else {
+        return if subtitle_changes
+            .values()
+            .any(|change| change.import_into_media)
+        {
+            vec![
+                "The current container is unknown; choose a container before importing subtitles."
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
+    };
+    let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
+    let mut conflicts = imported_subtitle_conflicts(&changes, sidecars, target);
+    if let Some(info) = info {
+        conflicts.extend(subtitle_metadata_conflicts(
+            info, &changes, sidecars, target, false,
+        ));
+    }
+    conflicts
+}
+
 pub(crate) fn final_stream_order(
     info: &MediaInfo,
     staged_order: &[u64],
@@ -5141,6 +5892,9 @@ fn stream_position_changed(
         != staged.iter().position(|candidate| *candidate == index)
 }
 
+/// Summarizes track moves/deletes/default-changes between a staged edit's baseline
+/// and its current state, grouped by track type — used by `staged_edit_summary` as
+/// the fallback once container/video/subtitle changes have been described.
 fn edit_summary(
     info: &MediaInfo,
     original_order: &[u64],
@@ -5214,6 +5968,145 @@ fn track_count_label(group: &str, count: usize) -> String {
     format!("{group} track{}", if count == 1 { "" } else { "s" })
 }
 
+/// Builds the human-readable list of changes staged for one file — container
+/// conversion/metadata, video re-encodes, subtitle import/export/metadata edits, and
+/// track moves/deletes/default changes — shown in the `ConfirmProcessAll` dialog
+/// before Ctrl+S actually dispatches the batch. Mirrors the old single-file
+/// `save_summary`, but reads from a given `StagedEdit` and that file's cached
+/// `MediaInfo` instead of the live `App` fields, since any staged file (not just the
+/// one currently open) needs to be summarizable.
+fn staged_edit_summary(path: &Path, info: &MediaInfo, staged: &StagedEdit) -> Vec<String> {
+    let mut lines = edit_summary(
+        info,
+        &staged.original_stream_order,
+        &staged.stream_order,
+        &staged.moved_streams,
+        &staged.deleted_streams,
+        &staged.original_default_streams,
+        &staged.default_streams,
+    );
+    if let Some(target) = staged.container_target {
+        let format_name = info
+            .format
+            .get("format_name")
+            .and_then(serde_json::Value::as_str);
+        let source = ContainerFormat::detect(path, format_name)
+            .map(ContainerFormat::label)
+            .unwrap_or("original");
+        lines.insert(
+            0,
+            format!("Changing container from {source} to {}", target.label()),
+        );
+    }
+    let original_metadata = ContainerMetadata {
+        title: info.container_title(),
+        comment: info.container_comment(),
+        date: info.container_date(),
+        genre: info.container_genre(),
+        artist: info.container_artist(),
+    };
+    let effective_metadata = staged
+        .container_metadata
+        .clone()
+        .unwrap_or_else(|| original_metadata.clone());
+    if original_metadata != effective_metadata {
+        let fields = [
+            ("title", &original_metadata.title, &effective_metadata.title),
+            (
+                "comment",
+                &original_metadata.comment,
+                &effective_metadata.comment,
+            ),
+            ("date", &original_metadata.date, &effective_metadata.date),
+            ("genre", &original_metadata.genre, &effective_metadata.genre),
+            (
+                "artist",
+                &original_metadata.artist,
+                &effective_metadata.artist,
+            ),
+        ];
+        let changed: Vec<&str> = fields
+            .iter()
+            .filter(|(_, o, e)| o != e)
+            .map(|(name, _, _)| *name)
+            .collect();
+        if !changed.is_empty() {
+            lines.push(format!(
+                "Updating container metadata: {}",
+                changed.join(", ")
+            ));
+        }
+    }
+    for (index, settings) in &staged.video_settings {
+        let codec = match settings.codec {
+            VideoCodec::Original => stream_by_index(info, *index)
+                .and_then(|stream| stream.get("codec_name"))
+                .and_then(serde_json::Value::as_str)
+                .map(|codec| codec.to_uppercase())
+                .unwrap_or_else(|| "original codec".to_string()),
+            codec => codec.label().to_string(),
+        };
+        let resolution = settings.resolution.label();
+        lines.push(match settings.resolution {
+            VideoResolution::Original => {
+                format!("Encoding video track #{index} as {codec}")
+            }
+            _ => format!("Encoding video track #{index} as {codec} at {resolution}"),
+        });
+    }
+    for change in staged.subtitle_changes.values() {
+        let source = match &change.source {
+            SubtitleSource::Embedded(index) => format!("subtitle track #{index}"),
+            SubtitleSource::Sidecar(path) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("subtitle sidecar")
+                .to_string(),
+        };
+        if change.import_into_media {
+            let target = change.embedded_target.unwrap_or(change.source_format);
+            lines.push(format!("Importing {source} as {}", target.label()));
+            continue;
+        }
+        if let Some(target) = change
+            .embedded_target
+            .filter(|_| change.export_target.is_none())
+        {
+            lines.push(match change.source {
+                SubtitleSource::Embedded(_) => {
+                    format!("Converting {source} in the media to {}", target.label())
+                }
+                SubtitleSource::Sidecar(_) => {
+                    format!("Converting {source} to {}", target.label())
+                }
+            });
+        }
+        if let Some(target) = change.export_target {
+            lines.push(format!("Exporting {source} as {}", target.label()));
+        }
+        if let Some(metadata) = &change.metadata {
+            let mut values = vec![format!("language {}", metadata.language.to_uppercase())];
+            values.push(match &metadata.title {
+                Some(title) => format!("title \u{201c}{title}\u{201d}"),
+                None => "no title".to_string(),
+            });
+            for (enabled, label) in [
+                (metadata.forced, "Forced"),
+                (metadata.cc, "CC"),
+                (metadata.hearing_impaired, "Hearing impaired"),
+                (metadata.original, "Original"),
+                (metadata.commentary, "Commentary"),
+            ] {
+                if enabled {
+                    values.push(label.to_string());
+                }
+            }
+            lines.push(format!("Updating {source} metadata: {}", values.join(", ")));
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use kernal::prelude::*;
@@ -5236,7 +6129,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory, probe_tx, edit_tx).unwrap();
+        let mut app = App::new(directory, probe_tx, edit_tx.clone(), edit_tx).unwrap();
         app.outcome = Some(ProbeOutcome::Video(info));
         app.loading = false;
         app.reset_track_edits();
@@ -5259,7 +6152,7 @@ mod tests {
         }
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory, probe_tx, edit_tx).unwrap();
+        let mut app = App::new(directory, probe_tx, edit_tx.clone(), edit_tx).unwrap();
         app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
             {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
@@ -5374,6 +6267,53 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_files_should_populate_the_in_memory_cache_from_disk_cache_on_demand() {
+        // Regression test: the in-memory probe cache used to be built once, eagerly,
+        // by cloning the *entire* on-disk cache at startup — including entries for
+        // files outside the current directory — which `reconcile_files` then
+        // immediately pruned back down again. It's now populated lazily, per file,
+        // from `disk_cache` as files show up in `self.files`; this exercises that path
+        // directly rather than relying on the full clone that used to do it.
+        let mut app = test_file_app(&["a.mkv", "unrelated.mkv"]);
+        let directory = app.directory.clone();
+        let first = app.files[0].clone();
+        let outcome = ProbeOutcome::Video(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        app.disk_cache.insert(
+            first.path.clone(),
+            first.fingerprint.length,
+            first.fingerprint.modified,
+            outcome.clone(),
+        );
+        // An entry for a file that was never in this directory must never be pulled
+        // into the in-memory cache, matching the old eager-clone-then-prune result.
+        app.disk_cache.insert(
+            directory.join("elsewhere.mkv"),
+            0,
+            None,
+            ProbeOutcome::NotVideo("audio".to_string()),
+        );
+        assert_that!(&app.cache).is_empty();
+
+        // Act: re-run reconciliation so it re-derives `self.cache` from `disk_cache`.
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert
+        match app.cache.get(&CacheKey::for_file(&first)) {
+            Some(ProbeOutcome::Video(info)) => {
+                assert_that!(info.streams[0]["codec_name"].as_str()).contains("h264");
+            }
+            other => panic!("expected a cached video outcome, got {other:?}"),
+        }
+        assert_that!(app.cache.len()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn receive_directory_snapshots_should_apply_a_scan_error_and_then_recover_from_it() {
         // Arrange: the watcher thread reports both outcomes on the same channel, and an
         // unreadable directory must not leave the last good listing on screen.
@@ -5421,7 +6361,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("a.mkv"), b"media").unwrap();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
         app.select_file_position_with_force(Some(0), true);
         assert_that!(app.pending_since.is_some()).is_true();
 
@@ -5511,13 +6451,36 @@ mod tests {
             ]))),
         })
         .unwrap();
-        app.receive_probe_results(&rx);
+        let drained = app.receive_probe_results(&rx);
 
         // Assert: displayed, and the stream selection resets so it cannot point past the
         // end of a file with fewer tracks than the last one.
         assert!(matches!(app.outcome, Some(ProbeOutcome::Video(_))));
         assert_that!(app.loading).is_false();
         assert_that!(app.selected_stream).is_equal_to(0);
+        // The main loop skips redrawing when nothing was drained; assert this doesn't
+        // regress into always reporting "nothing changed".
+        assert_that!(drained).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_functions_should_report_no_change_when_their_channel_is_empty() {
+        // Regression test: the main loop only redraws when `receive_directory_snapshots`
+        // / `receive_probe_results` / `receive_edit_results` report they drained
+        // something, to avoid repainting the whole UI on every idle tick. If these ever
+        // stopped reporting "unchanged" for an empty channel, that optimization would
+        // silently turn back into an unconditional redraw.
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        let (_snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let (_probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (_edit_tx, edit_rx) = std::sync::mpsc::channel();
+
+        assert_that!(app.receive_directory_snapshots(&snapshot_rx)).is_false();
+        assert_that!(app.receive_probe_results(&probe_rx)).is_false();
+        assert_that!(app.receive_edit_results(&edit_rx)).is_false();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -5554,6 +6517,1245 @@ mod tests {
     }
 
     #[test]
+    fn switching_files_should_preserve_each_files_staged_edits() {
+        // Regression test for the exact bug reported: edit file A, switch to file B,
+        // edit it too, switch back to A — A's edits used to be silently discarded the
+        // moment the selection moved (`select_file_position_with_force` unconditionally
+        // called `clear_edit_state()`). Both files' edits must now survive round-trip
+        // navigation, and switching to an unedited file must show a clean baseline
+        // rather than leaking the other file's staged state.
+        let mut app = test_file_app(&["a.mkv", "b.mkv", "c.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        let streams = serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}}
+        ]);
+        for file in &files {
+            app.cache.insert(
+                CacheKey::for_file(file),
+                ProbeOutcome::Video(media(streams.clone())),
+            );
+        }
+
+        // Edit file A: mark its audio track for deletion.
+        app.select_file_position(Some(0));
+        app.deleted_streams.insert(1);
+        assert_that!(app.has_track_edits()).is_true();
+
+        // Edit file B: give it a container target.
+        app.select_file_position(Some(1));
+        assert_that!(app.deleted_streams.is_empty()).is_true(); // clean baseline for B
+        app.container_target = Some(crate::edit::ContainerFormat::Mp4);
+
+        // C is never touched — selecting it should show a clean baseline too.
+        app.select_file_position(Some(2));
+        assert_that!(app.deleted_streams.is_empty()).is_true();
+        assert_that!(app.container_target.is_none()).is_true();
+
+        // Switch back to A: its deletion must still be staged.
+        app.select_file_position(Some(0));
+        assert_that!(app.deleted_streams.contains(&1)).is_true();
+        assert_that!(app.container_target.is_none()).is_true();
+
+        // And back to B: its container target must still be staged.
+        app.select_file_position(Some(1));
+        assert_that!(app.deleted_streams.is_empty()).is_true();
+        assert_that!(app.container_target).is_equal_to(Some(crate::edit::ContainerFormat::Mp4));
+
+        // Both ended up recorded in the staged-edits map, keyed by path.
+        assert_that!(app.staged_edits.contains_key(&files[0].path)).is_true();
+        assert_that!(app.staged_edits.contains_key(&files[1].path)).is_true();
+        assert_that!(app.staged_edits.contains_key(&files[2].path)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resetting_every_edit_on_a_file_should_unstage_it() {
+        // Regression test: staging is keyed on `has_track_edits()` at the moment of
+        // leaving a file — if the user undoes every edit before switching away, the
+        // stale staged entry must be dropped, not kept around as an empty no-op edit.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        for file in &files {
+            app.cache.insert(
+                CacheKey::for_file(file),
+                ProbeOutcome::Video(media(serde_json::json!([
+                    {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+                ]))),
+            );
+        }
+
+        app.select_file_position(Some(0));
+        app.container_target = Some(crate::edit::ContainerFormat::Mp4);
+        app.select_file_position(Some(1));
+        assert_that!(app.staged_edits.contains_key(&files[0].path)).is_true();
+
+        app.select_file_position(Some(0));
+        app.container_target = None;
+        app.select_file_position(Some(1));
+        assert_that!(app.staged_edits.contains_key(&files[0].path)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reconcile_files_should_flag_a_staged_files_edits_stale_when_it_changes_on_disk() {
+        // Regression test for the confirmed staleness rule: if a staged (non-open)
+        // file's on-disk fingerprint changes before it's processed, its staged edits
+        // must be kept (not silently dropped) but flagged `stale`.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        app.cache.insert(
+            CacheKey::for_file(&files[1]),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        );
+
+        // Stage an edit on b.mkv, then move away from it so it's no longer "open".
+        app.select_file_position(Some(1));
+        app.container_target = Some(crate::edit::ContainerFormat::Mp4);
+        app.select_file_position(Some(0));
+        assert_that!(app.staged_edits.get(&files[1].path).unwrap().stale).is_false();
+
+        // Something else touches b.mkv on disk.
+        std::fs::write(&files[1].path, b"changed contents").unwrap();
+
+        // Act: reconcile against the new on-disk state.
+        let rescanned = scan_directory(&directory).unwrap();
+        app.reconcile_files(rescanned);
+
+        // Assert: still staged, but now flagged stale.
+        let staged = app
+            .staged_edits
+            .get(&files[1].path)
+            .expect("staged edits must be kept, not dropped");
+        assert_that!(staged.stale).is_true();
+        assert_that!(staged.container_target).is_equal_to(Some(crate::edit::ContainerFormat::Mp4));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_status_should_reflect_the_open_files_live_edit_validity() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        let path = app.files[0].path.clone();
+        assert_that!(app.staged_file_status(&path)).is_equal_to(StagedFileStatus::Unstaged);
+
+        // A no-op-ish but genuine edit (container target matching the source format)
+        // still counts as staged and passes validation.
+        app.container_target = Some(ContainerFormat::Matroska);
+        assert_that!(app.staged_file_status(&path)).is_equal_to(StagedFileStatus::Valid);
+
+        // SubRip can't go into MP4 — this is now an invalid staged edit.
+        app.container_target = Some(ContainerFormat::Mp4);
+        match app.staged_file_status(&path) {
+            StagedFileStatus::Invalid(_) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_status_should_validate_a_non_open_staged_file_via_the_cache() {
+        // `staged_file_status` must be able to validate a file that isn't currently
+        // open at all, using its cached probe data — this is what lets the file list
+        // mark other staged files valid/invalid, and what gates a future "process all
+        // staged files" action.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        let streams = serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+             "tags": {"language": "eng"}}
+        ]);
+        for file in &files {
+            app.cache.insert(
+                CacheKey::for_file(file),
+                ProbeOutcome::Video(media(streams.clone())),
+            );
+        }
+
+        app.select_file_position(Some(0));
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.select_file_position(Some(1));
+        assert_that!(app.staged_file_status(&files[0].path)).is_equal_to(StagedFileStatus::Valid);
+
+        app.select_file_position(Some(0));
+        app.container_target = Some(ContainerFormat::Mp4);
+        app.select_file_position(Some(1));
+        match app.staged_file_status(&files[0].path) {
+            StagedFileStatus::Invalid(_) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_status_should_report_invalid_for_a_stale_staged_file() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        app.cache.insert(
+            CacheKey::for_file(&files[1]),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        );
+
+        app.select_file_position(Some(1));
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.select_file_position(Some(0));
+        assert_that!(app.staged_file_status(&files[1].path)).is_equal_to(StagedFileStatus::Valid);
+
+        std::fs::write(&files[1].path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&directory).unwrap();
+        app.reconcile_files(rescanned);
+
+        match app.staged_file_status(&files[1].path) {
+            StagedFileStatus::Invalid(message) => {
+                assert_that!(message.as_str()).contains("changed on disk");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_summary_should_describe_every_kind_of_staged_change_for_a_non_open_file() {
+        // Arrange: the confirm-all popup is the last thing a user reads before an
+        // irreversible batch remux, so every staged change on every file — not just
+        // the one currently open — has to be named in it, sourced from
+        // `staged_edits`/the cache rather than the (by then different) live fields.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-staged-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        std::fs::write(directory.join("other.mkv"), b"media").unwrap();
+
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+
+        let movie = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "movie.mkv")
+            .unwrap()
+            .clone();
+        let other = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "other.mkv")
+            .unwrap()
+            .clone();
+        app.cache.insert(
+            CacheKey::for_file(&movie),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]))),
+        );
+        app.cache.insert(
+            CacheKey::for_file(&other),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        );
+
+        let movie_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "movie.mkv")
+            .unwrap();
+        let other_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "other.mkv")
+            .unwrap();
+
+        // Force a real transition away from whatever `App::new` auto-selected before
+        // the cache above existed, so the next selection genuinely picks up the
+        // now-cached probe data via `queue_probe`'s synchronous cache-hit path.
+        // `queue_probe` resets `layer` to `Files` on every selection, so it's set
+        // back to `Streams` only after the last select below, not before.
+        app.select_file_position(Some(other_index));
+        app.select_file_position(Some(movie_index));
+        app.layer = Layer::Streams;
+
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::P720,
+            },
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        assert!(app.transfer_subtitle(1), "the embedded track should export");
+        app.container_target = Some(ContainerFormat::Mp4);
+
+        // Act: switch away, staging movie.mkv's edits.
+        app.select_file_position(Some(other_index));
+        let summary = app.staged_file_summary(&movie.path).join("\n");
+
+        // Assert
+        assert_that!(summary.as_str()).contains("Changing container from MKV to MP4");
+        assert_that!(summary.as_str()).contains("Encoding video track #0 as AV1 at 1280×720");
+        assert_that!(summary.as_str()).contains("Exporting subtitle track #1");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_summary_should_group_track_moves_deletes_and_default_changes() {
+        // Arrange: with nothing more specific staged (no container/video/subtitle
+        // change), the summary falls back to describing raw track moves, deletes, and
+        // default changes, grouped by track type.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-staged-summary-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        std::fs::write(directory.join("other.mkv"), b"media").unwrap();
+
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        app.layer = Layer::Streams;
+
+        let movie = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "movie.mkv")
+            .unwrap()
+            .clone();
+        let other = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "other.mkv")
+            .unwrap()
+            .clone();
+        app.cache.insert(
+            CacheKey::for_file(&movie),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "subtitle"},
+                {"index": 3, "codec_type": "audio"}
+            ]))),
+        );
+        app.cache.insert(
+            CacheKey::for_file(&other),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video"}
+            ]))),
+        );
+
+        let movie_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "movie.mkv")
+            .unwrap();
+        let other_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "other.mkv")
+            .unwrap();
+
+        app.select_file_position(Some(other_index));
+        app.select_file_position(Some(movie_index));
+
+        app.original_stream_order = vec![0, 1, 3, 2];
+        app.stream_order = vec![0, 3, 1, 2];
+        app.moved_streams = BTreeSet::from([3]);
+        app.deleted_streams = BTreeSet::from([2]);
+        app.original_default_streams = BTreeSet::from([1]);
+        app.default_streams = BTreeSet::from([3]);
+
+        // Act
+        app.select_file_position(Some(other_index));
+        let summary = app.staged_file_summary(&movie.path);
+
+        // Assert
+        assert_that!(summary).contains_exactly_in_given_order([
+            "Moving 1 audio track".to_string(),
+            "Deleting 1 subtitle track".to_string(),
+            "Changing the default audio track".to_string(),
+        ]);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirm_process_all_scroll_should_move_within_the_clamped_range() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        app.set_confirm_process_all_max_scroll(5);
+
+        app.scroll_confirm_process_all_down(2);
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(2);
+
+        app.scroll_confirm_process_all_down(10);
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(5);
+
+        app.scroll_confirm_process_all_up(2);
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(3);
+
+        app.scroll_confirm_process_all_to_start();
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(0);
+
+        app.scroll_confirm_process_all_to_end();
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(5);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirm_process_all_should_route_requests_by_transcode_vs_remux_and_track_batch_items() {
+        // Regression test for the pool-classification wiring: a plain staged edit
+        // must land in the remux pool, a genuine codec change must land in the
+        // transcode pool, and both must show up as Pending batch items.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-confirm-process-all-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("remux.mkv"), b"media").unwrap();
+        std::fs::write(directory.join("transcode.mkv"), b"media").unwrap();
+
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, transcode_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        app.layer = Layer::Streams;
+
+        let streams = serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}}
+        ]);
+        for name in ["remux.mkv", "transcode.mkv"] {
+            let file = app
+                .files
+                .iter()
+                .find(|file| file.display_name == name)
+                .unwrap()
+                .clone();
+            app.cache.insert(
+                CacheKey::for_file(&file),
+                ProbeOutcome::Video(media(streams.clone())),
+            );
+        }
+        let position_of = |app: &App, name: &str| {
+            app.files
+                .iter()
+                .position(|file| file.display_name == name)
+                .unwrap()
+        };
+        let remux_index = position_of(&app, "remux.mkv");
+        let transcode_index = position_of(&app, "transcode.mkv");
+
+        // Whichever file `App::new` auto-selected got probed before the cache above
+        // was populated, so its `stream_order` is still the construction-time empty
+        // default. Force a real transition away from it first so the next selection
+        // below is a genuine change and picks up the now-cached probe data via
+        // `queue_probe`'s synchronous cache-hit path.
+        app.select_file_position(Some(transcode_index));
+
+        // Stage a plain container change on remux.mkv — no codec change, stays a copy.
+        app.select_file_position(Some(remux_index));
+        app.container_target = Some(ContainerFormat::Matroska);
+
+        // Stage a genuine codec change on transcode.mkv.
+        app.select_file_position(Some(transcode_index));
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::Original,
+            },
+        );
+
+        // Act
+        app.request_process_all();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+        app.confirm_process_all();
+
+        // Assert: each request landed in the pool matching its actual work.
+        let remux_request = remux_rx
+            .try_recv()
+            .expect("remux.mkv should route to the remux pool");
+        assert_that!(remux_request.path.file_name().unwrap().to_str().unwrap())
+            .is_equal_to("remux.mkv");
+        assert!(
+            remux_rx.try_recv().is_err(),
+            "transcode.mkv must not also land in the remux pool"
+        );
+
+        let transcode_request = transcode_rx
+            .try_recv()
+            .expect("transcode.mkv should route to the transcode pool");
+        assert_that!(
+            transcode_request
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+        .is_equal_to("transcode.mkv");
+
+        // And the batch dialog now tracks both as pending.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
+        let batch = app.active_batch.as_ref().unwrap();
+        assert_that!(batch.items.len()).is_equal_to(2);
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|item| item.status == crate::staging::BatchItemStatus::Pending)
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirm_process_all_should_filter_deleted_tracks_out_of_the_dispatched_stream_order() {
+        // Regression test: `StagedEdit::stream_order` is the raw display order and
+        // still contains deleted tracks (`final_stream_order` is what actually drops
+        // them and reconciles group positions) — `staged_file_status` already runs
+        // edits through it before validating, which is why a deletion never shows the
+        // ⚠ invalid marker. But `confirm_process_all` was sending
+        // `staged.stream_order` straight through unfiltered, so the worker's own
+        // `validate_edit` saw the deleted track as both kept and deleted and rejected
+        // a perfectly valid edit — reported to the user as a spurious "source
+        // changed" failure with no way to tell it apart from genuine staleness.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-confirm-process-all-deletion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        std::fs::write(directory.join("other.mkv"), b"media").unwrap();
+
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+
+        let movie = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "movie.mkv")
+            .unwrap()
+            .clone();
+        app.cache.insert(
+            CacheKey::for_file(&movie),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}, "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "ass",
+                 "tags": {"language": "eng"}}
+            ]))),
+        );
+        let movie_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "movie.mkv")
+            .unwrap();
+        let other_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "other.mkv")
+            .unwrap();
+        // Force a real transition away from whatever `App::new` auto-selected before
+        // the cache above existed, so the next selection genuinely picks up the
+        // now-cached probe data via `queue_probe`'s synchronous cache-hit path.
+        app.select_file_position(Some(other_index));
+        app.select_file_position(Some(movie_index));
+        app.layer = Layer::Streams;
+
+        // Delete track 2 (the ASS subtitle) — `stream_order` itself is untouched by
+        // this, per `App`'s own model; only `deleted_streams` records it.
+        app.deleted_streams.insert(2);
+        assert_that!(&app.stream_order).contains(2);
+
+        // Act
+        app.request_process_all();
+        assert_that!(app.dialog).contains(Dialog::ConfirmProcessAll);
+        app.confirm_process_all();
+
+        // Assert: the dispatched request's stream_order must not contain the deleted
+        // track — this is exactly what `validate_edit` (in `edit.rs`) requires.
+        let request = remux_rx
+            .try_recv()
+            .expect("movie.mkv should have been dispatched");
+        assert_that!(&request.stream_order).does_not_contain(2);
+        assert_that!(&request.default_streams).does_not_contain(2);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirm_process_all_choice_should_control_whether_activating_starts_or_cancels() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-confirm-process-all-choice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        std::fs::write(directory.join("other.mkv"), b"media").unwrap();
+
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+
+        let movie = app
+            .files
+            .iter()
+            .find(|file| file.display_name == "movie.mkv")
+            .unwrap()
+            .clone();
+        app.cache.insert(
+            CacheKey::for_file(&movie),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}}
+            ]))),
+        );
+        let movie_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "movie.mkv")
+            .unwrap();
+        let other_index = app
+            .files
+            .iter()
+            .position(|file| file.display_name == "other.mkv")
+            .unwrap();
+        // Force a real transition away from whatever `App::new` auto-selected before
+        // the cache above existed, so the next selection genuinely picks up the
+        // now-cached probe data via `queue_probe`'s synchronous cache-hit path.
+        app.select_file_position(Some(other_index));
+        app.select_file_position(Some(movie_index));
+        app.layer = Layer::Streams;
+        app.container_target = Some(ContainerFormat::Mp4);
+
+        app.request_process_all();
+        assert_that!(app.dialog).contains(Dialog::ConfirmProcessAll);
+        assert_that!(app.confirm_process_all_choice).is_equal_to(ConfirmProcessAllChoice::Start);
+
+        // Act: focus Cancel and activate — dismisses without starting anything.
+        app.choose_confirm_process_all(1);
+        assert_that!(app.confirm_process_all_choice).is_equal_to(ConfirmProcessAllChoice::Cancel);
+        app.activate_confirm_process_all();
+
+        // Assert
+        assert_that!(app.dialog).is_none();
+        assert!(
+            remux_rx.try_recv().is_err(),
+            "cancelling the confirm dialog must not dispatch anything"
+        );
+        assert_that!(app.staged_edits.len()).is_equal_to(1);
+
+        // Act: reopen and activate with Start (the default) focused. Leftover cursor
+        // state from an earlier run must not survive into the new batch.
+        app.batch_cursor = 3;
+        app.batch_scroll = 2;
+        app.request_process_all();
+        assert_that!(app.confirm_process_all_choice).is_equal_to(ConfirmProcessAllChoice::Start);
+        app.activate_confirm_process_all();
+
+        // Assert: this time it actually dispatched.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
+        assert_that!(app.batch_cursor).is_equal_to(0);
+        assert_that!(app.batch_scroll).is_equal_to(0);
+        assert!(remux_rx.try_recv().is_ok());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn batch_app(count: usize) -> App {
+        let mut app = test_file_app(&["a.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: (0..count)
+                .map(|index| crate::staging::BatchItem {
+                    path: app.directory.join(format!("movie{index}.mkv")),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Pending,
+                    output_path: None,
+                })
+                .collect(),
+            started: std::time::Instant::now(),
+        });
+        app
+    }
+
+    #[test]
+    fn batch_cursor_should_clamp_at_both_ends_of_the_file_list() {
+        // Arrange
+        let mut app = batch_app(4);
+        let directory = app.directory.clone();
+
+        // Act / Assert: the cursor stops on the last row rather than running past it.
+        app.move_batch_cursor_down(10);
+        assert_that!(app.batch_cursor).is_equal_to(3);
+        app.move_batch_cursor_up(10);
+        assert_that!(app.batch_cursor).is_equal_to(0);
+        app.move_batch_cursor_up(1);
+        assert_that!(app.batch_cursor).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn batch_cursor_should_not_move_without_an_open_batch_dialog() {
+        // Arrange: the right dialog but no batch, then a batch but the wrong dialog.
+        let mut app = batch_app(4);
+        let directory = app.directory.clone();
+        app.active_batch = None;
+
+        // Act / Assert
+        app.move_batch_cursor_down(1);
+        assert_that!(app.batch_cursor).is_equal_to(0);
+
+        app = batch_app(4);
+        app.dialog = None;
+        app.move_batch_cursor_down(1);
+        assert_that!(app.batch_cursor).is_equal_to(0);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn sync_batch_scroll_should_slide_the_viewport_only_when_the_cursor_leaves_it() {
+        // Arrange: eight files, three rows visible.
+        let mut app = batch_app(8);
+        let directory = app.directory.clone();
+
+        // Act / Assert: movement inside the window leaves the viewport alone.
+        app.move_batch_cursor_down(2);
+        app.sync_batch_scroll(3);
+        assert_that!(app.batch_scroll).is_equal_to(0);
+
+        // One row further pulls the viewport down by exactly one row.
+        app.move_batch_cursor_down(1);
+        app.sync_batch_scroll(3);
+        assert_that!(app.batch_scroll).is_equal_to(1);
+
+        // Jumping to the end stops at the last full window, not past it.
+        app.move_batch_cursor_down(10);
+        app.sync_batch_scroll(3);
+        assert_that!(app.batch_cursor).is_equal_to(7);
+        assert_that!(app.batch_scroll).is_equal_to(5);
+
+        // Coming back up drags the viewport with the cursor.
+        app.move_batch_cursor_up(7);
+        app.sync_batch_scroll(3);
+        assert_that!(app.batch_scroll).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_edit_results_should_route_batch_events_by_path_and_summarize_on_completion() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![
+                crate::staging::BatchItem {
+                    path: files[0].path.clone(),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Pending,
+                    output_path: None,
+                },
+                crate::staging::BatchItem {
+                    path: files[1].path.clone(),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Pending,
+                    output_path: None,
+                },
+            ],
+            started: std::time::Instant::now(),
+        });
+        // A staged entry for a.mkv, so completion can be checked to remove it.
+        app.staged_edits.insert(
+            files[0].path.clone(),
+            StagedEdit {
+                fingerprint: files[0].fingerprint,
+                stale: false,
+                stream_order: vec![0],
+                moved_streams: BTreeSet::new(),
+                deleted_streams: BTreeSet::new(),
+                default_streams: BTreeSet::new(),
+                default_sidecars: BTreeSet::new(),
+                video_settings: BTreeMap::new(),
+                subtitle_changes: BTreeMap::new(),
+                left_subtitle_order: Vec::new(),
+                container_target: Some(ContainerFormat::Mp4),
+                container_metadata: None,
+                original_stream_order: vec![0],
+                original_default_streams: BTreeSet::new(),
+            },
+        );
+
+        // Progress for a.mkv only must not affect b.mkv's row.
+        result_tx
+            .send(EditEvent::Progress {
+                path: files[0].path.clone(),
+                progress: crate::edit::EditProgress::measured(
+                    crate::edit::EditPhase::WriteMedia("Remuxing".to_string()),
+                    0.5,
+                ),
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+        {
+            let batch = app.active_batch.as_ref().unwrap();
+            let a = batch
+                .items
+                .iter()
+                .find(|item| item.path == files[0].path)
+                .unwrap();
+            let b = batch
+                .items
+                .iter()
+                .find(|item| item.path == files[1].path)
+                .unwrap();
+            assert_that!(a.status.clone()).is_equal_to(crate::staging::BatchItemStatus::Running);
+            assert_that!(a.fraction).is_equal_to(Some(0.5));
+            assert_that!(b.status.clone()).is_equal_to(crate::staging::BatchItemStatus::Pending);
+        }
+
+        // a.mkv finishes successfully; the batch is still open (b.mkv pending).
+        result_tx
+            .send(EditEvent::Finished {
+                path: files[0].path.clone(),
+                outcome: EditOutcome::Completed {
+                    output_path: files[0].path.clone(),
+                    media_changed: true,
+                },
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
+        assert!(!app.staged_edits.contains_key(&files[0].path));
+
+        // b.mkv fails; the batch is now fully terminal and must auto-close with a
+        // summary notice, since every item has reached a terminal state.
+        result_tx
+            .send(EditEvent::Finished {
+                path: files[1].path.clone(),
+                outcome: EditOutcome::Failed("ffmpeg exited with status 1".to_string()),
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+        assert_that!(app.dialog).is_none();
+        assert!(app.active_batch.is_none());
+        assert_that!(app.notice.as_deref().unwrap()).contains("1 of 2");
+        assert_that!(app.notice.as_deref().unwrap()).contains("1 failed");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn request_cancel_edit_should_prompt_before_flipping_the_shared_cancellation_flag() {
+        // Regression test for the "pause and prompt" behavior: Esc from the batch
+        // progress dialog must NOT cancel immediately — it opens a confirm prompt,
+        // and the batch keeps running (the flag stays unflipped) until the user
+        // actually confirms.
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: cancelled.clone(),
+            items: vec![crate::staging::BatchItem {
+                path: app.files[0].path.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+
+        // Act: request cancellation — this must only open the prompt.
+        app.request_cancel_edit();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmCancel));
+        assert!(!cancelled.load(Ordering::Relaxed), "must not cancel yet");
+
+        // Choosing "keep processing" and confirming leaves the batch untouched.
+        app.dismiss_cancel_edit();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
+        assert!(!cancelled.load(Ordering::Relaxed));
+
+        // Only explicitly confirming "cancel processing" flips the flag.
+        app.request_cancel_edit();
+        app.choose_cancel_edit(1);
+        app.activate_cancel_edit();
+        assert!(cancelled.load(Ordering::Relaxed));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn summarize_batch_outcome_should_read_naturally_for_common_cases() {
+        assert_that!(summarize_batch_outcome(1, 1, 0, 0).as_str()).is_equal_to("Processed 1 file.");
+        assert_that!(summarize_batch_outcome(3, 3, 0, 0).as_str())
+            .is_equal_to("Processed 3 files.");
+        assert_that!(summarize_batch_outcome(3, 1, 1, 1).as_str())
+            .is_equal_to("Processed 1 of 3 files (1 failed, 1 cancelled).");
+        assert_that!(summarize_batch_outcome(2, 1, 0, 1).as_str())
+            .is_equal_to("Processed 1 of 2 files (1 cancelled).");
+    }
+
+    #[test]
+    fn reset_track_should_restore_one_tracks_position_without_disturbing_others() {
+        // Regression test for the per-track reset algorithm: resetting one track's
+        // position must not undo other tracks' independently staged reordering.
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "audio", "disposition": {"default": 0}},
+                {"index": 3, "codec_type": "audio", "disposition": {"default": 0}}
+            ]),
+        );
+        let original = app.stream_order.clone();
+        assert_that!(original).is_equal_to(vec![0, 1, 2, 3]);
+
+        // Move track 1 down twice (past 2 and 3), then move track 3 up once. Both are
+        // now individually "moved" relative to the original order.
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.move_selected_stream(1);
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.move_selected_stream(1);
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(3))
+            .unwrap();
+        app.move_selected_stream(-1);
+        let before_reset = app.stream_order.clone();
+
+        // Act: reset only track 1's position.
+        app.reset_track(TrackRef::Embedded(1));
+
+        // Assert: only track 1 moved (back to sitting right after track 0, since
+        // track 0 is the only original predecessor still present); the OTHER tracks'
+        // relative order among themselves is exactly what it was before this reset —
+        // that reordering was staged independently and must be untouched by it.
+        let after_reset = app.stream_order.clone();
+        let others_before: Vec<u64> = before_reset
+            .iter()
+            .copied()
+            .filter(|track| *track != 1)
+            .collect();
+        let others_after: Vec<u64> = after_reset
+            .iter()
+            .copied()
+            .filter(|track| *track != 1)
+            .collect();
+        assert_that!(others_after).is_equal_to(others_before);
+        assert_that!(after_reset.iter().position(|track| *track == 1)).is_equal_to(Some(1)); // right after track 0, per the algorithm
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reset_focused_field_should_reset_only_the_highlighted_container_field() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.container_target = Some(ContainerFormat::Mp4);
+        app.container_metadata = Some(ContainerMetadata {
+            title: Some("Custom title".to_string()),
+            comment: None,
+            date: None,
+            genre: None,
+            artist: None,
+        });
+        app.open_container_settings();
+        app.container_settings_popup.as_mut().unwrap().field = ContainerSettingsField::Title;
+
+        // Act: reset only the focused Title field.
+        app.reset_focused_field();
+
+        // Assert: Title reverted, but the Format field (a different staged edit) is
+        // untouched — `r` only resets the one field under the cursor.
+        assert_that!(app.container_metadata.is_none()).is_true();
+        assert_that!(app.container_target).is_equal_to(Some(ContainerFormat::Mp4));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reset_focused_field_should_reset_only_the_highlighted_video_field() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080}
+            ]),
+        );
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::P720,
+            },
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(0))
+            .unwrap();
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Resolution;
+
+        // Act: reset only the focused Resolution field.
+        app.reset_focused_field();
+
+        // Assert: resolution reverted to Original, codec change (a different field)
+        // survives.
+        let settings = app.video_settings.get(&0).copied().unwrap();
+        assert_that!(settings.resolution).is_equal_to(VideoResolution::Original);
+        assert_that!(settings.codec).is_equal_to(VideoCodec::Hevc);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reset_focused_field_should_reset_only_the_highlighted_subtitle_field() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        let source = SubtitleSource::Embedded(1);
+        let mut metadata = app.subtitle_metadata_for(&source).unwrap();
+        metadata.language = "fre".to_string();
+        metadata.forced = true;
+        app.store_subtitle_metadata(source.clone(), SubtitleFormat::SubRip, metadata);
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_true();
+
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_subtitle_settings(source.clone());
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Language;
+
+        // Act: reset only the focused Language field.
+        app.reset_focused_field();
+
+        // Assert: language reverted, but Forced (a different staged field on the same
+        // subtitle) survives.
+        let current = app.subtitle_metadata_for(&source).unwrap();
+        assert_that!(current.language.as_str()).is_equal_to("eng");
+        assert_that!(current.forced).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reset_focused_field_should_clear_only_the_subtitle_codec_choice() {
+        // Regression test: resetting the Codec field must clear just the staged
+        // embedded/export format choice, leaving any other staged field (metadata) on
+        // the same subtitle untouched, and must not touch `import_into_media` — a
+        // separate concern driven by `transfer_subtitle` (Ctrl-h/l), not this field.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "ass".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        let source = SubtitleSource::Embedded(1);
+
+        // Stage both a metadata change and a codec change on the same subtitle.
+        let mut metadata = app.subtitle_metadata_for(&source).unwrap();
+        metadata.language = "fre".to_string();
+        app.store_subtitle_metadata(source.clone(), SubtitleFormat::SubRip, metadata);
+        let mut change = app.subtitle_change(&source, SubtitleFormat::SubRip);
+        change.embedded_target = Some(SubtitleFormat::Ass);
+        app.store_subtitle_change(source.clone(), change);
+        assert_that!(
+            app.subtitle_changes
+                .get(&source)
+                .and_then(|change| change.embedded_target)
+        )
+        .is_equal_to(Some(SubtitleFormat::Ass));
+
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_subtitle_settings(source.clone());
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Codec;
+
+        // Act: reset only the focused Codec field.
+        app.reset_focused_field();
+
+        // Assert: codec choice cleared, language change (a different field) survives.
+        let remaining_codec = app
+            .subtitle_changes
+            .get(&source)
+            .and_then(|change| change.embedded_target);
+        assert_that!(remaining_codec.is_none()).is_true();
+        let current = app.subtitle_metadata_for(&source).unwrap();
+        assert_that!(current.language.as_str()).is_equal_to("fra");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn request_reset_file_should_unstage_a_non_open_file_after_confirmation() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let directory = app.directory.clone();
+        let files = app.files.clone();
+        for file in &files {
+            app.cache.insert(
+                CacheKey::for_file(file),
+                ProbeOutcome::Video(media(serde_json::json!([
+                    {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+                ]))),
+            );
+        }
+        app.select_file_position(Some(1));
+        app.select_file_position(Some(0));
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.select_file_position(Some(1));
+        assert_that!(app.staged_edits.contains_key(&files[0].path)).is_true();
+
+        // Act: request + confirm resetting a.mkv specifically, while b.mkv is open.
+        app.request_reset_file(files[0].path.clone());
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmReset));
+        app.choose_reset(1); // "Reset edits"
+        app.activate_reset();
+
+        // Assert
+        assert_that!(app.staged_edits.contains_key(&files[0].path)).is_false();
+        assert_that!(app.dialog.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn activate_reset_should_keep_edits_unless_reset_is_explicitly_chosen() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.container_target = Some(ContainerFormat::Mp4);
+
+        // Act: open the confirm-current-file dialog but confirm with the default
+        // ("keep edits") choice.
+        app.request_reset_current_file();
+        assert_that!(app.reset_choice).is_equal_to(ResetChoice::KeepEdits);
+        app.activate_reset();
+
+        // Assert: nothing was discarded.
+        assert_that!(app.container_target).is_equal_to(Some(ContainerFormat::Mp4));
+        assert_that!(app.dialog.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn request_save_should_refuse_while_container_conflicts_remain() {
         // Arrange: SubRip cannot go into MP4, so converting the container leaves a
         // conflict the user has to resolve. Saving anyway would silently drop the track.
@@ -5571,54 +7773,71 @@ mod tests {
         assert!(!app.selected_container_conflicts().is_empty());
 
         // Act
-        app.request_save();
+        app.request_process_all();
 
-        // Assert: the error dialog, not the save dialog.
+        // Assert: the error dialog, not the confirm dialog.
         assert_that!(app.dialog).is_equal_to(Some(Dialog::Error));
-        assert_that!(app.edit_error.as_deref().unwrap()).contains("Resolve the container");
+        assert_that!(app.edit_error.as_deref().unwrap()).contains("Resolve the following");
 
-        // And with no edits staged at all, saving is a no-op with an explanation rather
-        // than an error dialog.
+        // And with no edits staged at all, processing is a no-op with an explanation
+        // rather than an error dialog.
         let mut app = test_file_app(&["movie.mkv"]);
-        app.request_save();
+        app.request_process_all();
         assert_that!(app.dialog).is_none();
-        assert_that!(app.notice.as_deref()).is_equal_to(Some("No media changes to save."));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("No staged changes to process."));
 
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
     }
 
     #[test]
-    fn receive_edit_results_should_ignore_events_once_the_dialog_moved_on() {
-        // Arrange: an edit worker that is still reporting after its dialog closed —
-        // exactly what a cancelled or finished job does before its thread notices.
+    fn receive_edit_results_should_ignore_stale_events_with_no_active_batch() {
+        // Arrange: an edit worker that is still reporting after its batch already
+        // finished (and `active_batch` was cleared) — exactly what a straggling event
+        // from a just-completed or just-cancelled job looks like.
         let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         app.dialog = None;
+        app.active_batch = None;
 
-        // Act
-        tx.send(EditEvent::Progress(crate::edit::EditProgress {
-            phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
-            fraction: Some(0.5),
-        }))
+        // Act: with no active batch, the event has nothing to attribute to and is
+        // discarded.
+        tx.send(EditEvent::Progress {
+            path: app.directory.join("movie.mkv"),
+            progress: crate::edit::EditProgress {
+                phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
+                fraction: Some(0.5),
+            },
+        })
         .unwrap();
         app.receive_edit_results(&rx);
+        assert!(app.active_batch.is_none());
 
-        // Assert: nothing leaks into the UI.
-        assert_that!(app.edit_progress.is_none()).is_true();
-        assert_that!(app.edit_progress_label.is_none()).is_true();
-
-        // With the dialog open, the same event is taken.
-        app.dialog = Some(Dialog::Processing);
-        tx.send(EditEvent::Progress(crate::edit::EditProgress {
-            phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
-            fraction: Some(0.5),
-        }))
+        // With an active batch, the same shape of event updates the matching item.
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: app.directory.join("movie.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Pending,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+        tx.send(EditEvent::Progress {
+            path: app.directory.join("movie.mkv"),
+            progress: crate::edit::EditProgress {
+                phase: crate::edit::EditPhase::WriteMedia("movie.mkv".to_string()),
+                fraction: Some(0.5),
+            },
+        })
         .unwrap();
         app.receive_edit_results(&rx);
-        assert_that!(app.edit_progress).is_equal_to(Some(0.5));
-        assert_that!(app.edit_progress_label.is_some()).is_true();
+        let item = &app.active_batch.as_ref().unwrap().items[0];
+        assert_that!(item.fraction).is_equal_to(Some(0.5));
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -5689,113 +7908,6 @@ mod tests {
 
         // Assert
         assert_that!(result).is_equal_to(0);
-    }
-
-    #[test]
-    fn processing_description_should_describe_container_conversion_and_subtitle_exports() {
-        // Arrange
-        let mut app = test_file_app(&["alpha.mkv"]);
-        let directory = app.directory.clone();
-        app.container_target = Some(ContainerFormat::Mp4);
-        app.subtitle_changes.insert(
-            SubtitleSource::Embedded(2),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(2),
-                source_format: SubtitleFormat::SubRip,
-                embedded_target: None,
-                export_target: Some(SubtitleFormat::SubRip),
-                import_into_media: false,
-                ocr_language: None,
-
-                metadata: None,
-            },
-        );
-        app.subtitle_changes.insert(
-            SubtitleSource::Embedded(3),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(3),
-                source_format: SubtitleFormat::Ass,
-                embedded_target: None,
-                export_target: Some(SubtitleFormat::Ass),
-                import_into_media: false,
-                ocr_language: None,
-
-                metadata: None,
-            },
-        );
-
-        // Act
-        let description = app.processing_description();
-
-        // Assert
-        assert_that!(description)
-            .is_equal_to("Converting MKV to MP4 · Exporting 2 subtitles".to_string());
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn processing_description_should_singularize_one_subtitle_export() {
-        // Arrange
-        let mut app = test_file_app(&["alpha.mkv"]);
-        let directory = app.directory.clone();
-        app.subtitle_changes.insert(
-            SubtitleSource::Embedded(2),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(2),
-                source_format: SubtitleFormat::SubRip,
-                embedded_target: None,
-                export_target: Some(SubtitleFormat::SubRip),
-                import_into_media: false,
-                ocr_language: None,
-
-                metadata: None,
-            },
-        );
-
-        // Act
-        let description = app.processing_description();
-
-        // Assert
-        assert_that!(description).is_equal_to("Exporting 1 subtitle".to_string());
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn processing_description_should_describe_a_deleted_track() {
-        // Arrange
-        let mut app = test_file_app(&["alpha.mkv"]);
-        let directory = app.directory.clone();
-        app.deleted_streams.insert(1);
-
-        // Act
-        let description = app.processing_description();
-
-        // Assert
-        assert_that!(description).is_equal_to("Deleting 1 audio track".to_string());
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn processing_description_should_describe_a_default_subtitle_change() {
-        // Arrange
-        let mut app = test_file_app(&["alpha.mkv"]);
-        let directory = app.directory.clone();
-        app.default_streams.insert(2);
-
-        // Act
-        let description = app.processing_description();
-
-        // Assert
-        assert_that!(description).is_equal_to("Changing the default subtitle track".to_string());
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6021,9 +8133,12 @@ mod tests {
         popup.mode = SubtitleSettingsMode::CodecDropdown;
         popup.codec_cursor = vobsub_position;
         app.activate_subtitle_settings();
-        assert_that!(app.save_summary())
-            .contains("Exporting subtitle track #1 as VobSub".to_string())
-            .does_not_contain("Converting subtitle track #1 in the media to VobSub".to_string());
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(1))
+            .unwrap();
+        assert_that!(change.export_target).contains(SubtitleFormat::VobSub);
+        assert_that!(change.embedded_target).is_none();
         app.container_target = None;
         assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Forced)).is_none();
         assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Cc)).is_none();
@@ -6315,10 +8430,7 @@ mod tests {
         let change = app.subtitle_changes.get(&source).unwrap();
         assert_that!(change.import_into_media).is_true();
         assert_that!(change.embedded_target).is_none();
-        assert_that!(app.media_will_change()).is_true();
-        assert_that!(app.processing_description()).is_equal_to("Importing 1 subtitle".to_string());
-        assert_that!(app.save_summary())
-            .contains("Importing movie.eng.srt as SubRip / SRT".to_string());
+        assert_that!(app.has_track_edits()).is_true();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -6411,35 +8523,6 @@ mod tests {
 
         // Assert
         assert_that!(result).contains_exactly_in_given_order([0, 1, 2, 4]);
-    }
-
-    #[test]
-    fn edit_summary_should_group_actions_by_track_type_when_multiple_edits_are_staged() {
-        // Arrange
-        let info = media(serde_json::json!([
-            {"index": 0, "codec_type": "video"},
-            {"index": 1, "codec_type": "audio"},
-            {"index": 2, "codec_type": "subtitle"},
-            {"index": 3, "codec_type": "audio"}
-        ]));
-
-        // Act
-        let lines = edit_summary(
-            &info,
-            &[0, 1, 3, 2],
-            &[0, 3, 1, 2],
-            &BTreeSet::from([3]),
-            &BTreeSet::from([2]),
-            &BTreeSet::from([1]),
-            &BTreeSet::from([3]),
-        );
-
-        // Assert
-        assert_that!(lines).contains_exactly_in_given_order([
-            "Moving 1 audio track".to_string(),
-            "Deleting 1 subtitle track".to_string(),
-            "Changing the default audio track".to_string(),
-        ]);
     }
 
     #[test]
@@ -6940,7 +9023,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_video_settings_should_stage_a_valid_custom_resolution_and_enable_save() {
+    fn escape_video_settings_should_stage_a_valid_custom_resolution() {
         // Arrange
         let mut app = test_app(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
@@ -6963,7 +9046,6 @@ mod tests {
             .video_settings
             .get(&0)
             .map(|settings| settings.resolution);
-        app.save_from_video_settings();
 
         // Assert
         assert_that!(staged).contains(VideoResolution::Custom(CustomResolution {
@@ -6971,7 +9053,6 @@ mod tests {
             height: 720,
             scaling: CustomScaling::FitPad,
         }));
-        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -7145,6 +9226,10 @@ mod tests {
                 "Width and height must be positive whole numbers.",
             ),
             ("1280", "1082", "Upscaling isn't possible yet."),
+            // A real report: 1920x10 is positive, even and not upscaling, so it used to
+            // reach ffmpeg and fail there once libx265 was already opening.
+            ("1920", "10", "Width and height must be at least 16 pixels."),
+            ("10", "1080", "Width and height must be at least 16 pixels."),
         ];
 
         for (width, height, expected) in cases {
@@ -7275,12 +9360,12 @@ mod tests {
         app.move_container_settings_cursor(1);
         app.activate_container_settings();
         app.close_container_settings();
-        app.request_save();
+        app.request_process_all();
 
-        // Assert
+        // Assert: batch processing always replaces the original in place — there's no
+        // per-batch destination choice.
         assert_that!(app.container_target).contains(ContainerFormat::Mp4);
-        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
-        assert_that!(app.save_destination).is_equal_to(SaveDestination::ReplaceOriginal);
+        assert_that!(app.dialog).contains(Dialog::ConfirmProcessAll);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -7308,7 +9393,7 @@ mod tests {
         app.container_target = Some(ContainerFormat::Mp4);
 
         // Act: unresolved conflict
-        app.request_save();
+        app.request_process_all();
         let error = app.edit_error.clone().unwrap();
 
         // Assert: the reason is actionable
@@ -7331,10 +9416,10 @@ mod tests {
                 metadata: None,
             },
         );
-        app.request_save();
+        app.request_process_all();
 
         // Assert
-        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+        assert_that!(app.dialog).contains(Dialog::ConfirmProcessAll);
         assert_that!(app.selected_container_conflicts()).is_empty();
 
         // Cleanup
@@ -7475,37 +9560,6 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn subtitle_export_save_dialog_should_allow_selecting_a_copy_destination() {
-        // Arrange
-        let mut app = test_app(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "h264"},
-            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "eng"}}
-        ])));
-        app.subtitle_changes.insert(
-            SubtitleSource::Embedded(1),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(1),
-                source_format: SubtitleFormat::SubRip,
-                embedded_target: None,
-                export_target: Some(SubtitleFormat::SubRip),
-                import_into_media: false,
-                ocr_language: None,
-
-                metadata: None,
-            },
-        );
-        app.request_save();
-
-        // Act
-        app.move_save_dialog_cursor(-1);
-        app.choose_save_destination(1);
-
-        // Assert
-        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Destination);
-        assert_that!(app.save_destination).is_equal_to(SaveDestination::CreateCopy);
     }
 
     #[test]
@@ -7664,8 +9718,18 @@ mod tests {
         let mut app = test_file_app(&["alpha.mkv", "beta.mkv"]);
         let directory = app.directory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
-        app.edit_cancel = Some(cancelled.clone());
-        app.dialog = Some(Dialog::Processing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: cancelled.clone(),
+            items: vec![crate::staging::BatchItem {
+                path: directory.join("alpha.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+        app.dialog = Some(Dialog::BatchProcessing);
         std::fs::remove_file(directory.join("alpha.mkv")).unwrap();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
 
@@ -7676,7 +9740,7 @@ mod tests {
 
         // Assert: keep ownership with the worker to allow cross-extension replacement
         assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
-        assert_that!(app.dialog).contains(Dialog::Processing);
+        assert_that!(app.dialog).contains(Dialog::BatchProcessing);
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("alpha.mkv");
 
         // Act: the worker confirms that an external removal changed the source
@@ -7773,83 +9837,6 @@ mod tests {
     }
 
     #[test]
-    fn save_dialog_should_open_on_replace_with_start_selected_and_allow_copy_selection() {
-        // Arrange
-        let mut app = test_app(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
-            {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
-            {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}}
-        ])));
-        let directory = app.directory.clone();
-        app.deleted_streams.insert(2);
-
-        // Act
-        app.request_save();
-        let initial_field = app.save_dialog_field;
-        app.move_save_dialog_cursor(-1);
-        app.activate_save_dialog();
-
-        // Assert
-        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
-        assert_that!(initial_field).is_equal_to(SaveDialogField::Start);
-        assert_that!(app.save_destination).is_equal_to(SaveDestination::CreateCopy);
-        assert_that!(app.save_dialog_field).is_equal_to(SaveDialogField::Destination);
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn activating_start_should_send_the_selected_destination_to_the_worker() {
-        // Arrange
-        let directory = std::env::temp_dir().join(format!(
-            "reel-tui-save-dialog-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("alpha.mkv"), b"media").unwrap();
-        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
-        let (edit_tx, edit_rx) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
-        app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "h264", "disposition": {"default": 1}},
-            {"index": 1, "codec_type": "audio", "codec_name": "aac", "disposition": {"default": 1}},
-            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 0}}
-        ]))));
-        app.loading = false;
-        app.reset_track_edits();
-        app.layer = Layer::Streams;
-        app.subtitle_capabilities = ToolCapabilities {
-            ffmpeg: true,
-            ffmpeg_muxers: BTreeSet::from(["mp4".to_string()]),
-            ..ToolCapabilities::default()
-        };
-        app.container_target = Some(ContainerFormat::Mp4);
-        app.deleted_streams.insert(2);
-        app.request_save();
-        app.move_save_dialog_cursor(-1);
-        app.choose_save_destination(-1);
-        app.choose_save_destination(1);
-        app.move_save_dialog_cursor(1);
-
-        // Act
-        app.activate_save_dialog();
-        let request = edit_rx.try_recv().unwrap();
-
-        // Assert
-        assert_that!(request.destination).is_equal_to(SaveDestination::CreateCopy);
-        assert_that!(request.container).contains(ContainerFormat::Mp4);
-        assert_that!(app.dialog).contains(Dialog::Processing);
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn completed_copy_should_refresh_and_select_the_output_file() {
         // Arrange
         let mut app = test_file_app(&["alpha.mkv"]);
@@ -7858,7 +9845,18 @@ mod tests {
         let output = directory.join("alpha-edited.mkv");
         std::fs::write(&output, b"edited media").unwrap();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        app.dialog = Some(Dialog::Processing);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: source.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         result_tx
             .send(EditEvent::Finished {
                 path: source,
@@ -7889,7 +9887,18 @@ mod tests {
         let source = directory.join("alpha.mkv");
         let output = directory.join("alpha.mp4");
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        app.dialog = Some(Dialog::Processing);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: source.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         std::fs::write(&output, b"edited media").unwrap();
         std::fs::remove_file(&source).unwrap();
         app.apply_directory_snapshot(DirectorySnapshot::Files(
@@ -7924,11 +9933,25 @@ mod tests {
         let directory = app.directory.clone();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         app.dialog = Some(Dialog::ConfirmCancel);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: app.directory.join("alpha.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         result_tx
-            .send(EditEvent::Progress(crate::edit::EditProgress::measured(
-                crate::edit::EditPhase::WriteMedia("Encoding video".to_string()),
-                0.5,
-            )))
+            .send(EditEvent::Progress {
+                path: app.directory.join("alpha.mkv"),
+                progress: crate::edit::EditProgress::measured(
+                    crate::edit::EditPhase::WriteMedia("Encoding video".to_string()),
+                    0.5,
+                ),
+            })
             .unwrap();
 
         // Act
@@ -7936,8 +9959,9 @@ mod tests {
 
         // Assert
         assert_that!(app.dialog).contains(Dialog::ConfirmCancel);
-        assert_that!(app.edit_progress).contains(0.5);
-        assert_that!(app.edit_progress_label.as_deref()).contains("Encoding video");
+        let item = &app.active_batch.as_ref().unwrap().items[0];
+        assert_that!(item.fraction).contains(0.5);
+        assert_that!(item.label.as_deref()).contains("Encoding video");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -8085,8 +10109,19 @@ mod tests {
         let directory = app.directory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         app.deleted_streams.insert(2);
-        app.edit_cancel = Some(cancelled.clone());
-        app.dialog = Some(Dialog::Processing);
+        let item_path = directory.join("movie.mkv");
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: cancelled.clone(),
+            items: vec![crate::staging::BatchItem {
+                path: item_path.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         let (result_tx, result_rx) = std::sync::mpsc::channel();
 
         // Act
@@ -8094,14 +10129,13 @@ mod tests {
 
         // Assert
         assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
-        assert_that!(app.dialog).contains(Dialog::Processing);
-        assert_that!(app.edit_progress_label.as_deref()).contains("Stopping active tools");
+        assert_that!(app.dialog).contains(Dialog::BatchProcessing);
         assert_that!(&app.deleted_streams).contains(2);
 
         // Act
         result_tx
             .send(EditEvent::Finished {
-                path: PathBuf::from("movie.mkv"),
+                path: item_path,
                 outcome: EditOutcome::Cancelled,
             })
             .unwrap();
@@ -8125,8 +10159,18 @@ mod tests {
         ])));
         let directory = app.directory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
-        app.edit_cancel = Some(cancelled.clone());
-        app.dialog = Some(Dialog::Processing);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: cancelled.clone(),
+            items: vec![crate::staging::BatchItem {
+                path: directory.join("movie.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
 
         // Act
         app.request_cancel_edit();
@@ -8142,8 +10186,7 @@ mod tests {
 
         // Assert
         assert_that!(cancelled.load(Ordering::Relaxed)).is_true();
-        assert_that!(app.dialog).contains(Dialog::Processing);
-        assert_that!(app.edit_progress_label.as_deref()).contains("Stopping active tools");
+        assert_that!(app.dialog).contains(Dialog::BatchProcessing);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -8157,7 +10200,17 @@ mod tests {
         ])));
         let directory = app.directory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
-        app.edit_cancel = Some(cancelled.clone());
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: cancelled.clone(),
+            items: vec![crate::staging::BatchItem {
+                path: directory.join("movie.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         app.dialog = Some(Dialog::ConfirmCancel);
         app.cancel_edit_choice = CancelEditChoice::CancelProcessing;
 
@@ -8165,7 +10218,7 @@ mod tests {
         app.dismiss_cancel_edit();
 
         // Assert
-        assert_that!(app.dialog).contains(Dialog::Processing);
+        assert_that!(app.dialog).contains(Dialog::BatchProcessing);
         assert_that!(app.cancel_edit_choice).is_equal_to(CancelEditChoice::KeepProcessing);
         assert_that!(cancelled.load(Ordering::Relaxed)).is_false();
 
@@ -8942,6 +10995,33 @@ mod tests {
     }
 
     #[test]
+    fn file_panel_entries_should_reflect_files_reassigned_outside_reconcile() {
+        // Regression test: `file_panel_entries()` memoizes its result, but `files` is a
+        // `pub` field some callers assign to directly instead of going through
+        // `reconcile_files` (tests do this routinely for setup). A cache keyed by a
+        // dirty flag/counter bumped only inside `reconcile_files` would silently return
+        // a stale, shorter list after such a direct assignment — this must not happen.
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        assert_that!(app.file_panel_entries().len()).is_equal_to(1);
+
+        app.files = (0..5)
+            .map(|index| FileEntry {
+                path: directory.join(format!("{index}.mkv")),
+                display_name: format!("{index}.mkv"),
+                fingerprint: crate::files::FileFingerprint {
+                    length: 0,
+                    modified: None,
+                },
+            })
+            .collect();
+
+        assert_that!(app.file_panel_entries().len()).is_equal_to(5);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn subtitle_settings_should_search_language_and_edit_unicode_title_with_a_caret() {
         let mut app = test_app(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264"},
@@ -9104,31 +11184,35 @@ mod tests {
 
     #[test]
     fn legacy_subtitle_languages_should_remain_editable_and_pass_save_validation() {
-        let mut app = test_app(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "codec_name": "h264"},
-            {
-                "index": 1,
-                "codec_type": "subtitle",
-                "codec_name": "subrip",
-                "tags": {"language": "cze"},
-                "disposition": {"default": 0}
-            },
-            {
-                "index": 2,
-                "codec_type": "subtitle",
-                "codec_name": "subrip",
-                "tags": {"language": "ger"},
-                "disposition": {"default": 0}
-            },
-            {
-                "index": 3,
-                "codec_type": "subtitle",
-                "codec_name": "subrip",
-                "tags": {"language": "chi"},
-                "disposition": {"default": 0}
-            }
-        ])));
+        let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {
+                    "index": 1,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "tags": {"language": "cze"},
+                    "disposition": {"default": 0}
+                },
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "tags": {"language": "ger"},
+                    "disposition": {"default": 0}
+                },
+                {
+                    "index": 3,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "tags": {"language": "chi"},
+                    "disposition": {"default": 0}
+                }
+            ]),
+        );
         app.selected_stream = app
             .track_rows()
             .iter()
@@ -9150,9 +11234,38 @@ mod tests {
         app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Default;
         app.activate_subtitle_settings();
         app.close_subtitle_settings();
-        app.request_save();
-        assert_that!(app.dialog).contains(Dialog::ConfirmSave);
+        app.request_process_all();
+        assert_that!(app.dialog).contains(Dialog::ConfirmProcessAll);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_container_should_trust_the_probed_format_over_a_renamed_extension() {
+        // Arrange: a file literally named `movie.mp4` whose actual bytes ffprobe still
+        // reports as Matroska — as happens when a `.mkv` gets renamed rather than
+        // genuinely converted.
+        let mut app = test_file_app(&["movie.mp4"]);
+        let directory = app.directory.clone();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": { "format_name": "matroska,webm" },
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"}
+                ]
+            }))
+            .unwrap(),
+        ));
+
+        // Act / Assert: the label follows what the file actually is, not its name.
+        assert_that!(app.source_container()).contains(ContainerFormat::Matroska);
+
+        // Before a probe result is in yet, the extension is still the best guess
+        // available.
+        app.outcome = None;
+        assert_that!(app.source_container()).contains(ContainerFormat::Mp4);
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -9243,158 +11356,6 @@ mod tests {
         assert!(app.container_metadata.is_none());
 
         // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn media_will_change_should_be_true_for_container_metadata_only() {
-        // Arrange
-        let mut app = test_file_app(&["movie.mkv"]);
-        let directory = app.directory.clone();
-        assert_that!(app.media_will_change()).is_false();
-
-        // Act
-        app.container_metadata = Some(ContainerMetadata {
-            title: Some("New Title".to_string()),
-            ..Default::default()
-        });
-
-        // Assert
-        assert_that!(app.media_will_change()).is_true();
-        assert_that!(app.has_track_edits()).is_true();
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn save_summary_should_describe_every_kind_of_staged_change() {
-        // Arrange: the save dialog's summary is the last thing a user reads before an
-        // irreversible remux, so every staged change has to be named in it. One file
-        // carrying a video re-encode, a subtitle export, a sidecar import and a metadata
-        // edit at once.
-        let mut app = test_file_app(&["movie.mkv", "movie.nld.srt"]);
-        let directory = app.directory.clone();
-        set_media(
-            &mut app,
-            serde_json::json!([
-                {"index": 0, "codec_type": "video", "codec_name": "h264",
-                 "width": 1920, "height": 1080},
-                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
-                 "tags": {"language": "eng"}}
-            ]),
-        );
-        app.sidecars = vec![test_sidecar(&app, "movie.nld.srt", "nld")];
-
-        app.video_settings.insert(
-            0,
-            VideoSettings {
-                codec: VideoCodec::Av1,
-                resolution: VideoResolution::P720,
-            },
-        );
-        app.selected_stream = app
-            .track_rows()
-            .iter()
-            .position(|row| *row == TrackRef::Embedded(1))
-            .unwrap();
-        assert!(app.transfer_subtitle(1), "the embedded track should export");
-        app.selected_stream = app
-            .track_rows()
-            .iter()
-            .position(|row| *row == TrackRef::Sidecar(0))
-            .unwrap();
-        assert!(app.transfer_subtitle(-1), "the sidecar should import");
-
-        // Act
-        let summary = app.save_summary().join("\n");
-
-        // Assert
-        assert_that!(summary.as_str()).contains("Encoding video track #0 as AV1 at 1280×720");
-        assert_that!(summary.as_str()).contains("Exporting subtitle track #1");
-        assert_that!(summary.as_str()).contains("Importing movie.nld.srt");
-
-        // And with a container change on top, that leads the summary — it is the change
-        // that can invalidate every other one.
-        app.container_target = Some(ContainerFormat::Mp4);
-        let summary = app.save_summary();
-        assert_that!(summary[0].as_str()).contains("Changing container");
-
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn save_summary_should_spell_out_a_subtitle_metadata_edit() {
-        // Arrange: metadata edits are invisible in the overview beyond a `~`, so the save
-        // summary is the only place a user can check what is actually being written.
-        let mut app = test_file_app(&["movie.mkv"]);
-        let directory = app.directory.clone();
-        set_media(
-            &mut app,
-            serde_json::json!([
-                {"index": 0, "codec_type": "video", "codec_name": "h264"},
-                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
-                 "tags": {"language": "eng"}}
-            ]),
-        );
-        app.store_subtitle_change(
-            SubtitleSource::Embedded(1),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(1),
-                source_format: SubtitleFormat::SubRip,
-                embedded_target: Some(SubtitleFormat::Ass),
-                export_target: None,
-                import_into_media: false,
-                ocr_language: None,
-                metadata: Some(crate::subtitle::SubtitleMetadata {
-                    language: "nld".to_string(),
-                    title: Some("Nederlands".to_string()),
-                    forced: true,
-                    cc: true,
-                    hearing_impaired: true,
-                    original: true,
-                    commentary: true,
-                }),
-            },
-        );
-
-        // Act
-        let summary = app.save_summary().join("\n");
-
-        // Assert: the conversion and every flag, named.
-        assert_that!(summary.as_str()).contains("Converting subtitle track #1 in the media to");
-        assert_that!(summary.as_str()).contains("language NLD");
-        assert_that!(summary.as_str()).contains("title “Nederlands”");
-        for flag in ["Forced", "CC", "Hearing impaired", "Original", "Commentary"] {
-            assert!(
-                summary.contains(flag),
-                "{flag} should be listed:\n{summary}"
-            );
-        }
-
-        // A cleared title says so, rather than leaving the reader to assume it is kept.
-        app.store_subtitle_change(
-            SubtitleSource::Embedded(1),
-            SubtitleChange {
-                source: SubtitleSource::Embedded(1),
-                source_format: SubtitleFormat::SubRip,
-                embedded_target: None,
-                export_target: None,
-                import_into_media: false,
-                ocr_language: None,
-                metadata: Some(crate::subtitle::SubtitleMetadata {
-                    language: "eng".to_string(),
-                    title: None,
-                    forced: false,
-                    cc: false,
-                    hearing_impaired: false,
-                    original: false,
-                    commentary: false,
-                }),
-            },
-        );
-        assert_that!(app.save_summary().join("\n").as_str()).contains("no title");
-
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -9711,64 +11672,6 @@ mod tests {
         assert_that!(app.container_settings_popup.as_ref().unwrap().help_visible)
             .is_equal_to(!before);
 
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn save_summary_should_include_container_metadata_changes() {
-        // Arrange
-        let info = MediaInfo::from_json(serde_json::json!({
-            "format": {
-                "format_name": "matroska,webm",
-                "tags": { "title": "Original" }
-            },
-            "streams": [
-                {"index": 0, "codec_type": "video", "codec_name": "h264"}
-            ]
-        }))
-        .unwrap();
-        let mut app = test_app(info);
-        let directory = app.directory.clone();
-        app.container_metadata = Some(ContainerMetadata {
-            title: Some("New Title".to_string()),
-            genre: Some("Action".to_string()),
-            ..Default::default()
-        });
-
-        // Act
-        let summary = app.save_summary();
-
-        // Assert
-        assert_that!(
-            summary
-                .iter()
-                .any(|line| line.contains("container metadata")
-                    && line.contains("title")
-                    && line.contains("genre"))
-        )
-        .is_true();
-
-        // Cleanup
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn processing_description_should_describe_metadata_only_edits() {
-        // Arrange
-        let mut app = test_file_app(&["movie.mkv"]);
-        let directory = app.directory.clone();
-        app.container_metadata = Some(ContainerMetadata {
-            title: Some("New Title".to_string()),
-            ..Default::default()
-        });
-
-        // Act
-        let description = app.processing_description();
-
-        // Assert
-        assert_that!(description).is_equal_to("Updating container metadata".to_string());
-
-        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

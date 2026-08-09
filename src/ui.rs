@@ -6,21 +6,23 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CancelEditChoice, CharClass, ContainerChoice, ContainerSettingsField,
-        ContainerSettingsMode, ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject,
-        Layer, SaveDialogField, SearchState, SubtitleDisplayState, SubtitleSettingsField,
-        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
-        TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode,
+        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ContainerChoice,
+        ContainerSettingsField, ContainerSettingsMode, ContainerSettingsPopup,
+        CustomResolutionField, Dialog, InputReject, Layer, ResetChoice, SearchState,
+        StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
+        SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
+        VideoSettingsField, VideoSettingsMode,
     },
-    edit::{ContainerFormat, SaveDestination, stream_index},
+    edit::{ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
+    staging::BatchItemStatus,
     subtitle::{
         SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleSource,
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
@@ -92,6 +94,7 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
                     .map(|sidecar| sidecar.display_name.as_str()),
                 !filtering && app.is_file_folded(&file.path),
                 has_any_sidecars,
+                app.staged_file_status(&file.path),
             )))
         })
         .collect();
@@ -123,19 +126,34 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// `status` drives the same yellow/italic-for-changed and warning-triangle-for-invalid
+/// visual language used for track rows in the details panel (`changed_style()`,
+/// `warning_style()`), applied here to a whole file's row so staged (and possibly
+/// stale/conflicting) files are distinguishable at a glance in the file list.
 fn file_tree_lines<'a>(
     display_name: &str,
     sidecar_names: impl IntoIterator<Item = &'a str>,
     folded: bool,
     has_any_sidecars: bool,
+    status: StagedFileStatus,
 ) -> Vec<Line<'static>> {
+    let (name_style, marker) = match status {
+        StagedFileStatus::Unstaged => (None, ""),
+        StagedFileStatus::Valid => (Some(changed_style()), ""),
+        StagedFileStatus::Invalid(_) => (Some(warning_style(true)), "⚠ "),
+    };
+    let styled_name = |text: String| match name_style {
+        Some(style) => Line::styled(text, style),
+        None => Line::from(text),
+    };
+
     let sidecar_names = sidecar_names.into_iter().collect::<Vec<_>>();
     if sidecar_names.is_empty() {
         let prefix = if has_any_sidecars { "  " } else { "" };
-        return vec![Line::from(format!("{prefix}{display_name}"))];
+        return vec![styled_name(format!("{prefix}{marker}{display_name}"))];
     }
     let prefix = if folded { "▹ " } else { "▿ " };
-    let first_line = Line::from(format!("{prefix}{display_name}"));
+    let first_line = styled_name(format!("{prefix}{marker}{display_name}"));
     if folded {
         return vec![first_line];
     }
@@ -1088,26 +1106,28 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_subtitle_settings_dialog(frame, app);
         return;
     }
-    if dialog == Dialog::Processing {
-        render_progress_dialog(frame, app);
-        return;
-    }
     if dialog == Dialog::ConfirmCancel {
-        render_progress_dialog(frame, app);
+        render_batch_progress_dialog(frame, app);
         render_cancel_edit_dialog(frame, app);
         return;
     }
-    if dialog == Dialog::ConfirmSave {
-        render_save_dialog(frame, app);
+    if dialog == Dialog::ConfirmProcessAll {
+        render_confirm_process_all_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::BatchProcessing {
+        render_batch_progress_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::ConfirmReset {
+        render_confirm_reset_dialog(frame, app);
         return;
     }
     let (title, body, color) = match dialog {
-        Dialog::Keybindings
-        | Dialog::ContainerSettings
-        | Dialog::VideoSettings
-        | Dialog::SubtitleSettings
-        | Dialog::ConfirmSave => unreachable!(),
-        Dialog::Processing | Dialog::ConfirmCancel => unreachable!(),
+        Dialog::Keybindings | Dialog::ContainerSettings | Dialog::VideoSettings => unreachable!(),
+        Dialog::SubtitleSettings | Dialog::ConfirmCancel => unreachable!(),
+        Dialog::ConfirmProcessAll | Dialog::BatchProcessing => unreachable!(),
+        Dialog::ConfirmReset => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -1331,67 +1351,24 @@ fn render_cancel_edit_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn render_save_dialog(frame: &mut Frame, app: &App) {
-    let summary = app.save_summary();
-    let mut lines = vec![Line::styled(
-        "Changes",
-        Style::default().fg(Color::Cyan).bold(),
-    )];
-    lines.extend(
-        summary
-            .into_iter()
-            .map(|item| Line::from(format!("• {item}"))),
-    );
-    lines.push(Line::from(""));
-
-    if app.media_will_change() {
-        let destination_focused = app.save_dialog_field == SaveDialogField::Destination;
-        lines.push(Line::from(vec![
-            Span::styled(
-                if destination_focused {
-                    "› Output  "
-                } else {
-                    "  Output  "
-                },
-                Style::default().add_modifier(if destination_focused {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-            ),
-            destination_option(
-                " Replace original ",
-                app.save_destination == SaveDestination::ReplaceOriginal,
-            ),
+/// The `r`/`R` "are you sure?" popup — mirrors `render_cancel_edit_dialog`'s
+/// two-option layout, naming what's about to be discarded via `ResetScope::label`.
+fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
+    let Some(scope) = app.pending_reset() else {
+        return;
+    };
+    let lines = vec![
+        Line::from(scope.label()).centered(),
+        Line::from(""),
+        Line::from(vec![
+            action_option(" Keep edits ", app.reset_choice == ResetChoice::KeepEdits),
             Span::raw("  "),
-            destination_option(
-                " Create a copy ",
-                app.save_destination == SaveDestination::CreateCopy,
-            ),
-        ]));
-        lines.push(Line::from(""));
-    }
-
-    let start_focused = app.save_dialog_field == SaveDialogField::Start;
-    lines.push(
-        Line::from(Span::styled(
-            if start_focused {
-                "       ▶  START       "
-            } else {
-                "          START       "
-            },
-            if start_focused {
-                focused_style(false)
-            } else {
-                Style::default().fg(Color::White).bold()
-            },
-        ))
+            action_option(" Reset edits ", app.reset_choice == ResetChoice::ResetEdits),
+        ])
         .centered(),
-    );
-
+    ];
     let text = padded_popup_text(Text::from(lines));
-    let area = save_dialog_area(frame.area(), &text.lines);
-    let scroll = max_scroll(&text, area);
+    let area = centered_fixed(frame.area(), 64, 7);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)
@@ -1399,44 +1376,17 @@ fn render_save_dialog(frame: &mut Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
-                    .title(if app.media_will_change() {
-                        " Save media edits "
-                    } else {
-                        " Save subtitle changes "
-                    }),
+                    .title(" Confirm reset "),
             )
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn save_dialog_area(frame_area: Rect, lines: &[Line<'_>]) -> Rect {
-    let width = 68.min(frame_area.width.saturating_sub(2)).max(1);
-    let content_width = width.saturating_sub(2).max(1) as usize;
-    let rendered_lines = lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(content_width))
-        .sum::<usize>();
-    let height = rendered_lines.saturating_add(2).min(u16::MAX as usize) as u16;
-    centered_fixed(frame_area, width, height.max(10))
 }
 
 fn action_option(label: &'static str, focused: bool) -> Span<'static> {
     Span::styled(
         label,
         if focused {
-            focused_style(false)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    )
-}
-
-fn destination_option(label: &'static str, chosen: bool) -> Span<'static> {
-    Span::styled(
-        label,
-        if chosen {
             focused_style(false)
         } else {
             Style::default().fg(Color::White)
@@ -1579,7 +1529,6 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
-    keybinding(&mut lines, "Ctrl-c", "Cancel processing");
 
     keybindings_section(&mut lines, "Text input");
     keybinding(
@@ -1632,7 +1581,18 @@ fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
     ]));
 }
 
+/// The original single-file design: one centered box, one label line, one gauge (or
+/// indeterminate loader before the first measured progress arrives). Used whenever
+/// `active_batch` has exactly one item — including the common case of processing
+/// just one staged file, which never needs the multi-row table — via
+/// `render_batch_progress_dialog`.
 fn render_progress_dialog(frame: &mut Frame, app: &App) {
+    let Some(batch) = app.active_batch.as_ref() else {
+        return;
+    };
+    let Some(item) = batch.items.first() else {
+        return;
+    };
     let area = centered_fixed(frame.area(), 64, 9);
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1658,10 +1618,14 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
             .style(Style::default().fg(Color::Cyan).bold()),
         rows[0],
     );
-    let label = app
-        .edit_progress_label
-        .clone()
-        .unwrap_or_else(|| app.processing_description());
+    let label = item.label.clone().unwrap_or_else(|| {
+        let name = item
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        format!("Processing {name}")
+    });
     frame.render_widget(
         Paragraph::new(processing_info_line(truncate_end(
             &label,
@@ -1671,12 +1635,10 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
         rows[2],
     );
 
-    let tick = app
-        .edit_started
-        .map_or(0, |started| (started.elapsed().as_millis() / 80) as usize);
-    let percent = app
-        .edit_progress
-        .map(|progress| (progress.clamp(0.0, 1.0) * 100.0).round() as u16);
+    let tick = (batch.started.elapsed().as_millis() / 80) as usize;
+    let percent = item
+        .fraction
+        .map(|fraction| (fraction.clamp(0.0, 1.0) * 100.0).round() as u16);
     if let Some(percent) = percent {
         frame.render_widget(
             Gauge::default()
@@ -1692,6 +1654,232 @@ fn render_progress_dialog(frame: &mut Frame, app: &App) {
         );
     } else {
         frame.render_widget(Paragraph::new(loader_line(tick)).centered(), rows[4]);
+    }
+}
+
+/// Renders one bullet per file about to be processed, all sharing a single "Start" /
+/// "Cancel" hint — the confirm step for `App::request_process_all`, gating on every
+/// staged file already being valid (see `App::confirm_process_all`).
+/// Lists every staged file with a summary of its own staged changes (`App::
+/// staged_file_summary`), scrollable like the keybindings dialog once the content
+/// exceeds the popup — replaces the old bare filename list, which grew unbounded
+/// with the file count instead of scrolling. A fixed Start/Cancel button bar (mirrors
+/// `render_cancel_edit_dialog`/`render_confirm_reset_dialog`'s `action_option` style)
+/// stays pinned at the bottom, outside the scrollable area. Since the list scrolls
+/// now, the popup itself can stay compact rather than growing to fit every file.
+fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
+    let mut paths: Vec<_> = app.staged_edits.keys().cloned().collect();
+    paths.sort();
+    let count = paths.len();
+    let title = format!(
+        " Process {count} file{} ",
+        if count == 1 { "" } else { "s" }
+    );
+    let area = popup_area(frame.area(), 60, 50);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        lines.push(Line::styled(format!("• {name}"), changed_style()));
+        for change in app.staged_file_summary(path) {
+            lines.push(Line::from(format!("    {change}")));
+        }
+        lines.push(Line::from(""));
+    }
+    let text = padded_popup_text(Text::from(lines));
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    app.set_confirm_process_all_max_scroll(max_scroll(&text, chunks[0]));
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.confirm_process_all_scroll, 0)),
+        chunks[0],
+    );
+
+    let buttons = Line::from(vec![
+        action_option(
+            " \u{25b6} Start ",
+            app.confirm_process_all_choice == ConfirmProcessAllChoice::Start,
+        ),
+        Span::raw("  "),
+        action_option(
+            " Cancel ",
+            app.confirm_process_all_choice == ConfirmProcessAllChoice::Cancel,
+        ),
+    ])
+    .centered();
+    frame.render_widget(Paragraph::new(buttons), chunks[1]);
+}
+
+/// One progress row per staged file being processed, table-like (a single column of
+/// rows), each rendered like the single-file `render_progress_dialog` (a label line
+/// plus a gauge once measured progress is known, or an indeterminate loader before
+/// then). The row under `App::batch_cursor` carries a thick cyan left border, and the
+/// viewport (`App::batch_scroll`, synced here where the visible row count is known)
+/// follows that cursor when more files are in the batch than fit in the popup.
+fn render_batch_progress_dialog(frame: &mut Frame, app: &mut App) {
+    let Some(total) = app.active_batch.as_ref().map(|batch| batch.items.len()) else {
+        return;
+    };
+    if total == 1 {
+        render_progress_dialog(frame, app);
+        return;
+    }
+    let area = centered_fixed(
+        frame.area(),
+        70,
+        frame.area().height.saturating_sub(4).min(24),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Processing {total} files "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    const ROW_HEIGHT: u16 = 3; // name/status line, gauge line, blank spacer
+    let visible_rows = (inner.height / ROW_HEIGHT).max(1) as usize;
+    app.sync_batch_scroll(visible_rows);
+    let offset = app.batch_scroll as usize;
+    let cursor = app.batch_cursor;
+    let Some(batch) = app.active_batch.as_ref() else {
+        return;
+    };
+    let tick = (batch.started.elapsed().as_millis() / 80) as usize;
+
+    let mut constraints = vec![Constraint::Length(ROW_HEIGHT); visible_rows.min(total - offset)];
+    if constraints.is_empty() {
+        return;
+    }
+    let footer_needed = offset + constraints.len() < total || offset > 0;
+    if footer_needed {
+        constraints.push(Constraint::Length(1));
+    }
+    let rows = Layout::vertical(constraints).split(inner);
+
+    for (row_index, item) in batch.items[offset..].iter().take(visible_rows).enumerate() {
+        // The left gutter carries the cursor bar; every row is indented by it so the
+        // text does not shift when the highlight moves.
+        let columns =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(0)]).split(rows[row_index]);
+        let sub_rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(columns[1]);
+        if offset + row_index == cursor {
+            let bar = Rect {
+                height: sub_rows[1].bottom().saturating_sub(columns[0].y),
+                ..columns[0]
+            };
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Cyan)),
+                bar,
+            );
+        }
+        let name = item
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let (status_text, status_style) = match &item.status {
+            BatchItemStatus::Pending => {
+                ("Waiting…".to_string(), Style::default().fg(Color::DarkGray))
+            }
+            BatchItemStatus::Running => (
+                item.label
+                    .clone()
+                    .unwrap_or_else(|| "Processing".to_string()),
+                Style::default().fg(Color::Cyan),
+            ),
+            BatchItemStatus::Completed => ("Done".to_string(), Style::default().fg(Color::Green)),
+            BatchItemStatus::Failed(error) => {
+                (format!("Failed: {error}"), Style::default().fg(Color::Red))
+            }
+            BatchItemStatus::Cancelled => (
+                "Cancelled".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled(
+                    truncate_end(name, sub_rows[0].width.saturating_sub(1) as usize / 2),
+                    Style::default().bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_end(&status_text, sub_rows[0].width as usize / 2),
+                    status_style,
+                ),
+            ]),
+            sub_rows[0],
+        );
+        match &item.status {
+            BatchItemStatus::Completed | BatchItemStatus::Cancelled => {
+                let is_completed = item.status == BatchItemStatus::Completed;
+                frame.render_widget(
+                    Gauge::default()
+                        .gauge_style(
+                            Style::default().fg(status_style.fg.unwrap_or(Color::DarkGray)),
+                        )
+                        .percent(if is_completed { 100 } else { 0 })
+                        .label(status_text.clone()),
+                    sub_rows[1],
+                );
+            }
+            BatchItemStatus::Failed(_) => {
+                frame.render_widget(Paragraph::new(""), sub_rows[1]);
+            }
+            BatchItemStatus::Pending | BatchItemStatus::Running => {
+                if let Some(fraction) = item.fraction {
+                    let percent = (fraction.clamp(0.0, 1.0) * 100.0).round() as u16;
+                    frame.render_widget(
+                        Gauge::default()
+                            .gauge_style(
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .bg(Color::DarkGray)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .percent(percent)
+                            .label(format!("{percent}%")),
+                        sub_rows[1],
+                    );
+                } else {
+                    frame.render_widget(Paragraph::new(loader_line(tick)), sub_rows[1]);
+                }
+            }
+        }
+    }
+
+    if footer_needed {
+        let footer_area = rows[rows.len() - 1];
+        let remaining_above = offset;
+        let remaining_below = total.saturating_sub(offset + visible_rows.min(total - offset));
+        let mut parts = Vec::new();
+        if remaining_above > 0 {
+            parts.push(format!("↑ {remaining_above} more"));
+        }
+        if remaining_below > 0 {
+            parts.push(format!("↓ {remaining_below} more"));
+        }
+        frame.render_widget(
+            Paragraph::new(processing_info_line(parts.join("   ·   "))).centered(),
+            footer_area,
+        );
     }
 }
 
@@ -3880,7 +4068,7 @@ mod tests {
         }
         let (probe_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let app = App::new(directory.clone(), probe_tx, edit_tx).unwrap();
+        let app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
         (app, directory)
     }
 
@@ -3997,14 +4185,71 @@ mod tests {
                     title_input: TextInputState::new(String::new()),
                 });
             }
-            Dialog::ConfirmSave => {}
-            Dialog::Processing | Dialog::ConfirmCancel => {
-                app.edit_progress = Some(0.42);
-                app.edit_progress_label = Some("Remuxing movie.mkv".to_string());
-                app.edit_started = Some(std::time::Instant::now());
+            Dialog::ConfirmCancel => {
+                app.active_batch = Some(crate::staging::BatchState {
+                    cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    items: vec![crate::staging::BatchItem {
+                        path: app.directory.join("movie.mkv"),
+                        label: Some("Remuxing movie.mkv".to_string()),
+                        fraction: Some(0.42),
+                        status: crate::staging::BatchItemStatus::Running,
+                        output_path: None,
+                    }],
+                    started: std::time::Instant::now(),
+                });
             }
             Dialog::Error => {
                 app.edit_error = Some("ffmpeg exited with status 1".to_string());
+            }
+            Dialog::ConfirmProcessAll => {
+                let path = app.directory.join("movie.mkv");
+                let fingerprint = crate::files::FileFingerprint {
+                    length: 0,
+                    modified: None,
+                };
+                app.cache.insert(
+                    crate::app::CacheKey {
+                        path: path.clone(),
+                        length: fingerprint.length,
+                        modified: fingerprint.modified,
+                    },
+                    app.outcome.clone().expect("probed_app sets an outcome"),
+                );
+                app.staged_edits.insert(
+                    path,
+                    crate::staging::StagedEdit {
+                        fingerprint,
+                        stale: false,
+                        stream_order: vec![0, 1, 2, 3],
+                        moved_streams: Default::default(),
+                        deleted_streams: Default::default(),
+                        default_streams: Default::default(),
+                        default_sidecars: Default::default(),
+                        video_settings: Default::default(),
+                        subtitle_changes: Default::default(),
+                        left_subtitle_order: Vec::new(),
+                        container_target: Some(ContainerFormat::Mp4),
+                        container_metadata: None,
+                        original_stream_order: vec![0, 1, 2, 3],
+                        original_default_streams: Default::default(),
+                    },
+                );
+            }
+            Dialog::BatchProcessing => {
+                app.active_batch = Some(crate::staging::BatchState {
+                    cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    items: vec![crate::staging::BatchItem {
+                        path: app.directory.join("movie.mkv"),
+                        label: Some("Remuxing movie.mkv".to_string()),
+                        fraction: Some(0.42),
+                        status: crate::staging::BatchItemStatus::Running,
+                        output_path: None,
+                    }],
+                    started: std::time::Instant::now(),
+                });
+            }
+            Dialog::ConfirmReset => {
+                app.request_reset_current_file();
             }
         }
         app.dialog = Some(dialog);
@@ -4014,15 +4259,19 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 8] = [
+        const DIALOGS: [(Dialog, &str); 9] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
             (Dialog::SubtitleSettings, "Subtitle track #2"),
-            (Dialog::ConfirmSave, "Replace original"),
-            (Dialog::Processing, "Remuxing movie.mkv"),
             (Dialog::ConfirmCancel, "Are you sure you want to cancel"),
             (Dialog::Error, "ffmpeg exited with status 1"),
+            (
+                Dialog::ConfirmProcessAll,
+                "Changing container from MKV to MP4",
+            ),
+            (Dialog::BatchProcessing, "Remuxing movie.mkv"),
+            (Dialog::ConfirmReset, "Reset this file's edits?"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -4059,6 +4308,142 @@ mod tests {
             }
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn confirm_process_all_dialog_should_list_each_files_own_staged_changes() {
+        // Arrange: two staged files with different container conversions — each
+        // file's row must show its own summary, not just its own name.
+        let (mut app, directory) =
+            test_app("confirm-process-all-summary", &["alpha.mkv", "beta.mkv"]);
+        for (name, target) in [
+            ("alpha.mkv", ContainerFormat::Mp4),
+            ("beta.mkv", ContainerFormat::WebM),
+        ] {
+            let path = directory.join(name);
+            let fingerprint = crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            };
+            app.cache.insert(
+                crate::app::CacheKey {
+                    path: path.clone(),
+                    length: fingerprint.length,
+                    modified: fingerprint.modified,
+                },
+                ProbeOutcome::Video(
+                    MediaInfo::from_json(serde_json::json!({
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [
+                            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+                        ]
+                    }))
+                    .unwrap(),
+                ),
+            );
+            app.staged_edits.insert(
+                path,
+                crate::staging::StagedEdit {
+                    fingerprint,
+                    stale: false,
+                    stream_order: vec![0],
+                    moved_streams: Default::default(),
+                    deleted_streams: Default::default(),
+                    default_streams: Default::default(),
+                    default_sidecars: Default::default(),
+                    video_settings: Default::default(),
+                    subtitle_changes: Default::default(),
+                    left_subtitle_order: Vec::new(),
+                    container_target: Some(target),
+                    container_metadata: None,
+                    original_stream_order: vec![0],
+                    original_default_streams: Default::default(),
+                },
+            );
+        }
+        app.dialog = Some(Dialog::ConfirmProcessAll);
+
+        // Act
+        let screen = draw(&mut app, 140, 40).join(" ");
+
+        // Assert
+        assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
+        assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("Changing container from MKV to MP4"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("Changing container from MKV to WebM"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("Start") && screen.contains("Cancel"),
+            "screen should show a Start/Cancel button bar; screen was:\n{screen}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirm_process_all_dialog_should_scroll_when_content_exceeds_the_popup() {
+        // Arrange: enough staged files that the summary can't fit a small popup.
+        let (mut app, directory) = test_app("confirm-process-all-scroll", &[]);
+        for index in 0..30 {
+            let name = format!("movie{index:02}.mkv");
+            let path = directory.join(&name);
+            std::fs::write(&path, b"media").unwrap();
+            let fingerprint = crate::files::FileFingerprint {
+                length: 4,
+                modified: None,
+            };
+            app.cache.insert(
+                crate::app::CacheKey {
+                    path: path.clone(),
+                    length: fingerprint.length,
+                    modified: fingerprint.modified,
+                },
+                ProbeOutcome::Video(
+                    MediaInfo::from_json(serde_json::json!({
+                        "streams": [
+                            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+                        ]
+                    }))
+                    .unwrap(),
+                ),
+            );
+            app.staged_edits.insert(
+                path,
+                crate::staging::StagedEdit {
+                    fingerprint,
+                    stale: false,
+                    stream_order: vec![0],
+                    moved_streams: Default::default(),
+                    deleted_streams: Default::default(),
+                    default_streams: Default::default(),
+                    default_sidecars: Default::default(),
+                    video_settings: Default::default(),
+                    subtitle_changes: Default::default(),
+                    left_subtitle_order: Vec::new(),
+                    container_target: Some(ContainerFormat::Mp4),
+                    container_metadata: None,
+                    original_stream_order: vec![0],
+                    original_default_streams: Default::default(),
+                },
+            );
+        }
+        app.dialog = Some(Dialog::ConfirmProcessAll);
+
+        // Act / Assert: rendering computes a non-zero max scroll, and scrolling
+        // actually changes what's on screen.
+        let first_screen = draw(&mut app, 140, 20).join("\n");
+        assert_that!(app.confirm_process_all_max_scroll).is_greater_than(0);
+
+        app.scroll_confirm_process_all_down(5);
+        let scrolled_screen = draw(&mut app, 140, 20).join("\n");
+        assert_that!(scrolled_screen.as_str()).is_not_equal_to(first_screen.as_str());
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4708,8 +5093,17 @@ mod tests {
     #[test]
     fn progress_dialog_should_use_a_standalone_loader_or_a_real_gauge() {
         let (mut app, directory) = test_app("progress-ui", &[]);
-        app.edit_progress_label = Some("Running OCR on movie.dan.sup → SRT (dan)".to_string());
-        app.edit_started = Some(std::time::Instant::now());
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: app.directory.join("movie.dan.sup"),
+                label: Some("Running OCR on movie.dan.sup → SRT (dan)".to_string()),
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 15)).unwrap();
 
@@ -4732,7 +5126,7 @@ mod tests {
         )
         .is_false();
 
-        app.edit_progress = Some(0.42);
+        app.active_batch.as_mut().unwrap().items[0].fraction = Some(0.42);
         terminal
             .draw(|frame| render_progress_dialog(frame, &app))
             .unwrap();
@@ -4750,6 +5144,65 @@ mod tests {
                 .any(|cell| cell.bg == Color::DarkGray)
         )
         .is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn batch_of(app: &App, count: usize) -> crate::staging::BatchState {
+        crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: (0..count)
+                .map(|index| crate::staging::BatchItem {
+                    path: app.directory.join(format!("movie{index}.mkv")),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Pending,
+                    output_path: None,
+                })
+                .collect(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn batch_progress_dialog_should_mark_the_cursor_row_and_scroll_to_follow_it() {
+        // Arrange: more files than the popup can show at once.
+        let (mut app, directory) = test_app("batch-cursor-ui", &[]);
+        app.active_batch = Some(batch_of(&app, 8));
+        app.dialog = Some(Dialog::BatchProcessing);
+
+        // Act: draw with the cursor at rest, then after moving it past the last row.
+        let resting = draw(&mut app, 100, 16);
+        app.move_batch_cursor_down(7);
+        let scrolled = draw(&mut app, 100, 16);
+
+        // Assert: the bar sits beside the cursor row and nowhere else, and the viewport
+        // followed the cursor to the end of the list.
+        let bar_rows: Vec<usize> = resting
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains('┃'))
+            .map(|(index, _)| index)
+            .collect();
+        let first_row = resting
+            .iter()
+            .position(|row| row.contains("movie0.mkv"))
+            .expect("the first file is visible");
+        assert_that!(bar_rows).is_equal_to(vec![first_row, first_row + 1]);
+        assert_that!(resting.iter().any(|row| row.contains("movie7.mkv"))).is_false();
+
+        assert_that!(scrolled.iter().any(|row| row.contains("movie0.mkv"))).is_false();
+        let last_row = scrolled
+            .iter()
+            .position(|row| row.contains("movie7.mkv"))
+            .expect("the cursor row is visible after scrolling");
+        let scrolled_bars: Vec<usize> = scrolled
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains('┃'))
+            .map(|(index, _)| index)
+            .collect();
+        assert_that!(scrolled_bars).is_equal_to(vec![last_row, last_row + 1]);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -5434,7 +5887,7 @@ mod tests {
     fn render_footer_should_include_network_mode_tag_only_when_in_network_mode() {
         let (probe_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx).unwrap();
+        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
 
         app.is_network_mount = true;
         let mut terminal =
@@ -5467,7 +5920,7 @@ mod tests {
     fn render_details_should_show_unsupported_format_only_for_non_video_outcomes() {
         let (probe_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx).unwrap();
+        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
         app.files = vec![crate::files::FileEntry {
             path: std::path::PathBuf::from("/media/image.png"),
             display_name: "image.png".to_string(),
@@ -5892,7 +6345,13 @@ mod tests {
         let sidecars = ["movie.eng.srt", "movie.nld.forced.ass"];
 
         // Act - Unfolded (false, sidecars present)
-        let lines = file_tree_lines("movie.mkv", sidecars, false, true);
+        let lines = file_tree_lines(
+            "movie.mkv",
+            sidecars,
+            false,
+            true,
+            StagedFileStatus::Unstaged,
+        );
         let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let text = text.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -5906,7 +6365,13 @@ mod tests {
         assert_eq!(lines[2].spans[1].style.fg, Some(Color::DarkGray));
 
         // Act - Folded (true, sidecars present)
-        let folded_lines = file_tree_lines("movie.mkv", sidecars, true, true);
+        let folded_lines = file_tree_lines(
+            "movie.mkv",
+            sidecars,
+            true,
+            true,
+            StagedFileStatus::Unstaged,
+        );
         let folded_text = folded_lines.iter().map(Line::to_string).collect::<Vec<_>>();
         let folded_strs = folded_text.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -5914,12 +6379,35 @@ mod tests {
         assert_that!(folded_strs).contains_exactly_in_given_order(["▹ movie.mkv"]);
 
         // Act - Standalone file when sidecars exist in folder
-        let standalone_padded = file_tree_lines("other.mp4", [], false, true);
+        let standalone_padded =
+            file_tree_lines("other.mp4", [], false, true, StagedFileStatus::Unstaged);
         assert_eq!(standalone_padded[0].to_string(), "  other.mp4");
 
         // Act - Standalone file when NO sidecars exist in folder
-        let standalone_unpadded = file_tree_lines("other.mp4", [], false, false);
+        let standalone_unpadded =
+            file_tree_lines("other.mp4", [], false, false, StagedFileStatus::Unstaged);
         assert_eq!(standalone_unpadded[0].to_string(), "other.mp4");
+    }
+
+    #[test]
+    fn file_tree_lines_should_mark_staged_files_yellow_and_invalid_ones_with_a_warning() {
+        let valid = file_tree_lines("movie.mkv", [], false, false, StagedFileStatus::Valid);
+        assert_eq!(valid[0].to_string(), "movie.mkv");
+        assert_eq!(valid[0].style, changed_style());
+
+        let invalid = file_tree_lines(
+            "movie.mkv",
+            [],
+            false,
+            false,
+            StagedFileStatus::Invalid("The file's tracks changed.".to_string()),
+        );
+        assert_eq!(invalid[0].to_string(), "⚠ movie.mkv");
+        assert_eq!(invalid[0].style, warning_style(true));
+
+        let unstaged = file_tree_lines("movie.mkv", [], false, false, StagedFileStatus::Unstaged);
+        assert_eq!(unstaged[0].to_string(), "movie.mkv");
+        assert_eq!(unstaged[0].style, Style::default());
     }
 
     #[test]
@@ -6372,21 +6860,6 @@ mod tests {
             .ends_with("SRT · ENG")
             .does_not_contain("Old title")
             .does_not_contain("no title");
-    }
-
-    #[test]
-    fn save_dialog_area_should_grow_for_wrapped_change_lines() {
-        // Arrange
-        let lines = (0..9)
-            .map(|_| Line::from("A change summary that occupies more than one rendered line because it is deliberately longer than the dialog content width"))
-            .collect::<Vec<_>>();
-
-        // Act
-        let area = save_dialog_area(Rect::new(0, 0, 100, 40), &lines);
-
-        // Assert
-        assert_that!(area.width).is_equal_to(68);
-        assert_that!(area.height).is_equal_to(20);
     }
 
     #[test]
@@ -7199,7 +7672,6 @@ mod tests {
             "Home/End",
             "Backspace/Delete",
             "languages",
-            "Ctrl-c",
         ];
 
         // Act
@@ -7209,6 +7681,9 @@ mod tests {
         for value in expected {
             assert_that!(&help).contains(value);
         }
+        // Cancelling a batch goes through the confirm dialog only; there is no
+        // immediate-stop chord left to advertise.
+        assert_that!(&help).does_not_contain("Cancel processing");
     }
 
     #[test]
@@ -8224,21 +8699,6 @@ mod tests {
         assert!(focused_changed.add_modifier.contains(Modifier::ITALIC));
         assert_eq!(disabled.fg, Some(Color::DarkGray));
         assert_eq!(disabled.bg, None);
-    }
-
-    #[test]
-    fn destination_option_should_keep_the_chosen_destination_as_a_full_cyan_block() {
-        // Act
-        let chosen = destination_option(" Replace original ", true);
-        let available = destination_option(" Create a copy ", false);
-
-        // Assert
-        assert_that!(chosen.content.as_ref()).is_equal_to(" Replace original ");
-        assert_eq!(chosen.style.fg, Some(Color::White));
-        assert_eq!(chosen.style.bg, Some(Color::Cyan));
-        assert!(chosen.style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(available.style.fg, Some(Color::White));
-        assert_eq!(available.style.bg, None);
     }
 
     #[test]

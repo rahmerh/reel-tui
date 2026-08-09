@@ -2,9 +2,11 @@
 
 ## Project Structure & Module Organization
 
-This repository builds one Rust 2024 binary, `reel`, from `src/main.rs`. Keep responsibilities aligned across modules:
+This repository builds a Rust 2024 library, `reel_tui` (`src/lib.rs`), and one binary, `reel` (`src/main.rs`), on top of it. The library exists so integration tests under `tests/` can drive the same code the binary does. Keep responsibilities aligned across modules:
 
-- `src/main.rs`: Entry point, worker spawning, and top-level terminal event loop.
+- `src/lib.rs`: Module declarations only; the crate root shared by the binary and the integration tests.
+- `src/main.rs`: Entry point, worker spawning, terminal setup, and the top-level event loop. Deliberately thin — anything testable belongs in the library.
+- `src/input.rs`: Key handling (`handle_key` and friends): the mapping from a `KeyEvent` to an `App` mutation.
 - `src/app.rs`: Application state, navigation layer management, probe/edit event dispatching, and persistent cache integration.
 - `src/ui.rs`: Ratatui rendering, split layout rendering, stream detail popups, and status indicators (including `[NET]` badge).
 - `src/files.rs`: Directory scanning, file tree nesting, and adaptive filesystem monitoring.
@@ -14,7 +16,17 @@ This repository builds one Rust 2024 binary, `reel`, from `src/main.rs`. Keep re
 - `src/mount.rs`: Network mount detection via `/proc/mounts` (NFS, SMB/CIFS, SSHFS, Rclone, Ceph, etc.) and `REEL_NETWORK_MODE` environment variable overrides.
 - `src/cache.rs`: Persistent on-disk probe metadata cache (`DiskCache`) stored at `$XDG_CACHE_HOME/reel-tui/probe_cache.json`.
 
-Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. Release publishing is defined in `.github/workflows/publish.yml`.
+Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. End-to-end tests live in `tests/e2e.rs` with helpers in `tests/e2e/`. Release publishing is defined in `.github/workflows/publish.yml`.
+
+## End-to-End Test Suite
+
+`tests/e2e.rs` drives the real application: it replays the `main.rs` event loop in-process, feeds synthetic `KeyEvent`s through the same `handle_key`, renders through the same `ui::render` into a `TestBackend`, and runs genuine `ffprobe`/`ffmpeg` subprocesses against real files. Nothing in the crate is mocked; only crossterm's terminal setup and byte decoding are bypassed.
+
+- It is a **separate cargo test target with `test = false`**, so `cargo test` does not run it. Run it with `cargo test --test e2e`.
+- Every scenario reproduces a failure that actually reached `~/.cache/reel-tui/edit_errors.log` in real use, and quotes that log line in its doc comment. That log is the first place to look when hunting for a regression worth locking in.
+- Fixtures are built by `tests/e2e/fixtures.rs` over `lavfi` sources, parameterised by codec and container. Codec/container realism is the point: the bugs this suite exists for come from combinations like `subrip` into MP4 or `mov_text` into Matroska, which the simpler `ffv1`/`pcm_s16le` unit fixtures cannot express.
+- The harness redirects `XDG_CACHE_HOME` to throwaway storage, so runs never touch the user's real probe cache or failure log.
+- When adding a scenario, verify it actually catches the regression by reintroducing the bug and watching it fail. A test that passes against broken code is worse than no test.
 
 ## Adaptive Filesystem & Performance Architecture
 
@@ -32,7 +44,8 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - `cargo build`: compile a debug binary.
 - `cargo build --release`: compile an optimized release binary.
 - `cargo install --path .`: install or replace the `reel` executable in `~/.cargo/bin/reel`. Always run this after making changes.
-- `cargo test`: run all module-local unit tests.
+- `cargo test`: run all module-local unit tests. Excludes the e2e suite.
+- `cargo test --test e2e`: run the end-to-end suite (requires `ffmpeg`/`ffprobe`; individual tests self-skip when an encoder is missing).
 - `cargo fmt --check`: verify standard Rust formatting.
 - `cargo clippy --all-targets -- -D warnings`: run strict linting used by CI.
 - `cargo publish --dry-run`: validate packaging without publishing.

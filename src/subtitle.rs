@@ -694,10 +694,13 @@ fn parse_sidecar_for_media<'a>(
     media_by_stem: &'a HashMap<String, Vec<PathBuf>>,
 ) -> Option<(&'a [PathBuf], ParsedSidecar)> {
     let without_extension = filename.rsplit_once('.')?.0;
+    // Lowercased once outside the loop: it doesn't depend on `stem`, so recomputing it
+    // per candidate media stem was an O(media_by_stem.len()) redundant allocation for
+    // every sidecar file matched.
+    let lower_without_extension = without_extension.to_ascii_lowercase();
     let (_media_stem, media_paths, tail) = media_by_stem.iter().find_map(|(stem, paths)| {
         let prefix = format!("{stem}.");
-        without_extension
-            .to_ascii_lowercase()
+        lower_without_extension
             .strip_prefix(&prefix)
             .map(|tail| (stem, paths.as_slice(), tail.to_string()))
     })?;
@@ -784,14 +787,18 @@ pub fn stream_language(stream: &BTreeMap<String, serde_json::Value>) -> String {
         .unwrap_or_else(|| "und".to_string())
 }
 
+/// A track's human-readable name.
+///
+/// Matroska stores it as `title`, but ISO-BMFF stores it in the track's `name` atom and
+/// ffprobe reports it under that key — so an MP4/MOV title reads as absent unless both
+/// are consulted, which made a title survive a remux into MP4 yet fail verification.
 pub fn stream_title(stream: &BTreeMap<String, serde_json::Value>) -> Option<String> {
-    stream
-        .get("tags")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|tags| tags.get("title"))
-        .and_then(serde_json::Value::as_str)
+    let tags = stream.get("tags").and_then(serde_json::Value::as_object)?;
+    ["title", "name"]
+        .into_iter()
+        .filter_map(|key| tags.get(key).and_then(serde_json::Value::as_str))
         .map(str::trim)
-        .filter(|title| !title.is_empty())
+        .find(|title| !title.is_empty())
         .map(str::to_string)
 }
 
@@ -1275,6 +1282,30 @@ mod tests {
             SubtitleFormat::SubRip,
         ))
         .is_equal_to("movie.nld.srt".to_string());
+    }
+
+    #[test]
+    fn stream_title_should_fall_back_to_the_iso_bmff_name_tag() {
+        // Arrange: ffprobe reports an MP4/MOV track's name under `name`, so a title that
+        // survived a remux into MP4 reads as absent unless both keys are consulted.
+        let mp4 = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"language": "kor", "name": "Forced"}}),
+        )
+        .unwrap();
+        let both = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"title": "Matroska", "name": "Ignored"}}),
+        )
+        .unwrap();
+        let blank_title = serde_json::from_value::<BTreeMap<String, serde_json::Value>>(
+            serde_json::json!({"tags": {"title": "  ", "name": "Forced"}}),
+        )
+        .unwrap();
+
+        // Act / Assert: `title` still wins when present, and an empty one does not
+        // shadow a real `name`.
+        assert_that!(stream_title(&mp4)).is_equal_to(Some("Forced".to_string()));
+        assert_that!(stream_title(&both)).is_equal_to(Some("Matroska".to_string()));
+        assert_that!(stream_title(&blank_title)).is_equal_to(Some("Forced".to_string()));
     }
 
     #[test]

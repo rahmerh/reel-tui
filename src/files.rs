@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -72,17 +71,10 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
         });
     }
 
-    files.sort_by(|left, right| {
-        let lower = left
-            .display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase());
-        if lower == Ordering::Equal {
-            left.display_name.cmp(&right.display_name)
-        } else {
-            lower
-        }
-    });
+    // `sort_by_cached_key` computes each entry's key once (O(n) lowercase
+    // allocations) instead of re-lowercasing both sides on every comparison inside a
+    // `sort_by` closure (O(n log n) allocations for the same result).
+    files.sort_by_cached_key(|file| (file.display_name.to_lowercase(), file.display_name.clone()));
 
     Ok(files)
 }

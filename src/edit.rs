@@ -1,11 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -84,6 +84,49 @@ impl ContainerFormat {
             Some("mov") => Some(Self::Mov),
             Some("webm") => Some(Self::WebM),
             _ => None,
+        }
+    }
+
+    /// Whether ffprobe's raw `format.format_name` (e.g. `"matroska,webm"` or
+    /// `"mov,mp4,m4a,3gp,3g2,mj2"`) is consistent with this specific container. MKV
+    /// and WebM share one demuxer, as do MP4 and MOV, so `format_name` alone can only
+    /// confirm which *family* a file is really in, not the exact member — this checks
+    /// family membership.
+    fn matches_format_name(self, format_name: &str) -> bool {
+        let mut tokens = format_name.split(',');
+        match self {
+            Self::Matroska | Self::WebM => {
+                tokens.any(|token| token == "matroska" || token == "webm")
+            }
+            Self::Mp4 | Self::Mov => {
+                tokens.any(|token| matches!(token, "mov" | "mp4" | "m4a" | "3gp" | "3g2" | "mj2"))
+            }
+        }
+    }
+
+    /// The container a file is actually in, cross-checking the extension against
+    /// ffprobe's own `format.format_name` when it's available (`None` when the file
+    /// hasn't been probed yet, in which case the extension is all there is to go on).
+    /// Renaming a file's extension doesn't change what's actually inside it — a
+    /// `movie.mkv` renamed to `movie.mp4` still probes as `"matroska,webm"`, so this
+    /// reports it as MKV rather than trusting the now-misleading name. Within a
+    /// family ffprobe can't tell apart (MKV vs. WebM, MP4 vs. MOV), the extension —
+    /// when it does at least agree on the family — still picks the exact member;
+    /// only a genuine mismatch defers to the family ffprobe actually detected.
+    pub fn detect(path: &Path, format_name: Option<&str>) -> Option<Self> {
+        let by_extension = Self::from_path(path);
+        let Some(format_name) = format_name else {
+            return by_extension;
+        };
+        if by_extension.is_some_and(|container| container.matches_format_name(format_name)) {
+            return by_extension;
+        }
+        if Self::Matroska.matches_format_name(format_name) {
+            Some(Self::Matroska)
+        } else if Self::Mp4.matches_format_name(format_name) {
+            Some(Self::Mp4)
+        } else {
+            by_extension
         }
     }
 
@@ -251,6 +294,10 @@ pub struct VideoSettings {
 pub enum SaveDestination {
     #[default]
     ReplaceOriginal,
+    // The batch flow always replaces in place — there's no UI path offering a
+    // destination choice anymore, so this is only constructed directly by
+    // `apply_edits`'s own tests exercising copy semantics.
+    #[allow(dead_code)]
     CreateCopy,
 }
 
@@ -301,8 +348,18 @@ pub struct EditRequest {
 
 #[derive(Clone, Debug)]
 pub enum EditEvent {
-    Progress(EditProgress),
-    Finished { path: PathBuf, outcome: EditOutcome },
+    /// Carries `path` because, once more than one file can be in flight at once
+    /// (across the transcode/remux worker pools), the UI needs to know which file a
+    /// progress update belongs to rather than assuming there's only ever one —
+    /// `App::apply_batch_event` routes each update to its `BatchItem` by this field.
+    Progress {
+        path: PathBuf,
+        progress: EditProgress,
+    },
+    Finished {
+        path: PathBuf,
+        outcome: EditOutcome,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -425,6 +482,11 @@ type ProgressReporter<'a> = dyn FnMut(EditProgress) + 'a;
 pub enum EditOutcome {
     Completed {
         output_path: PathBuf,
+        // Distinguished a "Subtitle changes saved." vs "Media edits saved." notice in
+        // the old single-file flow; the batch flow's completion notice doesn't surface
+        // this distinction per-item. Kept since `apply_edits` already computes it
+        // correctly and it may be worth resurfacing later.
+        #[allow(dead_code)]
         media_changed: bool,
     },
     Cancelled,
@@ -432,55 +494,201 @@ pub enum EditOutcome {
     Failed(String),
 }
 
-pub fn spawn_edit_worker() -> (Sender<EditRequest>, Receiver<EditEvent>) {
-    let (request_tx, request_rx) = mpsc::channel::<EditRequest>();
+/// Generalizes the per-stream `requires_transcode` check to a whole edit plan: does
+/// applying `video_settings` to any surviving video stream in `stream_order` actually
+/// require a real encode (`run_ffmpeg` runs this same check internally per-stream,
+/// edit.rs `run_ffmpeg`), as opposed to every stream being handled by `-c copy`. Used
+/// to route a staged file's `EditRequest` to the transcode pool (CPU-bound, kept to a
+/// low worker count to avoid several encodes contending for cores) or the remux pool
+/// (I/O-bound, safe to run with much higher concurrency) — see
+/// `spawn_edit_worker_pools`.
+pub(crate) fn plan_requires_transcode(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    video_settings: &BTreeMap<u64, VideoSettings>,
+) -> bool {
+    stream_order.iter().any(|source_index| {
+        info.streams
+            .iter()
+            .find(|stream| stream_index(stream) == Some(*source_index))
+            .is_some_and(|stream| {
+                stream_kind(stream) == Some("video")
+                    && video_settings
+                        .get(source_index)
+                        .is_some_and(|settings| requires_transcode(stream, *settings))
+            })
+    })
+}
+
+/// Appends one line to `~/.cache/reel-tui/edit_errors.log` for every edit that fails
+/// or gets abandoned because the source changed underneath it. The batch UI only ever
+/// shows a terse one-line notice for these (and it's gone the moment the next notice
+/// replaces it), so this is the only place the actual reason — plus enough of the
+/// request to tell what was being attempted — survives past that.
+fn log_edit_failure(request: &EditRequest, kind: &str, message: &str) {
+    let Some(dir) = crate::cache::DiskCache::cache_dir() else {
+        return;
+    };
+    append_edit_failure_log(&dir.join("edit_errors.log"), request, kind, message);
+}
+
+/// Does the actual writing for `log_edit_failure`, split out so tests can point it at
+/// a temp file instead of the real `~/.cache/reel-tui` directory. Best-effort: unable
+/// to write the log is never itself treated as an error.
+fn append_edit_failure_log(log_path: &Path, request: &EditRequest, kind: &str, message: &str) {
+    if let Some(parent) = log_path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let container = request
+        .container
+        .map(ContainerFormat::label)
+        .unwrap_or("unchanged");
+    let subtitle_changes = request
+        .subtitle_changes
+        .iter()
+        .map(|change| {
+            let source = match &change.source {
+                SubtitleSource::Embedded(index) => format!("#{index}"),
+                SubtitleSource::Sidecar(path) => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("sidecar")
+                    .to_string(),
+            };
+            format!(
+                "{source}(embedded_target={:?}, export_target={:?}, import={}, metadata={})",
+                change.embedded_target,
+                change.export_target,
+                change.import_into_media,
+                change.metadata.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let line = format!(
+        "[{timestamp}] {kind}: {} (destination: {:?}, container: {container}, \
+         stream_order: {:?}, deleted_streams: {:?}, default_streams: {:?}, \
+         video_settings: {}, subtitle_changes: [{}]) — {message}\n",
+        request.path.display(),
+        request.destination,
+        request.stream_order,
+        request.deleted_streams,
+        request.default_streams,
+        request.video_settings.len(),
+        subtitle_changes.join(", "),
+    );
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn run_edit_worker_pool(
+    request_rx: Arc<Mutex<Receiver<EditRequest>>>,
+    result_tx: Sender<EditEvent>,
+    worker_count: usize,
+) {
+    for _ in 0..worker_count.max(1) {
+        let request_rx = Arc::clone(&request_rx);
+        let result_tx = result_tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                let request = {
+                    let Ok(receiver) = request_rx.lock() else {
+                        break;
+                    };
+                    receiver.recv()
+                };
+                let Ok(request) = request else {
+                    break;
+                };
+                let progress_tx = result_tx.clone();
+                let progress_path = request.path.clone();
+                let result = apply_edits(
+                    EditTarget {
+                        source: &request.path,
+                        destination: request.destination,
+                        container: request.container,
+                        container_metadata: request.container_metadata.as_ref(),
+                    },
+                    TrackEdits {
+                        stream_order: &request.stream_order,
+                        deleted_streams: &request.deleted_streams,
+                        default_streams: &request.default_streams,
+                        default_sidecars: &request.default_sidecars,
+                        video_settings: &request.video_settings,
+                        subtitle_changes: &request.subtitle_changes,
+                        left_subtitle_order: &request.left_subtitle_order,
+                        sidecars: &request.sidecars,
+                    },
+                    &request.cancelled,
+                    |progress| {
+                        let _ = progress_tx.send(EditEvent::Progress {
+                            path: progress_path.clone(),
+                            progress,
+                        });
+                    },
+                );
+                let outcome = match result {
+                    Ok(result) => EditOutcome::Completed {
+                        output_path: result.output_path,
+                        media_changed: result.media_changed,
+                    },
+                    Err(EditError::Cancelled) => EditOutcome::Cancelled,
+                    Err(EditError::SourceChanged(error)) => {
+                        log_edit_failure(&request, "SourceChanged", &error);
+                        EditOutcome::SourceChanged(error)
+                    }
+                    Err(EditError::Failed(error)) => {
+                        log_edit_failure(&request, "Failed", &error);
+                        EditOutcome::Failed(error)
+                    }
+                };
+                let response = EditEvent::Finished {
+                    path: request.path.clone(),
+                    outcome,
+                };
+                if result_tx.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Two independent worker pools sharing one result channel: a small (typically 1)
+/// `transcode` pool for CPU-bound re-encodes, and a larger `remux` pool for cheap,
+/// I/O-bound `-c copy` operations — see `plan_requires_transcode` for how a request is
+/// routed to one or the other, and the "Parallelism analysis" section of the
+/// multi-file-staging design for why they're split rather than sharing one limit.
+pub fn spawn_edit_worker_pools(
+    transcode_workers: usize,
+    remux_workers: usize,
+) -> (
+    Sender<EditRequest>,
+    Sender<EditRequest>,
+    Receiver<EditEvent>,
+) {
+    let (transcode_tx, transcode_rx) = mpsc::channel::<EditRequest>();
+    let (remux_tx, remux_rx) = mpsc::channel::<EditRequest>();
     let (result_tx, result_rx) = mpsc::channel();
 
-    std::thread::spawn(move || {
-        while let Ok(request) = request_rx.recv() {
-            let progress_tx = result_tx.clone();
-            let result = apply_edits(
-                EditTarget {
-                    source: &request.path,
-                    destination: request.destination,
-                    container: request.container,
-                    container_metadata: request.container_metadata.as_ref(),
-                },
-                TrackEdits {
-                    stream_order: &request.stream_order,
-                    deleted_streams: &request.deleted_streams,
-                    default_streams: &request.default_streams,
-                    default_sidecars: &request.default_sidecars,
-                    video_settings: &request.video_settings,
-                    subtitle_changes: &request.subtitle_changes,
-                    left_subtitle_order: &request.left_subtitle_order,
-                    sidecars: &request.sidecars,
-                },
-                &request.cancelled,
-                |progress| {
-                    let _ = progress_tx.send(EditEvent::Progress(progress));
-                },
-            );
-            let outcome = match result {
-                Ok(result) => EditOutcome::Completed {
-                    output_path: result.output_path,
-                    media_changed: result.media_changed,
-                },
-                Err(EditError::Cancelled) => EditOutcome::Cancelled,
-                Err(EditError::SourceChanged(error)) => EditOutcome::SourceChanged(error),
-                Err(EditError::Failed(error)) => EditOutcome::Failed(error),
-            };
-            let response = EditEvent::Finished {
-                path: request.path.clone(),
-                outcome,
-            };
-            if result_tx.send(response).is_err() {
-                break;
-            }
-        }
-    });
+    run_edit_worker_pool(
+        Arc::new(Mutex::new(transcode_rx)),
+        result_tx.clone(),
+        transcode_workers,
+    );
+    run_edit_worker_pool(Arc::new(Mutex::new(remux_rx)), result_tx, remux_workers);
 
-    (request_tx, result_rx)
+    (transcode_tx, remux_tx, result_rx)
 }
 
 pub(crate) fn validate_deletion(info: &MediaInfo, selected: &BTreeSet<u64>) -> Result<(), String> {
@@ -523,6 +731,18 @@ pub(crate) fn validate_deletion(info: &MediaInfo, selected: &BTreeSet<u64>) -> R
     Ok(())
 }
 
+/// Renders a set of stream indices for the "tracks changed" diagnostic — `"none"`
+/// when empty (the common, unremarkable case for one side of the diff), the raw
+/// indices otherwise, so a mismatch actually says *which* tracks disagree rather than
+/// just that something, somewhere, no longer lines up.
+fn describe_index_diff(indices: &[&u64]) -> String {
+    if indices.is_empty() {
+        "none".to_string()
+    } else {
+        format!("track(s) {indices:?}")
+    }
+}
+
 pub(crate) fn validate_edit(
     info: &MediaInfo,
     stream_order: &[u64],
@@ -535,15 +755,30 @@ pub(crate) fn validate_edit(
         return Err("One or more tracks have no usable stream index.".to_string());
     }
     let ordered: BTreeSet<_> = stream_order.iter().copied().collect();
-    if ordered.len() != stream_order.len()
-        || !ordered.is_disjoint(deleted_streams)
-        || ordered
-            .union(deleted_streams)
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != available
-    {
-        return Err("The file's tracks changed. Reopen it and try again.".to_string());
+    if ordered.len() != stream_order.len() {
+        return Err(
+            "The file's tracks changed: the same track appears twice in the staged order. \
+             Reopen it and try again."
+                .to_string(),
+        );
+    }
+    if !ordered.is_disjoint(deleted_streams) {
+        let both: Vec<_> = ordered.intersection(deleted_streams).collect();
+        return Err(format!(
+            "The file's tracks changed: track(s) {both:?} are both kept and marked for \
+             deletion. Reopen it and try again."
+        ));
+    }
+    let staged: BTreeSet<_> = ordered.union(deleted_streams).copied().collect();
+    if staged != available {
+        let missing: Vec<_> = available.difference(&staged).collect();
+        let extra: Vec<_> = staged.difference(&available).collect();
+        return Err(format!(
+            "The file's tracks changed: {} in the file but not in the staged edit, {} in the \
+             staged edit but no longer in the file. Reopen it and try again.",
+            describe_index_diff(&missing),
+            describe_index_diff(&extra),
+        ));
     }
     if !default_streams.is_subset(&ordered) {
         return Err("A default track is also marked for deletion.".to_string());
@@ -576,6 +811,14 @@ pub(crate) fn validate_edit(
                     return Err(
                         "Custom width and height must be positive even numbers.".to_string()
                     );
+                }
+                if custom.width < MINIMUM_CUSTOM_DIMENSION
+                    || custom.height < MINIMUM_CUSTOM_DIMENSION
+                {
+                    return Err(format!(
+                        "Custom width and height must be at least {MINIMUM_CUSTOM_DIMENSION} \
+                         pixels."
+                    ));
                 }
                 let Some((source_width, source_height)) = source_width.zip(source_height) else {
                     return Err(
@@ -993,6 +1236,33 @@ fn validate_subtitle_languages(
     Ok(())
 }
 
+/// Whether a `validate_edit`/`validate_subtitle_sources`/`validate_subtitle_languages`
+/// failure means the staged edit is *stale* — the file's actual tracks/subtitles no
+/// longer match what was staged (typically because the probe the UI staged the edit
+/// against is out of date relative to the file, e.g. `App::staged_edits`'s staleness
+/// check missing a change, or the disk cache serving an outdated probe) — rather than
+/// the edit itself being invalid in a way the user needs to fix by choosing different
+/// settings. Routed to `EditError::SourceChanged` instead of `EditError::Failed` so
+/// the caller discards the stale staged edit (mirroring what already happens for a
+/// genuinely-removed source file), instead of leaving the user to retry the exact
+/// same broken request forever — every one of these messages literally says "reopen
+/// it and try again," which is precisely what discarding the stale staged edit forces.
+/// A message-based check, not a typed error, is a deliberate trade-off against a
+/// wider refactor of those three validation functions; each pattern here matches a
+/// small, fixed set of literals used at one or two call sites within them.
+fn classify_edit_error(message: String) -> EditError {
+    let is_stale = message.contains("tracks changed")
+        || message.contains("track changed")
+        || message.contains("sidecar changed")
+        || message.contains("sidecar is no longer available")
+        || message.contains("refer to a missing or deleted track");
+    if is_stale {
+        EditError::SourceChanged(message)
+    } else {
+        EditError::Failed(message)
+    }
+}
+
 fn apply_edits(
     target: EditTarget<'_>,
     edits: TrackEdits<'_>,
@@ -1047,11 +1317,11 @@ fn apply_edits(
             default_streams,
             video_settings,
         )
-        .map_err(EditError::Failed)?;
+        .map_err(classify_edit_error)?;
         validate_subtitle_sources(&source_info, subtitle_changes, sidecars)
-            .map_err(EditError::Failed)?;
+            .map_err(classify_edit_error)?;
         validate_subtitle_languages(&source_info, subtitle_changes, sidecars, deleted_streams)
-            .map_err(EditError::Failed)?;
+            .map_err(classify_edit_error)?;
         let output_stream_order = stream_order
             .iter()
             .copied()
@@ -1061,7 +1331,20 @@ fn apply_edits(
                 })
             })
             .collect::<Vec<_>>();
-        let effective_container = target_container.or_else(|| ContainerFormat::from_path(path));
+        // Cross-checks the extension against ffprobe's own `format_name` (just
+        // reprobed into `source_info` above) rather than trusting a possibly
+        // misleading extension — a `.mkv` renamed to `.mp4` (or vice versa) is still
+        // genuinely whatever it actually is, and both the compatibility checks below
+        // and the muxer `run_ffmpeg` is told to use need to agree with reality, not
+        // the filename.
+        let detected_container = ContainerFormat::detect(
+            path,
+            source_info
+                .format
+                .get("format_name")
+                .and_then(Value::as_str),
+        );
+        let effective_container = target_container.or(detected_container);
         if let Some(container) = effective_container {
             let mut conflicts = if target_container.is_some() {
                 container_conflicts(
@@ -1101,8 +1384,8 @@ fn apply_edits(
             ));
         }
         let duration = media_duration(&source_info);
-        let container_changed = target_container
-            .is_some_and(|container| ContainerFormat::from_path(path) != Some(container));
+        let container_changed =
+            target_container.is_some_and(|container| detected_container != Some(container));
         let container_metadata_changed = target.container_metadata.is_some();
         let media_changed = media_changes_required(
             &source_info,
@@ -1194,7 +1477,12 @@ fn apply_edits(
                 imports: &prepared.imports,
                 subtitle_changes,
                 sidecars,
-                container: target_container,
+                // Always the *real* muxer to write — `target_container` when the user
+                // asked for a conversion, otherwise `detected_container` (not the
+                // extension-only guess `run_ffmpeg` would otherwise fall back to) —
+                // so ffmpeg is never left to infer the format from a filename that
+                // might not match what's actually being written into it.
+                container: effective_container,
                 container_metadata: target.container_metadata,
                 duration,
                 cancelled,
@@ -2697,17 +2985,32 @@ fn validate_result(
     if output_kinds != expected_kinds {
         return Err("The remuxed tracks are not in the requested order.".to_string());
     }
+    let expected_defaults = output_tracks
+        .iter()
+        .map(|track| match track {
+            OutputTrack::Existing(index) => default_streams.contains(index),
+            OutputTrack::Imported(import_index) => subtitle_imports[*import_index].default,
+        })
+        .collect::<Vec<_>>();
+    let muxer_defaults = muxer_forced_default_positions(output, &expected_defaults, container);
     for (position, stream) in output.streams.iter().enumerate() {
         let Some(track) = output_tracks.get(position) else {
             return Err("The remuxed file has an unexpected extra track.".to_string());
         };
-        let expected = match track {
-            OutputTrack::Existing(index) => default_streams.contains(index),
-            OutputTrack::Imported(import_index) => subtitle_imports[*import_index].default,
-        };
-        if is_default(stream) != expected {
+        let expected = expected_defaults[position];
+        if is_default(stream) != expected
+            && !(is_default(stream) && muxer_defaults.contains(&position))
+        {
+            let source_label = match track {
+                OutputTrack::Existing(index) => format!("source track #{index}"),
+                OutputTrack::Imported(import_index) => {
+                    format!("imported subtitle #{import_index}")
+                }
+            };
             return Err(format!(
-                "The remuxed track at position {position} has the wrong default flag."
+                "The remuxed track at position {position} ({source_label}) has the wrong \
+                 default flag: expected {expected}, found {}. Staged defaults: {default_streams:?}.",
+                is_default(stream),
             ));
         }
         let source_index = match track {
@@ -2792,6 +3095,45 @@ fn validate_result(
     Ok(())
 }
 
+/// Positions the muxer is allowed to flag as default even though nothing staged asked
+/// for it.
+///
+/// MP4 and MOV store "default" as the `tkhd` *enabled* flag, and `movenc` enables the
+/// first track of a media type whenever no track of that type is flagged — there is no
+/// way to write an ISO-BMFF file where a whole track group is disabled, and
+/// `-disposition:N 0` does not change that. Matroska has no such rule, so a track group
+/// with no default stays that way there. Without this allowance, dropping every default
+/// subtitle (or keeping a single non-default one, the common case when converting one
+/// track to MOV Text) fails validation on a file the muxer wrote exactly as asked.
+fn muxer_forced_default_positions(
+    output: &MediaInfo,
+    expected_defaults: &[bool],
+    container: Option<ContainerFormat>,
+) -> BTreeSet<usize> {
+    if !matches!(
+        container,
+        Some(ContainerFormat::Mp4) | Some(ContainerFormat::Mov)
+    ) {
+        return BTreeSet::new();
+    }
+    let mut first_of_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut kinds_with_a_default: BTreeSet<&str> = BTreeSet::new();
+    for (position, stream) in output.streams.iter().enumerate() {
+        let Some(kind) = stream_kind(stream) else {
+            continue;
+        };
+        first_of_kind.entry(kind).or_insert(position);
+        if expected_defaults.get(position).copied().unwrap_or_default() {
+            kinds_with_a_default.insert(kind);
+        }
+    }
+    first_of_kind
+        .into_iter()
+        .filter(|(kind, _)| !kinds_with_a_default.contains(kind))
+        .map(|(_, position)| position)
+        .collect()
+}
+
 fn subtitle_metadata_matches(
     stream: &BTreeMap<String, Value>,
     expected: &SubtitleMetadata,
@@ -2873,9 +3215,15 @@ fn run_ffmpeg(
     report_progress: &mut ProgressReporter<'_>,
 ) -> Result<FfmpegOutput, EditError> {
     report_progress(EditProgress::new(phase.clone()));
-    let metadata_container = plan
-        .container
-        .or_else(|| ContainerFormat::from_path(plan.source));
+    let metadata_container = plan.container.or_else(|| {
+        ContainerFormat::detect(
+            plan.source,
+            plan.source_info
+                .format
+                .get("format_name")
+                .and_then(Value::as_str),
+        )
+    });
     let mut command = Command::new("ffmpeg");
     command
         .args([
@@ -3052,7 +3400,11 @@ fn run_ffmpeg(
         }
     }
     if let Some(container) = plan.container {
-        if container == ContainerFormat::Mp4 {
+        // MOV shares MP4's ISO-BMFF/QuickTime muxer family and benefits identically:
+        // without this, the `moov` atom lands at the end of the file, so opening or
+        // seeking it (especially over the network mounts this app targets) requires a
+        // full trailing scan instead of reading a few bytes from the front.
+        if matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov) {
             command.args(["-movflags", "+faststart"]);
         }
         command.args(["-f", container.muxer()]);
@@ -3373,6 +3725,14 @@ fn output_resolution_matches(
             }),
     }
 }
+
+/// The smallest custom width or height any of the encoders below will accept.
+///
+/// `libx265` refuses anything under 16 pixels in either direction ("Image size is too
+/// small"), and it only says so once the encoder is opening — after the whole pipeline
+/// has already run. `libx264` and `libsvtav1` go lower, but a single floor keeps the
+/// rule explainable, and 16 is well beneath any real video.
+pub const MINIMUM_CUSTOM_DIMENSION: u64 = 16;
 
 fn encoder_settings(codec: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match codec {
@@ -3728,6 +4088,38 @@ mod tests {
         assert_that!(ContainerFormat::Mov.supports_codec("audio", "pcm_s16le", false)).is_true();
         assert_that!(ContainerFormat::WebM.supports_codec("video", "h264", false)).is_false();
         assert_that!(ContainerFormat::WebM.supports_codec("video", "av1", false)).is_true();
+    }
+
+    #[test]
+    fn detect_should_prefer_the_probed_format_over_a_mismatched_extension() {
+        // Arrange: a `.mkv` renamed to `.mp4` — the bytes on disk, and so ffprobe's
+        // `format_name`, are still genuinely Matroska.
+        let renamed = Path::new("/videos/movie.mp4");
+
+        // Act / Assert: a mismatched extension loses to what's actually on disk.
+        assert_that!(ContainerFormat::detect(renamed, Some("matroska,webm")))
+            .contains(ContainerFormat::Matroska);
+
+        // An extension that does agree with the probed family still picks the exact
+        // member within that family — ffprobe alone can't tell MKV from WebM, or MP4
+        // from MOV, so the extension remains the tiebreaker when it isn't lying.
+        assert_that!(ContainerFormat::detect(
+            Path::new("/videos/movie.webm"),
+            Some("matroska,webm")
+        ))
+        .contains(ContainerFormat::WebM);
+        assert_that!(ContainerFormat::detect(
+            Path::new("/videos/movie.mov"),
+            Some("mov,mp4,m4a,3gp,3g2,mj2")
+        ))
+        .contains(ContainerFormat::Mov);
+
+        // No probe data yet (file not opened) — extension is all there is to go on.
+        assert_that!(ContainerFormat::detect(renamed, None)).contains(ContainerFormat::Mp4);
+
+        // An unrecognized format_name (e.g. a non-video file) falls back to whatever
+        // the extension says rather than reporting nothing.
+        assert_that!(ContainerFormat::detect(renamed, Some("wav"))).contains(ContainerFormat::Mp4);
     }
 
     #[test]
@@ -4235,6 +4627,59 @@ mod tests {
     }
 
     #[test]
+    fn validate_edit_should_reject_custom_dimensions_no_encoder_accepts() {
+        // Regression test for a real report: a 1920x10 custom resolution passed
+        // validation (positive, even, not upscaling) and only failed once libx265 was
+        // opening, minutes into the encode, with "Image size is too small".
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ]));
+        let settings = |width, height| {
+            BTreeMap::from([(
+                0,
+                VideoSettings {
+                    codec: VideoCodec::Original,
+                    resolution: VideoResolution::Custom(CustomResolution {
+                        width,
+                        height,
+                        scaling: CustomScaling::FitPad,
+                    }),
+                },
+            )])
+        };
+
+        // Act
+        let short = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &settings(1920, 10),
+        );
+        let narrow = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &settings(10, 1080),
+        );
+        let smallest_allowed = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &settings(16, 16),
+        );
+
+        // Assert: both directions are caught, and the floor itself still passes.
+        assert_that!(short)
+            .contains_error("Custom width and height must be at least 16 pixels.".to_string());
+        assert_that!(narrow)
+            .contains_error("Custom width and height must be at least 16 pixels.".to_string());
+        assert_that!(smallest_allowed).is_ok();
+    }
+
+    #[test]
     fn validate_edit_should_reject_odd_custom_dimensions() {
         // Arrange
         let info = media(serde_json::json!([
@@ -4258,6 +4703,31 @@ mod tests {
         // Assert
         assert_that!(result)
             .contains_error("Custom width and height must be positive even numbers.".to_string());
+    }
+
+    #[test]
+    fn muxer_forced_default_positions_should_only_excuse_iso_bmff_track_groups_without_a_default() {
+        // Arrange: video, two audio, two subtitles — the audio group has a staged
+        // default, the other two groups have none.
+        let output = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "audio"},
+            {"index": 3, "codec_type": "subtitle"},
+            {"index": 4, "codec_type": "subtitle"},
+        ]));
+        let expected = [false, false, true, false, false];
+
+        // Act
+        let mp4 = muxer_forced_default_positions(&output, &expected, Some(ContainerFormat::Mp4));
+        let mkv =
+            muxer_forced_default_positions(&output, &expected, Some(ContainerFormat::Matroska));
+
+        // Assert: only the first track of each group the muxer has to enable anyway —
+        // never the second audio track, whose group already has its default.
+        assert_that!(mp4).is_equal_to(BTreeSet::from([0, 3]));
+        // Matroska can leave a whole group undefaulted, so nothing is excused there.
+        assert_that!(mkv).is_equal_to(BTreeSet::new());
     }
 
     #[test]
@@ -4573,6 +5043,340 @@ mod tests {
         assert_that!(output_info.format["format_name"].as_str().unwrap()).contains("mp4");
         assert_that!(output_info.streams[0]["codec_name"].as_str()).contains("mpeg4");
         assert_that!(output_info.streams[1]["codec_name"].as_str()).contains("aac");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_treat_a_stream_order_mismatch_as_stale_rather_than_a_hard_failure() {
+        // Regression test: a staged edit computed against tracks that no longer match
+        // the file's actual current tracks (`validate_edit`'s "tracks changed" case)
+        // must come back as `EditError::SourceChanged`, not a generic
+        // `EditError::Failed` — otherwise the caller has no way to tell "discard this
+        // stale staged edit" apart from "the edit itself is invalid," and a retry
+        // just fails identically forever instead of prompting a fresh re-stage.
+        if !require_tools(
+            "apply_edits_should_treat_a_stream_order_mismatch_as_stale_rather_than_a_hard_failure",
+            &["ffmpeg"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-stale-edit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Act: stage an edit that references stream index 5, which doesn't exist —
+        // as if the file had more tracks when this was staged than it actually does
+        // now.
+        let result = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 5],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        );
+
+        // Assert
+        match result {
+            Err(EditError::SourceChanged(message)) => {
+                assert_that!(message.as_str()).contains("tracks changed");
+            }
+            other => panic!("expected EditError::SourceChanged, got {other:?}"),
+        }
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_keep_a_genuinely_invalid_edit_as_a_hard_failure() {
+        // Regression test: `classify_edit_error` must not sweep every validation
+        // failure into `SourceChanged` — an edit that's invalid on its own terms
+        // (here: marking a track default while also deleting it) is something the
+        // user needs to actively fix, not something reopening the file resolves, so
+        // it must stay `EditError::Failed` and the staged edit must survive.
+        if !require_tools(
+            "apply_edits_should_keep_a_genuinely_invalid_edit_as_a_hard_failure",
+            &["ffmpeg"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-invalid-edit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Act: track 0 is both deleted and marked default, a self-contradiction that
+        // has nothing to do with the file's actual state.
+        let result = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[],
+                deleted_streams: &BTreeSet::from([0]),
+                default_streams: &BTreeSet::from([0]),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        );
+
+        // Assert
+        match result {
+            Err(EditError::Failed(message)) => {
+                assert_that!(message.as_str()).contains("also marked for deletion");
+            }
+            other => panic!("expected EditError::Failed, got {other:?}"),
+        }
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_write_genuine_matroska_when_a_mkv_file_is_misnamed_with_an_mp4_extension()
+    {
+        // Regression test: renaming a `.mkv` to `.mp4` doesn't change what's actually
+        // inside it. Editing such a file without requesting a container conversion
+        // must still write real Matroska (matching what's genuinely there), not let
+        // `run_ffmpeg` infer "mp4" purely from the (lying) output extension and then
+        // have ffmpeg itself reject the SubRip subtitle MP4 can't hold.
+        if !require_tools(
+            "apply_edits_should_write_genuine_matroska_when_a_mkv_file_is_misnamed_with_an_mp4_extension",
+            &["ffmpeg"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-misnamed-mkv-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        // The extension says MP4; `-f matroska` below makes sure the actual bytes
+        // written are genuinely Matroska regardless — exactly what a renamed file
+        // looks like.
+        let source = directory.join("movie.mp4");
+        let subtitles = directory.join("movie.eng.srt");
+        fs::write(&subtitles, "1\n00:00:00,000 --> 00:00:00,800\nHello\n").unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-i",
+            ])
+            .arg(&subtitles)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:s:0",
+                "-c:v",
+                "mpeg4",
+                "-c:s",
+                "subrip",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-f",
+                "matroska",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Sanity check the fixture really is Matroska despite its name.
+        let source_info = media_info(&source).unwrap();
+        assert_that!(source_info.format["format_name"].as_str().unwrap()).contains("matroska");
+
+        // Act: no container conversion requested — just reorder the tracks, enough to
+        // force a real remux (`media_changed`) without touching the subtitle at all.
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[1, 0],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert: the output is still genuinely Matroska, subtitle intact, even
+        // though its name still says `.mp4`.
+        let output_info = media_info(&output.output_path).unwrap();
+        assert_that!(output_info.format["format_name"].as_str().unwrap()).contains("matroska");
+        assert_that!(output_info.streams.iter().any(|stream| {
+            stream.get("codec_name").and_then(|value| value.as_str()) == Some("subrip")
+        }))
+        .is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_place_moov_before_mdat_when_converting_to_mov() {
+        // Regression test: `-movflags +faststart` was only applied for the Mp4
+        // container target, silently skipping it for Mov even though Mov shares the
+        // same ISO-BMFF/QuickTime muxer family and benefits identically. Without it,
+        // the `moov` atom lands after `mdat`, requiring a full trailing scan to open
+        // or seek the file instead of reading a few bytes from the front.
+        if !require_tools(
+            "apply_edits_should_place_moov_before_mdat_when_converting_to_mov",
+            &["ffmpeg:aac"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-mov-faststart-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Act
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::CreateCopy,
+                container: Some(ContainerFormat::Mov),
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::from([0, 1]),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert
+        let bytes = fs::read(&output.output_path).unwrap();
+        let find_atom = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        let moov_offset = find_atom(b"moov").expect("output should contain a moov atom");
+        let mdat_offset = find_atom(b"mdat").expect("output should contain an mdat atom");
+        assert_that!(moov_offset).is_less_than(mdat_offset);
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -5204,6 +6008,277 @@ mod tests {
         assert_that!(media.streams[0]["codec_name"].as_str()).contains("mpeg4");
         assert_that!(exported.exists()).is_true();
         assert_that!(fs::read_to_string(exported).unwrap()).contains("Original codec");
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_default_the_one_surviving_converted_subtitle_after_bulk_deletion() {
+        // Regression test reproducing a real report: deleting most of a file's
+        // subtitle tracks, converting the one survivor for an MP4 target, and marking
+        // it default failed with "the wrong default flag" even though the request
+        // was entirely valid.
+        if !require_tools(
+            "apply_edits_should_default_the_one_surviving_converted_subtitle_after_bulk_deletion",
+            &["ffmpeg:mov_text"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-bulk-delete-default-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let subtitle = directory.join("fixture.srt");
+        fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:00,800\nSurvivor\n").unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-i",
+            ])
+            .arg(&subtitle)
+            .arg("-i")
+            .arg(&subtitle)
+            .arg("-i")
+            .arg(&subtitle)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:a:0",
+                "-map",
+                "3:s:0",
+                "-map",
+                "4:s:0",
+                "-map",
+                "5:s:0",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "subrip",
+                "-disposition:a:0",
+                "default",
+                "-disposition:a:1",
+                "0",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:1",
+                "language=nld",
+                "-metadata:s:s:2",
+                "language=fra",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Delete tracks 3 and 4 (eng, nld), keep track 5 (fra) — converted to
+        // MovText, since that's what MP4 requires — and mark it default. Two audio
+        // tracks (only one default) between the video and subtitles, matching the
+        // real report's group structure (video, 2 audio, then subtitles) — "position
+        // 3" in the output is the surviving subtitle.
+        let change = SubtitleChange {
+            source: SubtitleSource::Embedded(5),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: Some(SubtitleFormat::MovText),
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1, 2, 5],
+                deleted_streams: &BTreeSet::from([3, 4]),
+                default_streams: &BTreeSet::from([0, 1, 5]),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[change],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert: the surviving subtitle track really is marked default in the
+        // output.
+        let output_info = media_info(&output.output_path).unwrap();
+        let subtitle_stream = output_info
+            .streams
+            .iter()
+            .find(|stream| stream_kind(stream) == Some("subtitle"))
+            .unwrap();
+        assert_that!(is_default(subtitle_stream)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_edits_should_accept_the_default_flag_mp4_forces_onto_a_lone_subtitle() {
+        // Regression test for a real report: keeping a single *non-default* subtitle,
+        // converted to MOV Text for an MP4 target, failed with "the wrong default
+        // flag". MP4 stores "default" as the `tkhd` enabled flag and `movenc` enables
+        // the first track of a media type when none is flagged, so the muxer wrote the
+        // only file it can write and validation rejected it. The track's title also has
+        // to survive, since ffprobe reports an MP4 track name under `name`, not
+        // `title`.
+        if !require_tools(
+            "apply_edits_should_accept_the_default_flag_mp4_forces_onto_a_lone_subtitle",
+            &["ffmpeg:mov_text"],
+        ) {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-mp4-forced-default-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("movie.mkv");
+        let subtitle = directory.join("fixture.srt");
+        fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:00,800\nSurvivor\n").unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-i",
+            ])
+            .arg(&subtitle)
+            .arg("-i")
+            .arg(&subtitle)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:a:0",
+                "-map",
+                "3:s:0",
+                "-map",
+                "4:s:0",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "subrip",
+                "-disposition:a:0",
+                "default",
+                "-disposition:a:1",
+                "0",
+                // The survivor carries a title and no default flag — exactly the shape
+                // the report's source file had.
+                "-disposition:s:0",
+                "0",
+                "-disposition:s:1",
+                "0",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:1",
+                "language=kor",
+                "-metadata:s:s:1",
+                "title=Forced",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Delete subtitle 3, keep 4 converted to MOV Text, and leave it non-default.
+        let change = SubtitleChange {
+            source: SubtitleSource::Embedded(4),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: Some(SubtitleFormat::MovText),
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act
+        let output = apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1, 2, 4],
+                deleted_streams: &BTreeSet::from([3]),
+                default_streams: &BTreeSet::from([0, 1]),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[change],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        // Assert: the edit went through, and the title the muxer stored under `name`
+        // is still readable as the track's title.
+        let output_info = media_info(&output.output_path).unwrap();
+        let subtitle_stream = output_info
+            .streams
+            .iter()
+            .find(|stream| stream_kind(stream) == Some("subtitle"))
+            .unwrap();
+        assert_that!(stream_title(subtitle_stream)).is_equal_to(Some("Forced".to_string()));
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -5916,11 +6991,187 @@ mod tests {
     }
 
     #[test]
+    fn plan_requires_transcode_should_detect_only_a_genuine_codec_or_resolution_change() {
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"}
+        ]));
+
+        // No video_settings entry at all: nothing to transcode.
+        assert_that!(plan_requires_transcode(&info, &[0, 1], &BTreeMap::new())).is_false();
+
+        // Settings present but requesting the source's own codec at original
+        // resolution: still just a copy, not a transcode.
+        let no_op_settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                codec: VideoCodec::H264,
+                resolution: VideoResolution::Original,
+            },
+        )]);
+        assert_that!(plan_requires_transcode(&info, &[0, 1], &no_op_settings)).is_false();
+
+        // A genuine codec change on the video stream: this is a real transcode.
+        let transcode_settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::Original,
+            },
+        )]);
+        assert_that!(plan_requires_transcode(&info, &[0, 1], &transcode_settings)).is_true();
+
+        // Settings keyed to the AUDIO stream's index must never count, even with a
+        // "transcode-shaped" value — only video streams can trigger a transcode.
+        let audio_keyed_settings = BTreeMap::from([(
+            1,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::Original,
+            },
+        )]);
+        assert_that!(plan_requires_transcode(
+            &info,
+            &[0, 1],
+            &audio_keyed_settings
+        ))
+        .is_false();
+    }
+
+    #[test]
+    fn append_edit_failure_log_should_record_enough_context_to_diagnose_a_failure() {
+        // Arrange: a batch notice is terse and gone the moment the next one replaces
+        // it, so the log is the only place left to see what was actually attempted.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-edit-failure-log-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_path = directory.join("edit_errors.log");
+        let mut request = edit_request(
+            PathBuf::from("/videos/movie.mkv"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        request.container = Some(ContainerFormat::Mp4);
+        request.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::H264,
+                resolution: VideoResolution::Original,
+            },
+        );
+        request.subtitle_changes.push(SubtitleChange {
+            source: SubtitleSource::Embedded(3),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: Some(SubtitleFormat::MovText),
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        });
+
+        // Act
+        append_edit_failure_log(
+            &log_path,
+            &request,
+            "Failed",
+            "An embedded subtitle track changed. Reopen the file and try again.",
+        );
+
+        // Assert: the log file itself (and its parent directory) got created on
+        // demand, and the line names the file, what was being attempted (including
+        // the actual staged indices, not just counts), and why it failed.
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert_that!(contents.as_str()).contains("/videos/movie.mkv");
+        assert_that!(contents.as_str()).contains("Failed");
+        assert_that!(contents.as_str())
+            .contains("An embedded subtitle track changed. Reopen the file and try again.");
+        assert_that!(contents.as_str()).contains("container: MP4");
+        assert_that!(contents.as_str()).contains("video_settings: 1");
+        assert_that!(contents.as_str()).contains("stream_order: [0, 1]");
+        assert_that!(contents.as_str()).contains("deleted_streams: {1}");
+        assert_that!(contents.as_str()).contains("#3(embedded_target=Some(MovText)");
+
+        // Act: a second failure appends rather than overwriting the first.
+        append_edit_failure_log(&log_path, &request, "SourceChanged", "second failure");
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert_that!(contents.lines().count()).is_equal_to(2);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn spawn_edit_worker_pools_should_run_both_pools_concurrently_and_attribute_progress_by_path() {
+        // Regression test for the transcode/remux pool split: requests sent to
+        // *either* pool must be answered (not just the one historically exercised),
+        // and `EditEvent::Progress` must carry the path it's about now that more than
+        // one file can be in flight at once.
+        let (transcode_requests, remux_requests, events) = spawn_edit_worker_pools(1, 1);
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-edit-worker-pools-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let transcode_target = directory.join("not-a-file-transcode.mkv");
+        let remux_target = directory.join("not-a-file-remux.mkv");
+
+        transcode_requests
+            .send(edit_request(
+                transcode_target.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .unwrap();
+        remux_requests
+            .send(edit_request(
+                remux_target.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .unwrap();
+
+        // Both requests point at a source that doesn't exist, so each fails fast as
+        // `SourceChanged` without needing ffmpeg — but a Finished event, correctly
+        // attributed by path, must arrive for both regardless of which pool ran it.
+        let mut finished: BTreeSet<PathBuf> = BTreeSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while finished.len() < 2 && std::time::Instant::now() < deadline {
+            match events.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(EditEvent::Finished { path, outcome }) => {
+                    assert!(
+                        matches!(outcome, EditOutcome::SourceChanged(_)),
+                        "expected SourceChanged for a missing source, got {outcome:?}",
+                    );
+                    finished.insert(path);
+                }
+                Ok(EditEvent::Progress { path, .. }) => {
+                    assert!(
+                        path == transcode_target || path == remux_target,
+                        "progress event named an unexpected path: {path:?}",
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+        assert_that!(&finished).is_equal_to(&BTreeSet::from([
+            transcode_target.clone(),
+            remux_target.clone(),
+        ]));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn edit_worker_should_report_progress_then_a_finished_event_for_each_request() {
         // Arrange: the worker is the only thing standing between the UI thread and a
         // multi-minute ffmpeg run, so it has to answer every request exactly once —
         // including the ones that fail.
-        let (requests, events) = spawn_edit_worker();
+        let (requests, _remux_requests, events) = spawn_edit_worker_pools(1, 1);
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-edit-worker-{}-{}",
             std::process::id(),
@@ -5950,7 +7201,7 @@ mod tests {
                     assert_eq!(path, missing, "the event must name its request");
                     outcome = Some(got);
                 }
-                Ok(EditEvent::Progress(_)) => {}
+                Ok(EditEvent::Progress { .. }) => {}
                 Err(_) => break,
             }
         }
@@ -5973,7 +7224,7 @@ mod tests {
         while outcome.is_none() && std::time::Instant::now() < deadline {
             match events.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(EditEvent::Finished { outcome: got, .. }) => outcome = Some(got),
-                Ok(EditEvent::Progress(_)) => {}
+                Ok(EditEvent::Progress { .. }) => {}
                 Err(_) => break,
             }
         }

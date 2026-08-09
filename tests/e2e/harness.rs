@@ -1,0 +1,669 @@
+//! A headless driver for the real app.
+//!
+//! [`Harness`] replays the event loop from `src/main.rs` in-process: it spawns the
+//! same directory monitor, probe worker and edit worker pools the binary does, feeds
+//! synthetic `KeyEvent`s through the same `handle_key`, and renders through the same
+//! `ui::render` into a `TestBackend`. Nothing in the crate is mocked — the probes and
+//! edits are real `ffprobe`/`ffmpeg` subprocesses operating on real files.
+//!
+//! The only layers not covered are crossterm's terminal setup and its byte-to-
+//! `KeyEvent` decoding, plus writing the finished frame to a tty.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Once;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use reel_tui::app::{App, Dialog, Layer, ResolutionChoiceValue, TrackRef};
+use reel_tui::edit::{EditEvent, spawn_edit_worker_pools};
+use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
+use reel_tui::input::{InputOutcome, InputState, handle_key};
+use reel_tui::probe::{ProbeOutcome, ProbeResponse, spawn_probe_worker};
+use reel_tui::ui;
+
+/// Generous enough to absorb a cold ffmpeg start on a loaded machine, short enough
+/// that a genuinely stuck test fails within a coffee break.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Points `XDG_CACHE_HOME` at throwaway storage before the first `App` is built.
+///
+/// `App::new` loads `DiskCache` and `receive_probe_results` saves it, and
+/// `edit::log_edit_failure` appends to `edit_errors.log` — all under
+/// `$XDG_CACHE_HOME/reel-tui`. Without this, running the suite would read and rewrite
+/// the user's real probe cache and pollute their real failure log with test paths.
+///
+/// This is process-global and cannot be scoped to one test, which is why it runs once
+/// under a `Once` before any `App` exists rather than per-harness. `XDG_CACHE_HOME` is
+/// read in exactly one place (`src/cache.rs`), so the blast radius is small.
+fn redirect_cache_dir() {
+    static REDIRECT: Once = Once::new();
+    REDIRECT.call_once(|| {
+        // A fixed path rather than a per-process one, so repeated runs reuse a single
+        // directory instead of littering `$TMPDIR`; cleared first so no run inherits a
+        // previous run's cached probes.
+        let dir = std::env::temp_dir().join("reel-tui-e2e-cache");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        // SAFETY: called once, before any harness spawns a worker thread, so no other
+        // thread can be reading the environment concurrently.
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &dir);
+        }
+    });
+}
+
+/// A temp directory that cleans itself up even when a test panics — unlike the manual
+/// `fs::remove_dir_all` at the end of each unit test, which leaks on failure.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "reel-tui-e2e-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+pub struct Harness {
+    pub app: App,
+    input: InputState,
+    terminal: Terminal<TestBackend>,
+    directory_rx: Receiver<DirectorySnapshot>,
+    probe_rx: Receiver<ProbeResponse>,
+    edit_rx: Receiver<EditEvent>,
+    /// Declared last so the directory outlives the `App` and workers on drop.
+    scratch: Scratch,
+}
+
+impl Harness {
+    /// Wires up exactly what `main()` does, against an already-populated directory.
+    pub fn start(scratch: Scratch) -> Self {
+        redirect_cache_dir();
+        let directory = scratch.path().to_path_buf();
+        let directory_rx = spawn_directory_monitor(directory.clone());
+        let (request_tx, probe_rx) = spawn_probe_worker();
+        let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
+        let app = App::new(directory, request_tx, transcode_tx, remux_tx).unwrap();
+        Self {
+            app,
+            input: InputState::default(),
+            terminal: Terminal::new(TestBackend::new(160, 45)).unwrap(),
+            directory_rx,
+            probe_rx,
+            edit_rx,
+            scratch,
+        }
+    }
+
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.scratch.join(name)
+    }
+
+    pub fn directory(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    /// One iteration of the loop in `src/main.rs`. Always draws, so every scenario
+    /// also exercises rendering in each intermediate state it passes through.
+    pub fn pump(&mut self) {
+        self.app.receive_directory_snapshots(&self.directory_rx);
+        self.app.receive_probe_results(&self.probe_rx);
+        self.app.receive_edit_results(&self.edit_rx);
+        self.app.start_pending_probe();
+        let app = &mut self.app;
+        self.terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    }
+
+    pub fn press(&mut self, key: KeyEvent) -> InputOutcome {
+        self.pump();
+        handle_key(&mut self.app, &mut self.input, key)
+    }
+
+    /// Pumps until `predicate` holds, panicking with a screen dump on timeout.
+    ///
+    /// Iteration counts would be the wrong tool: `start_pending_probe` debounces for
+    /// 120 ms and probes/encodes take real wall time, so progress here is a function
+    /// of elapsed time rather than of how many times the loop spun.
+    pub fn wait_until(&mut self, label: &str, predicate: impl Fn(&App) -> bool) {
+        let started = Instant::now();
+        loop {
+            self.pump();
+            if predicate(&self.app) {
+                return;
+            }
+            if started.elapsed() > DEFAULT_TIMEOUT {
+                panic!(
+                    "timed out after {:?} waiting for {label}\n\
+                     layer: {:?}, dialog: {:?}, notice: {:?}, edit_error: {:?}\n\
+                     screen:\n{}",
+                    DEFAULT_TIMEOUT,
+                    self.app.layer,
+                    self.app.dialog,
+                    self.app.notice,
+                    self.app.edit_error,
+                    self.screen(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Selects `name` in the file panel and waits for its probe to land, leaving the
+    /// app in the Streams layer with the file open — the state every scenario starts
+    /// from. Driven entirely through keypresses so the real selection path runs.
+    pub fn open(&mut self, name: &str) {
+        self.wait_until(&format!("{name} to appear in the file panel"), |app| {
+            app.files.iter().any(|file| file.display_name == name)
+        });
+
+        let target = self.path(name);
+        for _ in 0..self.app.files.len().max(1) * 2 {
+            if self.app.selected_file().is_some_and(|f| f.path == target) {
+                break;
+            }
+            self.press(key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            self.app.selected_file().map(|f| f.path.clone()),
+            Some(target),
+            "could not select {name} in the file panel"
+        );
+
+        self.wait_until(&format!("{name} to finish probing"), |app| {
+            matches!(app.outcome, Some(ProbeOutcome::Video(_)))
+        });
+        self.press(key(KeyCode::Enter));
+        assert_eq!(self.app.layer, Layer::Streams, "should have opened {name}");
+    }
+
+    /// Moves the stream cursor onto the row at `index` within `track_rows()`.
+    pub fn select_track_row(&mut self, index: usize) {
+        assert!(
+            index < self.app.track_rows().len(),
+            "track row {index} out of range ({} rows)",
+            self.app.track_rows().len()
+        );
+        while self.app.selected_stream > index {
+            self.press(key(KeyCode::Char('k')));
+        }
+        while self.app.selected_stream < index {
+            self.press(key(KeyCode::Char('j')));
+        }
+    }
+
+    /// Opens the container settings popup from the Container row in the track list.
+    pub fn open_container_settings(&mut self) {
+        let index = self
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Container)
+            .expect("the track list should have a container row");
+        self.select_track_row(index);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::ContainerSettings),
+            "Enter on the container row should open container settings"
+        );
+    }
+
+    /// Stages a container conversion by driving the format dropdown, exactly as a
+    /// user would: Enter to open it, j to walk to the target, Enter to pick, Esc to
+    /// close the popup.
+    pub fn choose_container_format(&mut self, label: &str) {
+        self.open_container_settings();
+        self.press(key(KeyCode::Enter));
+
+        // The dropdown cursor starts on the source's own format and does not wrap, so
+        // walk toward the target in whichever direction it lies.
+        let target = self
+            .app
+            .container_choices()
+            .iter()
+            .position(|choice| choice.label == label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no container choice labelled {label}; choices: {:?}",
+                    self.app
+                        .container_choices()
+                        .iter()
+                        .map(|c| c.label.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        for _ in 0..self.app.container_choices().len() {
+            let cursor = self
+                .app
+                .container_settings_popup
+                .as_ref()
+                .map(|popup| popup.format_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+
+        let cursor = self
+            .app
+            .container_settings_popup
+            .as_ref()
+            .map(|popup| popup.format_cursor)
+            .unwrap_or_default();
+        assert_eq!(
+            self.app.container_choices().get(cursor).map(|c| &c.label),
+            Some(&label.to_string()),
+            "could not move the dropdown onto {label}; choices: {:?}",
+            self.app
+                .container_choices()
+                .iter()
+                .map(|c| c.label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        self.press(key(KeyCode::Enter));
+        self.press(key(KeyCode::Esc));
+        assert_eq!(
+            self.app.dialog, None,
+            "Esc should close the container settings popup"
+        );
+    }
+
+    /// Stages a subtitle codec conversion on the subtitle track at `row`, the way the
+    /// app's own conflict message tells the user to ("Convert it to MOV Text").
+    pub fn convert_subtitle_to(&mut self, row: usize, label: &str) {
+        self.select_track_row(row);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::SubtitleSettings),
+            "Enter on row {row} should open subtitle settings"
+        );
+
+        // The Codec field is focused by default; Enter opens its dropdown.
+        self.press(key(KeyCode::Enter));
+
+        let target = self
+            .subtitle_choices()
+            .iter()
+            .position(|choice| choice.label == label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no subtitle codec labelled {label}; choices: {:?}",
+                    self.subtitle_choices()
+                        .iter()
+                        .map(|c| c.label.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+
+        assert!(
+            self.subtitle_choices()[target].enabled,
+            "{label} is not selectable for this source/container combination: {:?}",
+            self.subtitle_choices()[target].reason
+        );
+
+        // The cursor skips disabled entries, so it can overshoot; bound the walk and
+        // then assert on the label rather than trusting index arithmetic.
+        for _ in 0..self.subtitle_choices().len() * 2 {
+            let cursor = self
+                .app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.codec_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        let cursor = self
+            .app
+            .subtitle_settings_popup
+            .as_ref()
+            .map(|popup| popup.codec_cursor)
+            .unwrap_or_default();
+        assert_eq!(
+            self.subtitle_choices()
+                .get(cursor)
+                .map(|choice| choice.label.clone()),
+            Some(label.to_string()),
+            "could not move the codec dropdown onto {label}; choices: {:?}",
+            self.subtitle_choices()
+                .iter()
+                .map(|c| c.label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        self.press(key(KeyCode::Enter));
+        self.press(key(KeyCode::Esc));
+        assert_eq!(
+            self.app.dialog, None,
+            "Esc should close the subtitle settings popup"
+        );
+        assert!(
+            !self.app.subtitle_changes.is_empty(),
+            "choosing {label} should have staged a subtitle change"
+        );
+    }
+
+    /// Moves the open video-settings resolution dropdown onto its "Custom" entry.
+    pub fn select_resolution_choice_custom(&mut self) {
+        let index = self
+            .app
+            .video_settings_popup
+            .as_ref()
+            .map(|popup| popup.stream_index)
+            .expect("video settings should be open");
+        let target = self
+            .app
+            .resolution_choices(index)
+            .iter()
+            .position(|choice| choice.value == ResolutionChoiceValue::Custom)
+            .expect("the resolution dropdown should offer a custom entry");
+
+        for _ in 0..self.app.resolution_choices(index).len() * 2 {
+            let cursor = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.resolution_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+    }
+
+    /// Types `value` into the focused custom-resolution field, replacing whatever it
+    /// was prefilled with. Leaves the field with Esc so the draft stays open; pass
+    /// `commit` to finish with Enter instead, which applies the whole draft.
+    pub fn type_custom_dimension(&mut self, value: &str, commit: bool) {
+        self.press(key(KeyCode::Char('i')));
+        assert!(
+            self.app.custom_resolution_input_active(),
+            "`i` should have activated a custom resolution field"
+        );
+        for _ in 0..12 {
+            self.press(key(KeyCode::Backspace));
+            if !self.app.custom_resolution_input_active() {
+                // Backspace on an empty field deactivates it; step back in.
+                self.press(key(KeyCode::Char('i')));
+                break;
+            }
+        }
+        for character in value.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+        self.press(key(if commit { KeyCode::Enter } else { KeyCode::Esc }));
+    }
+
+    /// Drives the full custom-resolution flow from the video row: settings →
+    /// Resolution → dropdown → Custom → width → height → commit.
+    pub fn set_custom_resolution(&mut self, width: &str, height: &str) {
+        self.select_track_row(1);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::VideoSettings),
+            "Enter on the video row should open video settings"
+        );
+        self.press(key(KeyCode::Char('j')));
+        self.press(key(KeyCode::Enter));
+        self.select_resolution_choice_custom();
+        self.press(key(KeyCode::Enter));
+
+        self.type_custom_dimension(width, false);
+        self.press(key(KeyCode::Char('j')));
+        self.type_custom_dimension(height, true);
+
+        // The draft is applied on the way out of the custom-resolution editor, not by
+        // the Enter that leaves the last field, so back all the way out of the popup.
+        for _ in 0..4 {
+            if self.app.dialog.is_none() {
+                break;
+            }
+            self.press(key(KeyCode::Esc));
+        }
+        assert_eq!(
+            self.app.dialog, None,
+            "backing out should have closed the video settings popup"
+        );
+    }
+
+    /// The codec choices the open subtitle settings popup is currently offering.
+    fn subtitle_choices(&self) -> Vec<reel_tui::subtitle::FormatChoice> {
+        let popup = self
+            .app
+            .subtitle_settings_popup
+            .as_ref()
+            .expect("subtitle settings should be open");
+        self.app
+            .subtitle_choices(&popup.source, popup.source_format)
+    }
+
+    /// The first subtitle row in the track list, as a `track_rows()` index.
+    pub fn first_subtitle_row(&self) -> usize {
+        let info = match &self.app.outcome {
+            Some(ProbeOutcome::Video(info)) => info,
+            other => panic!("no probed media to inspect: {other:?}"),
+        };
+        let subtitle_indices: Vec<u64> = info
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(_, stream)| {
+                stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("subtitle")
+            })
+            .map(|(index, _)| index as u64)
+            .collect();
+        let first = *subtitle_indices
+            .first()
+            .expect("the fixture should carry a subtitle track");
+        self.app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(first))
+            .expect("the subtitle track should have a row")
+    }
+
+    /// Ctrl+S → confirm → wait for the batch to finish, the way a user saves.
+    pub fn process_all(&mut self) {
+        self.press(ctrl('s'));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::ConfirmProcessAll),
+            "Ctrl+S should open the confirm dialog; notice: {:?}, error: {:?}",
+            self.app.notice,
+            self.app.edit_error,
+        );
+        self.press(key(KeyCode::Enter));
+        self.wait_until("the batch to finish", |app| app.active_batch.is_none());
+    }
+
+    /// The terminal contents as one string, for assertions and failure messages.
+    pub fn screen(&self) -> String {
+        let buffer = self.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Fails unless every edit in the last batch reported success. Batch status is
+    /// consumed as it finishes, so the notice is what survives.
+    ///
+    /// Requires a *positive* success notice rather than merely the absence of failure
+    /// words: a batch that never dispatched leaves no notice at all, and would
+    /// otherwise sail through every assertion in this suite.
+    pub fn assert_batch_succeeded(&self) {
+        let notice = self.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("saved"),
+            "expected a success notice, got {notice:?}\nscreen:\n{}",
+            self.screen()
+        );
+        assert!(
+            !notice.contains("could not")
+                && !notice.contains("Could not")
+                && !notice.contains("failed")
+                && !notice.contains("changed. Reopen"),
+            "edit reported a failure: {notice}\nscreen:\n{}",
+            self.screen()
+        );
+        assert!(
+            self.app.edit_error.is_none(),
+            "edit surfaced an error dialog: {:?}",
+            self.app.edit_error
+        );
+    }
+
+    /// No `.reel-tui-*` scratch files or transaction backups may survive an edit —
+    /// the standing cleanliness assertion in the `src/edit.rs` ffmpeg tests.
+    pub fn assert_no_temp_leftovers(&self) {
+        let leftovers: Vec<String> = fs::read_dir(self.directory())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".reel-tui-") || name.contains("transaction-backup"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "edit left temporary files behind: {leftovers:?}"
+        );
+    }
+}
+
+pub fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+pub fn ctrl(code: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)
+}
+
+/// Mirrors `require_tools` in `src/edit.rs`'s test module, which integration tests
+/// cannot reach because it lives inside a `#[cfg(test)]` block. Accepts either a bare
+/// program name or `program:encoder`.
+pub fn require_tools(test: &str, tools: &[&str]) -> bool {
+    for tool in tools {
+        let (program, encoder) = match tool.split_once(':') {
+            Some((program, encoder)) => (program, Some(encoder)),
+            None => (*tool, None),
+        };
+        let succeeds = |arguments: &[&str]| {
+            Command::new(program)
+                .args(arguments)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        // ffmpeg spells it `-version`, most other tools `--version`.
+        let available = match encoder {
+            Some(encoder) => succeeds(&["-v", "error", "-h", &format!("encoder={encoder}")]),
+            None => succeeds(&["-version"]) || succeeds(&["--version"]),
+        };
+        if !available {
+            eprintln!("SKIPPED {test}: {tool} is not available");
+            return false;
+        }
+    }
+    true
+}
+
+/// Convenience for asserting on a produced file's streams.
+pub fn probe(path: &Path) -> reel_tui::probe::MediaInfo {
+    reel_tui::probe::probe_any_file(path)
+        .unwrap_or_else(|error| panic!("ffprobe should read {}: {error}", path.display()))
+}
+
+pub fn codec_names(info: &reel_tui::probe::MediaInfo) -> Vec<String> {
+    info.streams
+        .iter()
+        .map(|stream| {
+            stream
+                .get("codec_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect()
+}
+
+pub fn languages(info: &reel_tui::probe::MediaInfo) -> Vec<String> {
+    info.streams
+        .iter()
+        .map(|stream| {
+            stream
+                .get("tags")
+                .and_then(|tags| tags.get("language"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("und")
+                .to_string()
+        })
+        .collect()
+}
+
+pub fn default_flags(info: &reel_tui::probe::MediaInfo) -> Vec<bool> {
+    info.streams
+        .iter()
+        .map(|stream| {
+            stream
+                .get("disposition")
+                .and_then(|disposition| disposition.get("default"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                == 1
+        })
+        .collect()
+}
+
+pub fn stream_indices_of_type(info: &reel_tui::probe::MediaInfo, kind: &str) -> BTreeSet<usize> {
+    info.streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some(kind)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
