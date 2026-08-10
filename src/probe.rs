@@ -14,6 +14,14 @@ pub struct ProbeRequest {
     pub generation: u64,
     pub path: PathBuf,
     pub fingerprint: FileFingerprint,
+    /// Whether `path` lives on a network mount, decided once by the caller (`App`
+    /// already computes and caches this for its own `directory`) rather than
+    /// re-derived here on every request — `crate::mount::is_network_mount` can
+    /// require a fresh `/proc/mounts` read plus `canonicalize()`'s per-component
+    /// stat, which on an actual network mount may be a network round trip. Doing
+    /// that on every probe (i.e. on every file selection) would add the exact kind
+    /// of network chatter this flag exists to avoid.
+    pub is_network_mount: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +242,7 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
             while let Ok(newer) = request_rx.try_recv() {
                 request = newer;
             }
-            let outcome = probe_file(&request.path);
+            let outcome = probe_file(&request.path, request.is_network_mount);
             if result_tx
                 .send(ProbeResponse {
                     generation: request.generation,
@@ -252,8 +260,7 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
     (request_tx, result_rx)
 }
 
-pub(crate) fn probe_file(path: &Path) -> ProbeOutcome {
-    let is_network = crate::mount::is_network_mount(path);
+pub(crate) fn probe_file(path: &Path, is_network: bool) -> ProbeOutcome {
     let mut command = Command::new("ffprobe");
     command.args([
         "-v",
@@ -333,6 +340,7 @@ mod tests {
                         length: 16,
                         modified: None,
                     },
+                    is_network_mount: false,
                 })
                 .unwrap();
         }
@@ -386,6 +394,7 @@ mod tests {
                 length: 0,
                 modified: None,
             },
+            is_network_mount: false,
         });
     }
 

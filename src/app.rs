@@ -1512,6 +1512,7 @@ impl App {
             generation: self.generation,
             path: file.path.clone(),
             fingerprint: file.fingerprint,
+            is_network_mount: self.is_network_mount,
         });
         self.pending_since = None;
     }
@@ -6381,11 +6382,43 @@ mod tests {
         let request = probe_rx.try_recv().expect("the probe should be queued");
         assert_that!(request.generation).is_equal_to(app.generation);
         assert_that!(request.path).is_equal_to(directory.join("a.mkv"));
+        assert_that!(request.is_network_mount).is_equal_to(app.is_network_mount);
         assert_that!(app.pending_since.is_none()).is_true();
 
         // And a second call sends nothing more.
         app.start_pending_probe();
         assert!(probe_rx.try_recv().is_err(), "one probe per selection");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn start_pending_probe_should_forward_the_app_s_cached_network_mount_flag() {
+        // `App::new` decides `is_network_mount` once for the whole session; the probe
+        // worker must reuse that answer instead of re-deriving it per file (which, on
+        // an actual network mount, can mean a fresh `/proc/mounts` read plus a
+        // `canonicalize()` round trip on every single selection).
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-pending-probe-network-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.mkv"), b"media").unwrap();
+        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        app.is_network_mount = true;
+        app.select_file_position_with_force(Some(0), true);
+        app.pending_since = Some(Instant::now() - Duration::from_millis(200));
+
+        app.start_pending_probe();
+
+        let request = probe_rx.try_recv().expect("the probe should be queued");
+        assert_that!(request.is_network_mount).is_true();
 
         std::fs::remove_dir_all(directory).unwrap();
     }

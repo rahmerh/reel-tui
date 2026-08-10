@@ -41,8 +41,17 @@ pub enum DirectorySnapshot {
     Error(String),
 }
 
+/// How many `metadata()` stats a network-mount scan keeps in flight at once. Each
+/// stat on a network share is dominated by round-trip latency rather than the work
+/// on either end, so issuing several concurrently lets the client pipeline them
+/// instead of paying the round trip once per file — a directory of a few hundred
+/// files can otherwise take the round-trip-count times the round-trip-time to list.
+/// Local disks don't have that latency to hide, so they keep the plain sequential
+/// path below.
+const NETWORK_SCAN_CONCURRENCY: usize = 8;
+
 pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
-    let mut files = Vec::new();
+    let mut candidates = Vec::new();
 
     for entry in fs::read_dir(directory)? {
         let Ok(entry) = entry else {
@@ -52,24 +61,26 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
         if display_name.starts_with(".reel-tui-") {
             continue;
         }
+        // `file_type()` is typically served from the same readdir buffer as the
+        // name (e.g. `d_type` on Linux), not a fresh stat, so it's cheap even on a
+        // network mount and safe to keep in this single-threaded first pass.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if !file_type.is_file() {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        files.push(FileEntry {
-            path: entry.path(),
-            display_name,
-            fingerprint: FileFingerprint {
-                length: metadata.len(),
-                modified: metadata.modified().ok(),
-            },
-        });
+        candidates.push((entry.path(), display_name));
     }
+
+    let mut files = if crate::mount::is_network_mount(directory) {
+        stat_candidates_concurrently(candidates)
+    } else {
+        candidates
+            .into_iter()
+            .filter_map(|(path, display_name)| file_entry_for(path, display_name))
+            .collect()
+    };
 
     // `sort_by_cached_key` computes each entry's key once (O(n) lowercase
     // allocations) instead of re-lowercasing both sides on every comparison inside a
@@ -77,6 +88,53 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
     files.sort_by_cached_key(|file| (file.display_name.to_lowercase(), file.display_name.clone()));
 
     Ok(files)
+}
+
+fn file_entry_for(path: PathBuf, display_name: String) -> Option<FileEntry> {
+    let metadata = fs::metadata(&path).ok()?;
+    Some(FileEntry {
+        path,
+        display_name,
+        fingerprint: FileFingerprint {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+    })
+}
+
+/// Stats `candidates` across a small pool of scoped threads instead of one at a
+/// time. Order doesn't matter here — `scan_directory` sorts the result afterward
+/// regardless of which chunk finishes first.
+fn stat_candidates_concurrently(candidates: Vec<(PathBuf, String)>) -> Vec<FileEntry> {
+    if candidates.len() <= 1 {
+        return candidates
+            .into_iter()
+            .filter_map(|(path, display_name)| file_entry_for(path, display_name))
+            .collect();
+    }
+
+    let chunk_size = candidates.len().div_ceil(NETWORK_SCAN_CONCURRENCY).max(1);
+    let mut files = Vec::with_capacity(candidates.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .cloned()
+                        .filter_map(|(path, display_name)| file_entry_for(path, display_name))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Ok(chunk_files) = handle.join() {
+                files.extend(chunk_files);
+            }
+        }
+    });
+    files
 }
 
 pub fn spawn_directory_monitor(directory: PathBuf) -> Receiver<DirectorySnapshot> {
@@ -180,6 +238,82 @@ mod tests {
 
         // Assert
         assert_that!(result).is_empty();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `scan_directory` only takes this path when `is_network_mount` says so (not
+    /// reproducible from a plain temp directory), so it's exercised directly here
+    /// rather than through `scan_directory` — this is the path a real network-mount
+    /// scan actually runs.
+    #[test]
+    fn stat_candidates_concurrently_should_return_metadata_for_every_candidate_across_chunks() {
+        // Arrange: more candidates than `NETWORK_SCAN_CONCURRENCY` so the chunking
+        // itself is exercised, not just a single thread handling everything.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-network-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut candidates = Vec::new();
+        for index in 0..(NETWORK_SCAN_CONCURRENCY * 3) {
+            let display_name = format!("movie-{index}.mkv");
+            let path = directory.join(&display_name);
+            fs::write(&path, b"not really media").unwrap();
+            candidates.push((path, display_name));
+        }
+
+        // Act
+        let mut files = stat_candidates_concurrently(candidates);
+        files.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+        // Assert: every candidate came back, each with the length it was written with
+        // (not zeroed out or dropped by whichever chunk happened to run it).
+        assert_that!(files.len()).is_equal_to(NETWORK_SCAN_CONCURRENCY * 3);
+        for file in &files {
+            assert_that!(file.fingerprint.length).is_equal_to(b"not really media".len() as u64);
+        }
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stat_candidates_concurrently_should_silently_drop_a_candidate_that_no_longer_exists() {
+        // Arrange: mirrors the sequential path's `let Ok(metadata) = ... else { continue }`
+        // — a file that vanished between the readdir pass and the stat (common on a
+        // network share where reconciliation and external changes race) must not
+        // surface as an error or panic, just be left out.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-network-scan-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let present = directory.join("present.mkv");
+        fs::write(&present, b"media").unwrap();
+        let missing = directory.join("missing.mkv");
+        let candidates = vec![
+            (present.clone(), "present.mkv".to_string()),
+            (missing, "missing.mkv".to_string()),
+        ];
+
+        // Act
+        let files = stat_candidates_concurrently(candidates);
+
+        // Assert
+        assert_that!(files.len()).is_equal_to(1);
+        assert_that!(files[0].path.clone()).is_equal_to(present);
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
