@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ContainerChoice,
+        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ConflictChoice, ContainerChoice,
         ContainerSettingsField, ContainerSettingsMode, ContainerSettingsPopup,
         CustomResolutionField, Dialog, InputReject, Layer, ResetChoice, SearchState,
         StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
@@ -1123,11 +1123,15 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_confirm_reset_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::ResolveConflicts {
+        render_resolve_conflicts_dialog(frame, app);
+        return;
+    }
     let (title, body, color) = match dialog {
         Dialog::Keybindings | Dialog::ContainerSettings | Dialog::VideoSettings => unreachable!(),
         Dialog::SubtitleSettings | Dialog::ConfirmCancel => unreachable!(),
         Dialog::ConfirmProcessAll | Dialog::BatchProcessing => unreachable!(),
-        Dialog::ConfirmReset => unreachable!(),
+        Dialog::ConfirmReset | Dialog::ResolveConflicts => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -1720,6 +1724,76 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
     ])
     .centered();
     frame.render_widget(Paragraph::new(buttons), chunks[1]);
+}
+
+/// Lists every staged file whose background structural re-probe confirmed a genuine
+/// on-disk change since staging — see `App::conflicting_paths`. Unlike
+/// `render_confirm_process_all_dialog`'s single dialog-wide Start/Cancel, each row
+/// carries its own Overwrite/Discard pair (`App::conflict_choice_for`), and the row
+/// at `App::conflict_cursor` is marked with a leading cursor glyph — only that row's
+/// choice responds to Left/Right (`App::choose_conflict`); Enter applies every row's
+/// own choice at once (`App::activate_conflicts`).
+fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
+    /// Bullet + note line, choice-button line, blank spacer — see `scroll_to_show_line`
+    /// below, which needs this to convert `conflict_cursor` into a line index.
+    const ROWS_PER_ITEM: usize = 3;
+
+    let paths = app.conflicting_paths();
+    let count = paths.len();
+    let title = format!(
+        " Resolve {count} conflict{} ",
+        if count == 1 { "" } else { "s" }
+    );
+    let area = popup_area(frame.area(), 60, 50);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let is_cursor_row = index == app.conflict_cursor;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        lines.push(Line::from(vec![
+            Span::raw(if is_cursor_row { "▶ " } else { "  " }),
+            Span::styled(name.to_string(), changed_style()),
+            Span::styled(
+                " — changed on disk since staged",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        let choice = app.conflict_choice_for(path);
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            action_option(" Overwrite ", choice == ConflictChoice::Overwrite),
+            Span::raw("  "),
+            action_option(" Discard ", choice == ConflictChoice::Discard),
+        ]));
+        lines.push(Line::from(""));
+    }
+    let text = padded_popup_text(Text::from(lines));
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    app.set_conflict_max_scroll(max_scroll(&text, chunks[0]));
+    let cursor_line = app.conflict_cursor * ROWS_PER_ITEM + 1; // +1 for padded_popup_text's leading blank
+    app.conflict_scroll = scroll_to_show_line(&text, chunks[0], cursor_line, app.conflict_scroll);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.conflict_scroll, 0)),
+        chunks[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new("↑↓ select · ←→ choose · Enter apply · Esc defer").centered(),
+        chunks[1],
+    );
 }
 
 /// One progress row per staged file being processed, table-like (a single column of
@@ -4067,8 +4141,16 @@ mod tests {
             std::fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         (app, directory)
     }
 
@@ -4220,6 +4302,8 @@ mod tests {
                     crate::staging::StagedEdit {
                         fingerprint,
                         stale: false,
+                        baseline: None,
+                        conflict_confirmed: false,
                         stream_order: vec![0, 1, 2, 3],
                         moved_streams: Default::default(),
                         deleted_streams: Default::default(),
@@ -4251,6 +4335,34 @@ mod tests {
             Dialog::ConfirmReset => {
                 app.request_reset_current_file();
             }
+            Dialog::ResolveConflicts => {
+                let path = app.directory.join("movie.mkv");
+                let fingerprint = crate::files::FileFingerprint {
+                    length: 0,
+                    modified: None,
+                };
+                app.staged_edits.insert(
+                    path,
+                    crate::staging::StagedEdit {
+                        fingerprint,
+                        stale: true,
+                        baseline: None,
+                        conflict_confirmed: true,
+                        stream_order: vec![0, 1, 2, 3],
+                        moved_streams: Default::default(),
+                        deleted_streams: Default::default(),
+                        default_streams: Default::default(),
+                        default_sidecars: Default::default(),
+                        video_settings: Default::default(),
+                        subtitle_changes: Default::default(),
+                        left_subtitle_order: Vec::new(),
+                        container_target: Some(ContainerFormat::Mp4),
+                        container_metadata: None,
+                        original_stream_order: vec![0, 1, 2, 3],
+                        original_default_streams: Default::default(),
+                    },
+                );
+            }
         }
         app.dialog = Some(dialog);
     }
@@ -4259,7 +4371,7 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 9] = [
+        const DIALOGS: [(Dialog, &str); 10] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
@@ -4272,6 +4384,7 @@ mod tests {
             ),
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
+            (Dialog::ResolveConflicts, "changed on disk since staged"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -4346,6 +4459,8 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
+                    baseline: None,
+                    conflict_confirmed: false,
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -4386,6 +4501,67 @@ mod tests {
     }
 
     #[test]
+    fn resolve_conflicts_dialog_should_list_each_file_with_its_own_choice() {
+        // Arrange: two staged files, each independently flagged as a confirmed
+        // conflict by a background re-probe — every row must show its own name and
+        // its own Overwrite/Discard state, not one dialog-wide choice.
+        let (mut app, directory) = test_app("resolve-conflicts", &["alpha.mkv", "beta.mkv"]);
+        for name in ["alpha.mkv", "beta.mkv"] {
+            let path = directory.join(name);
+            let fingerprint = crate::files::FileFingerprint {
+                length: 5,
+                modified: None,
+            };
+            app.staged_edits.insert(
+                path,
+                crate::staging::StagedEdit {
+                    fingerprint,
+                    stale: true,
+                    baseline: None,
+                    conflict_confirmed: true,
+                    stream_order: vec![0],
+                    moved_streams: Default::default(),
+                    deleted_streams: Default::default(),
+                    default_streams: Default::default(),
+                    default_sidecars: Default::default(),
+                    video_settings: Default::default(),
+                    subtitle_changes: Default::default(),
+                    left_subtitle_order: Vec::new(),
+                    container_target: None,
+                    container_metadata: None,
+                    original_stream_order: vec![0],
+                    original_default_streams: Default::default(),
+                },
+            );
+        }
+        assert!(
+            app.maybe_open_conflict_dialog(),
+            "conflicts must auto-open the dialog"
+        );
+        // The second (alphabetically) row is set to Discard; the first stays at its
+        // Overwrite default — both must show up distinctly.
+        app.move_conflict_cursor_down();
+        app.choose_conflict(1);
+
+        // Act
+        let screen = draw(&mut app, 140, 40).join(" ");
+
+        // Assert
+        assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
+        assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("changed on disk since staged"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.matches("Overwrite").count() >= 2 && screen.matches("Discard").count() >= 2,
+            "every row should show both options; screen was:\n{screen}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn confirm_process_all_dialog_should_scroll_when_content_exceeds_the_popup() {
         // Arrange: enough staged files that the summary can't fit a small popup.
         let (mut app, directory) = test_app("confirm-process-all-scroll", &[]);
@@ -4417,6 +4593,8 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
+                    baseline: None,
+                    conflict_confirmed: false,
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -5886,8 +6064,16 @@ mod tests {
     #[test]
     fn render_footer_should_include_network_mode_tag_only_when_in_network_mode() {
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
 
         app.is_network_mount = true;
         let mut terminal =
@@ -5919,8 +6105,16 @@ mod tests {
     #[test]
     fn render_details_should_show_unsupported_format_only_for_non_video_outcomes() {
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.files = vec![crate::files::FileEntry {
             path: std::path::PathBuf::from("/media/image.png"),
             display_name: "image.png".to_string(),

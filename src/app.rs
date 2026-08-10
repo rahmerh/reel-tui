@@ -441,6 +441,11 @@ pub enum Dialog {
     /// "Are you sure?" before an `r`/`R` reset that discards more than a single
     /// field's value — see `App::pending_reset`/`ResetScope`.
     ConfirmReset,
+    /// Lists every staged file whose background structural re-probe confirmed a
+    /// genuine change on disk (not just an mtime bump) since it was staged, each with
+    /// its own Overwrite/Discard choice — opens itself automatically, no manual
+    /// action needed. See `App::conflicting_paths`/`maybe_open_conflict_dialog`.
+    ResolveConflicts,
 }
 
 /// What an in-progress `Dialog::ConfirmReset` would discard if confirmed.
@@ -497,6 +502,18 @@ pub enum ConfirmProcessAllChoice {
     #[default]
     Start,
     Cancel,
+}
+
+/// One conflicting file's resolution in `Dialog::ResolveConflicts`. Defaults to
+/// `Overwrite` — unlike `ResetChoice`'s "default to the safe choice" pattern,
+/// `Overwrite` is the option that keeps the user's staged work (subject to the same
+/// `validate_edit` gate every other save path already runs), while `Discard` is the
+/// destructive one that throws it away.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConflictChoice {
+    #[default]
+    Overwrite,
+    Discard,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -958,6 +975,34 @@ pub struct App {
     pub staged_edits: HashMap<PathBuf, StagedEdit>,
     pub is_network_mount: bool,
     pub disk_cache: crate::cache::DiskCache,
+    /// Sender for the second, non-coalescing probe worker (`probe::spawn_conflict_probe_worker`)
+    /// dedicated to background staleness re-checks — kept separate from `request_tx`
+    /// so a burst of several changed staged files can never starve, or be starved by,
+    /// the interactive per-selection probe. See `reconcile_files`'s dispatch and
+    /// `receive_conflict_probe_results`'s answering half.
+    conflict_tx: Sender<ProbeRequest>,
+    /// For each path with a background structural check dispatched (queued or
+    /// running) against the conflict worker, the exact fingerprint that check is for.
+    /// Prevents re-enqueuing the same fingerprint on every reconcile pass while a
+    /// file stays stale, and lets `receive_conflict_probe_results` recognize a
+    /// response as superseded (the file changed again since this check was
+    /// dispatched) rather than authoritative.
+    pending_conflict_checks: HashMap<PathBuf, crate::files::FileFingerprint>,
+    /// Paths the user explicitly deferred out of `Dialog::ResolveConflicts`
+    /// (Escape/`dismiss_conflicts`), mapped to the on-disk fingerprint they were
+    /// dismissed at. Suppresses re-opening the dialog for that exact state, but not
+    /// once the file changes again — see `conflicting_paths`.
+    dismissed_conflicts: HashMap<PathBuf, crate::files::FileFingerprint>,
+    /// Highlighted row in `Dialog::ResolveConflicts`, an index into
+    /// `conflicting_paths()`. Mirrors `batch_cursor`.
+    pub conflict_cursor: usize,
+    /// Each currently-conflicting path's selected resolution, live only while
+    /// `Dialog::ResolveConflicts` is open — applied all at once by
+    /// `activate_conflicts`. Not persisted on `StagedEdit` because it's a pending UI
+    /// choice, not staged-edit state.
+    conflict_choices: HashMap<PathBuf, ConflictChoice>,
+    pub conflict_scroll: u16,
+    pub conflict_max_scroll: u16,
     pub keybindings_search: SearchState,
     pub file_search: SearchState,
     file_search_origin: Option<PathBuf>,
@@ -971,6 +1016,7 @@ impl App {
     pub fn new(
         directory: PathBuf,
         request_tx: Sender<ProbeRequest>,
+        conflict_tx: Sender<ProbeRequest>,
         transcode_tx: Sender<EditRequest>,
         remux_tx: Sender<EditRequest>,
     ) -> Result<Self> {
@@ -1038,6 +1084,13 @@ impl App {
             staged_edits: HashMap::new(),
             is_network_mount,
             disk_cache,
+            conflict_tx,
+            pending_conflict_checks: HashMap::new(),
+            dismissed_conflicts: HashMap::new(),
+            conflict_cursor: 0,
+            conflict_choices: HashMap::new(),
+            conflict_scroll: 0,
+            conflict_max_scroll: 0,
             keybindings_search: SearchState::default(),
             file_search: SearchState::default(),
             file_search_origin: None,
@@ -1118,9 +1171,35 @@ impl App {
         // staged work silently.
         self.staged_edits
             .retain(|path, _| current_paths.contains(path.as_path()));
+        self.pending_conflict_checks
+            .retain(|path, _| current_paths.contains(path.as_path()));
+        self.dismissed_conflicts
+            .retain(|path, _| current_paths.contains(path.as_path()));
         for file in &self.files {
-            if let Some(staged) = self.staged_edits.get_mut(&file.path) {
-                staged.stale = staged.fingerprint != file.fingerprint;
+            let Some(staged) = self.staged_edits.get_mut(&file.path) else {
+                continue;
+            };
+            staged.stale = staged.fingerprint != file.fingerprint;
+            if !staged.stale {
+                staged.conflict_confirmed = false;
+                self.pending_conflict_checks.remove(&file.path);
+                self.dismissed_conflicts.remove(&file.path);
+                continue;
+            }
+            // Dispatch a background structural re-check, but only once per fingerprint
+            // — otherwise every reconcile pass while a file stays stale (up to once a
+            // second locally) would re-enqueue it, and the second, non-coalescing
+            // conflict worker answers every request it's sent rather than dropping
+            // superseded ones itself (see `probe::spawn_conflict_probe_worker`).
+            if self.pending_conflict_checks.get(&file.path) != Some(&file.fingerprint) {
+                let _ = self.conflict_tx.send(ProbeRequest {
+                    generation: 0,
+                    path: file.path.clone(),
+                    fingerprint: file.fingerprint,
+                    is_network_mount: self.is_network_mount,
+                });
+                self.pending_conflict_checks
+                    .insert(file.path.clone(), file.fingerprint);
             }
         }
         // Pull in any disk-cached outcome for files that just appeared and aren't in
@@ -1555,6 +1634,65 @@ impl App {
                 self.loading = false;
                 self.selected_stream = 0;
                 self.load_staged_or_reset();
+            }
+        }
+        if disk_cache_dirty {
+            let _ = self.disk_cache.save();
+        }
+        received
+    }
+
+    /// Returns whether any conflict-check response was drained, so the main loop can
+    /// skip redrawing when none arrived. Answers arrive from the second, FIFO probe
+    /// worker (`conflict_tx`/`probe::spawn_conflict_probe_worker`) that `reconcile_files`
+    /// dispatches into — every request it sends gets an answer here, not just the
+    /// newest, unlike `receive_probe_results`'s interactive channel.
+    pub fn receive_conflict_probe_results(&mut self, receiver: &Receiver<ProbeResponse>) -> bool {
+        let mut disk_cache_dirty = false;
+        let mut received = false;
+        while let Ok(response) = receiver.try_recv() {
+            received = true;
+            // Superseded: the file changed again since this check was dispatched (a
+            // newer check now owns this path in `pending_conflict_checks`, or the file
+            // is gone entirely) — this answer describes on-disk state that's no longer
+            // current, so it must not resolve or confirm anything.
+            if self.pending_conflict_checks.get(&response.path) != Some(&response.fingerprint) {
+                continue;
+            }
+            self.pending_conflict_checks.remove(&response.path);
+
+            let key = CacheKey {
+                path: response.path.clone(),
+                length: response.fingerprint.length,
+                modified: response.fingerprint.modified,
+            };
+            self.cache.insert(key, response.outcome.clone());
+            self.disk_cache.insert(
+                response.path.clone(),
+                response.fingerprint.length,
+                response.fingerprint.modified,
+                response.outcome.clone(),
+            );
+            disk_cache_dirty = true;
+
+            let Some(staged) = self.staged_edits.get_mut(&response.path) else {
+                continue;
+            };
+            if !staged.stale {
+                // Resolved another way (manual reopen, reset) while this check was in
+                // flight — nothing left to do.
+                continue;
+            }
+            let matches_baseline = matches!(
+                (&staged.baseline, &response.outcome),
+                (Some(baseline), ProbeOutcome::Video(fresh)) if baseline == fresh
+            );
+            if matches_baseline {
+                staged.fingerprint = response.fingerprint;
+                staged.stale = false;
+                staged.conflict_confirmed = false;
+            } else {
+                staged.conflict_confirmed = true;
             }
         }
         if disk_cache_dirty {
@@ -4755,12 +4893,7 @@ impl App {
             return;
         }
         match scope {
-            ResetScope::File(path) => {
-                self.staged_edits.remove(&path);
-                if self.selected_file().is_some_and(|file| file.path == path) {
-                    self.reset_track_edits();
-                }
-            }
+            ResetScope::File(path) => self.discard_staged_file(&path),
             ResetScope::CurrentFile => {
                 if let Some(path) = self.selected_file().map(|file| file.path.clone()) {
                     self.staged_edits.remove(&path);
@@ -4777,6 +4910,210 @@ impl App {
         self.reset_choice = ResetChoice::default();
         self.dialog = None;
         self.notice = Some("Staged edits reset.".to_string());
+    }
+
+    /// Unstages `path`'s edits and, if it's the currently-open file, resets the live
+    /// edit fields too — shared by `activate_reset`'s single-file scope and
+    /// `activate_conflicts`'s per-file Discard choice.
+    fn discard_staged_file(&mut self, path: &Path) {
+        self.staged_edits.remove(path);
+        if self.selected_file().is_some_and(|file| file.path == path) {
+            self.reset_track_edits();
+        }
+    }
+
+    /// The set of staged files whose background structural re-probe has confirmed a
+    /// genuine on-disk change since staging (not just an mtime bump), excluding any
+    /// the user already deferred via `dismiss_conflicts` for this exact fingerprint.
+    /// Computed on demand from `staged_edits` rather than stored, so it can never
+    /// drift from live state. Sorted for stable rendering/cursor order.
+    pub fn conflicting_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for (path, staged) in &self.staged_edits {
+            if !staged.stale || !staged.conflict_confirmed {
+                continue;
+            }
+            let live_fingerprint = self
+                .files
+                .iter()
+                .find(|file| &file.path == path)
+                .map(|file| file.fingerprint);
+            if let Some(fingerprint) = live_fingerprint
+                && self.dismissed_conflicts.get(path) == Some(&fingerprint)
+            {
+                continue;
+            }
+            paths.push(path.clone());
+        }
+        paths.sort();
+        paths
+    }
+
+    /// Opens `Dialog::ResolveConflicts` the instant there's something to resolve and
+    /// nothing else is already showing — called every main-loop tick, so it fires
+    /// both the moment a background check confirms a conflict and the moment any
+    /// other dialog closes, with no manual action required.
+    /// Returns whether it opened the dialog, so the main loop knows to redraw —
+    /// otherwise a conflict confirmed between key presses would sit unseen until
+    /// some unrelated event happened to trigger a redraw.
+    pub fn maybe_open_conflict_dialog(&mut self) -> bool {
+        if self.dialog.is_some() {
+            return false;
+        }
+        let paths = self.conflicting_paths();
+        if paths.is_empty() {
+            return false;
+        }
+        self.conflict_cursor = 0;
+        self.conflict_scroll = 0;
+        for path in paths {
+            self.conflict_choices.entry(path).or_default();
+        }
+        self.dialog = Some(Dialog::ResolveConflicts);
+        true
+    }
+
+    /// Moves the `Dialog::ResolveConflicts` highlight by one row; mirrors
+    /// `move_batch_cursor_down`.
+    pub fn move_conflict_cursor_down(&mut self) {
+        let Some(last) = self.conflict_cursor_last_row() else {
+            return;
+        };
+        self.conflict_cursor = self.conflict_cursor.saturating_add(1).min(last);
+    }
+
+    pub fn move_conflict_cursor_up(&mut self) {
+        if self.conflict_cursor_last_row().is_none() {
+            return;
+        }
+        self.conflict_cursor = self.conflict_cursor.saturating_sub(1);
+    }
+
+    /// The highest selectable row index, or `None` when the dialog isn't open or
+    /// lists nothing — both cases where the cursor must not move. Mirrors
+    /// `batch_cursor_last_row`.
+    fn conflict_cursor_last_row(&self) -> Option<usize> {
+        if self.dialog != Some(Dialog::ResolveConflicts) {
+            return None;
+        }
+        // Not `(len > 0).then_some(len - 1)` — `then_some`'s argument is evaluated
+        // eagerly, so `len - 1` would underflow before the guard ever short-circuits.
+        match self.conflicting_paths().len() {
+            0 => None,
+            len => Some(len - 1),
+        }
+    }
+
+    /// Sets the choice for the row currently under `conflict_cursor` — Left picks
+    /// `Overwrite`, Right picks `Discard`, mirroring `choose_reset`'s direction
+    /// mapping but scoped to one row instead of one dialog-wide field.
+    pub fn choose_conflict(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ResolveConflicts) || direction == 0 {
+            return;
+        }
+        let paths = self.conflicting_paths();
+        let Some(path) = paths.get(self.conflict_cursor) else {
+            return;
+        };
+        let choice = if direction.is_positive() {
+            ConflictChoice::Discard
+        } else {
+            ConflictChoice::Overwrite
+        };
+        self.conflict_choices.insert(path.clone(), choice);
+    }
+
+    /// The currently-selected resolution for `path` within an open
+    /// `Dialog::ResolveConflicts` — `Overwrite` if nothing has been chosen for it
+    /// yet, matching `ConflictChoice`'s default.
+    pub fn conflict_choice_for(&self, path: &Path) -> ConflictChoice {
+        self.conflict_choices.get(path).copied().unwrap_or_default()
+    }
+
+    pub fn set_conflict_max_scroll(&mut self, maximum: u16) {
+        self.conflict_max_scroll = maximum;
+        self.conflict_scroll = self.conflict_scroll.min(maximum);
+    }
+
+    /// Escape on `Dialog::ResolveConflicts` — defers every currently-listed conflict
+    /// (records each path's live fingerprint into `dismissed_conflicts`, so the
+    /// dialog won't reopen for that exact on-disk state) without discarding or
+    /// overwriting anything. `stale`/`conflict_confirmed` are untouched, so Ctrl+S
+    /// still refuses these files until they're actually resolved — the dialog simply
+    /// reopens automatically the next time the file changes again.
+    pub fn dismiss_conflicts(&mut self) {
+        if self.dialog != Some(Dialog::ResolveConflicts) {
+            return;
+        }
+        for path in self.conflicting_paths() {
+            if let Some(file) = self.files.iter().find(|file| file.path == path) {
+                self.dismissed_conflicts.insert(path, file.fingerprint);
+            }
+        }
+        self.conflict_choices.clear();
+        self.conflict_cursor = 0;
+        self.dialog = None;
+    }
+
+    /// Enter on `Dialog::ResolveConflicts` — applies every listed path's currently
+    /// selected choice (defaulting to `Overwrite` if one is somehow missing) and
+    /// closes the dialog.
+    pub fn activate_conflicts(&mut self) {
+        if self.dialog != Some(Dialog::ResolveConflicts) {
+            return;
+        }
+        for path in self.conflicting_paths() {
+            let choice = self
+                .conflict_choices
+                .get(&path)
+                .copied()
+                .unwrap_or_default();
+            match choice {
+                ConflictChoice::Overwrite => self.overwrite_conflict(&path),
+                ConflictChoice::Discard => {
+                    self.discard_staged_file(&path);
+                    self.dismissed_conflicts.remove(&path);
+                }
+            }
+        }
+        self.conflict_choices.clear();
+        self.conflict_cursor = 0;
+        self.dialog = None;
+    }
+
+    /// Re-baselines a conflicting staged file against its current on-disk content
+    /// instead of blindly trusting the (possibly now-wrong) staged track selections.
+    /// Deliberately does not call `validate_edit` itself: clearing `stale` just lets
+    /// the file fall back through the exact same `staged_file_status`/
+    /// `confirm_process_all` validation gate every staged file already goes through,
+    /// so an edit that no longer makes sense against the new content (e.g. a deleted
+    /// track index that no longer exists) still surfaces as a normal `Invalid`
+    /// rather than being force-applied.
+    fn overwrite_conflict(&mut self, path: &Path) {
+        let Some(file) = self.files.iter().find(|file| file.path == path) else {
+            return;
+        };
+        let fingerprint = file.fingerprint;
+        let key = CacheKey {
+            path: path.to_path_buf(),
+            length: fingerprint.length,
+            modified: fingerprint.modified,
+        };
+        // If the fresh probe isn't cached yet (the file changed again very recently,
+        // right before the user hit Enter), leave it conflicted rather than guessing
+        // — `reconcile_files` already re-dispatched a check for the newer fingerprint,
+        // and the dialog will reopen on its own once that answers.
+        let Some(ProbeOutcome::Video(info)) = self.cache.get(&key).cloned() else {
+            return;
+        };
+        let Some(staged) = self.staged_edits.get_mut(path) else {
+            return;
+        };
+        staged.fingerprint = fingerprint;
+        staged.baseline = Some(info);
+        staged.stale = false;
+        staged.conflict_confirmed = false;
+        self.dismissed_conflicts.remove(path);
     }
 
     /// Actually stops the batch: flips the shared cancellation flag, so every request
@@ -5050,12 +5387,15 @@ impl App {
         };
         let path = file.path.clone();
         let fingerprint = file.fingerprint;
+        let baseline = self.media_info().cloned();
         if self.has_track_edits() {
             self.staged_edits.insert(
                 path,
                 StagedEdit {
                     fingerprint,
                     stale: false,
+                    baseline,
+                    conflict_confirmed: false,
                     stream_order: self.stream_order.clone(),
                     moved_streams: self.moved_streams.clone(),
                     deleted_streams: self.deleted_streams.clone(),
@@ -6129,8 +6469,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory, probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(directory, probe_tx, conflict_tx, edit_tx.clone(), edit_tx).unwrap();
         app.outcome = Some(ProbeOutcome::Video(info));
         app.loading = false;
         app.reset_track_edits();
@@ -6152,8 +6493,9 @@ mod tests {
             std::fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory, probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(directory, probe_tx, conflict_tx, edit_tx.clone(), edit_tx).unwrap();
         app.outcome = Some(ProbeOutcome::Video(media(serde_json::json!([
             {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
             {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
@@ -6351,6 +6693,7 @@ mod tests {
         // Arrange: holding a cursor key past ten files must not queue ten ffprobe runs,
         // so a probe is only sent once the selection has settled.
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-pending-probe-{}-{}",
@@ -6362,7 +6705,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("a.mkv"), b"media").unwrap();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.select_file_position_with_force(Some(0), true);
         assert_that!(app.pending_since.is_some()).is_true();
 
@@ -6399,6 +6749,7 @@ mod tests {
         // an actual network mount, can mean a fresh `/proc/mounts` read plus a
         // `canonicalize()` round trip on every single selection).
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-pending-probe-network-{}-{}",
@@ -6410,7 +6761,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("a.mkv"), b"media").unwrap();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.is_network_mount = true;
         app.select_file_position_with_force(Some(0), true);
         app.pending_since = Some(Instant::now() - Duration::from_millis(200));
@@ -6673,6 +7031,443 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Builds a bare `StagedEdit` with every collection defaulted, for tests that only
+    /// care about `fingerprint`/`stale`/`baseline`/`conflict_confirmed`/`stream_order`.
+    fn staged_edit(
+        fingerprint: crate::files::FileFingerprint,
+        stream_order: Vec<u64>,
+    ) -> StagedEdit {
+        StagedEdit {
+            fingerprint,
+            stale: true,
+            baseline: None,
+            conflict_confirmed: false,
+            stream_order,
+            moved_streams: Default::default(),
+            deleted_streams: Default::default(),
+            default_streams: Default::default(),
+            default_sidecars: Default::default(),
+            video_settings: Default::default(),
+            subtitle_changes: Default::default(),
+            left_subtitle_order: Vec::new(),
+            container_target: None,
+            container_metadata: None,
+            original_stream_order: Vec::new(),
+            original_default_streams: Default::default(),
+        }
+    }
+
+    #[test]
+    fn reconcile_files_should_dispatch_exactly_one_conflict_probe_request_per_fingerprint() {
+        // Regression test for the dedup rule in `reconcile_files`: while a staged file
+        // stays stale at the same fingerprint, repeated reconcile passes (up to once a
+        // second locally) must not re-enqueue a background check every time.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-conflict-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.mkv"), b"media").unwrap();
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, conflict_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        app.staged_edits
+            .insert(path.clone(), staged_edit(old_fingerprint, vec![0]));
+        app.staged_edits.get_mut(&path).unwrap().stale = false;
+
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&directory).unwrap();
+
+        // Act: reconcile twice against the same (now-stale) on-disk state.
+        app.reconcile_files(rescanned.clone());
+        app.reconcile_files(rescanned);
+
+        // Assert: exactly one request went out, for the new fingerprint.
+        let request = conflict_rx.try_recv().expect("a check must be dispatched");
+        assert_that!(request.path).is_equal_to(path);
+        assert_that!(request.fingerprint).is_not_equal_to(old_fingerprint);
+        assert!(
+            conflict_rx.try_recv().is_err(),
+            "a second reconcile at the same fingerprint must not dispatch again"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_auto_resolve_when_reprobe_matches_baseline() {
+        // A pure mtime bump (e.g. an external re-sync preserving bytes) must resolve
+        // itself with no popup — see `App::receive_conflict_probe_results`.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ]));
+        let mut edit = staged_edit(old_fingerprint, vec![0]);
+        edit.baseline = Some(info.clone());
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), new_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            outcome: ProbeOutcome::Video(info),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_false();
+        assert_that!(staged.conflict_confirmed).is_false();
+        assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
+        assert_that!(app.pending_conflict_checks.contains_key(&path)).is_false();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_flag_a_confirmed_conflict_when_reprobe_differs() {
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let mut edit = staged_edit(old_fingerprint, vec![0]);
+        edit.baseline = Some(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ])));
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), new_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: still stale, at the *old* fingerprint (not silently re-baselined),
+        // and now confirmed as a genuine conflict.
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_true();
+        assert_that!(staged.conflict_confirmed).is_true();
+        assert_that!(staged.fingerprint).is_equal_to(old_fingerprint);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_ignore_a_response_superseded_by_a_newer_dispatched_check()
+     {
+        // Mirrors `receive_probe_results_should_ignore_a_response_for_a_superseded_generation`:
+        // the file changed again after this check was dispatched, so its answer
+        // describes on-disk state that's no longer current and must not be acted on.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let stale_response_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let newer_dispatched_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 2,
+            modified: old_fingerprint.modified,
+        };
+        let edit = staged_edit(old_fingerprint, vec![0]);
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), newer_dispatched_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: stale_response_fingerprint,
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: nothing about the staged edit changed, and the newer dispatched
+        // check is still tracked as pending (not clobbered by the stale answer).
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_true();
+        assert_that!(staged.conflict_confirmed).is_false();
+        assert_that!(staged.fingerprint).is_equal_to(old_fingerprint);
+        assert_that!(app.pending_conflict_checks.get(&path).copied())
+            .is_equal_to(Some(newer_dispatched_fingerprint));
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn overwrite_conflict_should_revalidate_rather_than_blindly_trust_stale_indices() {
+        // A track the staged edit still references (here, via `video_settings`, which
+        // `final_stream_order` doesn't get a chance to quietly reconcile away the way
+        // it does for `stream_order` itself) may no longer exist in the new content —
+        // Overwrite must not force the stale selection through; it should fall back
+        // through the normal validation gate exactly like any other staged file, so
+        // this surfaces as a plain `Invalid`, not a silent misapply.
+        // `staged_edits`-based validation only kicks in for a file that isn't the
+        // currently-open one (the open file validates its *live* fields instead), so
+        // a second file is selected to keep "a.mkv" staged-but-not-open.
+        let mut app = test_file_app(&["a.mkv", "z.mkv"]);
+        app.select_file_position(Some(1));
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        app.files[0].fingerprint = new_fingerprint;
+        app.cache.insert(
+            CacheKey {
+                path: path.clone(),
+                length: new_fingerprint.length,
+                modified: new_fingerprint.modified,
+            },
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        );
+        let mut edit = staged_edit(old_fingerprint, vec![0]);
+        edit.conflict_confirmed = true;
+        edit.baseline = Some(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "video", "disposition": {"default": 0}}
+        ])));
+        edit.video_settings.insert(
+            1,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        app.staged_edits.insert(path.clone(), edit);
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.conflict_choices
+            .insert(path.clone(), ConflictChoice::Overwrite);
+
+        // Act
+        app.activate_conflicts();
+
+        // Assert: re-baselined (no longer stale/conflicted)...
+        let staged = app
+            .staged_edits
+            .get(&path)
+            .expect("Overwrite keeps the staged entry");
+        assert_that!(staged.stale).is_false();
+        assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
+        assert_that!(app.dialog).is_equal_to(None);
+        // ...but validation against the actual new content still fails, since track 1
+        // no longer exists.
+        match app.staged_file_status(&path) {
+            StagedFileStatus::Invalid(_) => {}
+            other => {
+                panic!("expected Invalid after overwriting against changed tracks, got {other:?}")
+            }
+        }
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn discard_conflict_should_unstage_the_file_like_a_manual_reset_does() {
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let fingerprint = app.files[0].fingerprint;
+        let mut edit = staged_edit(fingerprint, vec![0]);
+        edit.conflict_confirmed = true;
+        app.staged_edits.insert(path.clone(), edit);
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.conflict_choices
+            .insert(path.clone(), ConflictChoice::Discard);
+
+        // Act
+        app.activate_conflicts();
+
+        // Assert: same end state `activate_reset`'s `ResetScope::File` arm produces.
+        assert_that!(app.staged_edits.contains_key(&path)).is_false();
+        assert_that!(app.dialog).is_equal_to(None);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn activate_conflicts_should_apply_each_paths_own_independently_chosen_resolution() {
+        // The core behavior the per-file design exists for: one path set to Overwrite
+        // and another to Discard, applied correctly in a single `activate_conflicts`
+        // call — a bulk (dialog-wide) choice would fail this.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        let path_a = app.files[0].path.clone();
+        let path_b = app.files[1].path.clone();
+        for file in app.files.clone() {
+            app.cache.insert(
+                CacheKey::for_file(&file),
+                ProbeOutcome::Video(media(serde_json::json!([
+                    {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+                ]))),
+            );
+            let mut edit = staged_edit(file.fingerprint, vec![0]);
+            edit.conflict_confirmed = true;
+            app.staged_edits.insert(file.path, edit);
+        }
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.conflict_choices
+            .insert(path_a.clone(), ConflictChoice::Overwrite);
+        app.conflict_choices
+            .insert(path_b.clone(), ConflictChoice::Discard);
+
+        // Act
+        app.activate_conflicts();
+
+        // Assert
+        let staged_a = app
+            .staged_edits
+            .get(&path_a)
+            .expect("Overwrite keeps a.mkv staged");
+        assert_that!(staged_a.stale).is_false();
+        assert_that!(app.staged_edits.contains_key(&path_b)).is_false();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn maybe_open_conflict_dialog_should_not_reopen_a_dismissed_conflict_until_the_file_changes_again()
+     {
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let fingerprint = app.files[0].fingerprint;
+        let mut edit = staged_edit(fingerprint, vec![0]);
+        edit.conflict_confirmed = true;
+        app.staged_edits.insert(path.clone(), edit);
+
+        assert_that!(app.maybe_open_conflict_dialog()).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ResolveConflicts));
+
+        app.dismiss_conflicts();
+        assert_that!(app.dialog).is_equal_to(None);
+
+        // Same on-disk state as when dismissed: must not reopen on its own.
+        assert_that!(app.maybe_open_conflict_dialog()).is_false();
+        assert_that!(app.dialog).is_equal_to(None);
+
+        // The file changes again — a fresh fingerprint no longer matches what was
+        // dismissed, so the dialog is free to reopen for it.
+        app.files[0].fingerprint = crate::files::FileFingerprint {
+            length: fingerprint.length + 1,
+            modified: fingerprint.modified,
+        };
+        assert_that!(app.maybe_open_conflict_dialog()).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ResolveConflicts));
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn maybe_open_conflict_dialog_should_list_multiple_simultaneous_conflicts_together() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        for file in app.files.clone() {
+            let mut edit = staged_edit(file.fingerprint, vec![0]);
+            edit.conflict_confirmed = true;
+            app.staged_edits.insert(file.path, edit);
+        }
+
+        assert_that!(app.maybe_open_conflict_dialog()).is_true();
+        let paths = app.conflicting_paths();
+        assert_that!(paths.len()).is_equal_to(2);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn move_conflict_cursor_should_clamp_and_only_move_while_the_dialog_is_open() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        for file in app.files.clone() {
+            let mut edit = staged_edit(file.fingerprint, vec![0]);
+            edit.conflict_confirmed = true;
+            app.staged_edits.insert(file.path, edit);
+        }
+
+        // Not open yet: cursor must not move.
+        app.move_conflict_cursor_down();
+        assert_that!(app.conflict_cursor).is_equal_to(0);
+
+        app.maybe_open_conflict_dialog();
+        app.move_conflict_cursor_down();
+        assert_that!(app.conflict_cursor).is_equal_to(1);
+        app.move_conflict_cursor_down(); // only two rows: clamp at the last one
+        assert_that!(app.conflict_cursor).is_equal_to(1);
+        app.move_conflict_cursor_up();
+        assert_that!(app.conflict_cursor).is_equal_to(0);
+        app.move_conflict_cursor_up(); // already at the top
+        assert_that!(app.conflict_cursor).is_equal_to(0);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn choose_conflict_should_only_change_the_row_under_the_cursor() {
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        for file in app.files.clone() {
+            let mut edit = staged_edit(file.fingerprint, vec![0]);
+            edit.conflict_confirmed = true;
+            app.staged_edits.insert(file.path, edit);
+        }
+        app.maybe_open_conflict_dialog();
+        let sorted_paths = app.conflicting_paths();
+        assert_that!(sorted_paths.len()).is_equal_to(2);
+        assert_that!(app.conflict_cursor).is_equal_to(0);
+
+        app.choose_conflict(1); // Discard, on row 0 only
+        assert_that!(app.conflict_choice_for(&sorted_paths[0]))
+            .is_equal_to(ConflictChoice::Discard);
+        assert_that!(app.conflict_choice_for(&sorted_paths[1]))
+            .is_equal_to(ConflictChoice::Overwrite);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
     #[test]
     fn staged_file_status_should_reflect_the_open_files_live_edit_validity() {
         let mut app = test_file_app(&["movie.mkv"]);
@@ -6790,9 +7585,17 @@ mod tests {
         std::fs::write(directory.join("other.mkv"), b"media").unwrap();
 
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let (remux_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
 
         let movie = app
             .files
@@ -6887,9 +7690,17 @@ mod tests {
         std::fs::write(directory.join("other.mkv"), b"media").unwrap();
 
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let (remux_tx, _) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
         app.layer = Layer::Streams;
 
         let movie = app
@@ -6997,9 +7808,17 @@ mod tests {
         std::fs::write(directory.join("transcode.mkv"), b"media").unwrap();
 
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (transcode_tx, transcode_rx) = std::sync::mpsc::channel::<EditRequest>();
         let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
         app.layer = Layer::Streams;
 
         let streams = serde_json::json!([
@@ -7115,9 +7934,17 @@ mod tests {
         std::fs::write(directory.join("other.mkv"), b"media").unwrap();
 
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
 
         let movie = app
             .files
@@ -7189,9 +8016,17 @@ mod tests {
         std::fs::write(directory.join("other.mkv"), b"media").unwrap();
 
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
         let (transcode_tx, _) = std::sync::mpsc::channel::<EditRequest>();
         let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, transcode_tx, remux_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
 
         let movie = app
             .files
@@ -7376,6 +8211,8 @@ mod tests {
             StagedEdit {
                 fingerprint: files[0].fingerprint,
                 stale: false,
+                baseline: None,
+                conflict_confirmed: false,
                 stream_order: vec![0],
                 moved_streams: BTreeSet::new(),
                 deleted_streams: BTreeSet::new(),

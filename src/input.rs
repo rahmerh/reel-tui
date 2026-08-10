@@ -509,6 +509,33 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
             }
             _ => {}
         },
+        Some(Dialog::ResolveConflicts) => match (key.code, key.modifiers) {
+            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_conflict_cursor_down();
+            }
+            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_conflict_cursor_up();
+            }
+            (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_conflict(-1);
+            }
+            (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_conflict(1);
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_conflicts();
+            }
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.dismiss_conflicts();
+            }
+            _ => {}
+        },
         None => return handle_layer_key(app, input, key),
     }
     InputOutcome::Continue
@@ -753,8 +780,16 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         (app, directory)
     }
 
@@ -1765,8 +1800,16 @@ mod tests {
             fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.layer = Layer::Files;
         app.select_first();
         let mut input = InputState::default();
@@ -1839,8 +1882,16 @@ mod tests {
             fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.layer = Layer::Files;
         app.select_first();
         let mut input = InputState::default();
@@ -1853,6 +1904,8 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
+                baseline: None,
+                conflict_confirmed: false,
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
                 deleted_streams: Default::default(),
@@ -1889,6 +1942,8 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
+                baseline: None,
+                conflict_confirmed: false,
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
                 deleted_streams: Default::default(),
@@ -1913,6 +1968,142 @@ mod tests {
             app.staged_edits.contains_key(&a),
             "zR must not reset staged edits"
         );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_keys_should_move_choose_and_apply_each_rows_own_choice() {
+        // Regression test for the `Dialog::ResolveConflicts` key arm: j/k move the
+        // cursor, h/l set the row under it, and Enter applies every row's own choice.
+        let (mut app, directory) = test_app();
+        let mut input = InputState::default();
+        // `dismiss_conflicts`/`conflicting_paths` both look up each path's *live*
+        // fingerprint via `app.files`, so it must actually list these — `test_app`'s
+        // one synchronous scan ran before these files existed on disk.
+        app.files.clear();
+        for name in ["a.mkv", "b.mkv"] {
+            let path = directory.join(name);
+            fs::write(&path, b"media").unwrap();
+            let fingerprint = FileFingerprint {
+                length: 5,
+                modified: None,
+            };
+            app.files.push(FileEntry {
+                path: path.clone(),
+                display_name: name.to_string(),
+                fingerprint,
+            });
+            app.staged_edits.insert(
+                path,
+                crate::staging::StagedEdit {
+                    fingerprint,
+                    stale: true,
+                    baseline: None,
+                    conflict_confirmed: true,
+                    stream_order: vec![0],
+                    moved_streams: Default::default(),
+                    deleted_streams: Default::default(),
+                    default_streams: Default::default(),
+                    default_sidecars: Default::default(),
+                    video_settings: Default::default(),
+                    subtitle_changes: Default::default(),
+                    left_subtitle_order: Vec::new(),
+                    container_target: None,
+                    container_metadata: None,
+                    original_stream_order: vec![0],
+                    original_default_streams: Default::default(),
+                },
+            );
+        }
+        assert!(app.maybe_open_conflict_dialog());
+        let paths = app.conflicting_paths();
+        assert_eq!(paths.len(), 2);
+
+        // j moves to row 1, l sets it to Discard; row 0 stays at its Overwrite default.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_eq!(
+            app.conflict_choice_for(&paths[1]),
+            crate::app::ConflictChoice::Discard
+        );
+        assert_eq!(
+            app.conflict_choice_for(&paths[0]),
+            crate::app::ConflictChoice::Overwrite
+        );
+        // k moves back to row 0, h explicitly (re)sets it to Overwrite.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_eq!(
+            app.conflict_choice_for(&paths[0]),
+            crate::app::ConflictChoice::Overwrite
+        );
+
+        // Enter applies both: row 0 (Overwrite, but no fresh probe cached) stays
+        // staged; row 1 (Discard) is unstaged.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(app.dialog, None);
+        assert!(app.staged_edits.contains_key(&paths[0]));
+        assert!(!app.staged_edits.contains_key(&paths[1]));
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_escape_should_defer_without_discarding_or_overwriting() {
+        let (mut app, directory) = test_app();
+        let mut input = InputState::default();
+        app.files.clear();
+        let path = directory.join("a.mkv");
+        fs::write(&path, b"media").unwrap();
+        let fingerprint = FileFingerprint {
+            length: 5,
+            modified: None,
+        };
+        app.files.push(FileEntry {
+            path: path.clone(),
+            display_name: "a.mkv".to_string(),
+            fingerprint,
+        });
+        app.staged_edits.insert(
+            path.clone(),
+            crate::staging::StagedEdit {
+                fingerprint,
+                stale: true,
+                baseline: None,
+                conflict_confirmed: true,
+                stream_order: vec![0],
+                moved_streams: Default::default(),
+                deleted_streams: Default::default(),
+                default_streams: Default::default(),
+                default_sidecars: Default::default(),
+                video_settings: Default::default(),
+                subtitle_changes: Default::default(),
+                left_subtitle_order: Vec::new(),
+                container_target: None,
+                container_metadata: None,
+                original_stream_order: vec![0],
+                original_default_streams: Default::default(),
+            },
+        );
+        assert!(app.maybe_open_conflict_dialog());
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert: closed, but the staged edit is untouched — still there and still
+        // stale, not discarded and not silently overwritten.
+        assert_eq!(app.dialog, None);
+        let staged = app
+            .staged_edits
+            .get(&path)
+            .expect("Escape must not discard the staged edit");
+        assert!(staged.stale);
+
+        // And it won't nag again for this same on-disk state.
+        assert!(!app.maybe_open_conflict_dialog());
 
         drop(app);
         fs::remove_dir_all(directory).unwrap();

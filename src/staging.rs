@@ -8,6 +8,7 @@ use std::{
 use crate::app::TrackRef;
 use crate::edit::{ContainerFormat, ContainerMetadata, VideoSettings};
 use crate::files::FileFingerprint;
+use crate::probe::MediaInfo;
 use crate::subtitle::{SubtitleChange, SubtitleSource};
 
 /// A per-file snapshot of staged (not-yet-processed) track/container/subtitle edits,
@@ -26,6 +27,22 @@ pub struct StagedEdit {
     /// instead of silently losing staged work, but this blocks processing until
     /// resolved.
     pub stale: bool,
+    /// The `MediaInfo` these edits were staged against — the structural baseline a
+    /// background re-probe (triggered once `fingerprint` no longer matches the live
+    /// file) is compared to, so a pure mtime bump from an external re-sync with
+    /// identical bytes can be told apart from a genuine change without ever reading
+    /// file content. `None` only in the defensive case where staging happened without
+    /// a successful video probe (shouldn't occur given `has_track_edits()`'s
+    /// preconditions) — treated as "can't prove it's safe," so it always routes to
+    /// the conflict dialog rather than auto-resolving. See
+    /// `App::receive_conflict_probe_results`.
+    pub baseline: Option<MediaInfo>,
+    /// Set once a background re-probe confirms `stale` is more than a metadata/mtime
+    /// bump — the fresh `MediaInfo` no longer structurally equals `baseline`. Always
+    /// false while `stale` is false, and false while a check is still queued or in
+    /// flight (a file can be `stale` without this being confirmed yet). Drives
+    /// `App::conflicting_paths`/`Dialog::ResolveConflicts`.
+    pub conflict_confirmed: bool,
     pub stream_order: Vec<u64>,
     pub moved_streams: BTreeSet<u64>,
     pub deleted_streams: BTreeSet<u64>,
