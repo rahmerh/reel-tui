@@ -443,8 +443,8 @@ pub enum Dialog {
     ConfirmReset,
     /// Lists every staged file whose background structural re-probe confirmed a
     /// genuine change on disk (not just an mtime bump) since it was staged, each with
-    /// its own Overwrite/Discard choice — opens itself automatically, no manual
-    /// action needed. See `App::conflicting_paths`/`maybe_open_conflict_dialog`.
+    /// its own Keep/Discard choice — opens itself automatically, no manual action
+    /// needed. See `App::conflicting_paths`/`maybe_open_conflict_dialog`.
     ResolveConflicts,
 }
 
@@ -505,14 +505,17 @@ pub enum ConfirmProcessAllChoice {
 }
 
 /// One conflicting file's resolution in `Dialog::ResolveConflicts`. Defaults to
-/// `Overwrite` — unlike `ResetChoice`'s "default to the safe choice" pattern,
-/// `Overwrite` is the option that keeps the user's staged work (subject to the same
-/// `validate_edit` gate every other save path already runs), while `Discard` is the
-/// destructive one that throws it away.
+/// `KeepEdits` — matching `ResetChoice`'s naming, though not its "default to the
+/// safe choice" convention: `KeepEdits` is the option that keeps the user's staged
+/// work (subject to the same `validate_edit` gate every other save path already
+/// runs — it does not blindly re-apply it), while `Discard` is the destructive one
+/// that throws it away. Named for what each choice does to the *staged edit*, not
+/// for what (if anything) eventually happens to the file on disk — neither choice
+/// writes anything; that only happens later, if the edit is still valid at Ctrl+S.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConflictChoice {
     #[default]
-    Overwrite,
+    KeepEdits,
     Discard,
 }
 
@@ -5005,7 +5008,7 @@ impl App {
     }
 
     /// Sets the choice for the row currently under `conflict_cursor` — Left picks
-    /// `Overwrite`, Right picks `Discard`, mirroring `choose_reset`'s direction
+    /// `KeepEdits`, Right picks `Discard`, mirroring `choose_reset`'s direction
     /// mapping but scoped to one row instead of one dialog-wide field.
     pub fn choose_conflict(&mut self, direction: isize) {
         if self.dialog != Some(Dialog::ResolveConflicts) || direction == 0 {
@@ -5018,13 +5021,13 @@ impl App {
         let choice = if direction.is_positive() {
             ConflictChoice::Discard
         } else {
-            ConflictChoice::Overwrite
+            ConflictChoice::KeepEdits
         };
         self.conflict_choices.insert(path.clone(), choice);
     }
 
     /// The currently-selected resolution for `path` within an open
-    /// `Dialog::ResolveConflicts` — `Overwrite` if nothing has been chosen for it
+    /// `Dialog::ResolveConflicts` — `KeepEdits` if nothing has been chosen for it
     /// yet, matching `ConflictChoice`'s default.
     pub fn conflict_choice_for(&self, path: &Path) -> ConflictChoice {
         self.conflict_choices.get(path).copied().unwrap_or_default()
@@ -5056,7 +5059,7 @@ impl App {
     }
 
     /// Enter on `Dialog::ResolveConflicts` — applies every listed path's currently
-    /// selected choice (defaulting to `Overwrite` if one is somehow missing) and
+    /// selected choice (defaulting to `KeepEdits` if one is somehow missing) and
     /// closes the dialog.
     pub fn activate_conflicts(&mut self) {
         if self.dialog != Some(Dialog::ResolveConflicts) {
@@ -5069,7 +5072,7 @@ impl App {
                 .copied()
                 .unwrap_or_default();
             match choice {
-                ConflictChoice::Overwrite => self.overwrite_conflict(&path),
+                ConflictChoice::KeepEdits => self.keep_staged_edit(&path),
                 ConflictChoice::Discard => {
                     self.discard_staged_file(&path);
                     self.dismissed_conflicts.remove(&path);
@@ -5083,13 +5086,14 @@ impl App {
 
     /// Re-baselines a conflicting staged file against its current on-disk content
     /// instead of blindly trusting the (possibly now-wrong) staged track selections.
-    /// Deliberately does not call `validate_edit` itself: clearing `stale` just lets
-    /// the file fall back through the exact same `staged_file_status`/
-    /// `confirm_process_all` validation gate every staged file already goes through,
-    /// so an edit that no longer makes sense against the new content (e.g. a deleted
-    /// track index that no longer exists) still surfaces as a normal `Invalid`
-    /// rather than being force-applied.
-    fn overwrite_conflict(&mut self, path: &Path) {
+    /// Nothing is written to disk here — that only happens later, if the edit is
+    /// still valid when the user actually saves. Deliberately does not call
+    /// `validate_edit` itself: clearing `stale` just lets the file fall back through
+    /// the exact same `staged_file_status`/`confirm_process_all` validation gate
+    /// every staged file already goes through, so an edit that no longer makes sense
+    /// against the new content (e.g. a deleted track index that no longer exists)
+    /// still surfaces as a normal `Invalid` rather than being force-applied.
+    fn keep_staged_edit(&mut self, path: &Path) {
         let Some(file) = self.files.iter().find(|file| file.path == path) else {
             return;
         };
@@ -7241,11 +7245,11 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_conflict_should_revalidate_rather_than_blindly_trust_stale_indices() {
+    fn keep_staged_edit_should_revalidate_rather_than_blindly_trust_stale_indices() {
         // A track the staged edit still references (here, via `video_settings`, which
         // `final_stream_order` doesn't get a chance to quietly reconcile away the way
         // it does for `stream_order` itself) may no longer exist in the new content —
-        // Overwrite must not force the stale selection through; it should fall back
+        // KeepEdits must not force the stale selection through; it should fall back
         // through the normal validation gate exactly like any other staged file, so
         // this surfaces as a plain `Invalid`, not a silent misapply.
         // `staged_edits`-based validation only kicks in for a file that isn't the
@@ -7286,7 +7290,7 @@ mod tests {
         app.staged_edits.insert(path.clone(), edit);
         app.dialog = Some(Dialog::ResolveConflicts);
         app.conflict_choices
-            .insert(path.clone(), ConflictChoice::Overwrite);
+            .insert(path.clone(), ConflictChoice::KeepEdits);
 
         // Act
         app.activate_conflicts();
@@ -7295,7 +7299,7 @@ mod tests {
         let staged = app
             .staged_edits
             .get(&path)
-            .expect("Overwrite keeps the staged entry");
+            .expect("KeepEdits keeps the staged entry");
         assert_that!(staged.stale).is_false();
         assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
         assert_that!(app.dialog).is_equal_to(None);
@@ -7304,7 +7308,7 @@ mod tests {
         match app.staged_file_status(&path) {
             StagedFileStatus::Invalid(_) => {}
             other => {
-                panic!("expected Invalid after overwriting against changed tracks, got {other:?}")
+                panic!("expected Invalid after keeping edits against changed tracks, got {other:?}")
             }
         }
 
@@ -7335,7 +7339,7 @@ mod tests {
 
     #[test]
     fn activate_conflicts_should_apply_each_paths_own_independently_chosen_resolution() {
-        // The core behavior the per-file design exists for: one path set to Overwrite
+        // The core behavior the per-file design exists for: one path set to KeepEdits
         // and another to Discard, applied correctly in a single `activate_conflicts`
         // call — a bulk (dialog-wide) choice would fail this.
         let mut app = test_file_app(&["a.mkv", "b.mkv"]);
@@ -7354,7 +7358,7 @@ mod tests {
         }
         app.dialog = Some(Dialog::ResolveConflicts);
         app.conflict_choices
-            .insert(path_a.clone(), ConflictChoice::Overwrite);
+            .insert(path_a.clone(), ConflictChoice::KeepEdits);
         app.conflict_choices
             .insert(path_b.clone(), ConflictChoice::Discard);
 
@@ -7365,7 +7369,7 @@ mod tests {
         let staged_a = app
             .staged_edits
             .get(&path_a)
-            .expect("Overwrite keeps a.mkv staged");
+            .expect("KeepEdits keeps a.mkv staged");
         assert_that!(staged_a.stale).is_false();
         assert_that!(app.staged_edits.contains_key(&path_b)).is_false();
 
@@ -7463,7 +7467,7 @@ mod tests {
         assert_that!(app.conflict_choice_for(&sorted_paths[0]))
             .is_equal_to(ConflictChoice::Discard);
         assert_that!(app.conflict_choice_for(&sorted_paths[1]))
-            .is_equal_to(ConflictChoice::Overwrite);
+            .is_equal_to(ConflictChoice::KeepEdits);
 
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
     }

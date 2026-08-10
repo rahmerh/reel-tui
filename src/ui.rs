@@ -1729,10 +1729,14 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
 /// Lists every staged file whose background structural re-probe confirmed a genuine
 /// on-disk change since staging — see `App::conflicting_paths`. Unlike
 /// `render_confirm_process_all_dialog`'s single dialog-wide Start/Cancel, each row
-/// carries its own Overwrite/Discard pair (`App::conflict_choice_for`), and the row
+/// carries its own Keep/Discard pair (`App::conflict_choice_for`), and the row
 /// at `App::conflict_cursor` is marked with a leading cursor glyph — only that row's
 /// choice responds to Left/Right (`App::choose_conflict`); Enter applies every row's
-/// own choice at once (`App::activate_conflicts`).
+/// own choice at once (`App::activate_conflicts`). No inline key hint here — control
+/// help lives solely in the keybindings popup (`?`, reachable from anywhere), and
+/// its existing generic entries (`h/l`, `Enter`, `Esc/q`, `j/k`) already cover this
+/// dialog the same way they already cover `ConfirmReset`/`ConfirmProcessAll` without
+/// a dialog-specific line of their own.
 fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
     /// Bullet + note line, choice-button line, blank spacer — see `scroll_to_show_line`
     /// below, which needs this to convert `conflict_cursor` into a line index.
@@ -1771,28 +1775,25 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
         let choice = app.conflict_choice_for(path);
         lines.push(Line::from(vec![
             Span::raw("    "),
-            action_option(" Overwrite ", choice == ConflictChoice::Overwrite),
+            action_option(" Keep staged changes ", choice == ConflictChoice::KeepEdits),
             Span::raw("  "),
-            action_option(" Discard ", choice == ConflictChoice::Discard),
+            action_option(
+                " Discard staged changes ",
+                choice == ConflictChoice::Discard,
+            ),
         ]));
         lines.push(Line::from(""));
     }
     let text = padded_popup_text(Text::from(lines));
 
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    app.set_conflict_max_scroll(max_scroll(&text, chunks[0]));
+    app.set_conflict_max_scroll(max_scroll(&text, inner));
     let cursor_line = app.conflict_cursor * ROWS_PER_ITEM + 1; // +1 for padded_popup_text's leading blank
-    app.conflict_scroll = scroll_to_show_line(&text, chunks[0], cursor_line, app.conflict_scroll);
+    app.conflict_scroll = scroll_to_show_line(&text, inner, cursor_line, app.conflict_scroll);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((app.conflict_scroll, 0)),
-        chunks[0],
-    );
-
-    frame.render_widget(
-        Paragraph::new("↑↓ select · ←→ choose · Enter apply · Esc defer").centered(),
-        chunks[1],
+        inner,
     );
 }
 
@@ -4504,7 +4505,7 @@ mod tests {
     fn resolve_conflicts_dialog_should_list_each_file_with_its_own_choice() {
         // Arrange: two staged files, each independently flagged as a confirmed
         // conflict by a background re-probe — every row must show its own name and
-        // its own Overwrite/Discard state, not one dialog-wide choice.
+        // its own Keep/Discard state, not one dialog-wide choice.
         let (mut app, directory) = test_app("resolve-conflicts", &["alpha.mkv", "beta.mkv"]);
         for name in ["alpha.mkv", "beta.mkv"] {
             let path = directory.join(name);
@@ -4539,7 +4540,7 @@ mod tests {
             "conflicts must auto-open the dialog"
         );
         // The second (alphabetically) row is set to Discard; the first stays at its
-        // Overwrite default — both must show up distinctly.
+        // Keep default — both must show up distinctly.
         app.move_conflict_cursor_down();
         app.choose_conflict(1);
 
@@ -4554,7 +4555,8 @@ mod tests {
             "screen was:\n{screen}"
         );
         assert!(
-            screen.matches("Overwrite").count() >= 2 && screen.matches("Discard").count() >= 2,
+            screen.matches("Keep staged changes").count() >= 2
+                && screen.matches("Discard staged changes").count() >= 2,
             "every row should show both options; screen was:\n{screen}"
         );
 

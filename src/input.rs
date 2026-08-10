@@ -2021,7 +2021,7 @@ mod tests {
         let paths = app.conflicting_paths();
         assert_eq!(paths.len(), 2);
 
-        // j moves to row 1, l sets it to Discard; row 0 stays at its Overwrite default.
+        // j moves to row 1, l sets it to Discard; row 0 stays at its KeepEdits default.
         handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
         assert_eq!(
@@ -2030,17 +2030,17 @@ mod tests {
         );
         assert_eq!(
             app.conflict_choice_for(&paths[0]),
-            crate::app::ConflictChoice::Overwrite
+            crate::app::ConflictChoice::KeepEdits
         );
-        // k moves back to row 0, h explicitly (re)sets it to Overwrite.
+        // k moves back to row 0, h explicitly (re)sets it to KeepEdits.
         handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
         assert_eq!(
             app.conflict_choice_for(&paths[0]),
-            crate::app::ConflictChoice::Overwrite
+            crate::app::ConflictChoice::KeepEdits
         );
 
-        // Enter applies both: row 0 (Overwrite, but no fresh probe cached) stays
+        // Enter applies both: row 0 (KeepEdits, but no fresh probe cached) stays
         // staged; row 1 (Discard) is unstaged.
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         assert_eq!(app.dialog, None);
@@ -2052,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_conflicts_dialog_escape_should_defer_without_discarding_or_overwriting() {
+    fn resolve_conflicts_dialog_escape_should_defer_without_discarding_or_reapplying() {
         let (mut app, directory) = test_app();
         let mut input = InputState::default();
         app.files.clear();
