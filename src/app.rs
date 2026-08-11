@@ -1818,7 +1818,7 @@ impl App {
                         output_path: output,
                         ..
                     } => {
-                        self.staged_edits.remove(&path);
+                        self.unstage_consumed_file(&path);
                         output_path = Some(output);
                         BatchItemStatus::Completed
                     }
@@ -1826,7 +1826,7 @@ impl App {
                     EditOutcome::SourceChanged(error) => {
                         // The attempted edit was against stale data; the staged
                         // edits are no longer meaningful and must be redone.
-                        self.staged_edits.remove(&path);
+                        self.unstage_consumed_file(&path);
                         BatchItemStatus::Failed(error)
                     }
                     EditOutcome::Failed(error) => BatchItemStatus::Failed(error),
@@ -1840,6 +1840,28 @@ impl App {
                 }
                 self.finish_batch_if_done();
             }
+        }
+    }
+
+    /// Drops `path`'s staged edits once a worker has consumed them — either applied
+    /// them (`Completed`) or found them unusable against the file on disk
+    /// (`SourceChanged`). Either way they must not be staged any more.
+    ///
+    /// Clearing the *live* edit fields too when `path` is the open file is the half
+    /// that isn't optional: `staged_edits` is only half of where an edit lives, and
+    /// `finish_batch_if_done` rescans the directory immediately after this. That
+    /// rescan sees the file's fingerprint move — because this app just moved it — so
+    /// `reconcile_files` snapshots whatever the open file still holds live back into
+    /// `staged_edits` against the *pre-save* fingerprint, marks it stale, and the
+    /// structural re-check then correctly reports that the tracks the edit names are
+    /// gone. The user gets an unskippable conflict notice demanding they discard the
+    /// edit that just succeeded. The baseline is rebuilt from the new content by the
+    /// probe `finish_batch_if_done` queues (`load_staged_or_reset`), so clearing here
+    /// loses nothing.
+    fn unstage_consumed_file(&mut self, path: &Path) {
+        self.staged_edits.remove(path);
+        if self.selected_file().is_some_and(|file| file.path == path) {
+            self.clear_track_edits();
         }
     }
 
@@ -8197,7 +8219,12 @@ mod tests {
         // conflict notice, acknowledge, then edit again and Ctrl+S.
         std::fs::copy(src.join("one.mkv"), &target).unwrap();
         app.reconcile_files(scan_directory(&directory).unwrap());
-        let fresh = app.files.iter().find(|f| f.path == target).unwrap().fingerprint;
+        let fresh = app
+            .files
+            .iter()
+            .find(|f| f.path == target)
+            .unwrap()
+            .fingerprint;
         let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
         tx.send(ProbeResponse {
             generation: 0,
@@ -9451,6 +9478,79 @@ mod tests {
         assert!(app.active_batch.is_none());
         assert_that!(app.notice.as_deref().unwrap()).contains("1 of 2");
         assert_that!(app.notice.as_deref().unwrap()).contains("1 failed");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_completed_edit_should_not_restage_the_open_file_against_the_output_it_just_wrote() {
+        // Regression test for the app accusing itself of an on-disk change: delete a
+        // track, save, and the conflict notice opens over the freshly written file
+        // demanding the deletion that just succeeded be discarded.
+        //
+        // An edit lives in two places — `staged_edits` and the open file's live edit
+        // fields — and completion only cleared the first. `finish_batch_if_done`
+        // rescans the directory right afterwards, `reconcile_files` sees the
+        // fingerprint move (this app moved it), and re-stages the live fields against
+        // the pre-save fingerprint, which is stale by construction.
+        let mut app = test_file_app(&["clip.mkv"]);
+        let directory = app.directory.clone();
+        let path = app.files[0].path.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        // Stage a deletion of the audio track through the same seam Ctrl+S uses.
+        app.deleted_streams.insert(1);
+        app.snapshot_current_edits();
+        assert!(app.staged_edits.contains_key(&path));
+
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: path.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+
+        // What the worker does before reporting success: the file on disk is now the
+        // edited output, so its fingerprint no longer matches what was staged against.
+        std::fs::write(&path, b"media with one track fewer").unwrap();
+
+        result_tx
+            .send(EditEvent::Finished {
+                path: path.clone(),
+                outcome: EditOutcome::Completed {
+                    output_path: path.clone(),
+                    media_changed: true,
+                },
+            })
+            .unwrap();
+        app.receive_edit_results(&result_rx);
+
+        assert_that!(app.notice.as_deref().unwrap()).contains("saved");
+        assert!(
+            app.staged_edits.is_empty(),
+            "an applied edit must not be re-staged against its own output: {:?}",
+            app.staged_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.deleted_streams.is_empty(),
+            "the applied deletion must not survive in the live edit fields: {:?}",
+            app.deleted_streams
+        );
+        assert!(
+            app.pending_conflict_checks.is_empty(),
+            "nothing is staged, so no structural re-check should have been dispatched"
+        );
+        assert!(
+            app.conflicting_paths().is_empty(),
+            "a clean save must leave nothing to resolve: {:?}",
+            app.conflicting_paths()
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -520,6 +520,19 @@ impl Harness {
         self.wait_until("the batch to finish", |app| app.active_batch.is_none());
     }
 
+    /// Keeps replaying the loop for `duration` with nothing else happening, the way
+    /// the app idles between keypresses. Background work — the directory monitor's
+    /// reconcile, a conflict re-probe, the dialogs either can raise — only lands on a
+    /// later tick, so a scenario that stops pumping the moment its foreground action
+    /// returns never sees what that action set in motion.
+    pub fn settle(&mut self, duration: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < duration {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The terminal contents as one string, for assertions and failure messages.
     pub fn screen(&self) -> String {
         let buffer = self.terminal.backend().buffer();
