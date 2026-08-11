@@ -1,8 +1,8 @@
 # reel 🎞️
 
-> ❗ This project is 100% vibe coded using AI. Code quality is probably lacking, but functionally well tested. ❗
+> ❗ This project is 100% vibe coded using AI. I just wanted a tool quickly, I'll probably rewrite this myself in the future. ❗
 
-A TUI to inspect and edit video files. Uses ffprobe and ffmpeg to inspect and edit media files.
+A TUI to inspect and edit video file metadata. Uses ffprobe and ffmpeg to inspect and edit media files.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ Optional subtitle tools:
 - `seconv` for PGS/VobSub conversion, image subtitle rendering, and OCR
 - `tesseract` plus installed language data for image-to-text OCR
 
-Reel detects optional tools from `PATH`. When it can't find these tools you're not able to convert certain formats.
+Reel detects optional tools from `PATH`, if not found you can still use the rest of the app.
 
 ## Installation
 
@@ -47,7 +47,12 @@ reel /path/to/media
 ## Features
 
 - **Media Inspection**: Inspect container formats, track layouts, duration, bitrates, and metadata across your video collection.
-- **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and set default streams without re-encoding.
+- **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and modify stream metadata without re-encoding.
 - **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting.
-- **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats; edit language, title, default, Forced, CC, Hearing impaired, Original, and Commentary metadata where the container supports it. Sidecars read `.cc`, `.sdh`, and `.hi` as hearing-impaired aliases and write the canonical `.sdh` suffix.
+- **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
+
+## Future planned
+
+- **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
+- **Audio track conversion**: Audio track format conversion, equivalent to current video track editing.
