@@ -1917,6 +1917,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: Vec::new(),
                 original_default_streams: Default::default(),
+                track_groups: Default::default(),
             },
         );
 
@@ -1954,6 +1955,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: Vec::new(),
                 original_default_streams: Default::default(),
+                track_groups: Default::default(),
             },
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
@@ -2011,6 +2013,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
@@ -2082,6 +2085,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: vec![0],
                 original_default_streams: Default::default(),
+                track_groups: Default::default(),
             },
         );
         assert!(app.maybe_open_conflict_dialog());

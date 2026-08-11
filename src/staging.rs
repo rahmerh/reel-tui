@@ -52,6 +52,16 @@ pub struct StagedEdit {
     /// track's position without disturbing other tracks' staged moves.
     pub original_stream_order: Vec<u64>,
     pub original_default_streams: BTreeSet<u64>,
+    /// Which stream-type group (`app::stream_group`'s "video"/"audio"/"subtitle"/
+    /// "other") each index in `original_stream_order` belonged to when editing began
+    /// — covers tracks later marked for deletion too, since those can still vanish
+    /// from disk independently. This is the minimal snapshot `App::reconcile_untouched_groups`
+    /// needs to tell "a group nobody edited grew or shrank a track" (auto-resolve)
+    /// apart from "a group the edit actually touches changed" (always a conflict) —
+    /// deliberately just a type label per index rather than a full `MediaInfo`
+    /// snapshot, since a type label doesn't flap on ordinary metadata/tag changes the
+    /// way whole-stream equality did.
+    pub track_groups: BTreeMap<u64, &'static str>,
 }
 
 /// The lifecycle of one file within an in-flight `BatchState`.

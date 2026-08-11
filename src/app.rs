@@ -960,6 +960,10 @@ pub struct App {
     pub(crate) cache: HashMap<CacheKey, ProbeOutcome>,
     original_stream_order: Vec<u64>,
     original_default_streams: BTreeSet<u64>,
+    /// See `StagedEdit::track_groups` — the live-editing-field counterpart, kept in
+    /// sync with `original_stream_order` (populated on `reset_track_edits`, snapshotted
+    /// into a `StagedEdit` on staging, restored from it on reopening).
+    track_groups: BTreeMap<u64, &'static str>,
     sidecars_by_media: HashMap<PathBuf, Vec<SidecarEntry>>,
     unfolded_files: BTreeSet<PathBuf>,
     /// Memoized `file_panel_entries()` result. Rebuilding that Vec re-lowercases every
@@ -1081,6 +1085,7 @@ impl App {
             cache: HashMap::new(),
             original_stream_order: Vec::new(),
             original_default_streams: BTreeSet::new(),
+            track_groups: BTreeMap::new(),
             sidecars_by_media: HashMap::new(),
             unfolded_files: BTreeSet::new(),
             file_panel_cache: RefCell::new(None),
@@ -1156,6 +1161,17 @@ impl App {
         );
         if selected_removed && was_processing {
             return;
+        }
+
+        // Snapshot the open file's live edits *before* `self.files` is reassigned to
+        // the rescanned list, while `self.selected_file()` still resolves to
+        // `old_file`'s pre-change fingerprint. This must happen before the per-file
+        // staged-edit reconciliation loop below, so that loop treats this file
+        // exactly like any other staged file whose fingerprint moved — routing it
+        // through the same stale/conflict-probe/auto-resolve pipeline instead of the
+        // unconditional wipe the `selected_changed` branch used to do further down.
+        if selected_changed && !was_processing && self.has_track_edits() {
+            self.snapshot_current_edits();
         }
 
         self.files = files;
@@ -1244,9 +1260,19 @@ impl App {
                 .unwrap_or_default();
             let sidecars_changed = old_sidecars != self.sidecars;
             if selected_changed && !was_processing {
-                self.clear_edit_state();
-                self.notice = Some("Selected file changed; reloaded latest metadata.".to_string());
-                self.queue_probe();
+                if !self.has_track_edits() {
+                    self.clear_edit_state();
+                    self.notice =
+                        Some("Selected file changed; reloaded latest metadata.".to_string());
+                    self.queue_probe();
+                }
+                // Otherwise: already snapshotted into `staged_edits` above and now
+                // flowing through the same stale/conflict-probe pipeline every other
+                // staged file uses. Deliberately not calling `queue_probe()` here —
+                // it force-resets `self.layer` to `Layer::Files`, which would eject
+                // the user from the Streams view they're actively in. `self.outcome`
+                // is refreshed lazily once resolution actually completes (see
+                // `refresh_cached_outcome`).
             } else if sidecars_changed && !was_processing {
                 self.subtitle_changes.clear();
                 self.subtitle_settings_popup = None;
@@ -1690,14 +1716,15 @@ impl App {
             // content — not whether the file is byte-for-byte-identical metadata-wise.
             // A change completely unrelated to what's actually staged (e.g. an
             // untouched audio track's tags changing while only video settings are
-            // staged) must not force a conflict prompt; see `validate_staged_edit`.
+            // staged, or an untouched group gaining or losing a track entirely) must
+            // not force a conflict prompt; see `validate_staged_edit`.
             let sidecars = self
                 .sidecars_by_media
                 .get(&response.path)
                 .cloned()
                 .unwrap_or_default();
-            let still_valid = matches!(&response.outcome, ProbeOutcome::Video(fresh_info) if
-                validate_staged_edit(
+            let reconciled = match &response.outcome {
+                ProbeOutcome::Video(fresh_info) => validate_staged_edit(
                     &self.subtitle_capabilities,
                     &response.path,
                     fresh_info,
@@ -1705,25 +1732,50 @@ impl App {
                     &staged.stream_order,
                     &staged.deleted_streams,
                     &staged.default_streams,
+                    &staged.original_stream_order,
+                    &staged.original_default_streams,
+                    &staged.track_groups,
+                    &staged.moved_streams,
                     &staged.video_settings,
                     &staged.subtitle_changes,
                     staged.container_target,
-                ).is_ok()
-            );
+                )
+                .ok(),
+                _ => None,
+            };
+
+            // Captured before the mutable `staged_edits` borrow below — needed to
+            // resync the live edit fields if this is the currently-open file (see
+            // `apply_staged_snapshot`), since a quiet auto-resolve here would
+            // otherwise leave the Streams view showing pre-reconciliation data.
+            let is_open = self
+                .selected_file()
+                .is_some_and(|file| file.path == response.path);
 
             let Some(staged) = self.staged_edits.get_mut(&response.path) else {
                 continue;
             };
-            if still_valid {
+            if let Some(reconciled) = reconciled {
+                staged.stream_order = reconciled.stream_order;
+                staged.deleted_streams = reconciled.deleted_streams;
+                staged.default_streams = reconciled.default_streams;
+                staged.original_stream_order = reconciled.original_stream_order;
+                staged.original_default_streams = reconciled.original_default_streams;
+                staged.track_groups = reconciled.track_groups;
                 staged.fingerprint = response.fingerprint;
                 staged.stale = false;
                 staged.conflict_confirmed = false;
+                let snapshot = is_open.then(|| staged.clone());
                 let name = response
                     .path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("file");
                 self.notice = Some(format!("{name} changed on disk; staged edit still valid."));
+                if let Some(snapshot) = snapshot {
+                    self.refresh_cached_outcome();
+                    self.apply_staged_snapshot(&snapshot);
+                }
             } else {
                 staged.conflict_confirmed = true;
             }
@@ -2599,10 +2651,40 @@ impl App {
     /// file-list yellow/warning-triangle markers and to block Ctrl+S's "process all
     /// staged files" until every staged file is `Valid`.
     pub fn staged_file_status(&self, path: &Path) -> StagedFileStatus {
+        let is_open = self.selected_file().is_some_and(|file| file.path == path);
+        // A `staged_edits` entry can exist (and be `stale`/`conflict_confirmed`) for
+        // the currently-open file too, now that `reconcile_files` snapshots live
+        // edits into it the moment the open file's on-disk content changes — see
+        // `App::reconcile_files`. That has to be checked *before* branching on
+        // `is_open` below, or an unresolved conflict on the open file would fall
+        // straight through to live-field validation and wrongly report `Valid`,
+        // letting `request_process_all` process content that no longer matches what
+        // was staged. A confirmed conflict means a background re-probe already
+        // established, using fresh content, that these staged fields no longer
+        // validate — re-running validation here against the cache entry at
+        // `staged.fingerprint` would be wrong, since that entry is necessarily the
+        // *old* (pre-change) content, not current disk state. `stale` without
+        // `conflict_confirmed` means that check is still queued or in flight.
+        if let Some(staged) = self.staged_edits.get(path) {
+            if staged.conflict_confirmed {
+                return StagedFileStatus::Invalid(
+                    "File changed on disk and no longer matches the staged edit — resolve it \
+                     via the conflict dialog."
+                        .to_string(),
+                );
+            }
+            if staged.stale {
+                return StagedFileStatus::Invalid(
+                    "File changed on disk; still checking whether the staged edit is affected…"
+                        .to_string(),
+                );
+            }
+        }
+
         // The currently-open file's live edit fields count as "staged" here even
         // before `snapshot_current_edits` has captured them into `staged_edits` on a
         // selection change, so the file list reflects in-progress edits immediately.
-        if self.selected_file().is_some_and(|file| file.path == path) {
+        if is_open {
             if !self.has_track_edits() {
                 return StagedFileStatus::Unstaged;
             }
@@ -2612,25 +2694,6 @@ impl App {
         let Some(staged) = self.staged_edits.get(path) else {
             return StagedFileStatus::Unstaged;
         };
-        // A confirmed conflict means a background re-probe already established, using
-        // fresh content, that these staged fields no longer validate — re-running
-        // validation here against the cache entry at `staged.fingerprint` would be
-        // wrong, since that entry is necessarily the *old* (pre-change) content, not
-        // current disk state. `stale` without `conflict_confirmed` means that check is
-        // still queued or in flight.
-        if staged.conflict_confirmed {
-            return StagedFileStatus::Invalid(
-                "File changed on disk and no longer matches the staged edit — resolve it via \
-                 the conflict dialog."
-                    .to_string(),
-            );
-        }
-        if staged.stale {
-            return StagedFileStatus::Invalid(
-                "File changed on disk; still checking whether the staged edit is affected…"
-                    .to_string(),
-            );
-        }
         let key = CacheKey {
             path: path.to_path_buf(),
             length: staged.fingerprint.length,
@@ -2654,11 +2717,15 @@ impl App {
             &staged.stream_order,
             &staged.deleted_streams,
             &staged.default_streams,
+            &staged.original_stream_order,
+            &staged.original_default_streams,
+            &staged.track_groups,
+            &staged.moved_streams,
             &staged.video_settings,
             &staged.subtitle_changes,
             staged.container_target,
         ) {
-            Ok(()) => StagedFileStatus::Valid,
+            Ok(_) => StagedFileStatus::Valid,
             Err(error) => StagedFileStatus::Invalid(error),
         }
     }
@@ -2697,11 +2764,15 @@ impl App {
             &self.stream_order,
             &self.deleted_streams,
             &self.default_streams,
+            &self.original_stream_order,
+            &self.original_default_streams,
+            &self.track_groups,
+            &self.moved_streams,
             &self.video_settings,
             &self.subtitle_changes,
             self.container_target,
         ) {
-            Ok(()) => StagedFileStatus::Valid,
+            Ok(_) => StagedFileStatus::Valid,
             Err(error) => StagedFileStatus::Invalid(error),
         }
     }
@@ -4921,10 +4992,14 @@ impl App {
 
     /// Unstages `path`'s edits and, if it's the currently-open file, resets the live
     /// edit fields too — shared by `activate_reset`'s single-file scope and
-    /// `activate_conflicts`'s per-file Discard choice.
+    /// `activate_conflicts`'s per-file Discard choice. Refreshes `self.outcome` from
+    /// the cache first, so a Discard triggered by a genuine on-disk change rebuilds
+    /// the reset baseline from the file's *current* content rather than whatever was
+    /// probed before the conflict — see `refresh_cached_outcome`.
     fn discard_staged_file(&mut self, path: &Path) {
         self.staged_edits.remove(path);
         if self.selected_file().is_some_and(|file| file.path == path) {
+            self.refresh_cached_outcome();
             self.reset_track_edits();
         }
     }
@@ -5121,6 +5196,19 @@ impl App {
         staged.stale = false;
         staged.conflict_confirmed = false;
         self.dismissed_conflicts.remove(path);
+        // If this is the currently-open file, the Streams view still shows whatever
+        // was on screen before the conflict was resolved — resync it from the
+        // just-kept (and already reconciled, if it went through auto-resolve first)
+        // `StagedEdit` rather than leaving it stale.
+        if self.selected_file().is_some_and(|file| file.path == path) {
+            self.refresh_cached_outcome();
+            let snapshot = self
+                .staged_edits
+                .get(path)
+                .cloned()
+                .expect("just updated above");
+            self.apply_staged_snapshot(&snapshot);
+        }
     }
 
     /// Actually stops the batch: flips the shared cancellation flag, so every request
@@ -5388,19 +5476,35 @@ impl App {
     /// longer does (e.g. the user reset every edit before switching away). Must be
     /// called while the file being left is still the selected file, so `media_info()`
     /// still resolves to its probe data.
+    ///
+    /// Preserves an existing entry's `fingerprint`/`stale`/`conflict_confirmed`
+    /// rather than blindly re-baselining them against the live file whenever it's
+    /// already `stale` — this is also called unconditionally from
+    /// `request_process_all` and `select_file_position_with_force`, and clobbering a
+    /// pending or confirmed conflict here would silently launder it past
+    /// `staged_file_status`'s staleness check before the background conflict pipeline
+    /// (`App::reconcile_files`/`receive_conflict_probe_results`) ever gets to resolve
+    /// it properly.
     fn snapshot_current_edits(&mut self) {
         let Some(file) = self.selected_file() else {
             return;
         };
         let path = file.path.clone();
-        let fingerprint = file.fingerprint;
         if self.has_track_edits() {
+            let (fingerprint, stale, conflict_confirmed) = match self.staged_edits.get(&path) {
+                Some(existing) if existing.stale => (
+                    existing.fingerprint,
+                    existing.stale,
+                    existing.conflict_confirmed,
+                ),
+                _ => (file.fingerprint, false, false),
+            };
             self.staged_edits.insert(
                 path,
                 StagedEdit {
                     fingerprint,
-                    stale: false,
-                    conflict_confirmed: false,
+                    stale,
+                    conflict_confirmed,
                     stream_order: self.stream_order.clone(),
                     moved_streams: self.moved_streams.clone(),
                     deleted_streams: self.deleted_streams.clone(),
@@ -5413,6 +5517,7 @@ impl App {
                     container_metadata: self.container_metadata.clone(),
                     original_stream_order: self.original_stream_order.clone(),
                     original_default_streams: self.original_default_streams.clone(),
+                    track_groups: self.track_groups.clone(),
                 },
             );
         } else {
@@ -5435,21 +5540,46 @@ impl App {
             self.reset_track_edits();
             return;
         };
-        self.stream_order = staged.stream_order;
-        self.moved_streams = staged.moved_streams;
-        self.deleted_streams = staged.deleted_streams;
-        self.default_streams = staged.default_streams;
-        self.default_sidecars = staged.default_sidecars;
-        self.video_settings = staged.video_settings;
-        self.subtitle_changes = staged.subtitle_changes;
-        self.left_subtitle_order = staged.left_subtitle_order;
+        self.apply_staged_snapshot(&staged);
+    }
+
+    /// Copies one `StagedEdit`'s track/container/subtitle fields onto the live edit
+    /// fields — shared by `load_staged_or_reset` (selecting a file), `keep_staged_edit`
+    /// (re-syncing the Streams view after "Keep" resolves a conflict on the currently
+    /// open file), and `receive_conflict_probe_results` (syncing after a quiet
+    /// background auto-resolve on the currently open file).
+    fn apply_staged_snapshot(&mut self, staged: &StagedEdit) {
+        self.stream_order = staged.stream_order.clone();
+        self.moved_streams = staged.moved_streams.clone();
+        self.deleted_streams = staged.deleted_streams.clone();
+        self.default_streams = staged.default_streams.clone();
+        self.default_sidecars = staged.default_sidecars.clone();
+        self.video_settings = staged.video_settings.clone();
+        self.subtitle_changes = staged.subtitle_changes.clone();
+        self.left_subtitle_order = staged.left_subtitle_order.clone();
         self.container_target = staged.container_target;
-        self.container_metadata = staged.container_metadata;
-        self.original_stream_order = staged.original_stream_order;
-        self.original_default_streams = staged.original_default_streams;
+        self.container_metadata = staged.container_metadata.clone();
+        self.original_stream_order = staged.original_stream_order.clone();
+        self.original_default_streams = staged.original_default_streams.clone();
+        self.track_groups = staged.track_groups.clone();
         self.video_settings_popup = None;
         self.subtitle_settings_popup = None;
         self.container_settings_popup = None;
+    }
+
+    /// Refreshes `self.outcome` from `self.cache` for the currently-selected file,
+    /// without `queue_probe`'s side effects (bumping `generation`, resetting
+    /// `layer`/`details_scroll`/`selected_stream`, dispatching a new async probe).
+    /// Used once a staged conflict resolves for the open file — the fresh outcome is
+    /// already cached by whatever triggered the resolution (`receive_conflict_probe_results`
+    /// inserts it before any staged-edit logic runs; `keep_staged_edit` only proceeds
+    /// once it's confirmed cached).
+    fn refresh_cached_outcome(&mut self) {
+        if let Some(key) = self.selected_file().map(CacheKey::for_file)
+            && let Some(cached) = self.cache.get(&key)
+        {
+            self.outcome = Some(cached.clone());
+        }
     }
 
     /// Restores one embedded track's position in `stream_order` to where it sat
@@ -5699,8 +5829,10 @@ impl App {
             .filter(|stream| is_default(stream))
             .filter_map(stream_index)
             .collect::<BTreeSet<_>>();
+        let track_groups = track_groups_for(info);
         self.stream_order = order.clone();
         self.original_stream_order = order;
+        self.track_groups = track_groups;
         self.moved_streams.clear();
         self.default_streams = defaults.clone();
         self.original_default_streams = defaults;
@@ -5718,6 +5850,7 @@ impl App {
     fn clear_track_edits(&mut self) {
         self.stream_order.clear();
         self.original_stream_order.clear();
+        self.track_groups.clear();
         self.left_subtitle_order.clear();
         self.moved_streams.clear();
         self.deleted_streams.clear();
@@ -5901,6 +6034,15 @@ pub(crate) fn stream_group(
         Some("subtitle") => "subtitle",
         _ => "other",
     }
+}
+
+/// Snapshot of every stream's `stream_group` in `info`, for `StagedEdit::track_groups`
+/// — see `reconcile_untouched_groups`.
+fn track_groups_for(info: &MediaInfo) -> BTreeMap<u64, &'static str> {
+    info.streams
+        .iter()
+        .filter_map(|stream| Some((stream_index(stream)?, stream_group(stream))))
+        .collect()
 }
 
 fn is_default(stream: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
@@ -6145,19 +6287,45 @@ fn validate_staged_edit(
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
     default_streams: &BTreeSet<u64>,
+    original_stream_order: &[u64],
+    original_default_streams: &BTreeSet<u64>,
+    track_groups: &BTreeMap<u64, &'static str>,
+    moved_streams: &BTreeSet<u64>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
     container_target: Option<ContainerFormat>,
-) -> Result<(), String> {
-    let order = final_stream_order(info, stream_order, deleted_streams);
-    let defaults = default_streams
-        .difference(deleted_streams)
+) -> Result<ReconciledTracks, String> {
+    let reconciled = reconcile_untouched_groups(
+        info,
+        stream_order,
+        deleted_streams,
+        default_streams,
+        original_stream_order,
+        original_default_streams,
+        track_groups,
+        moved_streams,
+        video_settings,
+        subtitle_changes,
+    )?;
+    let order = final_stream_order(info, &reconciled.stream_order, &reconciled.deleted_streams);
+    let defaults = reconciled
+        .default_streams
+        .difference(&reconciled.deleted_streams)
         .copied()
         .collect();
-    validate_edit(info, &order, deleted_streams, &defaults, video_settings)?;
-    if let Some(error) =
-        subtitle_language_error_for(Some(info), deleted_streams, subtitle_changes, sidecars)
-    {
+    validate_edit(
+        info,
+        &order,
+        &reconciled.deleted_streams,
+        &defaults,
+        video_settings,
+    )?;
+    if let Some(error) = subtitle_language_error_for(
+        Some(info),
+        &reconciled.deleted_streams,
+        subtitle_changes,
+        sidecars,
+    ) {
         return Err(error);
     }
     // `ContainerFormat::detect` cross-checks the extension against ffprobe's own
@@ -6173,8 +6341,8 @@ fn validate_staged_edit(
         Some(info),
         source_container,
         container_target,
-        stream_order,
-        deleted_streams,
+        &reconciled.stream_order,
+        &reconciled.deleted_streams,
         video_settings,
         subtitle_changes,
         sidecars,
@@ -6182,7 +6350,148 @@ fn validate_staged_edit(
     if !conflicts.is_empty() {
         return Err(conflicts.join("\n"));
     }
-    Ok(())
+    Ok(reconciled)
+}
+
+/// The `stream_order`/`deleted_streams`/`default_streams`/`original_stream_order`/
+/// `original_default_streams`/`track_groups` fields `reconcile_untouched_groups`
+/// produces — either carried forward unchanged (a touched group) or rebuilt fresh
+/// from `info` (an untouched one). See `App::validate_staged_edit`.
+struct ReconciledTracks {
+    stream_order: Vec<u64>,
+    deleted_streams: BTreeSet<u64>,
+    default_streams: BTreeSet<u64>,
+    original_stream_order: Vec<u64>,
+    original_default_streams: BTreeSet<u64>,
+    track_groups: BTreeMap<u64, &'static str>,
+}
+
+/// Distinguishes "a change to a track type the staged edit never touched" (silently
+/// absorbed) from "a change to a track type the staged edit actually edits" (always a
+/// conflict requiring the resolve dialog), rather than treating every added or removed
+/// track as an equally hard conflict. A group counts as touched when the staged edit
+/// moved, deleted, applied video settings to, or toggled the default flag on one of
+/// its tracks, or (for "subtitle") staged any subtitle change at all — sidecar
+/// subtitle changes don't correspond to an embedded index, so they can't be pinned to
+/// one via `track_groups`.
+///
+/// Requires `track_groups` — the type-per-index snapshot taken when editing began
+/// (see `StagedEdit::track_groups`) — to know which group an index that has since
+/// vanished from the file used to belong to. When that snapshot is empty (edits
+/// staged before this field existed, or bare test fixtures), there's no way to tell
+/// touched from untouched, so every group is conservatively treated as touched — the
+/// original, all-or-nothing completeness check.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_untouched_groups(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    default_streams: &BTreeSet<u64>,
+    original_stream_order: &[u64],
+    original_default_streams: &BTreeSet<u64>,
+    track_groups: &BTreeMap<u64, &'static str>,
+    moved_streams: &BTreeSet<u64>,
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+) -> Result<ReconciledTracks, String> {
+    if track_groups.is_empty() {
+        return Ok(ReconciledTracks {
+            stream_order: stream_order.to_vec(),
+            deleted_streams: deleted_streams.clone(),
+            default_streams: default_streams.clone(),
+            original_stream_order: original_stream_order.to_vec(),
+            original_default_streams: original_default_streams.clone(),
+            track_groups: track_groups.clone(),
+        });
+    }
+
+    let touched_indices: BTreeSet<u64> = moved_streams
+        .iter()
+        .chain(deleted_streams.iter())
+        .chain(video_settings.keys())
+        .chain(default_streams.symmetric_difference(original_default_streams))
+        .copied()
+        .collect();
+    let mut touched_groups: BTreeSet<&'static str> = touched_indices
+        .iter()
+        .filter_map(|index| track_groups.get(index).copied())
+        .collect();
+    if !subtitle_changes.is_empty() {
+        touched_groups.insert("subtitle");
+    }
+
+    let mut reconciled = ReconciledTracks {
+        stream_order: Vec::new(),
+        deleted_streams: BTreeSet::new(),
+        default_streams: BTreeSet::new(),
+        original_stream_order: Vec::new(),
+        original_default_streams: BTreeSet::new(),
+        track_groups: BTreeMap::new(),
+    };
+    for group in ["video", "audio", "subtitle", "other"] {
+        let old_set: BTreeSet<u64> = track_groups
+            .iter()
+            .filter(|(_, candidate)| **candidate == group)
+            .map(|(index, _)| *index)
+            .collect();
+        let new_set: BTreeSet<u64> = info
+            .streams
+            .iter()
+            .filter(|stream| stream_group(stream) == group)
+            .filter_map(stream_index)
+            .collect();
+
+        if touched_groups.contains(group) {
+            if old_set != new_set {
+                return Err(format!(
+                    "The file's {group} tracks changed on disk, and the staged edit \
+                     touches {group} tracks — resolve the conflict to continue."
+                ));
+            }
+            reconciled
+                .stream_order
+                .extend(stream_order.iter().filter(|index| old_set.contains(index)));
+            reconciled.deleted_streams.extend(
+                deleted_streams
+                    .iter()
+                    .filter(|index| old_set.contains(index)),
+            );
+            reconciled.default_streams.extend(
+                default_streams
+                    .iter()
+                    .filter(|index| old_set.contains(index)),
+            );
+            reconciled.original_stream_order.extend(
+                original_stream_order
+                    .iter()
+                    .filter(|index| old_set.contains(index)),
+            );
+            reconciled.original_default_streams.extend(
+                original_default_streams
+                    .iter()
+                    .filter(|index| old_set.contains(index)),
+            );
+            for index in old_set {
+                reconciled.track_groups.insert(index, group);
+            }
+        } else {
+            // Untouched: forget whatever was staged for this group and rebuild it
+            // fresh from the file's current content, exactly as opening the file
+            // anew would for just this group's tracks — vanished ones simply drop
+            // out, new ones join at their natural position, kept, with whatever
+            // default flag the file itself currently gives them.
+            for index in new_set {
+                reconciled.stream_order.push(index);
+                reconciled.original_stream_order.push(index);
+                reconciled.track_groups.insert(index, group);
+                if stream_by_index(info, index).is_some_and(is_default) {
+                    reconciled.default_streams.insert(index);
+                    reconciled.original_default_streams.insert(index);
+                }
+            }
+        }
+    }
+    Ok(reconciled)
 }
 
 pub(crate) fn final_stream_order(
@@ -7093,7 +7402,11 @@ mod tests {
     }
 
     /// Builds a bare `StagedEdit` with every collection defaulted, for tests that only
-    /// care about `fingerprint`/`stale`/`conflict_confirmed`/`stream_order`.
+    /// care about `fingerprint`/`stale`/`conflict_confirmed`/`stream_order`. Leaves
+    /// `track_groups` empty, which makes `reconcile_untouched_groups` fall back to its
+    /// no-snapshot, everything-is-touched behavior — i.e. the original all-or-nothing
+    /// completeness check. Tests that need the group-aware leniency itself should use
+    /// `staged_edit_with_groups` instead.
     fn staged_edit(
         fingerprint: crate::files::FileFingerprint,
         stream_order: Vec<u64>,
@@ -7114,7 +7427,24 @@ mod tests {
             container_metadata: None,
             original_stream_order: Vec::new(),
             original_default_streams: Default::default(),
+            track_groups: BTreeMap::new(),
         }
+    }
+
+    /// Like `staged_edit`, but also stamps `original_stream_order`/`track_groups` from
+    /// `info` — the snapshot `reconcile_untouched_groups` needs to tell a group the
+    /// edit touches apart from one it doesn't. `stream_order` is taken as both the
+    /// live and the original order (tests that need them to differ can still mutate
+    /// the result afterward).
+    fn staged_edit_with_groups(
+        fingerprint: crate::files::FileFingerprint,
+        stream_order: Vec<u64>,
+        info: &MediaInfo,
+    ) -> StagedEdit {
+        let mut edit = staged_edit(fingerprint, stream_order.clone());
+        edit.original_stream_order = stream_order;
+        edit.track_groups = track_groups_for(info);
+        edit
     }
 
     #[test]
@@ -7266,6 +7596,343 @@ mod tests {
     }
 
     #[test]
+    fn receive_conflict_probe_results_should_flag_a_confirmed_conflict_when_the_edited_groups_track_count_changes()
+     {
+        // The user-facing rule this whole reconciliation exists for: a group the
+        // staged edit actually touches (here, video, via `video_settings`) always
+        // requires manual resolution if its own track count changes on disk — unlike
+        // a *different*, untouched group gaining or losing a track, which
+        // auto-resolves (see the two tests below).
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let original_info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ]));
+        let mut edit = staged_edit_with_groups(old_fingerprint, vec![0], &original_info);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), new_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // A second video track appears — the touched group itself changed.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "video", "disposition": {"default": 0}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: still stale, at the *old* fingerprint, and confirmed as a conflict.
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_true();
+        assert_that!(staged.conflict_confirmed).is_true();
+        assert_that!(staged.fingerprint).is_equal_to(old_fingerprint);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_auto_resolve_when_an_untouched_groups_track_disappears()
+     {
+        // Regression test for the reported case: only the video track was edited; an
+        // unrelated, untouched audio track vanishing entirely on disk must not force
+        // the whole staged edit into conflict (as it did before this was scoped to
+        // "did a *touched* group change") — it should just drop out of the order,
+        // leaving the video edit intact.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let original_info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "disposition": {"default": 0}}
+        ]));
+        let mut edit = staged_edit_with_groups(old_fingerprint, vec![0, 1], &original_info);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), new_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // The audio track is gone entirely — video (the only edited group) is
+            // untouched by the change.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: auto-resolved, the vanished audio track quietly dropped from the
+        // order, and the video edit itself untouched.
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_false();
+        assert_that!(staged.conflict_confirmed).is_false();
+        assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
+        assert_that!(staged.stream_order.clone()).is_equal_to(vec![0]);
+        assert_that!(staged.video_settings.contains_key(&0)).is_true();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_auto_resolve_when_an_untouched_groups_track_appears() {
+        // Mirror image of the disappearing-track case: only the video track was
+        // edited; a brand new, untouched audio track appearing on disk must not force
+        // a conflict either — it should just be picked up as a normal kept track.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        let new_fingerprint = crate::files::FileFingerprint {
+            length: old_fingerprint.length + 1,
+            modified: old_fingerprint.modified,
+        };
+        let original_info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
+        ]));
+        let mut edit = staged_edit_with_groups(old_fingerprint, vec![0], &original_info);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        app.staged_edits.insert(path.clone(), edit);
+        app.pending_conflict_checks
+            .insert(path.clone(), new_fingerprint);
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // A new default audio track appears — video (the only edited group) is
+            // untouched by the change.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: auto-resolved, the new audio track picked up (kept, and marked
+        // default per its own disposition), and the video edit itself untouched.
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_false();
+        assert_that!(staged.conflict_confirmed).is_false();
+        assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
+        assert_that!(staged.stream_order.clone()).is_equal_to(vec![0, 1]);
+        assert_that!(staged.default_streams.contains(&1)).is_true();
+        assert_that!(staged.video_settings.contains_key(&0)).is_true();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn receive_conflict_probe_results_should_resync_the_open_files_live_fields_after_a_quiet_auto_resolve()
+     {
+        // Regression test: a quiet background auto-resolve on the *currently open*
+        // file used to update `staged_edits[path]`'s reconciled fields but never sync
+        // them back onto the live edit fields the Streams view actually reads from —
+        // leaving it stuck showing pre-reconciliation data. See
+        // `App::apply_staged_snapshot`/`App::refresh_cached_outcome`.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        assert_that!(app.has_track_edits()).is_true();
+
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&app.directory).unwrap();
+        app.reconcile_files(rescanned);
+        let new_fingerprint = app.files[0].fingerprint;
+        assert_that!(app.staged_edits.get(&path).unwrap().stale).is_true();
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // Same three tracks staged against (0 = video, 1 = audio, 2 = subtitle),
+            // but the audio track's codec is now different — irrelevant to the
+            // video-only edit; video (the only touched group) is unaffected.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "codec_name": "opus", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0},
+                 "tags": {"language": "eng"}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert: quietly resolved, and the live fields (not just the `StagedEdit`
+        // snapshot) reflect the fresh content.
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.stale).is_false();
+        assert_that!(staged.conflict_confirmed).is_false();
+        assert_that!(app.video_settings.contains_key(&0)).is_true();
+        assert_that!(&app.stream_order).contains_exactly_in_given_order([0, 1, 2]);
+        let audio_codec = app
+            .media_info()
+            .and_then(|info| info.streams.get(1))
+            .and_then(|stream| stream.get("codec_name"))
+            .and_then(|value| value.as_str());
+        assert_that!(audio_codec).is_equal_to(Some("opus"));
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn staged_file_status_should_report_invalid_for_a_confirmed_conflict_on_the_open_file() {
+        // Regression test: `staged_file_status` used to check "is this the open
+        // file?" first and, if so, only ever validate *live* fields — never looking
+        // at `staged_edits[path].conflict_confirmed`. Once the open file can become a
+        // confirmed conflict (via `App::reconcile_files` staging its live edits),
+        // that early branch would incorrectly keep reporting `Valid`, letting
+        // `Ctrl+S` sail past an unresolved conflict.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&app.directory).unwrap();
+        app.reconcile_files(rescanned);
+        let new_fingerprint = app.files[0].fingerprint;
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // A new video track appears — the touched group (video) itself changed,
+            // a genuine structural conflict.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}},
+                {"index": 3, "codec_type": "video", "disposition": {"default": 0}}
+            ]))),
+        })
+        .unwrap();
+
+        // Act
+        app.receive_conflict_probe_results(&rx);
+
+        // Assert
+        let staged = app.staged_edits.get(&path).unwrap();
+        assert_that!(staged.conflict_confirmed).is_true();
+        match app.staged_file_status(&path) {
+            StagedFileStatus::Invalid(message) => {
+                assert!(
+                    message.contains("conflict dialog"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Invalid for a confirmed conflict, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn request_process_all_should_not_launder_an_unresolved_conflict_on_the_open_file() {
+        // Regression test for `App::snapshot_current_edits` preserving staleness:
+        // `request_process_all` calls `snapshot_current_edits()` itself before
+        // validating every staged file — if that call blindly re-baselined the open
+        // file's `StagedEdit` (clearing `stale`/`conflict_confirmed`), an unresolved
+        // conflict would silently sail past validation and the batch would start.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&app.directory).unwrap();
+        app.reconcile_files(rescanned);
+        let new_fingerprint = app.files[0].fingerprint;
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}},
+                {"index": 3, "codec_type": "video", "disposition": {"default": 0}}
+            ]))),
+        })
+        .unwrap();
+        app.receive_conflict_probe_results(&rx);
+        assert_that!(app.staged_edits.get(&path).unwrap().conflict_confirmed).is_true();
+
+        // Act
+        app.request_process_all();
+
+        // Assert: refused, not silently started.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Error));
+        assert_that!(app.edit_error.as_deref().unwrap_or_default()).contains("conflict dialog");
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
     fn receive_conflict_probe_results_should_ignore_a_response_superseded_by_a_newer_dispatched_check()
      {
         // Mirrors `receive_probe_results_should_ignore_a_response_for_a_superseded_generation`:
@@ -7381,6 +8048,64 @@ mod tests {
     }
 
     #[test]
+    fn keep_staged_edit_should_resync_the_open_files_live_fields() {
+        // Regression test: `keep_staged_edit` re-baselined the `StagedEdit` on "Keep"
+        // but never touched `self.outcome`/the live edit fields — the Streams view
+        // kept showing whatever was on screen before the conflict resolved. See
+        // `App::apply_staged_snapshot`/`App::refresh_cached_outcome`.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+        assert_that!(app.media_info().unwrap().streams.len()).is_equal_to(3);
+
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&app.directory).unwrap();
+        app.reconcile_files(rescanned);
+        let new_fingerprint = app.files[0].fingerprint;
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            // A new video track appears — a genuine conflict against the touched
+            // (video) group, requiring manual resolution.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}},
+                {"index": 3, "codec_type": "video", "disposition": {"default": 0}}
+            ]))),
+        })
+        .unwrap();
+        app.receive_conflict_probe_results(&rx);
+        assert_that!(app.staged_edits.get(&path).unwrap().conflict_confirmed).is_true();
+        // Not yet resynced — still showing the pre-conflict, 3-track content.
+        assert_that!(app.media_info().unwrap().streams.len()).is_equal_to(3);
+
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.conflict_choices
+            .insert(path.clone(), ConflictChoice::KeepEdits);
+
+        // Act
+        app.activate_conflicts();
+
+        // Assert: `self.outcome` now reflects the fresh, 4-track content — proving
+        // `keep_staged_edit` resynced the open file's live state rather than leaving
+        // it stale.
+        assert_that!(app.media_info().unwrap().streams.len()).is_equal_to(4);
+        assert_that!(app.video_settings.contains_key(&0)).is_true();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
     fn discard_conflict_should_unstage_the_file_like_a_manual_reset_does() {
         let mut app = test_file_app(&["a.mkv"]);
         let path = app.files[0].path.clone();
@@ -7398,6 +8123,62 @@ mod tests {
         // Assert: same end state `activate_reset`'s `ResetScope::File` arm produces.
         assert_that!(app.staged_edits.contains_key(&path)).is_false();
         assert_that!(app.dialog).is_equal_to(None);
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    #[test]
+    fn discard_conflict_should_reset_the_open_files_live_fields_from_fresh_content() {
+        // Regression test: `discard_staged_file` resets the open file's live fields
+        // via `reset_track_edits()`, which reads `self.media_info()` — without
+        // `refresh_cached_outcome()` first, that still pointed at the pre-change
+        // probe, so the reset baseline would silently rebuild from stale content
+        // instead of what's actually on disk now.
+        let mut app = test_file_app(&["a.mkv"]);
+        let path = app.files[0].path.clone();
+        app.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
+
+        std::fs::write(&path, b"changed contents").unwrap();
+        let rescanned = scan_directory(&app.directory).unwrap();
+        app.reconcile_files(rescanned);
+        let new_fingerprint = app.files[0].fingerprint;
+
+        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
+        tx.send(ProbeResponse {
+            generation: 0,
+            path: path.clone(),
+            fingerprint: new_fingerprint,
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "subtitle", "disposition": {"default": 0}},
+                {"index": 3, "codec_type": "video", "disposition": {"default": 0}}
+            ]))),
+        })
+        .unwrap();
+        app.receive_conflict_probe_results(&rx);
+        assert_that!(app.staged_edits.get(&path).unwrap().conflict_confirmed).is_true();
+
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.conflict_choices
+            .insert(path.clone(), ConflictChoice::Discard);
+
+        // Act
+        app.activate_conflicts();
+
+        // Assert: the reset baseline reflects the fresh, 4-track content, and the
+        // conflict's video_settings edit is gone (a genuine reset, not a stale one).
+        assert_that!(app.staged_edits.contains_key(&path)).is_false();
+        assert_that!(app.media_info().unwrap().streams.len()).is_equal_to(4);
+        assert_that!(app.stream_order.len()).is_equal_to(4);
+        assert_that!(app.stream_order.contains(&3)).is_true();
+        assert_that!(app.video_settings.contains_key(&0)).is_false();
 
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
     }
@@ -8293,6 +9074,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: vec![0],
                 original_default_streams: BTreeSet::new(),
+                track_groups: BTreeMap::new(),
             },
         );
 
@@ -10701,11 +11483,11 @@ mod tests {
     }
 
     #[test]
-    fn directory_update_should_discard_staged_edits_and_reprobe_when_selected_file_changes() {
-        // Arrange
+    fn directory_update_should_reload_when_selected_file_changes_with_no_live_edits() {
+        // Arrange: nothing staged, so there's nothing to lose — the plain reload path
+        // (`clear_edit_state`/`queue_probe`) is still correct here.
         let mut app = test_file_app(&["alpha.mkv"]);
         let directory = app.directory.clone();
-        app.deleted_streams.insert(2);
         std::fs::write(directory.join("alpha.mkv"), b"changed media contents").unwrap();
 
         // Act
@@ -10715,9 +11497,58 @@ mod tests {
 
         // Assert
         assert_that!(app.layer).is_equal_to(Layer::Files);
-        assert_that!(&app.deleted_streams).is_empty();
         assert_that!(app.loading).is_true();
         assert_that!(app.notice.as_deref().unwrap()).contains("reloaded");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_update_should_stage_rather_than_wipe_the_open_files_live_edits_when_it_changes_on_disk()
+     {
+        // Regression test: previously, the moment the *currently open* file's
+        // on-disk fingerprint changed, `reconcile_files` unconditionally called
+        // `clear_edit_state()` — silently destroying any live track edits with no
+        // conflict prompt at all, and force-resetting `self.layer` back to
+        // `Layer::Files` via `queue_probe()` even though the user never navigated
+        // away. Now it must route through the same staged-edit conflict pipeline
+        // every other staged file already uses: snapshot into `staged_edits`,
+        // `stale`, and leave the user right where they were.
+        let mut app = test_file_app(&["alpha.mkv"]);
+        let directory = app.directory.clone();
+        let path = app.files[0].path.clone();
+        let old_fingerprint = app.files[0].fingerprint;
+        assert_that!(app.staged_edits.contains_key(&path)).is_false();
+
+        app.deleted_streams.insert(2);
+        assert_that!(app.has_track_edits()).is_true();
+        std::fs::write(directory.join("alpha.mkv"), b"changed media contents").unwrap();
+
+        // Act
+        app.apply_directory_snapshot(DirectorySnapshot::Files(
+            scan_directory(&directory).unwrap(),
+        ));
+
+        // Assert: edits survive, layer is untouched (no forced bounce to Files), and
+        // a background conflict probe is now tracking the new fingerprint.
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.has_track_edits()).is_true();
+        assert_that!(&app.deleted_streams).contains(&2);
+        assert_that!(app.notice.as_deref()).is_equal_to(None);
+        let staged = app
+            .staged_edits
+            .get(&path)
+            .expect("live edits must be snapshotted, not wiped");
+        assert_that!(staged.stale).is_true();
+        assert_that!(staged.fingerprint).is_equal_to(old_fingerprint);
+        assert_that!(app.pending_conflict_checks.contains_key(&path)).is_true();
+        // The file-panel marker must keep reflecting the staged edit rather than
+        // reverting to Unstaged.
+        match app.staged_file_status(&path) {
+            StagedFileStatus::Invalid(_) => {}
+            other => panic!("expected Invalid while the check is pending, got {other:?}"),
+        }
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

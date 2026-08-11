@@ -1727,19 +1727,22 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
 }
 
 /// Lists every staged file whose background structural re-probe confirmed a genuine
-/// on-disk change since staging — see `App::conflicting_paths`. Unlike
-/// `render_confirm_process_all_dialog`'s single dialog-wide Start/Cancel, each row
-/// carries its own Keep/Discard pair (`App::conflict_choice_for`), and the row
-/// at `App::conflict_cursor` is marked with a leading cursor glyph — only that row's
-/// choice responds to Left/Right (`App::choose_conflict`); Enter applies every row's
-/// own choice at once (`App::activate_conflicts`). No inline key hint here — control
-/// help lives solely in the keybindings popup (`?`, reachable from anywhere), and
-/// its existing generic entries (`h/l`, `Enter`, `Esc/q`, `j/k`) already cover this
+/// on-disk change since staging — see `App::conflicting_paths`. Each row shows its
+/// own currently-chosen resolution as plain, non-interactive text (`App::conflict_choice_for`),
+/// with the row at `App::conflict_cursor` marked by a leading cursor glyph; a single
+/// live Keep/Discard button pair is pinned to the center-bottom of the popup —
+/// mirroring `render_confirm_process_all_dialog`'s scrollable-list-plus-pinned-button-bar
+/// layout — reflecting and controlling whichever row is under the cursor. Only that
+/// row's choice responds to Left/Right (`App::choose_conflict`); Enter applies every
+/// row's own choice at once (`App::activate_conflicts`). No inline key hint here —
+/// control help lives solely in the keybindings popup (`?`, reachable from anywhere),
+/// and its existing generic entries (`h/l`, `Enter`, `Esc/q`, `j/k`) already cover this
 /// dialog the same way they already cover `ConfirmReset`/`ConfirmProcessAll` without
 /// a dialog-specific line of their own.
 fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
-    /// Bullet + note line, choice-button line, blank spacer — see `scroll_to_show_line`
-    /// below, which needs this to convert `conflict_cursor` into a line index.
+    /// Bullet + note line, plain-text choice line, blank spacer — see
+    /// `scroll_to_show_line` below, which needs this to convert `conflict_cursor`
+    /// into a line index.
     const ROWS_PER_ITEM: usize = 3;
 
     let paths = app.conflicting_paths();
@@ -1757,6 +1760,8 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let is_cursor_row = index == app.conflict_cursor;
@@ -1772,29 +1777,48 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
-        let choice = app.conflict_choice_for(path);
+        let (label, style) = match app.conflict_choice_for(path) {
+            ConflictChoice::KeepEdits => ("→ Keep", changed_style()),
+            ConflictChoice::Discard => ("→ Discard", Style::default().fg(Color::Red)),
+        };
         lines.push(Line::from(vec![
             Span::raw("    "),
-            action_option(" Keep staged changes ", choice == ConflictChoice::KeepEdits),
-            Span::raw("  "),
-            action_option(
-                " Discard staged changes ",
-                choice == ConflictChoice::Discard,
-            ),
+            Span::styled(label, style),
         ]));
         lines.push(Line::from(""));
     }
     let text = padded_popup_text(Text::from(lines));
 
-    app.set_conflict_max_scroll(max_scroll(&text, inner));
+    app.set_conflict_max_scroll(max_scroll(&text, chunks[0]));
     let cursor_line = app.conflict_cursor * ROWS_PER_ITEM + 1; // +1 for padded_popup_text's leading blank
-    app.conflict_scroll = scroll_to_show_line(&text, inner, cursor_line, app.conflict_scroll);
+    app.conflict_scroll = scroll_to_show_line(&text, chunks[0], cursor_line, app.conflict_scroll);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((app.conflict_scroll, 0)),
-        inner,
+        chunks[0],
     );
+
+    // Single, live, bottom-pinned, centered button pair reflecting whichever row is
+    // under `conflict_cursor` — Left/Right (`App::choose_conflict`) already only
+    // mutates that row; only *where* the buttons render moves.
+    let cursor_choice = paths
+        .get(app.conflict_cursor)
+        .map(|path| app.conflict_choice_for(path))
+        .unwrap_or_default();
+    let buttons = Line::from(vec![
+        action_option(
+            " Keep staged changes ",
+            cursor_choice == ConflictChoice::KeepEdits,
+        ),
+        Span::raw("  "),
+        action_option(
+            " Discard staged changes ",
+            cursor_choice == ConflictChoice::Discard,
+        ),
+    ])
+    .centered();
+    frame.render_widget(Paragraph::new(buttons), chunks[1]);
 }
 
 /// One progress row per staged file being processed, table-like (a single column of
@@ -4316,6 +4340,7 @@ mod tests {
                         container_metadata: None,
                         original_stream_order: vec![0, 1, 2, 3],
                         original_default_streams: Default::default(),
+                        track_groups: Default::default(),
                     },
                 );
             }
@@ -4359,6 +4384,7 @@ mod tests {
                         container_metadata: None,
                         original_stream_order: vec![0, 1, 2, 3],
                         original_default_streams: Default::default(),
+                        track_groups: Default::default(),
                     },
                 );
             }
@@ -4471,6 +4497,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
@@ -4528,6 +4555,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
@@ -4536,7 +4564,8 @@ mod tests {
             "conflicts must auto-open the dialog"
         );
         // The second (alphabetically) row is set to Discard; the first stays at its
-        // Keep default — both must show up distinctly.
+        // Keep default — both must show up distinctly, as plain per-row text, not as
+        // full interactive buttons (see the sibling test for the button bar itself).
         app.move_conflict_cursor_down();
         app.choose_conflict(1);
 
@@ -4550,10 +4579,74 @@ mod tests {
             screen.contains("changed on disk since staged"),
             "screen was:\n{screen}"
         );
+        assert!(screen.contains("→ Keep"), "screen was:\n{screen}");
+        assert!(screen.contains("→ Discard"), "screen was:\n{screen}");
+        // Exactly one Keep/Discard button pair — the single bottom-pinned control —
+        // not one per row as before the redesign (which would show 2 of each here).
+        assert_that!(screen.matches("Keep staged changes").count()).is_equal_to(1);
+        assert_that!(screen.matches("Discard staged changes").count()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_button_bar_should_be_pinned_to_the_bottom_and_track_the_cursor() {
+        // Regression test: the Keep/Discard buttons must render as a single row
+        // pinned to the bottom of the popup's inner content area (not scattered
+        // per-file through the scrollable list), and must reflect whichever row is
+        // currently under `conflict_cursor`.
+        let (mut app, directory) = test_app("resolve-conflicts-bottom-pin", &["alpha.mkv"]);
+        let path = directory.join("alpha.mkv");
+        app.staged_edits.insert(
+            path,
+            crate::staging::StagedEdit {
+                fingerprint: crate::files::FileFingerprint {
+                    length: 5,
+                    modified: None,
+                },
+                stale: true,
+                conflict_confirmed: true,
+                stream_order: vec![0],
+                moved_streams: Default::default(),
+                deleted_streams: Default::default(),
+                default_streams: Default::default(),
+                default_sidecars: Default::default(),
+                video_settings: Default::default(),
+                subtitle_changes: Default::default(),
+                left_subtitle_order: Vec::new(),
+                container_target: None,
+                container_metadata: None,
+                original_stream_order: vec![0],
+                original_default_streams: Default::default(),
+                track_groups: Default::default(),
+            },
+        );
+        assert!(app.maybe_open_conflict_dialog());
+
+        let width = 140;
+        let height = 40;
+        let lines = draw(&mut app, width, height);
+        let area = popup_area(ratatui::layout::Rect::new(0, 0, width, height), 60, 50);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
+
+        // Assert: the button pair is on the popup's last inner row...
         assert!(
-            screen.matches("Keep staged changes").count() >= 2
-                && screen.matches("Discard staged changes").count() >= 2,
-            "every row should show both options; screen was:\n{screen}"
+            bottom_row.contains("Keep staged changes")
+                && bottom_row.contains("Discard staged changes"),
+            "expected the button bar on the bottom row, got: {bottom_row:?}",
+        );
+        // ...and reflects the cursor row's (default `KeepEdits`) choice.
+        assert_that!(app.conflict_choice_for(&directory.join("alpha.mkv")))
+            .is_equal_to(ConflictChoice::KeepEdits);
+
+        // Moving the choice to Discard updates the same bottom row.
+        app.choose_conflict(1);
+        let lines = draw(&mut app, width, height);
+        let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
+        assert!(
+            bottom_row.contains("Discard staged changes"),
+            "expected the bottom row to track the cursor's new choice, got: {bottom_row:?}",
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -4604,6 +4697,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
