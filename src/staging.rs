@@ -26,6 +26,25 @@ pub struct StagedEdit {
     /// instead of silently losing staged work, but this blocks processing until
     /// resolved.
     pub stale: bool,
+    /// Which `app::stream_group` labels ("video"/"audio"/"subtitle"/"other") a
+    /// background re-probe found to be *structurally* conflicted: this edit stages
+    /// changes to tracks of that type, and that type's set of tracks on disk is no
+    /// longer the one that was staged against. Empty means no conflict.
+    ///
+    /// Deliberately narrower than "the staged edit no longer validates". A pure
+    /// metadata/mtime bump, a change to a type nothing is staged for, and an edit that
+    /// merely became *invalid* against the new content (say a staged MP4 conversion
+    /// after a SubRip track appeared) all leave this empty and auto-resolve quietly —
+    /// the last of those then surfaces through the ordinary
+    /// `App::staged_file_status` `Invalid` path, with the compatibility markers and
+    /// Ctrl+S block that already exist for it. Only this set forces the unskippable
+    /// `Dialog::ResolveConflicts` notice, because only this means the tracks the user
+    /// edited are not the tracks that are now there.
+    ///
+    /// Always empty while `stale` is false, and empty while a check is still queued or
+    /// in flight (a file can be `stale` without a conflict being confirmed yet). Drives
+    /// `App::conflicting_paths`/`App::acknowledge_conflicts`.
+    pub conflict_groups: BTreeSet<&'static str>,
     pub stream_order: Vec<u64>,
     pub moved_streams: BTreeSet<u64>,
     pub deleted_streams: BTreeSet<u64>,
@@ -41,6 +60,16 @@ pub struct StagedEdit {
     /// track's position without disturbing other tracks' staged moves.
     pub original_stream_order: Vec<u64>,
     pub original_default_streams: BTreeSet<u64>,
+    /// Which stream-type group (`app::stream_group`'s "video"/"audio"/"subtitle"/
+    /// "other") each index in `original_stream_order` belonged to when editing began
+    /// — covers tracks later marked for deletion too, since those can still vanish
+    /// from disk independently. This is the minimal snapshot `App::reconcile_untouched_groups`
+    /// needs to tell "a group nobody edited grew or shrank a track" (auto-resolve)
+    /// apart from "a group the edit actually touches changed" (always a conflict) —
+    /// deliberately just a type label per index rather than a full `MediaInfo`
+    /// snapshot, since a type label doesn't flap on ordinary metadata/tag changes the
+    /// way whole-stream equality did.
+    pub track_groups: BTreeMap<u64, &'static str>,
 }
 
 /// The lifecycle of one file within an in-flight `BatchState`.

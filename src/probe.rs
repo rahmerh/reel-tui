@@ -14,6 +14,14 @@ pub struct ProbeRequest {
     pub generation: u64,
     pub path: PathBuf,
     pub fingerprint: FileFingerprint,
+    /// Whether `path` lives on a network mount, decided once by the caller (`App`
+    /// already computes and caches this for its own `directory`) rather than
+    /// re-derived here on every request — `crate::mount::is_network_mount` can
+    /// require a fresh `/proc/mounts` read plus `canonicalize()`'s per-component
+    /// stat, which on an actual network mount may be a network round trip. Doing
+    /// that on every probe (i.e. on every file selection) would add the exact kind
+    /// of network chatter this flag exists to avoid.
+    pub is_network_mount: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +242,7 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
             while let Ok(newer) = request_rx.try_recv() {
                 request = newer;
             }
-            let outcome = probe_file(&request.path);
+            let outcome = probe_file(&request.path, request.is_network_mount);
             if result_tx
                 .send(ProbeResponse {
                     generation: request.generation,
@@ -252,8 +260,39 @@ pub fn spawn_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
     (request_tx, result_rx)
 }
 
-pub(crate) fn probe_file(path: &Path) -> ProbeOutcome {
-    let is_network = crate::mount::is_network_mount(path);
+/// Like `spawn_probe_worker`, but answers every request in the order it arrived
+/// instead of coalescing down to only the newest. Used for background staleness
+/// re-checks (`App::receive_conflict_probe_results`), where a burst of several
+/// staged files changing near-simultaneously must each get an answer — silently
+/// dropping all but the last (`spawn_probe_worker`'s behavior, correct for the
+/// interactive per-selection probe it serves, where a stale answer for a selection
+/// already moved past is worthless) would leave the others stuck flagged `stale`
+/// with no way to resolve short of the user manually reopening them.
+pub fn spawn_conflict_probe_worker() -> (Sender<ProbeRequest>, Receiver<ProbeResponse>) {
+    let (request_tx, request_rx) = mpsc::channel::<ProbeRequest>();
+    let (result_tx, result_rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        while let Ok(request) = request_rx.recv() {
+            let outcome = probe_file(&request.path, request.is_network_mount);
+            if result_tx
+                .send(ProbeResponse {
+                    generation: request.generation,
+                    path: request.path,
+                    fingerprint: request.fingerprint,
+                    outcome,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    (request_tx, result_rx)
+}
+
+pub(crate) fn probe_file(path: &Path, is_network: bool) -> ProbeOutcome {
     let mut command = Command::new("ffprobe");
     command.args([
         "-v",
@@ -333,6 +372,7 @@ mod tests {
                         length: 16,
                         modified: None,
                     },
+                    is_network_mount: false,
                 })
                 .unwrap();
         }
@@ -372,6 +412,54 @@ mod tests {
     }
 
     #[test]
+    fn conflict_probe_worker_should_answer_every_queued_request_without_coalescing() {
+        // Arrange: unlike the interactive worker above, a background staleness check
+        // must account for every file that changed, not just the most recent one —
+        // silently dropping all but the last would leave the others stuck flagged
+        // stale with no way to resolve short of the user manually reopening them.
+        let (requests, responses) = spawn_conflict_probe_worker();
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-conflict-probe-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Act: five files queued back to back, faster than any probe can finish.
+        for generation in 0..5u64 {
+            let path = directory.join(format!("{generation}.mkv"));
+            std::fs::write(&path, b"not really media").unwrap();
+            requests
+                .send(ProbeRequest {
+                    generation,
+                    path,
+                    fingerprint: crate::files::FileFingerprint {
+                        length: 16,
+                        modified: None,
+                    },
+                    is_network_mount: false,
+                })
+                .unwrap();
+        }
+
+        // Assert: all five come back, in the order they were sent.
+        let mut answered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while answered.len() < 5 && std::time::Instant::now() < deadline {
+            if let Ok(response) = responses.recv_timeout(std::time::Duration::from_millis(200)) {
+                answered.push(response.generation);
+            }
+        }
+        assert_that!(answered).contains_exactly_in_given_order([0, 1, 2, 3, 4]);
+
+        drop(requests);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn probe_worker_should_stop_when_its_results_are_no_longer_wanted() {
         // Arrange / Act: dropping the receiving end is how `reel` shuts the worker down.
         let (requests, responses) = spawn_probe_worker();
@@ -386,6 +474,7 @@ mod tests {
                 length: 0,
                 modified: None,
             },
+            is_network_mount: false,
         });
     }
 

@@ -509,6 +509,25 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
             }
             _ => {}
         },
+        // Deliberately handles no back key: acknowledging is the only way out of the
+        // source-changed notice, because deferring it would leave a staged edit
+        // pointing at tracks the file no longer has, silently unprocessable. Escape
+        // and `q` fall through to the catch-all below and do nothing.
+        Some(Dialog::ResolveConflicts) => match (key.code, key.modifiers) {
+            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.scroll_conflicts(1);
+            }
+            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.scroll_conflicts(-1);
+            }
+            (KeyCode::Enter | KeyCode::Char(' '), _) => {
+                input.reset_sequence();
+                app.acknowledge_conflicts();
+            }
+            _ => {}
+        },
         None => return handle_layer_key(app, input, key),
     }
     InputOutcome::Continue
@@ -753,8 +772,16 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         (app, directory)
     }
 
@@ -1765,8 +1792,16 @@ mod tests {
             fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.layer = Layer::Files;
         app.select_first();
         let mut input = InputState::default();
@@ -1839,8 +1874,16 @@ mod tests {
             fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
         let (edit_tx, _) = mpsc::channel::<EditRequest>();
-        let mut app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.layer = Layer::Files;
         app.select_first();
         let mut input = InputState::default();
@@ -1853,6 +1896,7 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
+                conflict_groups: Default::default(),
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
                 deleted_streams: Default::default(),
@@ -1865,6 +1909,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: Vec::new(),
                 original_default_streams: Default::default(),
+                track_groups: Default::default(),
             },
         );
 
@@ -1889,6 +1934,7 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
+                conflict_groups: Default::default(),
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
                 deleted_streams: Default::default(),
@@ -1901,6 +1947,7 @@ mod tests {
                 container_metadata: None,
                 original_stream_order: Vec::new(),
                 original_default_streams: Default::default(),
+                track_groups: Default::default(),
             },
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
@@ -1913,6 +1960,136 @@ mod tests {
             app.staged_edits.contains_key(&a),
             "zR must not reset staged edits"
         );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Backdates the notice's open time so its button is already armed — the
+    /// alternative is a test that sleeps for `CONFLICT_COUNTDOWN`.
+    fn arm_conflict_notice(app: &mut App) {
+        app.conflict_opened_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    }
+
+    /// Stages a conflicted edit for each name and lists the files, so
+    /// `conflicting_paths` (which reads live fingerprints out of `app.files`) sees
+    /// them — `test_app`'s one synchronous scan ran before these existed on disk.
+    fn conflicted_app(app: &mut App, directory: &std::path::Path, names: &[&str]) {
+        app.files.clear();
+        for name in names {
+            let path = directory.join(name);
+            fs::write(&path, b"media").unwrap();
+            let fingerprint = FileFingerprint {
+                length: 5,
+                modified: None,
+            };
+            app.files.push(FileEntry {
+                path: path.clone(),
+                display_name: (*name).to_string(),
+                fingerprint,
+            });
+            // `revert_group_edits` refuses to rebuild a group against content it
+            // hasn't probed, so the acknowledgement needs a cached probe to land on.
+            app.cache.insert(
+                crate::app::CacheKey {
+                    path: path.clone(),
+                    length: fingerprint.length,
+                    modified: fingerprint.modified,
+                },
+                crate::probe::ProbeOutcome::Video(
+                    crate::probe::MediaInfo::from_json(serde_json::json!({
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+                    }))
+                    .unwrap(),
+                ),
+            );
+            app.staged_edits.insert(
+                path,
+                crate::staging::StagedEdit {
+                    fingerprint,
+                    stale: true,
+                    conflict_groups: std::collections::BTreeSet::from(["video"]),
+                    stream_order: vec![0],
+                    moved_streams: Default::default(),
+                    deleted_streams: Default::default(),
+                    default_streams: Default::default(),
+                    default_sidecars: Default::default(),
+                    video_settings: Default::default(),
+                    subtitle_changes: Default::default(),
+                    left_subtitle_order: Vec::new(),
+                    container_target: None,
+                    container_metadata: None,
+                    original_stream_order: vec![0],
+                    original_default_streams: Default::default(),
+                    track_groups: Default::default(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_enter_should_acknowledge_every_listed_file_at_once() {
+        // The notice has one button and no per-file choice, so Enter resolves the
+        // whole list in one press rather than one file at a time.
+        let (mut app, directory) = test_app();
+        let mut input = InputState::default();
+        conflicted_app(&mut app, &directory, &["a.mkv", "b.mkv"]);
+        assert!(app.maybe_open_conflict_dialog());
+        assert_eq!(app.conflicting_paths().len(), 2);
+
+        // Enter is inert until the button arms, so a keystroke already in flight when
+        // the notice appeared can't revert anything.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::ResolveConflicts),
+            "Enter must do nothing while the button is still counting down"
+        );
+        assert_eq!(app.conflicting_paths().len(), 2);
+        arm_conflict_notice(&mut app);
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert
+        assert_eq!(app.dialog, None);
+        assert!(
+            app.conflicting_paths().is_empty(),
+            "acknowledging must clear every listed conflict, not just the first"
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_should_not_close_on_escape_or_q() {
+        // Regression test for the deliberately missing back-key arm: deferring this
+        // notice would leave a staged edit pointing at tracks the file no longer has,
+        // so acknowledging is the only way out.
+        let (mut app, directory) = test_app();
+        let mut input = InputState::default();
+        conflicted_app(&mut app, &directory, &["a.mkv"]);
+        assert!(app.maybe_open_conflict_dialog());
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+
+        // Assert
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::ResolveConflicts),
+            "neither Escape nor q may dismiss the source-changed notice"
+        );
+        assert_eq!(app.conflicting_paths().len(), 1);
+
+        // Space is the second accepted acknowledgement key.
+        arm_conflict_notice(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char(' ')));
+        assert_eq!(app.dialog, None);
 
         drop(app);
         fs::remove_dir_all(directory).unwrap();

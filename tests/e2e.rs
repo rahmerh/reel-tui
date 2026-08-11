@@ -19,12 +19,14 @@ mod fixtures;
 mod harness;
 
 use std::fs;
+use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use fixtures::{MediaSpec, SubtitleSpec, write_media};
 use harness::{
     Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
 };
+use reel_tui::app::TrackRef;
 
 /// > SourceChanged: test2.mp4 — The file's tracks changed: track(s) [7] are both kept
 /// > and marked for deletion. Reopen it and try again.
@@ -82,6 +84,94 @@ fn deleting_a_track_should_save_instead_of_claiming_the_file_changed() {
         after.streams.len(),
         4,
         "one of the five streams should be gone; codecs: {:?}",
+        codec_names(&after)
+    );
+}
+
+/// The save succeeds, and then the app immediately accuses itself: the conflict
+/// notice opens over the freshly written file, demanding the user discard the very
+/// deletion that was just applied.
+///
+/// Nothing on disk changed except by the app's own hand. `finish_batch_if_done`
+/// clears `active_batch`/`dialog` and *then* rescans, so `reconcile_files` no longer
+/// recognises the rescan as its own edit landing; the open file's live edit fields
+/// were never cleared on completion, so it re-stages them against the pre-save
+/// fingerprint, flags them stale, and the structural re-check correctly reports that
+/// the audio track the edit deletes is not there any more.
+///
+/// The whole flow is post-save background work, which is why every existing scenario
+/// misses it: they stop pumping the instant the batch finishes.
+#[test]
+fn saving_a_deleted_track_should_not_restage_it_against_the_file_it_just_wrote() {
+    let test = "saving_a_deleted_track_should_not_restage_it_against_the_file_it_just_wrote";
+    if !require_tools(test, &["ffmpeg"]) {
+        return;
+    }
+
+    let scratch = Scratch::new("restage");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().audio(&["eng", "nld"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    let row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(2))
+        .expect("the fixture should have a second audio track");
+    app.select_track_row(row);
+    app.press(key(KeyCode::Char('d')));
+    assert!(
+        !app.app.deleted_streams.is_empty(),
+        "pressing d should have staged a deletion"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+
+    assert!(
+        app.app.staged_edits.is_empty(),
+        "a completed save must leave nothing staged, got {:?}",
+        app.app.staged_edits.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        app.app.deleted_streams.is_empty(),
+        "the applied deletion must not survive as a live edit: {:?}",
+        app.app.deleted_streams
+    );
+
+    // The re-check runs in the background, so the accusation lands a beat after the
+    // save reports success.
+    app.settle(Duration::from_secs(5));
+    assert_eq!(
+        app.app.dialog,
+        None,
+        "the app must not raise a conflict over its own completed save\nscreen:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.app.conflicting_paths().is_empty(),
+        "no file should be conflicted after a clean save: {:?}",
+        app.app.conflicting_paths()
+    );
+    // Clearing the live edits must leave the view rebuilt from the saved file, not
+    // emptied: the container row plus the two surviving tracks.
+    assert_eq!(
+        app.app.track_rows().len(),
+        3,
+        "the Streams view should show the saved file's tracks\nscreen:\n{}",
+        app.screen()
+    );
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        after.streams.len(),
+        2,
+        "the second audio track should be gone; codecs: {:?}",
         codec_names(&after)
     );
 }

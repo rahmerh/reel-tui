@@ -18,7 +18,7 @@ use crate::{
         CustomResolutionField, Dialog, InputReject, Layer, ResetChoice, SearchState,
         StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
         SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
-        VideoSettingsField, VideoSettingsMode,
+        VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
     edit::{ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -31,6 +31,34 @@ use crate::{
 };
 
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
+
+/// Decides when the event loop repaints. The loop deliberately does *not* redraw
+/// unconditionally at some frame rate — it draws when app state changed, or while the
+/// UI is animating itself off wall-clock time (`App::is_animating`).
+///
+/// The subtlety this type exists to hold: when an animation stops, the frame showing
+/// its finished state is by definition the first frame where `animating` is false, so
+/// keying purely off `dirty || animating` never paints it. The conflict notice used to
+/// freeze on "Understood (1)", dim, until some unrelated event forced a repaint —
+/// while the button had in fact already armed. One trailing frame after `animating`
+/// goes false fixes that, and the same applies to a batch gauge's final position.
+///
+/// Lives here rather than inline in `main` so the rule is testable; `main` owns only
+/// the wiring.
+#[derive(Debug, Default)]
+pub struct RedrawState {
+    was_animating: bool,
+}
+
+impl RedrawState {
+    /// Whether to draw this tick. `dirty` is "app state changed since the last draw",
+    /// `animating` is `App::is_animating`.
+    pub fn tick(&mut self, dirty: bool, animating: bool) -> bool {
+        let draw = dirty || animating || self.was_animating;
+        self.was_animating = animating;
+        draw
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -110,7 +138,12 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(if focused {
             focused_style(false)
         } else {
-            Style::default().fg(Color::White).bold()
+            unfocused_highlight_style(
+                app.selected_file()
+                    .map(|file| file.path.clone())
+                    .map(|path| app.staged_file_status(&path))
+                    .unwrap_or(StagedFileStatus::Unstaged),
+            )
         })
         .highlight_symbol(if focused { "› " } else { "  " });
     frame.render_widget(block, area);
@@ -124,6 +157,24 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         frame.render_stateful_widget(list, inner, &mut app.list_state);
     }
+}
+
+/// The selection highlight for the file panel while the focus is elsewhere (editing
+/// tracks, reading details) — bold, and coloured by whether the selected file has
+/// staged changes.
+///
+/// Ratatui patches `highlight_style` over each row's own style, so its `fg` wins
+/// outright while modifiers merge. A fixed white here therefore repainted a staged
+/// file's yellow (`file_tree_lines` → `changed_style`) and kept only its italic — and
+/// since the file being edited *is* the selected one, that is the exact moment the
+/// marker matters. Deferring the colour to the row's status keeps both.
+fn unfocused_highlight_style(status: StagedFileStatus) -> Style {
+    match status {
+        StagedFileStatus::Unstaged => Style::default().fg(Color::White),
+        StagedFileStatus::Valid => changed_style(),
+        StagedFileStatus::Invalid(_) => warning_style(true),
+    }
+    .bold()
 }
 
 /// `status` drives the same yellow/italic-for-changed and warning-triangle-for-invalid
@@ -1123,11 +1174,15 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_confirm_reset_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::ResolveConflicts {
+        render_resolve_conflicts_dialog(frame, app);
+        return;
+    }
     let (title, body, color) = match dialog {
         Dialog::Keybindings | Dialog::ContainerSettings | Dialog::VideoSettings => unreachable!(),
         Dialog::SubtitleSettings | Dialog::ConfirmCancel => unreachable!(),
         Dialog::ConfirmProcessAll | Dialog::BatchProcessing => unreachable!(),
-        Dialog::ConfirmReset => unreachable!(),
+        Dialog::ConfirmReset | Dialog::ResolveConflicts => unreachable!(),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -1383,9 +1438,9 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn action_option(label: &'static str, focused: bool) -> Span<'static> {
+fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, focused: bool) -> Span<'static> {
     Span::styled(
-        label,
+        label.into(),
         if focused {
             focused_style(false)
         } else {
@@ -1720,6 +1775,215 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
     ])
     .centered();
     frame.render_widget(Paragraph::new(buttons), chunks[1]);
+}
+
+/// The unskippable notice for files whose tracks moved out from under a staged edit —
+/// see `App::conflicting_paths`. One section per affected file: its name and which
+/// track types changed, then the staged changes for exactly those types, which
+/// acknowledging will revert (`App::acknowledge_conflicts`). Everything else the file
+/// stages is untouched and deliberately not listed.
+///
+/// There is only one button, because there is only one outcome. Keeping the staged
+/// changes was previously offered and could never succeed — the tracks they name are
+/// no longer the tracks in the file, so every path but reverting them ends at the same
+/// blocked save. Escape is not handled either (see `input::handle_key`), making the
+/// button the only way out. Borrows `render_confirm_process_all_dialog`'s
+/// scrollable-list-plus-pinned-button-bar layout. No inline key hint — control help
+/// lives solely in the keybindings popup (`?`).
+/// Width the conflict notice's labels are padded to, so their values line up in one
+/// column. Sized to the longest label (`Reverting`) plus its colon and a space.
+const CONFLICT_LABEL_WIDTH: usize = "Reverting: ".len();
+
+/// Marks each entry of a multi-value row, and sets the column its wrapped
+/// continuations align to.
+const CONFLICT_BULLET: &str = "  - ";
+
+/// One label against its values.
+///
+/// A lone value sits on the label's own line (`Label:      value`), since a
+/// one-item list is just a sentence with extra furniture. Two or more become a real
+/// list: the label takes its own line and each value gets a bullet beneath it,
+/// because several values sharing a line's worth of indentation read as one run-on
+/// value.
+///
+/// Either way this pre-wraps rather than leaving it to `Wrap`, which returns to
+/// column zero and would break the alignment — continuations of an inline value line
+/// up under the value, continuations of a bullet under its text.
+///
+/// Renders nothing at all for an empty list, so a file with nothing to keep simply
+/// has no `Keeping` row rather than an empty one.
+fn labelled_rows(
+    label: &str,
+    values: Vec<String>,
+    style: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let label_style = Style::default().fg(Color::DarkGray);
+    if values.len() > 1 {
+        let bullet_width = CONFLICT_BULLET.width();
+        let indent = " ".repeat(bullet_width);
+        let mut lines = vec![Line::from(Span::styled(format!("{label}:"), label_style))];
+        for value in values {
+            for (index, piece) in wrap_value(&value, width.saturating_sub(bullet_width).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let head = if index == 0 {
+                    Span::styled(CONFLICT_BULLET, label_style)
+                } else {
+                    Span::raw(indent.clone())
+                };
+                lines.push(Line::from(vec![head, Span::styled(piece, style)]));
+            }
+        }
+        return lines;
+    }
+
+    let indent = " ".repeat(CONFLICT_LABEL_WIDTH);
+    let mut lines = Vec::new();
+    for value in values {
+        for piece in wrap_value(&value, width.saturating_sub(CONFLICT_LABEL_WIDTH).max(1)) {
+            let head = if lines.is_empty() {
+                Span::styled(
+                    format!("{:<CONFLICT_LABEL_WIDTH$}", format!("{label}:")),
+                    label_style,
+                )
+            } else {
+                Span::raw(indent.clone())
+            };
+            lines.push(Line::from(vec![head, Span::styled(piece, style)]));
+        }
+    }
+    lines
+}
+
+/// Word-wraps to `width` *display columns* rather than bytes or chars, so a wide
+/// character or an accented filename can't overrun the popup. A single word longer
+/// than the width is split rather than allowed to overflow.
+fn wrap_value(value: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for word in value.split_whitespace() {
+        let word_width = word.width();
+        if current_width > 0 && current_width + 1 + word_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if word_width > width {
+            // Longer than a whole line on its own: fill what's left, then keep going.
+            for character in word.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if current_width + character_width > width && current_width > 0 {
+                    lines.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                current.push(character);
+                current_width += character_width;
+            }
+            continue;
+        }
+        if current_width > 0 {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(word);
+        current_width += word_width;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
+    let paths = app.conflicting_paths();
+    let single = paths.len() == 1;
+    let area = popup_area(frame.area(), 60, 50);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(if single {
+            " Source file changed "
+        } else {
+            " Source files changed "
+        });
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+    // An aligned label column per file, rather than prose: four labels each answering
+    // one question — which file, what moved under it, what that costs, what it
+    // doesn't. The popup title already says the source changed, so no line repeats it.
+    // `Keeping` is the one that stops this reading as more destructive than it is:
+    // only the conflicting track types are reverted, which is invisible if the notice
+    // lists nothing but losses.
+    // Matches `max_scroll`'s idea of the usable content width, so a value pre-wrapped
+    // here is never re-wrapped by the `Wrap` below (which would lose the indent).
+    let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+    let value_style = Style::default().fg(Color::White);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let groups = app.conflict_groups_for(path);
+        lines.extend(labelled_rows(
+            "File",
+            vec![name.to_string()],
+            changed_style(),
+            width,
+        ));
+        lines.extend(labelled_rows(
+            "Changed",
+            vec![describe_track_groups(&groups)],
+            value_style,
+            width,
+        ));
+        let reverted = app.conflicting_change_summary(path);
+        // A staged change can fail to describe itself — a deleted track that has since
+        // vanished from the file has nothing left to name it by — and a bare "Reverting"
+        // with nothing after it reads like a bug rather than an answer.
+        let reverted = if reverted.is_empty() {
+            vec![format!(
+                "the staged {} changes",
+                describe_track_groups(&groups)
+                    .strip_suffix(" tracks")
+                    .unwrap_or("track")
+            )]
+        } else {
+            reverted
+        };
+        lines.extend(labelled_rows("Reverting", reverted, value_style, width));
+        lines.extend(labelled_rows(
+            "Keeping",
+            app.kept_change_summary(path),
+            value_style,
+            width,
+        ));
+        lines.push(Line::from(""));
+    }
+    let text = padded_popup_text(Text::from(lines));
+
+    app.set_conflict_max_scroll(max_scroll(&text, chunks[0]));
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.conflict_scroll, 0)),
+        chunks[0],
+    );
+
+    // Inert for its first seconds, counting down inside its own label — the notice
+    // appears unprompted, so an Enter already in flight must not acknowledge it. See
+    // `App::conflict_countdown`.
+    let button = match app.conflict_countdown() {
+        Some(seconds) => action_option(format!(" Understood ({seconds}) "), false),
+        None => action_option(" Understood ", true),
+    };
+    frame.render_widget(Paragraph::new(Line::from(button).centered()), chunks[1]);
 }
 
 /// One progress row per staged file being processed, table-like (a single column of
@@ -4067,8 +4331,16 @@ mod tests {
             std::fs::write(directory.join(name), b"media").unwrap();
         }
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let app = App::new(directory.clone(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         (app, directory)
     }
 
@@ -4220,6 +4492,7 @@ mod tests {
                     crate::staging::StagedEdit {
                         fingerprint,
                         stale: false,
+                        conflict_groups: Default::default(),
                         stream_order: vec![0, 1, 2, 3],
                         moved_streams: Default::default(),
                         deleted_streams: Default::default(),
@@ -4232,6 +4505,7 @@ mod tests {
                         container_metadata: None,
                         original_stream_order: vec![0, 1, 2, 3],
                         original_default_streams: Default::default(),
+                        track_groups: Default::default(),
                     },
                 );
             }
@@ -4251,6 +4525,34 @@ mod tests {
             Dialog::ConfirmReset => {
                 app.request_reset_current_file();
             }
+            Dialog::ResolveConflicts => {
+                let path = app.directory.join("movie.mkv");
+                let fingerprint = crate::files::FileFingerprint {
+                    length: 0,
+                    modified: None,
+                };
+                app.staged_edits.insert(
+                    path,
+                    crate::staging::StagedEdit {
+                        fingerprint,
+                        stale: true,
+                        conflict_groups: std::collections::BTreeSet::from(["video"]),
+                        stream_order: vec![0, 1, 2, 3],
+                        moved_streams: Default::default(),
+                        deleted_streams: Default::default(),
+                        default_streams: Default::default(),
+                        default_sidecars: Default::default(),
+                        video_settings: Default::default(),
+                        subtitle_changes: Default::default(),
+                        left_subtitle_order: Vec::new(),
+                        container_target: Some(ContainerFormat::Mp4),
+                        container_metadata: None,
+                        original_stream_order: vec![0, 1, 2, 3],
+                        original_default_streams: Default::default(),
+                        track_groups: Default::default(),
+                    },
+                );
+            }
         }
         app.dialog = Some(dialog);
     }
@@ -4259,7 +4561,7 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 9] = [
+        const DIALOGS: [(Dialog, &str); 10] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
@@ -4272,6 +4574,7 @@ mod tests {
             ),
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
+            (Dialog::ResolveConflicts, "Changed:   video tracks"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -4346,6 +4649,7 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
+                    conflict_groups: Default::default(),
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -4358,6 +4662,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
@@ -4380,6 +4685,316 @@ mod tests {
         assert!(
             screen.contains("Start") && screen.contains("Cancel"),
             "screen should show a Start/Cancel button bar; screen was:\n{screen}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_should_merge_two_conflicting_types_into_one_block() {
+        // A file can lose the tracks of more than one type it edits at once. That's
+        // still one block, with both types named on the `Changed` line and every
+        // affected change under a single `Reverting` — not one block per type.
+        let (mut app, directory) = test_app("resolve-conflicts-both", &["movie.mkv"]);
+        let path = directory.join("movie.mkv");
+        let fingerprint = crate::files::FileFingerprint {
+            length: 5,
+            modified: None,
+        };
+        app.cache.insert(
+            crate::app::CacheKey {
+                path: path.clone(),
+                length: fingerprint.length,
+                modified: fingerprint.modified,
+            },
+            ProbeOutcome::Video(
+                MediaInfo::from_json(serde_json::json!({
+                    "format": {"format_name": "matroska,webm"},
+                    "streams": [
+                        {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                        {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                        {"index": 2, "codec_type": "audio", "codec_name": "ac3"},
+                        {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                         "tags": {"language": "eng"}}
+                    ]
+                }))
+                .unwrap(),
+            ),
+        );
+        let mut edit = crate::staging::StagedEdit {
+            fingerprint,
+            stale: true,
+            conflict_groups: std::collections::BTreeSet::from(["audio", "video"]),
+            stream_order: vec![0, 2, 3],
+            moved_streams: Default::default(),
+            deleted_streams: std::collections::BTreeSet::from([1]),
+            default_streams: std::collections::BTreeSet::from([2]),
+            default_sidecars: Default::default(),
+            video_settings: Default::default(),
+            subtitle_changes: Default::default(),
+            left_subtitle_order: Vec::new(),
+            container_target: Some(ContainerFormat::Mp4),
+            container_metadata: None,
+            original_stream_order: vec![0, 1, 2, 3],
+            original_default_streams: std::collections::BTreeSet::from([1]),
+            track_groups: std::collections::BTreeMap::from([
+                (0, "video"),
+                (1, "audio"),
+                (2, "audio"),
+                (3, "subtitle"),
+            ]),
+        };
+        edit.video_settings.insert(
+            0,
+            crate::edit::VideoSettings {
+                codec: crate::edit::VideoCodec::Hevc,
+                resolution: crate::edit::VideoResolution::P1080,
+            },
+        );
+        app.staged_edits.insert(path, edit);
+        assert!(app.maybe_open_conflict_dialog());
+
+        // Act: narrow enough that the video encode line has to wrap.
+        let lines = draw(&mut app, 100, 30);
+        let screen = lines.join(" ");
+
+        // Assert: one block, both types named once.
+        assert_that!(screen.matches("File:").count()).is_equal_to(1);
+        assert_that!(screen.matches("Reverting:").count()).is_equal_to(1);
+        assert!(
+            screen.contains("audio and video tracks"),
+            "screen was:\n{screen}"
+        );
+        // Both types' changes are listed together, the audio ones and the video one.
+        assert!(
+            screen.contains("Deleting 1 audio track")
+                && screen.contains("Changing the default audio track")
+                && screen.contains("Encoding video track #0 as HEVC"),
+            "screen was:\n{screen}"
+        );
+        // The subtitle track and the container conversion are untouched by both.
+        assert!(
+            screen.contains("Keeping:") && screen.contains("Changing container from MKV to MP4"),
+            "screen was:\n{screen}"
+        );
+
+        // Several changes are a list, not a run-on value: the label owns its line and
+        // each change is bulleted beneath it.
+        let reverting_row = lines
+            .iter()
+            .find(|line| line.contains("Reverting:"))
+            .expect("the reverting row must render");
+        let after_label = reverting_row.split_once("Reverting:").unwrap().1;
+        assert!(
+            after_label
+                .trim_matches(|c: char| c.is_whitespace() || c == '│')
+                .is_empty(),
+            "the label must own its line, got {reverting_row:?}"
+        );
+        let bullet_column = lines
+            .iter()
+            .find_map(|line| line.find("- Deleting 1 audio track"))
+            .expect("each reverted change must be bulleted");
+
+        // A value too long for the popup wraps to its bullet's text, not to column
+        // zero — ratatui's own `Wrap` would do the latter and break the alignment.
+        let wrapped = lines
+            .iter()
+            .find(|line| line.contains("/ 16:9") && !line.contains("Encoding"))
+            .expect("the video encode line must wrap at this width");
+        assert_that!(wrapped.find("/ 16:9")).is_equal_to(Some(bullet_column + "- ".len()));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn labelled_rows_should_inline_a_lone_value_and_bullet_several() {
+        let style = Style::default();
+
+        // One value reads as a sentence, on the label's own line.
+        let single = labelled_rows(
+            "Reverting",
+            vec!["Deleting audio track #2".to_string()],
+            style,
+            60,
+        );
+        assert_that!(single.iter().map(Line::to_string).collect::<Vec<_>>())
+            .is_equal_to(vec!["Reverting: Deleting audio track #2".to_string()]);
+
+        // Several become a list: the label alone, then a bullet each.
+        let several = labelled_rows(
+            "Reverting",
+            vec![
+                "Deleting audio track #2".to_string(),
+                "Changing the default audio track".to_string(),
+            ],
+            style,
+            60,
+        );
+        assert_that!(several.iter().map(Line::to_string).collect::<Vec<_>>()).is_equal_to(vec![
+            "Reverting:".to_string(),
+            "  - Deleting audio track #2".to_string(),
+            "  - Changing the default audio track".to_string(),
+        ]);
+
+        // Nothing to say, nothing rendered — not an empty labelled row.
+        assert!(labelled_rows("Keeping", Vec::new(), style, 60).is_empty());
+    }
+
+    #[test]
+    fn resolve_conflicts_dialog_should_name_what_changed_what_goes_and_what_stays() {
+        // Arrange: two staged files, each flagged by a background re-probe as having
+        // lost the tracks its edit names. Both also stage a container conversion,
+        // which survives acknowledgement — the notice has to distinguish the two.
+        let (mut app, directory) = test_app("resolve-conflicts", &["alpha.mkv", "beta.mkv"]);
+        for (name, group) in [("alpha.mkv", "video"), ("beta.mkv", "audio")] {
+            let path = directory.join(name);
+            let fingerprint = crate::files::FileFingerprint {
+                length: 5,
+                modified: None,
+            };
+            // The summary describes the content the edit was staged against, so the
+            // probe at the *staged* fingerprint has to be cached (see
+            // `App::reconcile_files`, which keeps it alive past the change).
+            app.cache.insert(
+                crate::app::CacheKey {
+                    path: path.clone(),
+                    length: fingerprint.length,
+                    modified: fingerprint.modified,
+                },
+                ProbeOutcome::Video(
+                    MediaInfo::from_json(serde_json::json!({
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [
+                            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                            {"index": 2, "codec_type": "audio", "codec_name": "ac3"}
+                        ]
+                    }))
+                    .unwrap(),
+                ),
+            );
+            let mut edit = crate::staging::StagedEdit {
+                fingerprint,
+                stale: true,
+                conflict_groups: std::collections::BTreeSet::from([group]),
+                stream_order: vec![0, 1, 2],
+                moved_streams: Default::default(),
+                deleted_streams: Default::default(),
+                default_streams: Default::default(),
+                default_sidecars: Default::default(),
+                video_settings: Default::default(),
+                subtitle_changes: Default::default(),
+                left_subtitle_order: Vec::new(),
+                container_target: Some(ContainerFormat::Mp4),
+                container_metadata: None,
+                original_stream_order: vec![0, 1, 2],
+                original_default_streams: Default::default(),
+                track_groups: std::collections::BTreeMap::from([
+                    (0, "video"),
+                    (1, "audio"),
+                    (2, "audio"),
+                ]),
+            };
+            if group == "video" {
+                edit.video_settings.insert(
+                    0,
+                    crate::edit::VideoSettings {
+                        codec: crate::edit::VideoCodec::Hevc,
+                        resolution: crate::edit::VideoResolution::Original,
+                    },
+                );
+            } else {
+                edit.stream_order = vec![0, 2, 1];
+                edit.moved_streams = std::collections::BTreeSet::from([2]);
+            }
+            app.staged_edits.insert(path, edit);
+        }
+        assert!(
+            app.maybe_open_conflict_dialog(),
+            "conflicts must auto-open the dialog"
+        );
+
+        // Act
+        let width = 140;
+        let height = 40;
+        let lines = draw(&mut app, width, height);
+        let screen = lines.join(" ");
+
+        // Assert
+        assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
+        assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("Changed:") && screen.contains("video tracks"),
+            "screen was:\n{screen}"
+        );
+        assert!(screen.contains("audio tracks"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("Reverting:") && screen.contains("Encoding video track #0 as HEVC"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("Moving 1 audio track"),
+            "screen was:\n{screen}"
+        );
+        // The container conversion survives acknowledgement, so it belongs under
+        // `Keeping` — without it the notice lists only losses and reads as though
+        // everything staged for the file is going.
+        assert!(
+            screen.contains("Keeping:") && screen.contains("Changing container from MKV to MP4"),
+            "the surviving changes must be named, not just the reverted ones; screen \
+             was:\n{screen}"
+        );
+        // No header line restating what the popup title already says.
+        assert!(
+            !screen.contains("while you were editing"),
+            "screen was:\n{screen}"
+        );
+
+        // Every label's value starts in the same column, across both files' blocks.
+        let value_columns: Vec<usize> = lines
+            .iter()
+            .filter_map(|line| {
+                let label_end = ["File:", "Changed:", "Reverting:", "Keeping:"]
+                    .iter()
+                    .find_map(|label| Some(line.find(label)? + label.len()))?;
+                let rest = &line[label_end..];
+                Some(label_end + rest.len() - rest.trim_start().len())
+            })
+            .collect();
+        assert_that!(value_columns.len()).is_equal_to(8);
+        assert!(
+            value_columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "label values must share one column, got {value_columns:?}"
+        );
+
+        // The one button, pinned to the popup's last inner row.
+        let area = popup_area(ratatui::layout::Rect::new(0, 0, width, height), 60, 50);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
+        // It opens counting down, so a stray Enter can't acknowledge it — and says so
+        // in the label rather than just sitting there inert.
+        assert!(
+            bottom_row.contains("Understood (5)"),
+            "expected a counting-down button on the bottom row, got: {bottom_row:?}",
+        );
+        assert_that!(screen.matches("Understood").count()).is_equal_to(1);
+
+        // Once armed the count disappears and the button highlights.
+        app.conflict_opened_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        let lines = draw(&mut app, width, height);
+        let screen = lines.join(" ");
+        let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
+        assert!(
+            bottom_row.contains("Understood") && !bottom_row.contains("("),
+            "expected a plain armed button, got: {bottom_row:?}",
+        );
+        // The Keep/Discard buttons this notice replaced must be gone. ("Keeping:" is
+        // a content label, not the old button, so match the button text itself.)
+        assert!(
+            !screen.contains("Keep staged changes") && !screen.contains("Discard"),
+            "screen was:\n{screen}"
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -4417,6 +5032,7 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
+                    conflict_groups: Default::default(),
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -4429,6 +5045,7 @@ mod tests {
                     container_metadata: None,
                     original_stream_order: vec![0],
                     original_default_streams: Default::default(),
+                    track_groups: Default::default(),
                 },
             );
         }
@@ -5886,8 +6503,16 @@ mod tests {
     #[test]
     fn render_footer_should_include_network_mode_tag_only_when_in_network_mode() {
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
 
         app.is_network_mount = true;
         let mut terminal =
@@ -5919,8 +6544,16 @@ mod tests {
     #[test]
     fn render_details_should_show_unsupported_format_only_for_non_video_outcomes() {
         let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
         let (edit_tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(std::env::temp_dir(), probe_tx, edit_tx.clone(), edit_tx).unwrap();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
         app.files = vec![crate::files::FileEntry {
             path: std::path::PathBuf::from("/media/image.png"),
             display_name: "image.png".to_string(),
@@ -6408,6 +7041,74 @@ mod tests {
         let unstaged = file_tree_lines("movie.mkv", [], false, false, StagedFileStatus::Unstaged);
         assert_eq!(unstaged[0].to_string(), "movie.mkv");
         assert_eq!(unstaged[0].style, Style::default());
+    }
+
+    #[test]
+    fn the_selected_file_row_should_stay_yellow_while_the_focus_is_on_its_tracks() {
+        // Regression test for staged files reading as italic-but-white: the selection
+        // highlight is patched over the row, so its `fg` replaced `changed_style`'s
+        // yellow while the italic merged through. The file being edited is always the
+        // selected one, so this hit every staged file the moment it was staged.
+        //
+        // Asserted against painted cells rather than `file_tree_lines`' own style,
+        // since the whole defect lives in what the List widget does to that style.
+        let (mut app, directory) = test_app("selected-staged-row", &["movie.mkv", "other.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac"}
+            ]}))
+            .unwrap(),
+        ));
+        app.loading = false;
+        let path = app.selected_file().unwrap().path.clone();
+
+        let name_cells = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| render_files(frame, app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            // Column 3 is the first character of the file name, past the border and
+            // the two-cell highlight symbol.
+            let cell = &buffer[(3, 1)];
+            (cell.fg, cell.modifier)
+        };
+
+        // Unstaged: the plain white selection.
+        app.layer = Layer::Streams;
+        assert_eq!(
+            name_cells(&mut app),
+            (Color::White, Modifier::BOLD),
+            "an unstaged selected file should read as a plain selection"
+        );
+
+        // Staged: yellow *and* italic, not one or the other.
+        app.stream_order = vec![0, 1, 2];
+        app.deleted_streams.insert(2);
+        assert_eq!(app.staged_file_status(&path), StagedFileStatus::Valid);
+        let (fg, modifier) = name_cells(&mut app);
+        assert_eq!(fg, Color::Yellow, "a staged file must stay yellow");
+        assert!(
+            modifier.contains(Modifier::ITALIC),
+            "a staged file must stay italic, got {modifier:?}"
+        );
+
+        // An unprocessable edit keeps the warning colour rather than reverting to
+        // white — same patching problem, same fix.
+        app.deleted_streams.insert(1);
+        assert!(matches!(
+            app.staged_file_status(&path),
+            StagedFileStatus::Invalid(_)
+        ));
+        let (fg, modifier) = name_cells(&mut app);
+        assert_eq!(fg, Color::Yellow, "an invalid staged file must stay yellow");
+        assert!(modifier.contains(Modifier::ITALIC));
+
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8699,6 +9400,32 @@ mod tests {
         assert!(focused_changed.add_modifier.contains(Modifier::ITALIC));
         assert_eq!(disabled.fg, Some(Color::DarkGray));
         assert_eq!(disabled.bg, None);
+    }
+
+    #[test]
+    fn redraw_state_should_paint_one_frame_after_an_animation_stops() {
+        // Regression test for a conflict notice frozen on a dim "Understood (1)":
+        // the frame that shows an animation's finished state is the first frame where
+        // `animating` is false, so `dirty || animating` alone never paints it and the
+        // screen keeps the last mid-animation frame until something unrelated
+        // happens.
+        let mut redraw = RedrawState::default();
+
+        // Idle: nothing changed, nothing animating, nothing to draw.
+        assert!(!redraw.tick(false, false));
+
+        // Animating: every tick draws, state change or not.
+        assert!(redraw.tick(false, true));
+        assert!(redraw.tick(false, true));
+
+        // The tick the animation stops on must still draw — this is the armed button.
+        assert!(redraw.tick(false, false));
+        // ...and exactly one such frame, not a permanent repaint loop.
+        assert!(!redraw.tick(false, false));
+
+        // A plain state change still draws on its own.
+        assert!(redraw.tick(true, false));
+        assert!(!redraw.tick(false, false));
     }
 
     #[test]

@@ -2808,7 +2808,7 @@ fn source_matches_fingerprint(path: &Path, expected: FileFingerprint) -> std::io
 }
 
 fn media_info(path: &Path) -> Result<MediaInfo, String> {
-    match probe_file(path) {
+    match probe_file(path, crate::mount::is_network_mount(path)) {
         ProbeOutcome::Video(info) => Ok(info),
         ProbeOutcome::NotVideo(reason) | ProbeOutcome::Error(reason) => Err(reason),
     }

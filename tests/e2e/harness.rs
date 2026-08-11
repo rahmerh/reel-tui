@@ -24,7 +24,9 @@ use reel_tui::app::{App, Dialog, Layer, ResolutionChoiceValue, TrackRef};
 use reel_tui::edit::{EditEvent, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
-use reel_tui::probe::{ProbeOutcome, ProbeResponse, spawn_probe_worker};
+use reel_tui::probe::{
+    ProbeOutcome, ProbeResponse, spawn_conflict_probe_worker, spawn_probe_worker,
+};
 use reel_tui::ui;
 
 /// Generous enough to absorb a cold ffmpeg start on a loaded machine, short enough
@@ -97,6 +99,7 @@ pub struct Harness {
     terminal: Terminal<TestBackend>,
     directory_rx: Receiver<DirectorySnapshot>,
     probe_rx: Receiver<ProbeResponse>,
+    conflict_rx: Receiver<ProbeResponse>,
     edit_rx: Receiver<EditEvent>,
     /// Declared last so the directory outlives the `App` and workers on drop.
     scratch: Scratch,
@@ -109,14 +112,16 @@ impl Harness {
         let directory = scratch.path().to_path_buf();
         let directory_rx = spawn_directory_monitor(directory.clone());
         let (request_tx, probe_rx) = spawn_probe_worker();
+        let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
         let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
-        let app = App::new(directory, request_tx, transcode_tx, remux_tx).unwrap();
+        let app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
         Self {
             app,
             input: InputState::default(),
             terminal: Terminal::new(TestBackend::new(160, 45)).unwrap(),
             directory_rx,
             probe_rx,
+            conflict_rx,
             edit_rx,
             scratch,
         }
@@ -135,8 +140,10 @@ impl Harness {
     pub fn pump(&mut self) {
         self.app.receive_directory_snapshots(&self.directory_rx);
         self.app.receive_probe_results(&self.probe_rx);
+        self.app.receive_conflict_probe_results(&self.conflict_rx);
         self.app.receive_edit_results(&self.edit_rx);
         self.app.start_pending_probe();
+        self.app.maybe_open_conflict_dialog();
         let app = &mut self.app;
         self.terminal.draw(|frame| ui::render(frame, app)).unwrap();
     }
@@ -511,6 +518,19 @@ impl Harness {
         );
         self.press(key(KeyCode::Enter));
         self.wait_until("the batch to finish", |app| app.active_batch.is_none());
+    }
+
+    /// Keeps replaying the loop for `duration` with nothing else happening, the way
+    /// the app idles between keypresses. Background work — the directory monitor's
+    /// reconcile, a conflict re-probe, the dialogs either can raise — only lands on a
+    /// later tick, so a scenario that stops pumping the moment its foreground action
+    /// returns never sees what that action set in motion.
+    pub fn settle(&mut self, duration: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < duration {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The terminal contents as one string, for assertions and failure messages.
