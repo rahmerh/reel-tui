@@ -34,14 +34,14 @@ pub struct ProbeResponse {
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ProbeOutcome {
     Video(MediaInfo),
     NotVideo(String),
     Error(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub format: BTreeMap<String, Value>,
     pub streams: Vec<BTreeMap<String, Value>>,

@@ -1678,7 +1678,7 @@ impl App {
             );
             disk_cache_dirty = true;
 
-            let Some(staged) = self.staged_edits.get_mut(&response.path) else {
+            let Some(staged) = self.staged_edits.get(&response.path) else {
                 continue;
             };
             if !staged.stale {
@@ -1686,14 +1686,44 @@ impl App {
                 // flight — nothing left to do.
                 continue;
             }
-            let matches_baseline = matches!(
-                (&staged.baseline, &response.outcome),
-                (Some(baseline), ProbeOutcome::Video(fresh)) if baseline == fresh
+            // Auto-resolve if the staged edit still validates against the fresh
+            // content — not whether the file is byte-for-byte-identical metadata-wise.
+            // A change completely unrelated to what's actually staged (e.g. an
+            // untouched audio track's tags changing while only video settings are
+            // staged) must not force a conflict prompt; see `validate_staged_edit`.
+            let sidecars = self
+                .sidecars_by_media
+                .get(&response.path)
+                .cloned()
+                .unwrap_or_default();
+            let still_valid = matches!(&response.outcome, ProbeOutcome::Video(fresh_info) if
+                validate_staged_edit(
+                    &self.subtitle_capabilities,
+                    &response.path,
+                    fresh_info,
+                    &sidecars,
+                    &staged.stream_order,
+                    &staged.deleted_streams,
+                    &staged.default_streams,
+                    &staged.video_settings,
+                    &staged.subtitle_changes,
+                    staged.container_target,
+                ).is_ok()
             );
-            if matches_baseline {
+
+            let Some(staged) = self.staged_edits.get_mut(&response.path) else {
+                continue;
+            };
+            if still_valid {
                 staged.fingerprint = response.fingerprint;
                 staged.stale = false;
                 staged.conflict_confirmed = false;
+                let name = response
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file");
+                self.notice = Some(format!("{name} changed on disk; staged edit still valid."));
             } else {
                 staged.conflict_confirmed = true;
             }
@@ -2576,15 +2606,29 @@ impl App {
             if !self.has_track_edits() {
                 return StagedFileStatus::Unstaged;
             }
-            return self.validate_live_edits();
+            return self.validate_live_edits(path);
         }
 
         let Some(staged) = self.staged_edits.get(path) else {
             return StagedFileStatus::Unstaged;
         };
+        // A confirmed conflict means a background re-probe already established, using
+        // fresh content, that these staged fields no longer validate — re-running
+        // validation here against the cache entry at `staged.fingerprint` would be
+        // wrong, since that entry is necessarily the *old* (pre-change) content, not
+        // current disk state. `stale` without `conflict_confirmed` means that check is
+        // still queued or in flight.
+        if staged.conflict_confirmed {
+            return StagedFileStatus::Invalid(
+                "File changed on disk and no longer matches the staged edit — resolve it via \
+                 the conflict dialog."
+                    .to_string(),
+            );
+        }
         if staged.stale {
             return StagedFileStatus::Invalid(
-                "File changed on disk since edits were staged.".to_string(),
+                "File changed on disk; still checking whether the staged edit is affected…"
+                    .to_string(),
             );
         }
         let key = CacheKey {
@@ -2602,44 +2646,21 @@ impl App {
             .get(path)
             .cloned()
             .unwrap_or_default();
-        let order = final_stream_order(info, &staged.stream_order, &staged.deleted_streams);
-        let defaults = staged
-            .default_streams
-            .difference(&staged.deleted_streams)
-            .copied()
-            .collect();
-        if let Err(error) = validate_edit(
-            info,
-            &order,
-            &staged.deleted_streams,
-            &defaults,
-            &staged.video_settings,
-        ) {
-            return StagedFileStatus::Invalid(error);
-        }
-        if let Some(error) = subtitle_language_error_for(
-            Some(info),
-            &staged.deleted_streams,
-            &staged.subtitle_changes,
-            &sidecars,
-        ) {
-            return StagedFileStatus::Invalid(error);
-        }
-        let conflicts = staged_container_conflicts(
+        match validate_staged_edit(
             &self.subtitle_capabilities,
-            Some(info),
-            ContainerFormat::from_path(path),
-            staged.container_target,
+            path,
+            info,
+            &sidecars,
             &staged.stream_order,
             &staged.deleted_streams,
+            &staged.default_streams,
             &staged.video_settings,
             &staged.subtitle_changes,
-            &sidecars,
-        );
-        if !conflicts.is_empty() {
-            return StagedFileStatus::Invalid(conflicts.join("\n"));
+            staged.container_target,
+        ) {
+            Ok(()) => StagedFileStatus::Valid,
+            Err(error) => StagedFileStatus::Invalid(error),
         }
-        StagedFileStatus::Valid
     }
 
     /// The human-readable list of changes staged for `path`, shown per-file in the
@@ -2664,33 +2685,25 @@ impl App {
 
     /// The `staged_file_status` gates run against the currently-open file's live edit
     /// fields (as opposed to a `StagedEdit` snapshot for a non-open staged file).
-    fn validate_live_edits(&self) -> StagedFileStatus {
+    fn validate_live_edits(&self, path: &Path) -> StagedFileStatus {
         let Some(info) = self.media_info() else {
             return StagedFileStatus::Invalid("Media metadata isn't loaded yet.".to_string());
         };
-        let order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
-        let defaults = self
-            .default_streams
-            .difference(&self.deleted_streams)
-            .copied()
-            .collect();
-        if let Err(error) = validate_edit(
+        match validate_staged_edit(
+            &self.subtitle_capabilities,
+            path,
             info,
-            &order,
+            &self.sidecars,
+            &self.stream_order,
             &self.deleted_streams,
-            &defaults,
+            &self.default_streams,
             &self.video_settings,
+            &self.subtitle_changes,
+            self.container_target,
         ) {
-            return StagedFileStatus::Invalid(error);
+            Ok(()) => StagedFileStatus::Valid,
+            Err(error) => StagedFileStatus::Invalid(error),
         }
-        if let Some(error) = self.subtitle_language_error() {
-            return StagedFileStatus::Invalid(error);
-        }
-        let conflicts = self.selected_container_conflicts();
-        if !conflicts.is_empty() {
-            return StagedFileStatus::Invalid(conflicts.join("\n"));
-        }
-        StagedFileStatus::Valid
     }
 
     pub fn container_choices(&self) -> Vec<ContainerChoice> {
@@ -4614,15 +4627,6 @@ impl App {
         }
     }
 
-    fn subtitle_language_error(&self) -> Option<String> {
-        subtitle_language_error_for(
-            self.media_info(),
-            &self.deleted_streams,
-            &self.subtitle_changes,
-            &self.sidecars,
-        )
-    }
-
     /// The Ctrl+S entry point everywhere (Files panel, Streams layer, and the
     /// Container/Video/Subtitle Settings dialogs' own Ctrl+S shortcuts) — snapshots
     /// the currently-open file's live edits (if any) so it's included, then requires
@@ -5107,14 +5111,13 @@ impl App {
         // right before the user hit Enter), leave it conflicted rather than guessing
         // — `reconcile_files` already re-dispatched a check for the newer fingerprint,
         // and the dialog will reopen on its own once that answers.
-        let Some(ProbeOutcome::Video(info)) = self.cache.get(&key).cloned() else {
+        if !matches!(self.cache.get(&key), Some(ProbeOutcome::Video(_))) {
             return;
-        };
+        }
         let Some(staged) = self.staged_edits.get_mut(path) else {
             return;
         };
         staged.fingerprint = fingerprint;
-        staged.baseline = Some(info);
         staged.stale = false;
         staged.conflict_confirmed = false;
         self.dismissed_conflicts.remove(path);
@@ -5391,14 +5394,12 @@ impl App {
         };
         let path = file.path.clone();
         let fingerprint = file.fingerprint;
-        let baseline = self.media_info().cloned();
         if self.has_track_edits() {
             self.staged_edits.insert(
                 path,
                 StagedEdit {
                     fingerprint,
                     stale: false,
-                    baseline,
                     conflict_confirmed: false,
                     stream_order: self.stream_order.clone(),
                     moved_streams: self.moved_streams.clone(),
@@ -6126,6 +6127,62 @@ fn staged_container_conflicts(
         ));
     }
     conflicts
+}
+
+/// The single gate a set of staged track/container/subtitle edits must pass against
+/// `info` (a probe of the file's *current* content) — shared by `staged_file_status`'s
+/// two branches (staged-but-not-open, and the currently-open file's live fields) and
+/// by `App::receive_conflict_probe_results`'s background auto-resolve check, so those
+/// three call sites can't drift into disagreeing about what "still valid" means. Takes
+/// `subtitle_capabilities` explicitly rather than being a method so it can run inside
+/// `receive_conflict_probe_results` while a `&mut StagedEdit` borrow is held nearby.
+#[allow(clippy::too_many_arguments)]
+fn validate_staged_edit(
+    subtitle_capabilities: &ToolCapabilities,
+    path: &Path,
+    info: &MediaInfo,
+    sidecars: &[SidecarEntry],
+    stream_order: &[u64],
+    deleted_streams: &BTreeSet<u64>,
+    default_streams: &BTreeSet<u64>,
+    video_settings: &BTreeMap<u64, VideoSettings>,
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    container_target: Option<ContainerFormat>,
+) -> Result<(), String> {
+    let order = final_stream_order(info, stream_order, deleted_streams);
+    let defaults = default_streams
+        .difference(deleted_streams)
+        .copied()
+        .collect();
+    validate_edit(info, &order, deleted_streams, &defaults, video_settings)?;
+    if let Some(error) =
+        subtitle_language_error_for(Some(info), deleted_streams, subtitle_changes, sidecars)
+    {
+        return Err(error);
+    }
+    // `ContainerFormat::detect` cross-checks the extension against ffprobe's own
+    // `format_name` rather than trusting a possibly misleading extension, matching
+    // `App::source_container`'s logic for the currently-open file.
+    let format_name = info
+        .format
+        .get("format_name")
+        .and_then(serde_json::Value::as_str);
+    let source_container = ContainerFormat::detect(path, format_name);
+    let conflicts = staged_container_conflicts(
+        subtitle_capabilities,
+        Some(info),
+        source_container,
+        container_target,
+        stream_order,
+        deleted_streams,
+        video_settings,
+        subtitle_changes,
+        sidecars,
+    );
+    if !conflicts.is_empty() {
+        return Err(conflicts.join("\n"));
+    }
+    Ok(())
 }
 
 pub(crate) fn final_stream_order(
@@ -7036,7 +7093,7 @@ mod tests {
     }
 
     /// Builds a bare `StagedEdit` with every collection defaulted, for tests that only
-    /// care about `fingerprint`/`stale`/`baseline`/`conflict_confirmed`/`stream_order`.
+    /// care about `fingerprint`/`stale`/`conflict_confirmed`/`stream_order`.
     fn staged_edit(
         fingerprint: crate::files::FileFingerprint,
         stream_order: Vec<u64>,
@@ -7044,7 +7101,6 @@ mod tests {
         StagedEdit {
             fingerprint,
             stale: true,
-            baseline: None,
             conflict_confirmed: false,
             stream_order,
             moved_streams: Default::default(),
@@ -7113,9 +7169,12 @@ mod tests {
     }
 
     #[test]
-    fn receive_conflict_probe_results_should_auto_resolve_when_reprobe_matches_baseline() {
-        // A pure mtime bump (e.g. an external re-sync preserving bytes) must resolve
-        // itself with no popup — see `App::receive_conflict_probe_results`.
+    fn receive_conflict_probe_results_should_auto_resolve_when_the_staged_edit_still_validates() {
+        // Regression test for the reported false positive: a staged edit that only
+        // touches the video track must not be treated as conflicting just because an
+        // unrelated audio track changed — even though the file's MediaInfo as a whole
+        // is no longer identical to what was staged against. Detection is based on
+        // "does the staged edit still validate", not raw equality.
         let mut app = test_file_app(&["a.mkv"]);
         let path = app.files[0].path.clone();
         let old_fingerprint = app.files[0].fingerprint;
@@ -7123,11 +7182,14 @@ mod tests {
             length: old_fingerprint.length + 1,
             modified: old_fingerprint.modified,
         };
-        let info = media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
-        ]));
-        let mut edit = staged_edit(old_fingerprint, vec![0]);
-        edit.baseline = Some(info.clone());
+        let mut edit = staged_edit(old_fingerprint, vec![0, 1]);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Av1,
+                resolution: VideoResolution::Original,
+            },
+        );
         app.staged_edits.insert(path.clone(), edit);
         app.pending_conflict_checks
             .insert(path.clone(), new_fingerprint);
@@ -7137,7 +7199,12 @@ mod tests {
             generation: 0,
             path: path.clone(),
             fingerprint: new_fingerprint,
-            outcome: ProbeOutcome::Video(info),
+            // Same two tracks staged against (0 = video, 1 = audio), but the audio
+            // track's codec is now different — irrelevant to the video-only edit.
+            outcome: ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "codec_name": "opus", "disposition": {"default": 1}}
+            ]))),
         })
         .unwrap();
 
@@ -7150,12 +7217,17 @@ mod tests {
         assert_that!(staged.conflict_confirmed).is_false();
         assert_that!(staged.fingerprint).is_equal_to(new_fingerprint);
         assert_that!(app.pending_conflict_checks.contains_key(&path)).is_false();
+        assert_that!(app.notice.as_deref())
+            .is_equal_to(Some("a.mkv changed on disk; staged edit still valid."));
 
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
     }
 
     #[test]
-    fn receive_conflict_probe_results_should_flag_a_confirmed_conflict_when_reprobe_differs() {
+    fn receive_conflict_probe_results_should_flag_a_confirmed_conflict_when_a_track_is_added() {
+        // A genuine structural conflict: the staged edit's `stream_order` (just track
+        // 0) no longer accounts for every track once a new one appears on disk —
+        // `validate_edit`'s completeness check fails, so this must not auto-resolve.
         let mut app = test_file_app(&["a.mkv"]);
         let path = app.files[0].path.clone();
         let old_fingerprint = app.files[0].fingerprint;
@@ -7163,10 +7235,7 @@ mod tests {
             length: old_fingerprint.length + 1,
             modified: old_fingerprint.modified,
         };
-        let mut edit = staged_edit(old_fingerprint, vec![0]);
-        edit.baseline = Some(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "disposition": {"default": 1}}
-        ])));
+        let edit = staged_edit(old_fingerprint, vec![0]);
         app.staged_edits.insert(path.clone(), edit);
         app.pending_conflict_checks
             .insert(path.clone(), new_fingerprint);
@@ -7276,10 +7345,6 @@ mod tests {
         );
         let mut edit = staged_edit(old_fingerprint, vec![0]);
         edit.conflict_confirmed = true;
-        edit.baseline = Some(media(serde_json::json!([
-            {"index": 0, "codec_type": "video", "disposition": {"default": 1}},
-            {"index": 1, "codec_type": "video", "disposition": {"default": 0}}
-        ])));
         edit.video_settings.insert(
             1,
             VideoSettings {
@@ -8215,7 +8280,6 @@ mod tests {
             StagedEdit {
                 fingerprint: files[0].fingerprint,
                 stale: false,
-                baseline: None,
                 conflict_confirmed: false,
                 stream_order: vec![0],
                 moved_streams: BTreeSet::new(),

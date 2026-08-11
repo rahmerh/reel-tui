@@ -1904,7 +1904,6 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
-                baseline: None,
                 conflict_confirmed: false,
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
@@ -1942,7 +1941,6 @@ mod tests {
                     modified: None,
                 },
                 stale: false,
-                baseline: None,
                 conflict_confirmed: false,
                 stream_order: Vec::new(),
                 moved_streams: Default::default(),
@@ -2000,7 +1998,6 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: true,
-                    baseline: None,
                     conflict_confirmed: true,
                     stream_order: vec![0],
                     moved_streams: Default::default(),
@@ -2072,7 +2069,6 @@ mod tests {
             crate::staging::StagedEdit {
                 fingerprint,
                 stale: true,
-                baseline: None,
                 conflict_confirmed: true,
                 stream_order: vec![0],
                 moved_streams: Default::default(),
