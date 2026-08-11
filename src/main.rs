@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
-use reel_tui::app::{App, Dialog};
+use reel_tui::app::App;
 use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
 use reel_tui::input::{InputOutcome, InputState, handle_key};
@@ -35,6 +35,7 @@ fn main() -> Result<()> {
         // time (see `render_progress_dialog`), so it needs a redraw every tick while
         // showing regardless of whether app state changed.
         let mut dirty = true;
+        let mut redraw = ui::RedrawState::default();
         loop {
             dirty |= app.receive_directory_snapshots(&directory_rx);
             dirty |= app.receive_probe_results(&result_rx);
@@ -42,10 +43,8 @@ fn main() -> Result<()> {
             dirty |= app.receive_edit_results(&edit_rx);
             app.start_pending_probe();
             dirty |= app.maybe_open_conflict_dialog();
-            let animating = matches!(app.dialog, Some(Dialog::BatchProcessing));
-            if dirty || animating {
+            if redraw.tick(std::mem::take(&mut dirty), app.is_animating()) {
                 terminal.draw(|frame| ui::render(frame, &mut app))?;
-                dirty = false;
             }
 
             if event::poll(Duration::from_millis(50))? {

@@ -13,12 +13,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ConflictChoice, ContainerChoice,
+        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ContainerChoice,
         ContainerSettingsField, ContainerSettingsMode, ContainerSettingsPopup,
         CustomResolutionField, Dialog, InputReject, Layer, ResetChoice, SearchState,
         StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
         SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
-        VideoSettingsField, VideoSettingsMode,
+        VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
     edit::{ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -31,6 +31,34 @@ use crate::{
 };
 
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
+
+/// Decides when the event loop repaints. The loop deliberately does *not* redraw
+/// unconditionally at some frame rate — it draws when app state changed, or while the
+/// UI is animating itself off wall-clock time (`App::is_animating`).
+///
+/// The subtlety this type exists to hold: when an animation stops, the frame showing
+/// its finished state is by definition the first frame where `animating` is false, so
+/// keying purely off `dirty || animating` never paints it. The conflict notice used to
+/// freeze on "Understood (1)", dim, until some unrelated event forced a repaint —
+/// while the button had in fact already armed. One trailing frame after `animating`
+/// goes false fixes that, and the same applies to a batch gauge's final position.
+///
+/// Lives here rather than inline in `main` so the rule is testable; `main` owns only
+/// the wiring.
+#[derive(Debug, Default)]
+pub struct RedrawState {
+    was_animating: bool,
+}
+
+impl RedrawState {
+    /// Whether to draw this tick. `dirty` is "app state changed since the last draw",
+    /// `animating` is `App::is_animating`.
+    pub fn tick(&mut self, dirty: bool, animating: bool) -> bool {
+        let draw = dirty || animating || self.was_animating;
+        self.was_animating = animating;
+        draw
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -1387,9 +1415,9 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn action_option(label: &'static str, focused: bool) -> Span<'static> {
+fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, focused: bool) -> Span<'static> {
     Span::styled(
-        label,
+        label.into(),
         if focused {
             focused_style(false)
         } else {
@@ -1726,72 +1754,167 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(buttons), chunks[1]);
 }
 
-/// Lists every staged file whose background structural re-probe confirmed a genuine
-/// on-disk change since staging — see `App::conflicting_paths`. Each row shows its
-/// own currently-chosen resolution as plain, non-interactive text (`App::conflict_choice_for`),
-/// with the row at `App::conflict_cursor` marked by a leading cursor glyph; a single
-/// live Keep/Discard button pair is pinned to the center-bottom of the popup —
-/// mirroring `render_confirm_process_all_dialog`'s scrollable-list-plus-pinned-button-bar
-/// layout — reflecting and controlling whichever row is under the cursor. Only that
-/// row's choice responds to Left/Right (`App::choose_conflict`); Enter applies every
-/// row's own choice at once (`App::activate_conflicts`). No inline key hint here —
-/// control help lives solely in the keybindings popup (`?`, reachable from anywhere),
-/// and its existing generic entries (`h/l`, `Enter`, `Esc/q`, `j/k`) already cover this
-/// dialog the same way they already cover `ConfirmReset`/`ConfirmProcessAll` without
-/// a dialog-specific line of their own.
-fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
-    /// Bullet + note line, plain-text choice line, blank spacer — see
-    /// `scroll_to_show_line` below, which needs this to convert `conflict_cursor`
-    /// into a line index.
-    const ROWS_PER_ITEM: usize = 3;
+/// The unskippable notice for files whose tracks moved out from under a staged edit —
+/// see `App::conflicting_paths`. One section per affected file: its name and which
+/// track types changed, then the staged changes for exactly those types, which
+/// acknowledging will revert (`App::acknowledge_conflicts`). Everything else the file
+/// stages is untouched and deliberately not listed.
+///
+/// There is only one button, because there is only one outcome. Keeping the staged
+/// changes was previously offered and could never succeed — the tracks they name are
+/// no longer the tracks in the file, so every path but reverting them ends at the same
+/// blocked save. Escape is not handled either (see `input::handle_key`), making the
+/// button the only way out. Borrows `render_confirm_process_all_dialog`'s
+/// scrollable-list-plus-pinned-button-bar layout. No inline key hint — control help
+/// lives solely in the keybindings popup (`?`).
+/// Width the conflict notice's labels are padded to, so their values line up in one
+/// column. Sized to the longest label (`Reverting`) plus its colon and a space.
+const CONFLICT_LABEL_WIDTH: usize = "Reverting: ".len();
 
+/// `Label:      value`, one label against however many values, each starting on its
+/// own line and every continuation indented to the shared column — including the
+/// continuations produced by wrapping a value too long for the popup, which is why
+/// this pre-wraps rather than leaving it to `Wrap`: ratatui wraps back to column
+/// zero, which would break the very alignment the column exists for.
+///
+/// Renders nothing at all for an empty list, so a file with nothing to keep simply
+/// has no `Keeping` row rather than an empty one.
+fn labelled_rows(
+    label: &str,
+    values: Vec<String>,
+    style: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = " ".repeat(CONFLICT_LABEL_WIDTH);
+    let mut lines = Vec::new();
+    for value in values {
+        for piece in wrap_value(&value, width.saturating_sub(CONFLICT_LABEL_WIDTH).max(1)) {
+            let head = if lines.is_empty() {
+                Span::styled(
+                    format!("{:<CONFLICT_LABEL_WIDTH$}", format!("{label}:")),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::raw(indent.clone())
+            };
+            lines.push(Line::from(vec![head, Span::styled(piece, style)]));
+        }
+    }
+    lines
+}
+
+/// Word-wraps to `width` *display columns* rather than bytes or chars, so a wide
+/// character or an accented filename can't overrun the popup. A single word longer
+/// than the width is split rather than allowed to overflow.
+fn wrap_value(value: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for word in value.split_whitespace() {
+        let word_width = word.width();
+        if current_width > 0 && current_width + 1 + word_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if word_width > width {
+            // Longer than a whole line on its own: fill what's left, then keep going.
+            for character in word.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if current_width + character_width > width && current_width > 0 {
+                    lines.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                current.push(character);
+                current_width += character_width;
+            }
+            continue;
+        }
+        if current_width > 0 {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(word);
+        current_width += word_width;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
     let paths = app.conflicting_paths();
-    let count = paths.len();
-    let title = format!(
-        " Resolve {count} conflict{} ",
-        if count == 1 { "" } else { "s" }
-    );
+    let single = paths.len() == 1;
     let area = popup_area(frame.area(), 60, 50);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(title);
+        .title(if single {
+            " Source file changed "
+        } else {
+            " Source files changed "
+        });
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
 
+    // An aligned label column per file, rather than prose: four labels each answering
+    // one question — which file, what moved under it, what that costs, what it
+    // doesn't. The popup title already says the source changed, so no line repeats it.
+    // `Keeping` is the one that stops this reading as more destructive than it is:
+    // only the conflicting track types are reverted, which is invisible if the notice
+    // lists nothing but losses.
+    // Matches `max_scroll`'s idea of the usable content width, so a value pre-wrapped
+    // here is never re-wrapped by the `Wrap` below (which would lose the indent).
+    let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+    let value_style = Style::default().fg(Color::White);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
-        let is_cursor_row = index == app.conflict_cursor;
+    for path in &paths {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file");
-        lines.push(Line::from(vec![
-            Span::raw(if is_cursor_row { "▶ " } else { "  " }),
-            Span::styled(name.to_string(), changed_style()),
-            Span::styled(
-                " — changed on disk since staged",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        let (label, style) = match app.conflict_choice_for(path) {
-            ConflictChoice::KeepEdits => ("→ Keep", changed_style()),
-            ConflictChoice::Discard => ("→ Discard", Style::default().fg(Color::Red)),
+        let groups = app.conflict_groups_for(path);
+        lines.extend(labelled_rows(
+            "File",
+            vec![name.to_string()],
+            changed_style(),
+            width,
+        ));
+        lines.extend(labelled_rows(
+            "Changed",
+            vec![format!("{}, on disk", describe_track_groups(&groups))],
+            value_style,
+            width,
+        ));
+        let reverted = app.conflicting_change_summary(path);
+        // A staged change can fail to describe itself — a deleted track that has since
+        // vanished from the file has nothing left to name it by — and a bare "Reverting"
+        // with nothing after it reads like a bug rather than an answer.
+        let reverted = if reverted.is_empty() {
+            vec![format!(
+                "the staged {} changes",
+                describe_track_groups(&groups)
+                    .strip_suffix(" tracks")
+                    .unwrap_or("track")
+            )]
+        } else {
+            reverted
         };
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(label, style),
-        ]));
+        lines.extend(labelled_rows("Reverting", reverted, value_style, width));
+        lines.extend(labelled_rows(
+            "Keeping",
+            app.kept_change_summary(path),
+            value_style,
+            width,
+        ));
         lines.push(Line::from(""));
     }
     let text = padded_popup_text(Text::from(lines));
 
     app.set_conflict_max_scroll(max_scroll(&text, chunks[0]));
-    let cursor_line = app.conflict_cursor * ROWS_PER_ITEM + 1; // +1 for padded_popup_text's leading blank
-    app.conflict_scroll = scroll_to_show_line(&text, chunks[0], cursor_line, app.conflict_scroll);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -1799,26 +1922,14 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
         chunks[0],
     );
 
-    // Single, live, bottom-pinned, centered button pair reflecting whichever row is
-    // under `conflict_cursor` — Left/Right (`App::choose_conflict`) already only
-    // mutates that row; only *where* the buttons render moves.
-    let cursor_choice = paths
-        .get(app.conflict_cursor)
-        .map(|path| app.conflict_choice_for(path))
-        .unwrap_or_default();
-    let buttons = Line::from(vec![
-        action_option(
-            " Keep staged changes ",
-            cursor_choice == ConflictChoice::KeepEdits,
-        ),
-        Span::raw("  "),
-        action_option(
-            " Discard staged changes ",
-            cursor_choice == ConflictChoice::Discard,
-        ),
-    ])
-    .centered();
-    frame.render_widget(Paragraph::new(buttons), chunks[1]);
+    // Inert for its first seconds, counting down inside its own label — the notice
+    // appears unprompted, so an Enter already in flight must not acknowledge it. See
+    // `App::conflict_countdown`.
+    let button = match app.conflict_countdown() {
+        Some(seconds) => action_option(format!(" Understood ({seconds}) "), false),
+        None => action_option(" Understood ", true),
+    };
+    frame.render_widget(Paragraph::new(Line::from(button).centered()), chunks[1]);
 }
 
 /// One progress row per staged file being processed, table-like (a single column of
@@ -4327,7 +4438,7 @@ mod tests {
                     crate::staging::StagedEdit {
                         fingerprint,
                         stale: false,
-                        conflict_confirmed: false,
+                        conflict_groups: Default::default(),
                         stream_order: vec![0, 1, 2, 3],
                         moved_streams: Default::default(),
                         deleted_streams: Default::default(),
@@ -4371,7 +4482,7 @@ mod tests {
                     crate::staging::StagedEdit {
                         fingerprint,
                         stale: true,
-                        conflict_confirmed: true,
+                        conflict_groups: std::collections::BTreeSet::from(["video"]),
                         stream_order: vec![0, 1, 2, 3],
                         moved_streams: Default::default(),
                         deleted_streams: Default::default(),
@@ -4409,7 +4520,7 @@ mod tests {
             ),
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
-            (Dialog::ResolveConflicts, "changed on disk since staged"),
+            (Dialog::ResolveConflicts, "Changed:   video tracks, on disk"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -4484,7 +4595,7 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
-                    conflict_confirmed: false,
+                    conflict_groups: Default::default(),
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -4526,87 +4637,146 @@ mod tests {
     }
 
     #[test]
-    fn resolve_conflicts_dialog_should_list_each_file_with_its_own_choice() {
-        // Arrange: two staged files, each independently flagged as a confirmed
-        // conflict by a background re-probe — every row must show its own name and
-        // its own Keep/Discard state, not one dialog-wide choice.
-        let (mut app, directory) = test_app("resolve-conflicts", &["alpha.mkv", "beta.mkv"]);
-        for name in ["alpha.mkv", "beta.mkv"] {
-            let path = directory.join(name);
-            let fingerprint = crate::files::FileFingerprint {
-                length: 5,
-                modified: None,
-            };
-            app.staged_edits.insert(
-                path,
-                crate::staging::StagedEdit {
-                    fingerprint,
-                    stale: true,
-                    conflict_confirmed: true,
-                    stream_order: vec![0],
-                    moved_streams: Default::default(),
-                    deleted_streams: Default::default(),
-                    default_streams: Default::default(),
-                    default_sidecars: Default::default(),
-                    video_settings: Default::default(),
-                    subtitle_changes: Default::default(),
-                    left_subtitle_order: Vec::new(),
-                    container_target: None,
-                    container_metadata: None,
-                    original_stream_order: vec![0],
-                    original_default_streams: Default::default(),
-                    track_groups: Default::default(),
-                },
-            );
-        }
-        assert!(
-            app.maybe_open_conflict_dialog(),
-            "conflicts must auto-open the dialog"
+    fn resolve_conflicts_dialog_should_merge_two_conflicting_types_into_one_block() {
+        // A file can lose the tracks of more than one type it edits at once. That's
+        // still one block, with both types named on the `Changed` line and every
+        // affected change under a single `Reverting` — not one block per type.
+        let (mut app, directory) = test_app("resolve-conflicts-both", &["movie.mkv"]);
+        let path = directory.join("movie.mkv");
+        let fingerprint = crate::files::FileFingerprint {
+            length: 5,
+            modified: None,
+        };
+        app.cache.insert(
+            crate::app::CacheKey {
+                path: path.clone(),
+                length: fingerprint.length,
+                modified: fingerprint.modified,
+            },
+            ProbeOutcome::Video(
+                MediaInfo::from_json(serde_json::json!({
+                    "format": {"format_name": "matroska,webm"},
+                    "streams": [
+                        {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                        {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                        {"index": 2, "codec_type": "audio", "codec_name": "ac3"},
+                        {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                         "tags": {"language": "eng"}}
+                    ]
+                }))
+                .unwrap(),
+            ),
         );
-        // The second (alphabetically) row is set to Discard; the first stays at its
-        // Keep default — both must show up distinctly, as plain per-row text, not as
-        // full interactive buttons (see the sibling test for the button bar itself).
-        app.move_conflict_cursor_down();
-        app.choose_conflict(1);
+        let mut edit = crate::staging::StagedEdit {
+            fingerprint,
+            stale: true,
+            conflict_groups: std::collections::BTreeSet::from(["audio", "video"]),
+            stream_order: vec![0, 2, 3],
+            moved_streams: Default::default(),
+            deleted_streams: std::collections::BTreeSet::from([1]),
+            default_streams: std::collections::BTreeSet::from([2]),
+            default_sidecars: Default::default(),
+            video_settings: Default::default(),
+            subtitle_changes: Default::default(),
+            left_subtitle_order: Vec::new(),
+            container_target: Some(ContainerFormat::Mp4),
+            container_metadata: None,
+            original_stream_order: vec![0, 1, 2, 3],
+            original_default_streams: std::collections::BTreeSet::from([1]),
+            track_groups: std::collections::BTreeMap::from([
+                (0, "video"),
+                (1, "audio"),
+                (2, "audio"),
+                (3, "subtitle"),
+            ]),
+        };
+        edit.video_settings.insert(
+            0,
+            crate::edit::VideoSettings {
+                codec: crate::edit::VideoCodec::Hevc,
+                resolution: crate::edit::VideoResolution::P1080,
+            },
+        );
+        app.staged_edits.insert(path, edit);
+        assert!(app.maybe_open_conflict_dialog());
 
-        // Act
-        let screen = draw(&mut app, 140, 40).join(" ");
+        // Act: narrow enough that the video encode line has to wrap.
+        let lines = draw(&mut app, 100, 30);
+        let screen = lines.join(" ");
 
-        // Assert
-        assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
-        assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
+        // Assert: one block, both types named once.
+        assert_that!(screen.matches("File:").count()).is_equal_to(1);
+        assert_that!(screen.matches("Reverting:").count()).is_equal_to(1);
         assert!(
-            screen.contains("changed on disk since staged"),
+            screen.contains("audio and video tracks, on disk"),
             "screen was:\n{screen}"
         );
-        assert!(screen.contains("→ Keep"), "screen was:\n{screen}");
-        assert!(screen.contains("→ Discard"), "screen was:\n{screen}");
-        // Exactly one Keep/Discard button pair — the single bottom-pinned control —
-        // not one per row as before the redesign (which would show 2 of each here).
-        assert_that!(screen.matches("Keep staged changes").count()).is_equal_to(1);
-        assert_that!(screen.matches("Discard staged changes").count()).is_equal_to(1);
+        // Both types' changes are listed together, the audio ones and the video one.
+        assert!(
+            screen.contains("Deleting 1 audio track")
+                && screen.contains("Changing the default audio track")
+                && screen.contains("Encoding video track #0 as HEVC"),
+            "screen was:\n{screen}"
+        );
+        // The subtitle track and the container conversion are untouched by both.
+        assert!(
+            screen.contains("Keeping:") && screen.contains("Changing container from MKV to MP4"),
+            "screen was:\n{screen}"
+        );
+
+        // A value too long for the popup wraps to the label column, not to column
+        // zero — ratatui's own `Wrap` would do the latter and break the alignment.
+        let label_column = lines
+            .iter()
+            .find_map(|line| Some(line.find("Reverting:")? + "Reverting: ".len()))
+            .expect("the reverting row must render");
+        let wrapped = lines
+            .iter()
+            .find(|line| line.contains("1920×1080"))
+            .expect("the video encode line must wrap at this width");
+        assert_that!(wrapped.find("1920×1080")).is_equal_to(Some(label_column));
 
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn resolve_conflicts_dialog_button_bar_should_be_pinned_to_the_bottom_and_track_the_cursor() {
-        // Regression test: the Keep/Discard buttons must render as a single row
-        // pinned to the bottom of the popup's inner content area (not scattered
-        // per-file through the scrollable list), and must reflect whichever row is
-        // currently under `conflict_cursor`.
-        let (mut app, directory) = test_app("resolve-conflicts-bottom-pin", &["alpha.mkv"]);
-        let path = directory.join("alpha.mkv");
-        app.staged_edits.insert(
-            path,
-            crate::staging::StagedEdit {
-                fingerprint: crate::files::FileFingerprint {
-                    length: 5,
-                    modified: None,
+    fn resolve_conflicts_dialog_should_name_what_changed_what_goes_and_what_stays() {
+        // Arrange: two staged files, each flagged by a background re-probe as having
+        // lost the tracks its edit names. Both also stage a container conversion,
+        // which survives acknowledgement — the notice has to distinguish the two.
+        let (mut app, directory) = test_app("resolve-conflicts", &["alpha.mkv", "beta.mkv"]);
+        for (name, group) in [("alpha.mkv", "video"), ("beta.mkv", "audio")] {
+            let path = directory.join(name);
+            let fingerprint = crate::files::FileFingerprint {
+                length: 5,
+                modified: None,
+            };
+            // The summary describes the content the edit was staged against, so the
+            // probe at the *staged* fingerprint has to be cached (see
+            // `App::reconcile_files`, which keeps it alive past the change).
+            app.cache.insert(
+                crate::app::CacheKey {
+                    path: path.clone(),
+                    length: fingerprint.length,
+                    modified: fingerprint.modified,
                 },
+                ProbeOutcome::Video(
+                    MediaInfo::from_json(serde_json::json!({
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [
+                            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                            {"index": 2, "codec_type": "audio", "codec_name": "ac3"}
+                        ]
+                    }))
+                    .unwrap(),
+                ),
+            );
+            let mut edit = crate::staging::StagedEdit {
+                fingerprint,
                 stale: true,
-                conflict_confirmed: true,
-                stream_order: vec![0],
+                conflict_groups: std::collections::BTreeSet::from([group]),
+                stream_order: vec![0, 1, 2],
                 moved_streams: Default::default(),
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
@@ -4614,39 +4784,118 @@ mod tests {
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
-                container_target: None,
+                container_target: Some(ContainerFormat::Mp4),
                 container_metadata: None,
-                original_stream_order: vec![0],
+                original_stream_order: vec![0, 1, 2],
                 original_default_streams: Default::default(),
-                track_groups: Default::default(),
-            },
+                track_groups: std::collections::BTreeMap::from([
+                    (0, "video"),
+                    (1, "audio"),
+                    (2, "audio"),
+                ]),
+            };
+            if group == "video" {
+                edit.video_settings.insert(
+                    0,
+                    crate::edit::VideoSettings {
+                        codec: crate::edit::VideoCodec::Hevc,
+                        resolution: crate::edit::VideoResolution::Original,
+                    },
+                );
+            } else {
+                edit.stream_order = vec![0, 2, 1];
+                edit.moved_streams = std::collections::BTreeSet::from([2]);
+            }
+            app.staged_edits.insert(path, edit);
+        }
+        assert!(
+            app.maybe_open_conflict_dialog(),
+            "conflicts must auto-open the dialog"
         );
-        assert!(app.maybe_open_conflict_dialog());
 
+        // Act
         let width = 140;
         let height = 40;
         let lines = draw(&mut app, width, height);
+        let screen = lines.join(" ");
+
+        // Assert
+        assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
+        assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("Changed:") && screen.contains("video tracks, on disk"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("audio tracks, on disk"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("Reverting:") && screen.contains("Encoding video track #0 as HEVC"),
+            "screen was:\n{screen}"
+        );
+        assert!(
+            screen.contains("Moving 1 audio track"),
+            "screen was:\n{screen}"
+        );
+        // The container conversion survives acknowledgement, so it belongs under
+        // `Keeping` — without it the notice lists only losses and reads as though
+        // everything staged for the file is going.
+        assert!(
+            screen.contains("Keeping:") && screen.contains("Changing container from MKV to MP4"),
+            "the surviving changes must be named, not just the reverted ones; screen \
+             was:\n{screen}"
+        );
+        // No header line restating what the popup title already says.
+        assert!(
+            !screen.contains("while you were editing"),
+            "screen was:\n{screen}"
+        );
+
+        // Every label's value starts in the same column, across both files' blocks.
+        let value_columns: Vec<usize> = lines
+            .iter()
+            .filter_map(|line| {
+                let label_end = ["File:", "Changed:", "Reverting:", "Keeping:"]
+                    .iter()
+                    .find_map(|label| Some(line.find(label)? + label.len()))?;
+                let rest = &line[label_end..];
+                Some(label_end + rest.len() - rest.trim_start().len())
+            })
+            .collect();
+        assert_that!(value_columns.len()).is_equal_to(8);
+        assert!(
+            value_columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "label values must share one column, got {value_columns:?}"
+        );
+
+        // The one button, pinned to the popup's last inner row.
         let area = popup_area(ratatui::layout::Rect::new(0, 0, width, height), 60, 50);
         let inner = Block::default().borders(Borders::ALL).inner(area);
         let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
-
-        // Assert: the button pair is on the popup's last inner row...
+        // It opens counting down, so a stray Enter can't acknowledge it — and says so
+        // in the label rather than just sitting there inert.
         assert!(
-            bottom_row.contains("Keep staged changes")
-                && bottom_row.contains("Discard staged changes"),
-            "expected the button bar on the bottom row, got: {bottom_row:?}",
+            bottom_row.contains("Understood (5)"),
+            "expected a counting-down button on the bottom row, got: {bottom_row:?}",
         );
-        // ...and reflects the cursor row's (default `KeepEdits`) choice.
-        assert_that!(app.conflict_choice_for(&directory.join("alpha.mkv")))
-            .is_equal_to(ConflictChoice::KeepEdits);
+        assert_that!(screen.matches("Understood").count()).is_equal_to(1);
 
-        // Moving the choice to Discard updates the same bottom row.
-        app.choose_conflict(1);
+        // Once armed the count disappears and the button highlights.
+        app.conflict_opened_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
         let lines = draw(&mut app, width, height);
+        let screen = lines.join(" ");
         let bottom_row = lines[(inner.y + inner.height - 1) as usize].clone();
         assert!(
-            bottom_row.contains("Discard staged changes"),
-            "expected the bottom row to track the cursor's new choice, got: {bottom_row:?}",
+            bottom_row.contains("Understood") && !bottom_row.contains("("),
+            "expected a plain armed button, got: {bottom_row:?}",
+        );
+        // The Keep/Discard buttons this notice replaced must be gone. ("Keeping:" is
+        // a content label, not the old button, so match the button text itself.)
+        assert!(
+            !screen.contains("Keep staged changes") && !screen.contains("Discard"),
+            "screen was:\n{screen}"
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -4684,7 +4933,7 @@ mod tests {
                 crate::staging::StagedEdit {
                     fingerprint,
                     stale: false,
-                    conflict_confirmed: false,
+                    conflict_groups: Default::default(),
                     stream_order: vec![0],
                     moved_streams: Default::default(),
                     deleted_streams: Default::default(),
@@ -8984,6 +9233,32 @@ mod tests {
         assert!(focused_changed.add_modifier.contains(Modifier::ITALIC));
         assert_eq!(disabled.fg, Some(Color::DarkGray));
         assert_eq!(disabled.bg, None);
+    }
+
+    #[test]
+    fn redraw_state_should_paint_one_frame_after_an_animation_stops() {
+        // Regression test for a conflict notice frozen on a dim "Understood (1)":
+        // the frame that shows an animation's finished state is the first frame where
+        // `animating` is false, so `dirty || animating` alone never paints it and the
+        // screen keeps the last mid-animation frame until something unrelated
+        // happens.
+        let mut redraw = RedrawState::default();
+
+        // Idle: nothing changed, nothing animating, nothing to draw.
+        assert!(!redraw.tick(false, false));
+
+        // Animating: every tick draws, state change or not.
+        assert!(redraw.tick(false, true));
+        assert!(redraw.tick(false, true));
+
+        // The tick the animation stops on must still draw — this is the armed button.
+        assert!(redraw.tick(false, false));
+        // ...and exactly one such frame, not a permanent repaint loop.
+        assert!(!redraw.tick(false, false));
+
+        // A plain state change still draws on its own.
+        assert!(redraw.tick(true, false));
+        assert!(!redraw.tick(false, false));
     }
 
     #[test]

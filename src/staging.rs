@@ -26,17 +26,25 @@ pub struct StagedEdit {
     /// instead of silently losing staged work, but this blocks processing until
     /// resolved.
     pub stale: bool,
-    /// Set once a background re-probe (triggered once `fingerprint` no longer matches
-    /// the live file) confirms this edit's staged track/container/subtitle fields no
-    /// longer validate against the file's current content — see
-    /// `App::validate_staged_edit`/`App::receive_conflict_probe_results`. A pure
-    /// metadata/mtime bump, or any change unrelated to what's actually staged (e.g. an
-    /// untouched audio track's tags changing while only video settings are staged),
-    /// leaves this `false` and auto-resolves quietly instead. Always false while
-    /// `stale` is false, and false while a check is still queued or in flight (a file
-    /// can be `stale` without this being confirmed yet). Drives
-    /// `App::conflicting_paths`/`Dialog::ResolveConflicts`.
-    pub conflict_confirmed: bool,
+    /// Which `app::stream_group` labels ("video"/"audio"/"subtitle"/"other") a
+    /// background re-probe found to be *structurally* conflicted: this edit stages
+    /// changes to tracks of that type, and that type's set of tracks on disk is no
+    /// longer the one that was staged against. Empty means no conflict.
+    ///
+    /// Deliberately narrower than "the staged edit no longer validates". A pure
+    /// metadata/mtime bump, a change to a type nothing is staged for, and an edit that
+    /// merely became *invalid* against the new content (say a staged MP4 conversion
+    /// after a SubRip track appeared) all leave this empty and auto-resolve quietly —
+    /// the last of those then surfaces through the ordinary
+    /// `App::staged_file_status` `Invalid` path, with the compatibility markers and
+    /// Ctrl+S block that already exist for it. Only this set forces the unskippable
+    /// `Dialog::ResolveConflicts` notice, because only this means the tracks the user
+    /// edited are not the tracks that are now there.
+    ///
+    /// Always empty while `stale` is false, and empty while a check is still queued or
+    /// in flight (a file can be `stale` without a conflict being confirmed yet). Drives
+    /// `App::conflicting_paths`/`App::acknowledge_conflicts`.
+    pub conflict_groups: BTreeSet<&'static str>,
     pub stream_order: Vec<u64>,
     pub moved_streams: BTreeSet<u64>,
     pub deleted_streams: BTreeSet<u64>,
