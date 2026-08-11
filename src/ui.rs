@@ -1794,11 +1794,21 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
 /// column. Sized to the longest label (`Reverting`) plus its colon and a space.
 const CONFLICT_LABEL_WIDTH: usize = "Reverting: ".len();
 
-/// `Label:      value`, one label against however many values, each starting on its
-/// own line and every continuation indented to the shared column — including the
-/// continuations produced by wrapping a value too long for the popup, which is why
-/// this pre-wraps rather than leaving it to `Wrap`: ratatui wraps back to column
-/// zero, which would break the very alignment the column exists for.
+/// Marks each entry of a multi-value row, and sets the column its wrapped
+/// continuations align to.
+const CONFLICT_BULLET: &str = "  - ";
+
+/// One label against its values.
+///
+/// A lone value sits on the label's own line (`Label:      value`), since a
+/// one-item list is just a sentence with extra furniture. Two or more become a real
+/// list: the label takes its own line and each value gets a bullet beneath it,
+/// because several values sharing a line's worth of indentation read as one run-on
+/// value.
+///
+/// Either way this pre-wraps rather than leaving it to `Wrap`, which returns to
+/// column zero and would break the alignment — continuations of an inline value line
+/// up under the value, continuations of a bullet under its text.
 ///
 /// Renders nothing at all for an empty list, so a file with nothing to keep simply
 /// has no `Keeping` row rather than an empty one.
@@ -1808,6 +1818,27 @@ fn labelled_rows(
     style: Style,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let label_style = Style::default().fg(Color::DarkGray);
+    if values.len() > 1 {
+        let bullet_width = CONFLICT_BULLET.width();
+        let indent = " ".repeat(bullet_width);
+        let mut lines = vec![Line::from(Span::styled(format!("{label}:"), label_style))];
+        for value in values {
+            for (index, piece) in wrap_value(&value, width.saturating_sub(bullet_width).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let head = if index == 0 {
+                    Span::styled(CONFLICT_BULLET, label_style)
+                } else {
+                    Span::raw(indent.clone())
+                };
+                lines.push(Line::from(vec![head, Span::styled(piece, style)]));
+            }
+        }
+        return lines;
+    }
+
     let indent = " ".repeat(CONFLICT_LABEL_WIDTH);
     let mut lines = Vec::new();
     for value in values {
@@ -1815,7 +1846,7 @@ fn labelled_rows(
             let head = if lines.is_empty() {
                 Span::styled(
                     format!("{:<CONFLICT_LABEL_WIDTH$}", format!("{label}:")),
-                    Style::default().fg(Color::DarkGray),
+                    label_style,
                 )
             } else {
                 Span::raw(indent.clone())
@@ -1908,7 +1939,7 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
         ));
         lines.extend(labelled_rows(
             "Changed",
-            vec![format!("{}, on disk", describe_track_groups(&groups))],
+            vec![describe_track_groups(&groups)],
             value_style,
             width,
         ));
@@ -4543,7 +4574,7 @@ mod tests {
             ),
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
-            (Dialog::ResolveConflicts, "Changed:   video tracks, on disk"),
+            (Dialog::ResolveConflicts, "Changed:   video tracks"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -4731,7 +4762,7 @@ mod tests {
         assert_that!(screen.matches("File:").count()).is_equal_to(1);
         assert_that!(screen.matches("Reverting:").count()).is_equal_to(1);
         assert!(
-            screen.contains("audio and video tracks, on disk"),
+            screen.contains("audio and video tracks"),
             "screen was:\n{screen}"
         );
         // Both types' changes are listed together, the audio ones and the video one.
@@ -4747,19 +4778,67 @@ mod tests {
             "screen was:\n{screen}"
         );
 
-        // A value too long for the popup wraps to the label column, not to column
-        // zero — ratatui's own `Wrap` would do the latter and break the alignment.
-        let label_column = lines
+        // Several changes are a list, not a run-on value: the label owns its line and
+        // each change is bulleted beneath it.
+        let reverting_row = lines
             .iter()
-            .find_map(|line| Some(line.find("Reverting:")? + "Reverting: ".len()))
+            .find(|line| line.contains("Reverting:"))
             .expect("the reverting row must render");
+        let after_label = reverting_row.split_once("Reverting:").unwrap().1;
+        assert!(
+            after_label
+                .trim_matches(|c: char| c.is_whitespace() || c == '│')
+                .is_empty(),
+            "the label must own its line, got {reverting_row:?}"
+        );
+        let bullet_column = lines
+            .iter()
+            .find_map(|line| line.find("- Deleting 1 audio track"))
+            .expect("each reverted change must be bulleted");
+
+        // A value too long for the popup wraps to its bullet's text, not to column
+        // zero — ratatui's own `Wrap` would do the latter and break the alignment.
         let wrapped = lines
             .iter()
-            .find(|line| line.contains("1920×1080"))
+            .find(|line| line.contains("/ 16:9") && !line.contains("Encoding"))
             .expect("the video encode line must wrap at this width");
-        assert_that!(wrapped.find("1920×1080")).is_equal_to(Some(label_column));
+        assert_that!(wrapped.find("/ 16:9")).is_equal_to(Some(bullet_column + "- ".len()));
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn labelled_rows_should_inline_a_lone_value_and_bullet_several() {
+        let style = Style::default();
+
+        // One value reads as a sentence, on the label's own line.
+        let single = labelled_rows(
+            "Reverting",
+            vec!["Deleting audio track #2".to_string()],
+            style,
+            60,
+        );
+        assert_that!(single.iter().map(Line::to_string).collect::<Vec<_>>())
+            .is_equal_to(vec!["Reverting: Deleting audio track #2".to_string()]);
+
+        // Several become a list: the label alone, then a bullet each.
+        let several = labelled_rows(
+            "Reverting",
+            vec![
+                "Deleting audio track #2".to_string(),
+                "Changing the default audio track".to_string(),
+            ],
+            style,
+            60,
+        );
+        assert_that!(several.iter().map(Line::to_string).collect::<Vec<_>>()).is_equal_to(vec![
+            "Reverting:".to_string(),
+            "  - Deleting audio track #2".to_string(),
+            "  - Changing the default audio track".to_string(),
+        ]);
+
+        // Nothing to say, nothing rendered — not an empty labelled row.
+        assert!(labelled_rows("Keeping", Vec::new(), style, 60).is_empty());
     }
 
     #[test]
@@ -4846,13 +4925,10 @@ mod tests {
         assert!(screen.contains("alpha.mkv"), "screen was:\n{screen}");
         assert!(screen.contains("beta.mkv"), "screen was:\n{screen}");
         assert!(
-            screen.contains("Changed:") && screen.contains("video tracks, on disk"),
+            screen.contains("Changed:") && screen.contains("video tracks"),
             "screen was:\n{screen}"
         );
-        assert!(
-            screen.contains("audio tracks, on disk"),
-            "screen was:\n{screen}"
-        );
+        assert!(screen.contains("audio tracks"), "screen was:\n{screen}");
         assert!(
             screen.contains("Reverting:") && screen.contains("Encoding video track #0 as HEVC"),
             "screen was:\n{screen}"
