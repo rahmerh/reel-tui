@@ -138,7 +138,12 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(if focused {
             focused_style(false)
         } else {
-            Style::default().fg(Color::White).bold()
+            unfocused_highlight_style(
+                app.selected_file()
+                    .map(|file| file.path.clone())
+                    .map(|path| app.staged_file_status(&path))
+                    .unwrap_or(StagedFileStatus::Unstaged),
+            )
         })
         .highlight_symbol(if focused { "› " } else { "  " });
     frame.render_widget(block, area);
@@ -152,6 +157,24 @@ fn render_files(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         frame.render_stateful_widget(list, inner, &mut app.list_state);
     }
+}
+
+/// The selection highlight for the file panel while the focus is elsewhere (editing
+/// tracks, reading details) — bold, and coloured by whether the selected file has
+/// staged changes.
+///
+/// Ratatui patches `highlight_style` over each row's own style, so its `fg` wins
+/// outright while modifiers merge. A fixed white here therefore repainted a staged
+/// file's yellow (`file_tree_lines` → `changed_style`) and kept only its italic — and
+/// since the file being edited *is* the selected one, that is the exact moment the
+/// marker matters. Deferring the colour to the row's status keeps both.
+fn unfocused_highlight_style(status: StagedFileStatus) -> Style {
+    match status {
+        StagedFileStatus::Unstaged => Style::default().fg(Color::White),
+        StagedFileStatus::Valid => changed_style(),
+        StagedFileStatus::Invalid(_) => warning_style(true),
+    }
+    .bold()
 }
 
 /// `status` drives the same yellow/italic-for-changed and warning-triangle-for-invalid
@@ -6942,6 +6965,74 @@ mod tests {
         let unstaged = file_tree_lines("movie.mkv", [], false, false, StagedFileStatus::Unstaged);
         assert_eq!(unstaged[0].to_string(), "movie.mkv");
         assert_eq!(unstaged[0].style, Style::default());
+    }
+
+    #[test]
+    fn the_selected_file_row_should_stay_yellow_while_the_focus_is_on_its_tracks() {
+        // Regression test for staged files reading as italic-but-white: the selection
+        // highlight is patched over the row, so its `fg` replaced `changed_style`'s
+        // yellow while the italic merged through. The file being edited is always the
+        // selected one, so this hit every staged file the moment it was staged.
+        //
+        // Asserted against painted cells rather than `file_tree_lines`' own style,
+        // since the whole defect lives in what the List widget does to that style.
+        let (mut app, directory) = test_app("selected-staged-row", &["movie.mkv", "other.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac"}
+            ]}))
+            .unwrap(),
+        ));
+        app.loading = false;
+        let path = app.selected_file().unwrap().path.clone();
+
+        let name_cells = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| render_files(frame, app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            // Column 3 is the first character of the file name, past the border and
+            // the two-cell highlight symbol.
+            let cell = &buffer[(3, 1)];
+            (cell.fg, cell.modifier)
+        };
+
+        // Unstaged: the plain white selection.
+        app.layer = Layer::Streams;
+        assert_eq!(
+            name_cells(&mut app),
+            (Color::White, Modifier::BOLD),
+            "an unstaged selected file should read as a plain selection"
+        );
+
+        // Staged: yellow *and* italic, not one or the other.
+        app.stream_order = vec![0, 1, 2];
+        app.deleted_streams.insert(2);
+        assert_eq!(app.staged_file_status(&path), StagedFileStatus::Valid);
+        let (fg, modifier) = name_cells(&mut app);
+        assert_eq!(fg, Color::Yellow, "a staged file must stay yellow");
+        assert!(
+            modifier.contains(Modifier::ITALIC),
+            "a staged file must stay italic, got {modifier:?}"
+        );
+
+        // An unprocessable edit keeps the warning colour rather than reverting to
+        // white — same patching problem, same fix.
+        app.deleted_streams.insert(1);
+        assert!(matches!(
+            app.staged_file_status(&path),
+            StagedFileStatus::Invalid(_)
+        ));
+        let (fg, modifier) = name_cells(&mut app);
+        assert_eq!(fg, Color::Yellow, "an invalid staged file must stay yellow");
+        assert!(modifier.contains(Modifier::ITALIC));
+
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
