@@ -3801,9 +3801,22 @@ mod tests {
                     .status()
                     .is_ok_and(|status| status.success())
             };
-            // ffmpeg spells it `-version`, most other tools `--version`.
+            // ffmpeg spells it `-version`, most other tools `--version`. The encoder
+            // form has to consult `-encoders`: `ffmpeg -h encoder=<name>` exits 0 for
+            // *any* name, including ones it has never heard of, so gating on that
+            // never skipped anything and a machine without the encoder got a failure
+            // instead of the skip this exists to produce.
             let available = match encoder {
-                Some(encoder) => succeeds(&["-v", "error", "-h", &format!("encoder={encoder}")]),
+                Some(encoder) => Command::new(program)
+                    .args(["-hide_banner", "-encoders"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout)
+                                .lines()
+                                .filter_map(|line| line.split_whitespace().nth(1))
+                                .any(|name| name == encoder)
+                    }),
                 None => succeeds(&["-version"]) || succeeds(&["--version"]),
             };
             if !available {
@@ -3812,6 +3825,38 @@ mod tests {
             }
         }
         true
+    }
+
+    /// Regression test for a gate that never gated: `require_tools` narrowed to an
+    /// encoder by running `ffmpeg -h encoder=<name>`, which exits 0 for names ffmpeg
+    /// has never heard of. Every `"ffmpeg:libx264"`-style entry therefore reported the
+    /// encoder as present, so a machine without it got a hard failure instead of the
+    /// skip the gate exists to produce — and a green run could not be trusted to mean
+    /// the pipeline had actually been exercised.
+    #[test]
+    fn the_tool_gate_should_reject_an_encoder_ffmpeg_does_not_have() {
+        // Arrange / Act: a name no build ships, checked without assuming which real
+        // encoders this machine happens to have.
+        let bogus = require_tools(
+            "the_tool_gate_should_reject_an_encoder_ffmpeg_does_not_have",
+            &["ffmpeg:definitely_not_a_real_encoder"],
+        );
+        let missing_program = require_tools(
+            "the_tool_gate_should_reject_an_encoder_ffmpeg_does_not_have",
+            &["definitely-not-a-real-program"],
+        );
+
+        // Assert
+        assert_that!(bogus).is_false();
+        assert_that!(missing_program).is_false();
+        // And a real one still gates open, or every ffmpeg test would silently skip.
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            assert_that!(require_tools(
+                "the_tool_gate_should_reject_an_encoder_ffmpeg_does_not_have",
+                &["ffmpeg"],
+            ))
+            .is_true();
+        }
     }
 
     fn english_subtitle_metadata() -> SubtitleMetadata {

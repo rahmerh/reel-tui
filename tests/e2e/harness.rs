@@ -617,9 +617,22 @@ pub fn require_tools(test: &str, tools: &[&str]) -> bool {
                 .status()
                 .is_ok_and(|status| status.success())
         };
-        // ffmpeg spells it `-version`, most other tools `--version`.
+        // ffmpeg spells it `-version`, most other tools `--version`. The encoder
+        // form has to consult `-encoders`: `ffmpeg -h encoder=<name>` exits 0 for
+        // *any* name, including ones it has never heard of, so gating on that
+        // never skipped anything and a machine without the encoder got a failure
+        // instead of the skip this exists to produce.
         let available = match encoder {
-            Some(encoder) => succeeds(&["-v", "error", "-h", &format!("encoder={encoder}")]),
+            Some(encoder) => Command::new(program)
+                .args(["-hide_banner", "-encoders"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .filter_map(|line| line.split_whitespace().nth(1))
+                            .any(|name| name == encoder)
+                }),
             None => succeeds(&["-version"]) || succeeds(&["--version"]),
         };
         if !available {
