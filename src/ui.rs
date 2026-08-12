@@ -4344,6 +4344,288 @@ mod tests {
         (app, directory)
     }
 
+    /// Draws `draw` into a throwaway terminal and returns the glyphs as one string, the
+    /// same flattening the render tests below already do by hand.
+    fn drawn(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn the_file_list_should_show_the_search_line_only_while_a_filter_is_in_play() {
+        // Arrange
+        let (mut app, directory) = test_app("file-search-line", &["alpha.mkv", "beta.mkv"]);
+
+        // Act
+        let unfiltered = drawn(80, 20, |frame| render(frame, &mut app));
+        app.start_file_search();
+        app.paste_text("bet");
+        let searching = drawn(80, 20, |frame| render(frame, &mut app));
+        // The line stays up after the search is committed, because the filter is still
+        // hiding files.
+        app.finish_file_search();
+        let committed = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&unfiltered).does_not_contain("Search");
+        assert_that!(&searching).contains("Search");
+        assert_that!(&searching).contains("bet");
+        assert_that!(&committed).contains("Search");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_keybindings_popup_should_show_its_own_search_line() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-search-line", &["movie.mkv"]);
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act
+        let unfiltered = drawn(80, 24, |frame| render(frame, &mut app));
+        app.start_keybindings_search();
+        let empty = drawn(80, 24, |frame| render(frame, &mut app));
+        app.paste_text("zzq");
+        let searching = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&unfiltered).does_not_contain("type to filter");
+        assert_that!(&empty).contains("type to filter");
+        assert_that!(&searching).contains("zzq");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file being written shows a measured gauge; a finished one shows a full bar and
+    /// a cancelled one an empty bar, so the list reads at a glance without the labels.
+    #[test]
+    fn the_batch_dialog_should_gauge_each_files_own_progress() {
+        // Arrange
+        let (mut app, directory) = test_app("batch-gauges", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        let item = |name: &str, status, fraction| crate::staging::BatchItem {
+            path: app.directory.join(name),
+            label: Some("Saving".to_string()),
+            fraction,
+            status,
+            output_path: None,
+        };
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![
+                item(
+                    "running.mkv",
+                    crate::staging::BatchItemStatus::Running,
+                    Some(0.42),
+                ),
+                item("done.mkv", crate::staging::BatchItemStatus::Completed, None),
+                item(
+                    "stopped.mkv",
+                    crate::staging::BatchItemStatus::Cancelled,
+                    None,
+                ),
+            ],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&text).contains("42%");
+        assert_that!(&text).contains("running.mkv");
+        assert_that!(&text).contains("done.mkv");
+        assert_that!(&text).contains("stopped.mkv");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The field being typed into has to show the live buffer; every other field keeps
+    /// showing its stored value, or the dialog looks like it edits all of them at once.
+    #[test]
+    fn the_container_metadata_field_being_edited_should_show_the_live_buffer() {
+        // Arrange
+        let (mut app, directory) = test_app("container-text-edit", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"tags": {"title": "Stored title", "genre": "Stored genre"}},
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+            }))
+            .unwrap(),
+        ));
+        let mut text_input = TextInputState::new("Half-typed".to_string());
+        text_input.activate();
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Title,
+            mode: ContainerSettingsMode::TextEdit,
+            help_visible: false,
+            format_cursor: 0,
+            text_input,
+        });
+
+        // Act
+        let text = drawn(80, 20, |frame| {
+            render_container_settings_dialog(frame, &app)
+        });
+
+        // Assert
+        assert_that!(&text).contains("Half-typed");
+        assert_that!(&text).does_not_contain("Stored title");
+        assert_that!(&text).contains("Stored genre");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The overview row is for scanning, so it says what it can and stays quiet about
+    /// what it cannot: a bare channel count when ffprobe gave no layout, and nothing at
+    /// all for a track whose type it could not even determine.
+    #[test]
+    fn the_overview_row_should_fall_back_to_a_channel_count_and_stay_quiet_when_unknown() {
+        // Arrange
+        let row = |stream: serde_json::Value| {
+            let stream =
+                serde_json::from_value::<std::collections::BTreeMap<String, Value>>(stream)
+                    .unwrap();
+            stream_line(&stream, 0, false, false, false, false, false)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+
+        // Act / Assert: a layout wins when it is there.
+        assert_that!(&row(serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac",
+            "channels": 6, "channel_layout": "5.1",
+        })))
+        .contains("5.1");
+
+        // Act / Assert: without one, the count still says something useful.
+        let counted = row(serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+        }));
+        assert_that!(&counted).contains("2 ch");
+
+        // Act / Assert: an attachment names its type…
+        assert_that!(&row(serde_json::json!({
+            "index": 3, "codec_type": "attachment", "codec_name": "ttf",
+        })))
+        .contains("attachment");
+
+        // Act / Assert: …but a stream with no `codec_type` has nothing to name.
+        assert_that!(&row(
+            serde_json::json!({"index": 4, "codec_name": "bin_data"})
+        ))
+        .does_not_contain("unknown ");
+    }
+
+    /// The dropdown marks the option that is currently staged, and "Fit & pad" is the
+    /// default — so it is the selected option without being a *change*, and must not
+    /// carry the changed styling that tells the user they altered something.
+    #[test]
+    fn the_scaling_dropdown_should_mark_a_non_default_choice_as_changed() {
+        // Arrange
+        let draft = |scaling| crate::app::CustomResolutionDraft {
+            field: CustomResolutionField::Scaling,
+            width: TextInputState::new("1280".to_string()),
+            height: TextInputState::new("720".to_string()),
+            scaling,
+            scaling_cursor: 0,
+            scaling_dropdown_open: true,
+        };
+
+        // Act
+        let default = custom_scaling_lines(&draft(crate::edit::CustomScaling::FitPad));
+        let stretched = custom_scaling_lines(&draft(crate::edit::CustomScaling::Stretch));
+
+        // Assert: both list every option under the field row.
+        assert_that!(default.len()).is_equal_to(crate::edit::CustomScaling::OPTIONS.len() + 1);
+        let styled_as_changed = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.style == changed_style())
+        };
+        assert_that!(styled_as_changed(&default)).is_false();
+        assert_that!(styled_as_changed(&stretched)).is_true();
+    }
+
+    /// `i` opens the details popup for whatever row is focused, and each track kind has
+    /// its own panel — a subtitle's is the one that has to reflect staged conversions
+    /// rather than only what is in the file.
+    #[test]
+    fn the_details_popup_should_describe_each_kind_of_track_it_is_opened_on() {
+        // Arrange
+        let (mut app, directory) = test_app("details-popup-kinds", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}},
+                ],
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.layer = Layer::Streams;
+        let focus = |app: &mut App, track| {
+            app.selected_stream = app
+                .track_rows()
+                .iter()
+                .position(|row| *row == track)
+                .unwrap();
+        };
+
+        // Act / Assert
+        focus(&mut app, crate::app::TrackRef::Embedded(0));
+        let (_, video_title) = details_popup_content(&app).unwrap();
+        assert_that!(video_title.as_str()).is_equal_to(" Video #0 ");
+
+        focus(&mut app, crate::app::TrackRef::Embedded(1));
+        let (_, audio_title) = details_popup_content(&app).unwrap();
+        assert_that!(audio_title.as_str()).is_equal_to(" Audio #1 ");
+
+        focus(&mut app, crate::app::TrackRef::Embedded(2));
+        let (subtitle_text, subtitle_title) = details_popup_content(&app).unwrap();
+        assert_that!(subtitle_title.as_str()).is_equal_to(" Subtitle #2 ");
+        assert_that!(subtitle_text.to_string()).contains("English");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cover_art_track_should_be_labelled_as_such_in_its_details() {
+        // Arrange
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 1,
+            "codec_type": "video",
+            "codec_name": "mjpeg",
+            "disposition": {"attached_pic": 1},
+        }))
+        .unwrap();
+        let plain = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "h264",
+        }))
+        .unwrap();
+
+        // Act / Assert
+        assert_that!(video_roles(&stream, false)).is_equal_to(vec!["Cover art".to_string()]);
+        assert_that!(video_roles(&plain, true)).is_equal_to(vec!["Default".to_string()]);
+    }
+
     /// An app with a probed file: one video, one audio, two embedded subtitles and two
     /// sidecars. Enough for every section of the overview to be non-empty.
     fn probed_app(tag: &str) -> (App, std::path::PathBuf) {
@@ -6481,6 +6763,12 @@ mod tests {
             .contains("deaf or hard-of-hearing")
             .contains("canonical .sdh");
 
+        // Forced is the other flag a sidecar carries in its filename rather than in
+        // any container, so its help has to say where the choice actually goes.
+        popup.field = SubtitleSettingsField::Forced;
+        let forced = subtitle_field_help_text(&app, &popup).to_string();
+        assert_that!(forced).contains(".forced file name marker");
+
         popup.source = SubtitleSource::Embedded(1);
         popup.field = SubtitleSettingsField::Original;
         let original = subtitle_field_help_text(&app, &popup).to_string();
@@ -6734,6 +7022,212 @@ mod tests {
 
         // Assert
         assert_that!(result).is_equal_to("1.5 MiB".to_string());
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_size_should_say_so_instead_of_drawing_a_broken_layout() {
+        // Arrange: the split layout needs room for two panes and a status line. Below the
+        // minimum, ratatui's constraints collapse panes to zero width and the frame draws
+        // as unreadable fragments — so the whole UI is replaced by an instruction the user
+        // can act on. Both dimensions are checked independently.
+        for (width, height, case) in [
+            (49, 40, "too narrow"),
+            (140, 9, "too short"),
+            (20, 5, "too small in both"),
+        ] {
+            let (mut app, directory) = probed_app("render-too-small");
+
+            // Act
+            let screen = draw(&mut app, width, height).join(" ");
+
+            // Assert: the instruction is shown and the normal furniture is not.
+            assert!(
+                screen.contains("Terminal too small"),
+                "{case} ({width}×{height}) should report the size; screen was:\n{screen}",
+            );
+            assert!(
+                !screen.contains("Files ("),
+                "{case} must not also draw the file pane; screen was:\n{screen}",
+            );
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn shrinking_below_the_minimum_should_drop_the_side_by_side_subtitle_columns() {
+        // Arrange: the side-by-side subtitle layout is the widest thing the UI draws. If
+        // it stayed enabled through a resize below the minimum, the first frame drawn
+        // after growing back would still be laid out for a width that had gone away.
+        let (mut app, directory) = probed_app("render-too-small-columns");
+        app.set_subtitle_columns_side_by_side(true);
+        assert!(app.subtitle_columns_side_by_side);
+
+        // Act
+        let _ = draw(&mut app, 40, 8);
+
+        // Assert
+        assert!(
+            !app.subtitle_columns_side_by_side,
+            "a too-small frame must turn the wide layout off",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_at_exactly_the_minimum_size_should_draw_the_real_layout() {
+        // Arrange: the boundary itself must be usable — an off-by-one in the guard would
+        // refuse to draw at the very size the message tells the user to resize to.
+        let (mut app, directory) = probed_app("render-minimum");
+
+        // Act
+        let screen = draw(&mut app, 50, 10).join(" ");
+
+        // Assert
+        assert!(
+            !screen.contains("Terminal too small"),
+            "50×10 is the documented minimum and must draw; screen was:\n{screen}",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wrapping_should_break_between_words_without_exceeding_the_width() {
+        // Arrange / Act: the conflict dialog wraps filenames and reasons into a fixed
+        // column. Measuring in display columns rather than bytes is what keeps an accented
+        // or CJK filename from overrunning the popup border.
+        let lines = wrap_value("one two three four", 9);
+
+        // Assert: broken at spaces, and no line wider than the column.
+        assert_that!(lines.clone()).contains_exactly_in_given_order([
+            "one two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ]);
+        assert!(
+            lines.iter().all(|line| line.width() <= 9),
+            "no wrapped line may exceed the width: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn wrapping_should_split_a_single_word_too_long_to_fit() {
+        // Arrange: a long filename with no spaces — the common case in this dialog, since
+        // media filenames rarely contain any. Leaving it whole would push it straight
+        // through the popup's right border.
+        let lines = wrap_value("averylongfilenamewithnospaces.mkv", 10);
+
+        // Assert: split into full-width pieces that reassemble to the original.
+        assert!(
+            lines.iter().all(|line| line.width() <= 10),
+            "an over-long word must be split to fit: {lines:?}",
+        );
+        assert_that!(lines.concat()).is_equal_to("averylongfilenamewithnospaces.mkv".to_string());
+    }
+
+    #[test]
+    fn wrapping_should_measure_wide_characters_by_the_columns_they_occupy() {
+        // Arrange: CJK characters take two terminal columns each, so a width of 6 fits
+        // three of them, not six. Counting chars instead of columns would double the
+        // rendered width and corrupt the popup's layout.
+        let lines = wrap_value("日本語字幕", 6);
+
+        // Assert
+        assert!(
+            lines.iter().all(|line| line.width() <= 6),
+            "wide characters must be measured in columns: {lines:?}",
+        );
+        assert_that!(lines.concat()).is_equal_to("日本語字幕".to_string());
+    }
+
+    #[test]
+    fn wrapping_should_always_produce_at_least_one_line() {
+        // Arrange / Act / Assert: an empty or whitespace-only value must still yield one
+        // (empty) line — callers index the result to build rows, and an empty vector would
+        // silently drop the label those rows were being built for.
+        assert_that!(wrap_value("", 10)).is_equal_to(vec![String::new()]);
+        assert_that!(wrap_value("   ", 10)).is_equal_to(vec![String::new()]);
+        // A value that fits comes back as one line, unpadded.
+        assert_that!(wrap_value("short", 10)).is_equal_to(vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn format_bytes_should_stay_in_plain_bytes_and_stop_climbing_at_gibibytes() {
+        // Arrange / Act / Assert: the smallest unit prints whole bytes (a "512.0 B" reads
+        // as a rounding artefact), and the ladder stops at GiB rather than running off the
+        // end of the unit table on a large file.
+        assert_that!(format_bytes(0.0)).is_equal_to("0 B".to_string());
+        assert_that!(format_bytes(512.0)).is_equal_to("512 B".to_string());
+        // Exactly one KiB is the first step up.
+        assert_that!(format_bytes(1024.0)).is_equal_to("1.0 KiB".to_string());
+        // A 4 TiB file still reports in GiB, the largest unit available.
+        assert_that!(format_bytes(4.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0))
+            .is_equal_to("4096.0 GiB".to_string());
+    }
+
+    #[test]
+    fn format_bitrate_should_fall_back_to_kilobits_below_a_megabit() {
+        // Arrange / Act / Assert: audio tracks sit well under a megabit, and printing
+        // "0.1 Mb/s" for a 128 kb/s track loses the precision that makes the number useful.
+        assert_that!(format_bitrate(128_000.0)).is_equal_to("128 kb/s".to_string());
+        assert_that!(format_bitrate(999_999.0)).is_equal_to("1000 kb/s".to_string());
+    }
+
+    #[test]
+    fn format_sample_rate_should_drop_the_decimal_only_for_whole_kilohertz() {
+        // Arrange / Act / Assert: 48 kHz is the common case and must not read "48.0 kHz",
+        // while 44.1 kHz must keep the tenth that distinguishes it from 44 kHz.
+        assert_that!(format_sample_rate(48_000.0)).is_equal_to("48 kHz".to_string());
+        assert_that!(format_sample_rate(44_100.0)).is_equal_to("44.1 kHz".to_string());
+        // Below a kilohertz it stays in hertz rather than printing "0.8 kHz".
+        assert_that!(format_sample_rate(800.0)).is_equal_to("800 Hz".to_string());
+    }
+
+    #[test]
+    fn format_frame_rate_should_reject_rates_it_cannot_divide() {
+        // Arrange / Act / Assert: ffprobe reports `0/0` for streams with no meaningful
+        // frame rate (audio, some attached pictures). Dividing anyway yields NaN, which
+        // would render as "NaN" in the stream details next to real numbers.
+        assert_that!(format_frame_rate("0/0")).is_none();
+        assert_that!(format_frame_rate("25/0")).is_none();
+        // Malformed input is refused rather than guessed at.
+        assert_that!(format_frame_rate("25")).is_none();
+        assert_that!(format_frame_rate("abc/def")).is_none();
+        // A whole rate prints without a decimal tail.
+        assert_that!(format_frame_rate("25/1").as_deref()).contains("25");
+    }
+
+    #[test]
+    fn truncating_should_keep_the_informative_end_of_the_value() {
+        // Arrange / Act / Assert: `truncate` keeps the tail (filenames differ at the end),
+        // `truncate_end` keeps the head. Both must stay within the width they are given —
+        // overrunning by one cell corrupts the row's layout.
+        assert_that!(truncate("movie.mkv", 20)).is_equal_to("movie.mkv".to_string());
+        assert_that!(truncate("a-very-long-filename.mkv", 10))
+            .is_equal_to("…ename.mkv".to_string());
+        assert_that!(truncate_end("a-very-long-filename.mkv", 10))
+            .is_equal_to("a-very-lo…".to_string());
+        // Both fill exactly the width they were given, never one cell more.
+        assert_eq!(truncate("a-very-long-filename.mkv", 10).chars().count(), 10);
+        assert_eq!(
+            truncate_end("a-very-long-filename.mkv", 10).chars().count(),
+            10,
+        );
+    }
+
+    #[test]
+    fn truncating_into_no_usable_width_should_produce_no_overflow() {
+        // Arrange / Act / Assert: a pane dragged down to nothing hands these a width of
+        // one or zero. Returning the ellipsis plus a tail there would overrun the cell and
+        // smear the row across the one beside it.
+        assert_that!(truncate("movie.mkv", 1)).is_equal_to("…".to_string());
+        assert_that!(truncate_end("movie.mkv", 1)).is_equal_to("…".to_string());
+        assert_that!(truncate("movie.mkv", 0)).is_equal_to(String::new());
+        assert_that!(truncate_end("movie.mkv", 0)).is_equal_to(String::new());
+        // A value that already fits in one cell is returned untouched.
+        assert_that!(truncate("x", 1)).is_equal_to("x".to_string());
     }
 
     #[test]
@@ -7820,6 +8314,126 @@ mod tests {
         assert_that!(language_name("fre").as_deref()).contains("French");
         assert_that!(language_name("en-US").as_deref()).contains("English");
         assert_that!(language_name("qaa").as_deref()).contains("Unknown language (QAA)");
+    }
+
+    #[test]
+    fn language_name_should_give_up_rather_than_invent_a_name() {
+        // Arrange / Act / Assert: `und` and an empty tag mean "no language set", and must
+        // stay absent from the details rather than appear as a language the file does not
+        // claim. A long non-code tag is passed through verbatim — it is more likely to be
+        // a human-readable name the muxer wrote than something to translate.
+        assert_that!(language_name("und")).is_none();
+        assert_that!(language_name("")).is_none();
+        assert_that!(language_name("   ")).is_none();
+        assert_that!(language_name("und-US")).is_none();
+        // Longer than a code and not translatable: shown as written.
+        assert_that!(language_name("Brazilian Portuguese").as_deref())
+            .contains("Brazilian Portuguese");
+    }
+
+    #[test]
+    fn video_resolution_should_name_the_tier_only_for_a_standard_height() {
+        // Arrange: the tier label is how a user recognises "4K" at a glance, but a
+        // cropped or anamorphic film has a height matching no tier and must simply omit
+        // it rather than be mislabelled as the nearest one.
+        let stream = |width: u64, height: u64| {
+            BTreeMap::from([
+                ("width".to_string(), Value::from(width)),
+                ("height".to_string(), Value::from(height)),
+            ])
+        };
+
+        // Act / Assert: each standard height gets its label.
+        for (height, tier) in [
+            (4320, "8K"),
+            (2160, "4K"),
+            (1440, "1440p"),
+            (1080, "1080p"),
+            (720, "720p"),
+            (576, "576p"),
+            (480, "480p"),
+        ] {
+            let described = video_resolution_description(&stream(1920, height)).unwrap();
+            assert!(
+                described.ends_with(tier),
+                "height {height} must be labelled {tier}, got {described:?}",
+            );
+        }
+
+        // Act / Assert: a letterboxed height carries the dimensions and no tier.
+        let cropped = video_resolution_description(&stream(1920, 800)).unwrap();
+        assert_that!(cropped.as_str()).is_equal_to("1920×800");
+
+        // Act / Assert: a stream with no dimensions has nothing to describe.
+        assert_that!(video_resolution_description(&BTreeMap::new())).is_none();
+    }
+
+    #[test]
+    fn video_resolution_should_drop_a_placeholder_aspect_ratio() {
+        // Arrange: ffprobe writes `0:1` or `N/A` when it has no aspect ratio. Printing
+        // those verbatim puts "0:1" in the details next to real values.
+        let with_placeholder = BTreeMap::from([
+            ("width".to_string(), Value::from(1920)),
+            ("height".to_string(), Value::from(1080)),
+            ("display_aspect_ratio".to_string(), Value::from("0:1")),
+        ]);
+        let with_real = BTreeMap::from([
+            ("width".to_string(), Value::from(1920)),
+            ("height".to_string(), Value::from(1080)),
+            ("display_aspect_ratio".to_string(), Value::from("16:9")),
+        ]);
+
+        // Act / Assert
+        assert_that!(
+            video_resolution_description(&with_placeholder)
+                .unwrap()
+                .as_str()
+        )
+        .is_equal_to("1920×1080 · 1080p");
+        assert_that!(video_resolution_description(&with_real).unwrap().as_str())
+            .is_equal_to("1920×1080 · 16:9 · 1080p");
+    }
+
+    #[test]
+    fn audio_codec_descriptions_should_cover_the_pcm_family_and_fall_back_in_caps() {
+        // Arrange / Act / Assert: PCM arrives under many codec names (`pcm_s16le`,
+        // `pcm_s24be`, …) that all mean the same thing to the user, so they collapse to
+        // one label rather than leaking the sample format. Anything unrecognised is shown
+        // upper-cased rather than dropped, so a new codec still names itself.
+        let stream = |codec: &str| BTreeMap::from([("codec_name".to_string(), Value::from(codec))]);
+        for codec in ["pcm_s16le", "pcm_s24be", "pcm_f32le"] {
+            assert_that!(audio_format_description(&stream(codec)))
+                .is_equal_to("PCM · Uncompressed".to_string());
+        }
+        // An unrecognised codec is upper-cased rather than dropped.
+        assert_that!(audio_format_description(&stream("nellymoser")))
+            .is_equal_to("NELLYMOSER".to_string());
+        assert_that!(audio_format_description(&stream("flac")))
+            .is_equal_to("FLAC · Lossless".to_string());
+        // A stream with no codec at all still describes itself.
+        assert_that!(audio_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
+    }
+
+    #[test]
+    fn audio_channel_description_should_fall_back_to_the_channel_count() {
+        // Arrange: some containers report a channel count but no layout, and some report
+        // a layout string this code does not recognise. Either way the user must still be
+        // told mono from stereo rather than shown nothing.
+        let count_only = BTreeMap::from([("channels".to_string(), Value::from(2))]);
+        let unknown_layout = BTreeMap::from([
+            ("channel_layout".to_string(), Value::from("hexadecagonal")),
+            ("channels".to_string(), Value::from(1)),
+        ]);
+        let numeric_layout =
+            BTreeMap::from([("channel_layout".to_string(), Value::from("5.1(side)"))]);
+
+        // Act / Assert
+        assert_that!(audio_channel_description(&count_only).as_deref()).contains("Stereo");
+        assert_that!(audio_channel_description(&unknown_layout).as_deref()).contains("Mono");
+        assert_that!(audio_channel_description(&numeric_layout).as_deref())
+            .contains("5.1 surround");
+        // Nothing to go on at all stays absent rather than guessing.
+        assert_that!(audio_channel_description(&BTreeMap::new())).is_none();
     }
 
     #[test]

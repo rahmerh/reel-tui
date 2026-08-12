@@ -7028,6 +7028,614 @@ mod tests {
         app.layer = Layer::Streams;
     }
 
+    /// Every entry point here is reachable from a key `main` still delivers to `App`
+    /// while a dialog is up, so each has to refuse for itself. A missing guard means a
+    /// keystroke rewrites the edit behind a dialog the user is reading, with nothing on
+    /// screen to show it happened.
+    #[test]
+    fn an_open_dialog_should_make_the_track_editing_entry_points_inert() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let path = app.selected_file().unwrap().path.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.dan.srt", "dan")];
+        let order = app.stream_order.clone();
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act
+        app.toggle_delete_selected_stream();
+        app.open_container_settings();
+        app.open_video_settings();
+        app.open_stream_details();
+        app.move_selected_stream(1);
+        app.move_selected_stream(-1);
+        let transferred = app.transfer_subtitle(1);
+        let moved_column = app.move_subtitle_column(1);
+        app.request_process_all();
+        app.request_reset_file(path);
+        app.request_reset_current_file();
+        app.request_reset_all_files();
+
+        // Assert: the dialog is still the only thing on screen and nothing behind it
+        // moved.
+        assert_that!(app.dialog).contains(Dialog::Keybindings);
+        assert_that!(app.stream_order.clone()).is_equal_to(order);
+        assert_that!(app.deleted_streams.clone()).is_equal_to(BTreeSet::new());
+        assert_that!(app.container_settings_popup.is_none()).is_true();
+        assert_that!(app.video_settings_popup.is_none()).is_true();
+        assert_that!(app.subtitle_settings_popup.is_none()).is_true();
+        assert_that!(app.pending_reset().is_none()).is_true();
+        assert_that!(transferred).is_false();
+        assert_that!(moved_column).is_false();
+        assert_that!(app.notice.clone()).is_none();
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// The conflict and cancel prompts are driven by keys that stay live for other
+    /// dialogs too, so each checks that *its own* dialog is the one on screen.
+    #[test]
+    fn a_dialog_specific_action_should_do_nothing_while_a_different_dialog_is_up() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        app.set_conflict_max_scroll(5);
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act
+        app.scroll_conflicts(1);
+        app.acknowledge_conflicts();
+        app.request_cancel_edit();
+        app.choose_cancel_edit(1);
+        // Zero is "no direction" and must not move the choice even on the right dialog.
+        app.dialog = Some(Dialog::ConfirmCancel);
+        app.cancel_edit_choice = CancelEditChoice::KeepProcessing;
+        app.choose_cancel_edit(0);
+
+        // Assert
+        assert_that!(app.conflict_scroll).is_equal_to(0);
+        assert_that!(app.cancel_edit_choice).is_equal_to(CancelEditChoice::KeepProcessing);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// Container metadata is staged only when it actually differs from the file's own
+    /// tags. Typing a value back to what it already was — or clearing it to nothing —
+    /// has to leave the file unstaged, or the save dialog offers work with no effect.
+    #[test]
+    fn container_metadata_should_stage_only_a_value_that_differs_from_the_file() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"tags": {"title": "Original title"}},
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.reset_track_edits();
+        app.layer = Layer::Streams;
+        focus_track(&mut app, TrackRef::Container);
+        app.open_container_settings();
+        app.move_container_settings_cursor(1);
+
+        // Act / Assert: a new title stages.
+        app.start_container_text_input();
+        app.clear_text_to_start();
+        app.paste_text(" Different title ");
+        app.save_container_text_input();
+        assert_that!(
+            app.container_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone())
+        )
+        .contains("Different title".to_string());
+
+        // Act / Assert: typing the file's own title back unstages it entirely.
+        app.start_container_text_input();
+        app.clear_text_to_start();
+        app.paste_text("Original title");
+        app.save_container_text_input();
+        assert_that!(app.container_metadata.is_none()).is_true();
+
+        // Act / Assert: clearing the field stages an explicit removal.
+        app.start_container_text_input();
+        app.clear_text_to_start();
+        app.save_container_text_input();
+        assert_that!(app.container_metadata.is_some()).is_true();
+        assert_that!(
+            app.container_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone())
+        )
+        .is_none();
+
+        // Act / Assert: saving again outside edit mode changes nothing.
+        let staged = app.container_metadata.clone();
+        app.save_container_text_input();
+        assert_that!(app.container_metadata.clone()).is_equal_to(staged);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// `G` means "the end of what I'm looking at". With the columns side by side that
+    /// is the end of the focused column, not the last row on screen.
+    #[test]
+    fn going_to_the_end_should_stop_at_the_end_of_the_focused_subtitle_column() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "dan"}},
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.nld.srt", "nld")];
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+        app.set_subtitle_columns_side_by_side(true);
+
+        // Act / Assert: from an embedded subtitle, the last embedded one.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.select_last();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(2));
+
+        // Act / Assert: from the sidecar column, its own last row.
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.select_last();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+
+        // Act / Assert: from a non-subtitle row the columns do not apply, so it is the
+        // last row of the whole list.
+        focus_track(&mut app, TrackRef::Container);
+        app.select_first();
+        assert_that!(app.selected_stream).is_equal_to(0);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// Every list navigation key is live on an empty directory too — a filter that
+    /// matches nothing is the ordinary way to get there — so each has to survive a list
+    /// with no rows rather than indexing into it.
+    #[test]
+    fn navigating_an_empty_file_list_should_do_nothing_rather_than_panic() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        app.files.clear();
+        app.list_state.select(None);
+        app.layer = Layer::Files;
+
+        // Act
+        app.select_next();
+        app.select_previous();
+        app.select_first();
+        app.select_last();
+
+        // Assert
+        assert_that!(app.selected_file().is_none()).is_true();
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// h/l jump the cursor between the two subtitle columns, and which column a track
+    /// is in follows its staged import/export — not where it came from. Pushing toward
+    /// the column a track is already in has nowhere to go and must refuse.
+    #[test]
+    fn jumping_between_subtitle_columns_should_follow_where_each_track_currently_sits() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.sidecars = vec![
+            test_sidecar(&app, "movie.nld.srt", "nld"),
+            test_sidecar(&app, "movie.fra.srt", "fra"),
+        ];
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+        app.set_subtitle_columns_side_by_side(true);
+
+        // Arrange: stage an import so one sidecar sits in the left column.
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        assert_that!(app.transfer_subtitle(-1)).is_true();
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+
+        // Act / Assert: the imported sidecar is a left-column track now, so only a
+        // rightward jump has anywhere to land.
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        assert_that!(app.move_subtitle_column(-1)).is_false();
+        assert_that!(app.move_subtitle_column(1)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(1));
+
+        // Act / Assert: and the right-column sidecar only jumps left.
+        assert_that!(app.move_subtitle_column(1)).is_false();
+        assert_that!(app.move_subtitle_column(-1)).is_true();
+
+        // Arrange: export the embedded track, putting it in the right column.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.transfer_subtitle(1)).is_true();
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+
+        // Act / Assert
+        focus_track(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.move_subtitle_column(1)).is_false();
+        assert_that!(app.move_subtitle_column(-1)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// Ctrl-j/Ctrl-k reorder a track *within its own kind* — video with video, audio
+    /// with audio. A move that would cross a boundary, run off the end, or shuffle a
+    /// track already marked for deletion has to leave the order exactly as it was.
+    #[test]
+    fn reordering_a_track_should_stop_at_its_own_group_and_at_the_ends_of_the_list() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "audio", "codec_name": "ac3"},
+            ]),
+        );
+        let original = app.stream_order.clone();
+
+        // Act / Assert: the lone video cannot move down into the audio group.
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.move_selected_stream(1);
+        assert_that!(app.stream_order.clone()).is_equal_to(original.clone());
+        assert_that!(app.moved_streams.clone()).is_equal_to(BTreeSet::new());
+
+        // Act / Assert: nor can the last audio track move past the end of the list.
+        focus_track(&mut app, TrackRef::Embedded(2));
+        app.move_selected_stream(1);
+        assert_that!(app.stream_order.clone()).is_equal_to(original.clone());
+
+        // Act / Assert: nor can the first track move above position zero.
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.move_selected_stream(-1);
+        assert_that!(app.stream_order.clone()).is_equal_to(original.clone());
+
+        // Act / Assert: a track on its way out is not reordered either.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.toggle_delete_selected_stream();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.move_selected_stream(1);
+        assert_that!(app.stream_order.clone()).is_equal_to(original.clone());
+        assert_that!(app.notice.clone())
+            .contains("Unmark this track for deletion before moving it.".to_string());
+
+        // Act / Assert: within the audio group it does move, and says so.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.toggle_delete_selected_stream();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.move_selected_stream(1);
+        assert_that!(app.stream_order.clone()).is_equal_to(vec![0, 2, 1]);
+        // Only the track the user actually moved is marked, not the one it swapped with.
+        assert_that!(app.moved_streams.clone()).is_equal_to(BTreeSet::from([1_u64]));
+        assert_that!(app.notice.clone()).is_none();
+
+        // Act / Assert: moving it back clears the "moved" marks entirely.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.move_selected_stream(-1);
+        assert_that!(app.stream_order.clone()).is_equal_to(original);
+        assert_that!(app.moved_streams.clone()).is_equal_to(BTreeSet::new());
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// With the columns side by side, j/k walk one column at a time; running off either
+    /// end has to land back on the single-column rows above and below, not stick.
+    #[test]
+    fn walking_off_a_subtitle_column_should_leave_it_for_the_rows_around_it() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "dan"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.sidecars = vec![test_sidecar(&app, "movie.nld.srt", "nld")];
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+        app.set_subtitle_columns_side_by_side(true);
+
+        // Act / Assert: down within the embedded column.
+        focus_track(&mut app, TrackRef::Embedded(2));
+        assert_that!(app.move_within_subtitle_column(1, 1, false)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(3));
+
+        // Act / Assert: up off the top of the column lands on the row above it.
+        focus_track(&mut app, TrackRef::Embedded(2));
+        assert_that!(app.move_within_subtitle_column(-1, 1, false)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(1));
+
+        // Act / Assert: clamped, the same move stays put inside the column.
+        focus_track(&mut app, TrackRef::Embedded(2));
+        assert_that!(app.move_within_subtitle_column(-1, 1, true)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(2));
+
+        // Act / Assert: an exported track joins the external column, so its neighbour
+        // is now the sidecar rather than the other embedded subtitle.
+        focus_track(&mut app, TrackRef::Embedded(2));
+        app.transfer_subtitle(1);
+        let rows = app.track_rows();
+        let exported_row = rows
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(2))
+            .unwrap();
+        let sidecar_row = rows
+            .iter()
+            .position(|row| *row == TrackRef::Sidecar(0))
+            .unwrap();
+        let toward_sidecar = if sidecar_row > exported_row { 1 } else { -1 };
+        focus_track(&mut app, TrackRef::Embedded(2));
+        assert_that!(app.move_within_subtitle_column(toward_sidecar, 1, true)).is_true();
+        assert_that!(app.selected_track()).contains(TrackRef::Sidecar(0));
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// Nothing follows the subtitles, so walking down off the last one has nowhere to
+    /// go and must leave the selection where it is instead of running past the list.
+    #[test]
+    fn walking_down_off_the_last_subtitle_should_stay_when_nothing_follows_it() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.set_subtitle_columns_side_by_side(true);
+        focus_track(&mut app, TrackRef::Embedded(1));
+        let before = app.selected_stream;
+
+        // Act
+        let moved = app.move_within_subtitle_column(1, 1, false);
+
+        // Assert
+        assert_that!(moved).is_true();
+        assert_that!(app.selected_stream).is_equal_to(before);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    fn full_subtitle_capabilities() -> ToolCapabilities {
+        ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from([
+                "subrip".to_string(),
+                "ass".to_string(),
+                "webvtt".to_string(),
+                "ttml".to_string(),
+                "mov_text".to_string(),
+            ]),
+            ffmpeg_muxers: BTreeSet::from(["matroska".to_string()]),
+            seconv: true,
+            tesseract_languages: vec!["eng".to_string()],
+        }
+    }
+
+    /// Ctrl-h/Ctrl-l repeat while held, so the second press has to be a no-op rather
+    /// than a second edit — and it still reports success, or the caller treats a
+    /// track that is already where it was asked to go as a failed move.
+    #[test]
+    fn pushing_a_subtitle_to_the_side_it_is_already_on_should_change_nothing() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.sidecars = vec![test_sidecar(&app, "movie.dan.srt", "dan")];
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+
+        // Act / Assert: exporting an embedded track, twice.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        assert_that!(app.transfer_subtitle(1)).is_true();
+        let exported = app.subtitle_changes.clone();
+        assert_that!(app.transfer_subtitle(1)).is_true();
+        assert_that!(app.subtitle_changes.clone()).is_equal_to(exported);
+
+        // Act / Assert: pulling it back, twice.
+        assert_that!(app.transfer_subtitle(-1)).is_true();
+        let kept = app.subtitle_changes.clone();
+        assert_that!(app.transfer_subtitle(-1)).is_true();
+        assert_that!(app.subtitle_changes.clone()).is_equal_to(kept);
+
+        // Act / Assert: importing a sidecar, twice.
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        assert_that!(app.transfer_subtitle(-1)).is_true();
+        let imported = app.subtitle_changes.clone();
+        assert_that!(app.transfer_subtitle(-1)).is_true();
+        assert_that!(app.subtitle_changes.clone()).is_equal_to(imported);
+
+        // Act / Assert: sending it back out, twice.
+        assert_that!(app.transfer_subtitle(1)).is_true();
+        let external = app.subtitle_changes.clone();
+        assert_that!(app.transfer_subtitle(1)).is_true();
+        assert_that!(app.subtitle_changes.clone()).is_equal_to(external);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// The container-only half of a sidecar's metadata (title, Original, Commentary)
+    /// exists because the track is going *into* the file. Sending it back out has to
+    /// drop it, or the sidecar keeps flags no `.srt` on disk can carry.
+    #[test]
+    fn sending_an_imported_sidecar_back_out_should_drop_what_only_a_container_can_hold() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.sidecars = vec![test_sidecar(&app, "movie.dan.srt", "dan")];
+        app.left_subtitle_order = app.active_left_subtitle_tracks();
+        let source = SubtitleSource::Sidecar(app.sidecars[0].path.clone());
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.transfer_subtitle(-1);
+        app.default_sidecars.insert(0);
+        let change = app.subtitle_changes.get_mut(&source).unwrap();
+        change.metadata = Some(SubtitleMetadata {
+            language: "dan".to_string(),
+            title: Some("Commentary track".to_string()),
+            forced: true,
+            cc: false,
+            hearing_impaired: true,
+            original: true,
+            commentary: true,
+        });
+
+        // Act
+        assert_that!(app.transfer_subtitle(1)).is_true();
+
+        // Assert: the sidecar-capable flags survive; the container-only ones do not.
+        let metadata = app.subtitle_changes[&source].metadata.clone().unwrap();
+        assert_that!(metadata.title).is_none();
+        assert_that!(metadata.original).is_false();
+        assert_that!(metadata.commentary).is_false();
+        assert_that!(metadata.forced).is_true();
+        assert_that!(metadata.hearing_impaired).is_true();
+        assert_that!(app.default_sidecars.contains(&0)).is_false();
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    fn focus_track(app: &mut App, track: TrackRef) {
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == track)
+            .unwrap_or_else(|| panic!("{track:?} has no row"));
+    }
+
+    /// Encoding settings only make sense for a track ffmpeg will actually re-encode,
+    /// and the dialog has no way to say "never mind" — so the refusals happen before it
+    /// opens, each with the notice that says what to do instead.
+    #[test]
+    fn video_settings_should_refuse_every_track_that_cannot_be_re_encoded() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}},
+            ]),
+        );
+
+        // Act / Assert: audio.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_video_settings();
+        assert_that!(app.video_settings_popup.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Encoding settings are only available for video tracks.".to_string());
+
+        // Act / Assert: cover art is a video stream but not a playable one.
+        app.notice = None;
+        focus_track(&mut app, TrackRef::Embedded(2));
+        app.open_video_settings();
+        assert_that!(app.video_settings_popup.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Encoding settings are only available for video tracks.".to_string());
+
+        // Act / Assert: a video track already marked for deletion.
+        app.notice = None;
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.toggle_delete_selected_stream();
+        app.notice = None;
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+        assert_that!(app.video_settings_popup.is_none()).is_true();
+        assert_that!(app.notice.clone()).contains(
+            "Unmark this track for deletion before changing its video settings.".to_string(),
+        );
+
+        // Act / Assert: unmarked, it opens.
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.toggle_delete_selected_stream();
+        app.notice = None;
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+        assert_that!(app.video_settings_popup.is_some()).is_true();
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    #[test]
+    fn subtitle_settings_should_refuse_a_track_that_is_on_its_way_out() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "dvb_teletext",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+
+        // Act / Assert: marked for deletion.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.toggle_delete_selected_stream();
+        app.notice = None;
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+        assert_that!(app.subtitle_settings_popup.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Unmark this subtitle track for deletion before converting it.".to_string());
+
+        // Act / Assert: a codec reel has no conversion route for.
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.toggle_delete_selected_stream();
+        app.notice = None;
+        focus_track(&mut app, TrackRef::Embedded(2));
+        app.open_subtitle_settings(SubtitleSource::Embedded(2));
+        assert_that!(app.subtitle_settings_popup.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("This subtitle format is not supported for conversion yet.".to_string());
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
     fn test_sidecar(app: &App, name: &str, language: &str) -> SidecarEntry {
         SidecarEntry {
             path: app.directory.join(name),
@@ -7506,6 +8114,286 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The batch cursor is driven by keys that stay live while other dialogs are up, so
+    /// it has to refuse to move whenever the batch list is not what is on screen.
+    #[test]
+    fn the_batch_cursor_should_not_move_while_the_batch_list_is_not_on_screen() {
+        // Arrange
+        let mut app = batch_app(4);
+        app.batch_cursor = 2;
+
+        // Act / Assert: the cursor moves while the batch dialog owns the screen.
+        app.move_batch_cursor_down(1);
+        assert_that!(app.batch_cursor).is_equal_to(3);
+        app.move_batch_cursor_up(1);
+        assert_that!(app.batch_cursor).is_equal_to(2);
+
+        // Act / Assert: it does not once the confirm prompt takes over.
+        app.dialog = Some(Dialog::ConfirmCancel);
+        app.move_batch_cursor_down(1);
+        app.move_batch_cursor_up(1);
+        assert_that!(app.batch_cursor).is_equal_to(2);
+
+        // Act / Assert: nor with the batch dialog up but no batch behind it.
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = None;
+        app.move_batch_cursor_down(1);
+        app.move_batch_cursor_up(1);
+        assert_that!(app.batch_cursor).is_equal_to(2);
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// The confirm dialog is the last thing between the user and a batch that rewrites
+    /// their files, so container metadata has to be listed field by field — and a
+    /// "change" that matches what the file already says must not be listed at all.
+    #[test]
+    fn the_save_summary_should_name_which_container_metadata_fields_actually_changed() {
+        // Arrange
+        let info = MediaInfo::from_json(serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": {"title": "Old title", "genre": "Documentary"},
+            },
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+        }))
+        .unwrap();
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let base = || {
+            let mut staged = staged_edit(fingerprint, vec![0]);
+            staged.original_stream_order = vec![0];
+            staged
+        };
+        let path = Path::new("/videos/movie.mkv");
+
+        // Act: two fields differ from the file, one is retyped to the same value.
+        let mut changed = base();
+        changed.container_metadata = Some(ContainerMetadata {
+            title: Some("New title".to_string()),
+            comment: None,
+            date: None,
+            genre: Some("Documentary".to_string()),
+            artist: Some("Someone".to_string()),
+        });
+        let changed_lines = staged_edit_summary(path, &info, &changed);
+
+        // Act: metadata staged, but identical to what the file already has.
+        let mut identical = base();
+        identical.container_metadata = Some(ContainerMetadata {
+            title: Some("Old title".to_string()),
+            comment: None,
+            date: None,
+            genre: Some("Documentary".to_string()),
+            artist: None,
+        });
+        let identical_lines = staged_edit_summary(path, &info, &identical);
+
+        // Act: a container conversion is named with both ends of the change.
+        let mut converted = base();
+        converted.container_target = Some(ContainerFormat::Mp4);
+        let converted_lines = staged_edit_summary(path, &info, &converted);
+
+        // Assert
+        assert!(
+            changed_lines
+                .iter()
+                .any(|line| line == "Updating container metadata: title, artist"),
+            "only the fields that differ may be listed: {changed_lines:?}",
+        );
+        assert!(
+            !identical_lines
+                .iter()
+                .any(|line| line.contains("container metadata")),
+            "metadata equal to the file's own is not a change: {identical_lines:?}",
+        );
+        assert_that!(converted_lines.first().map(String::as_str))
+            .contains("Changing container from MKV to MP4");
+    }
+
+    /// A dropdown cursor can outlive the list it points into — a language filter that
+    /// now matches fewer entries, a codec list that shrank when the container changed.
+    /// Confirming on a cursor with nothing under it has to do nothing and leave the
+    /// dropdown open, not stage a change or index past the end.
+    #[test]
+    fn confirming_a_dropdown_with_nothing_under_the_cursor_should_do_nothing() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.container_target = Some(ContainerFormat::Matroska);
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+
+        // Act / Assert: the codec dropdown, with the cursor past its last entry.
+        app.activate_subtitle_settings();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(SubtitleSettingsMode::CodecDropdown);
+        app.subtitle_settings_popup.as_mut().unwrap().codec_cursor = 99;
+        app.activate_subtitle_settings();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(SubtitleSettingsMode::CodecDropdown);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Act / Assert: the language dropdown, same story.
+        app.escape_subtitle_settings();
+        app.move_subtitle_settings_cursor(1);
+        app.activate_subtitle_settings();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(SubtitleSettingsMode::LanguageDropdown);
+        app.subtitle_settings_popup
+            .as_mut()
+            .unwrap()
+            .language_cursor = 999;
+        app.activate_subtitle_settings();
+        assert_that!(app.subtitle_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(SubtitleSettingsMode::LanguageDropdown);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        std::fs::remove_dir_all(&app.directory).unwrap();
+    }
+
+    /// The confirm dialog lists one summary per staged file, and it is drawn from data
+    /// that can legitimately be missing — a file staged before its probe landed. Every
+    /// such case has to produce a line the user can read rather than an empty row.
+    #[test]
+    fn the_staged_summary_should_stay_readable_when_the_probe_is_missing() {
+        // Arrange
+        // The staged file must not be the open one, whose status is validated against
+        // the live edit fields instead.
+        let mut app = test_file_app(&["a.mkv", "b.mkv"]);
+        app.select_file_position(Some(0));
+        let file = app.files[1].clone();
+        let mut edit = staged_edit(file.fingerprint, vec![0]);
+        edit.stale = false;
+        edit.container_target = Some(ContainerFormat::Mp4);
+        app.staged_edits.insert(file.path.clone(), edit);
+
+        // Act
+        let unprobed = app.staged_file_summary(&file.path);
+        let unstaged = app.staged_file_summary(&app.directory.join("nothing.mkv"));
+        let status = app.staged_file_status(&file.path);
+        app.cache.insert(
+            CacheKey::for_file(&file),
+            ProbeOutcome::Video(media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]))),
+        );
+        let probed = app.staged_file_summary(&file.path);
+
+        // Assert
+        assert_that!(unprobed).is_equal_to(vec!["(changes staged)".to_string()]);
+        assert_that!(unstaged).is_empty();
+        assert!(
+            matches!(status, StagedFileStatus::Invalid(ref message) if message.contains("hasn't been probed yet")),
+            "an unprobed staged file must not be processable: {status:?}",
+        );
+        assert!(
+            probed.iter().any(|line| line.contains("MP4")),
+            "once probed, the real change is described: {probed:?}",
+        );
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    /// The conflict notice tells the user exactly what it is about to throw away and
+    /// what it will keep. Container-level changes are never in a track group, so they
+    /// always survive; anything tagged with a conflicting group does not.
+    #[test]
+    fn the_conflict_notice_should_split_what_it_reverts_from_what_it_keeps() {
+        // Arrange
+        let mut app = test_file_app(&["a.mkv"]);
+        let file = app.files[0].clone();
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+        ]));
+        let mut edit = staged_edit_with_groups(file.fingerprint, vec![0, 1], &info);
+        edit.conflict_groups = BTreeSet::from(["video"]);
+        edit.container_target = Some(ContainerFormat::Mp4);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::Original,
+            },
+        );
+        app.staged_edits.insert(file.path.clone(), edit);
+
+        // Act: with the file's probe not yet cached, there is nothing to describe.
+        let unprobed = app.conflicting_change_summary(&file.path);
+        app.cache
+            .insert(CacheKey::for_file(&file), ProbeOutcome::Video(info));
+        let reverted = app.conflicting_change_summary(&file.path);
+        let kept = app.kept_change_summary(&file.path);
+        let unstaged = app.conflicting_change_summary(&app.directory.join("nothing.mkv"));
+
+        // Assert
+        assert_that!(unprobed).is_equal_to(vec!["(changes staged)".to_string()]);
+        assert!(
+            reverted.iter().any(|line| line.contains("HEVC")),
+            "the video re-encode is in the conflicting group: {reverted:?}",
+        );
+        assert!(
+            kept.iter().any(|line| line.contains("MP4")),
+            "the container change is not in any track group: {kept:?}",
+        );
+        assert_that!(unstaged).is_empty();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    /// A sidecar appearing or vanishing changes what the subtitle columns contain, so
+    /// any staged subtitle work refers to a list that no longer exists. The rest of the
+    /// edit — the file itself has not changed — has to survive.
+    #[test]
+    fn reconcile_files_should_reload_the_sidecars_when_only_they_changed() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        std::fs::write(directory.join("movie.eng.srt"), b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        assert_that!(app.sidecars.len()).is_equal_to(1);
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.transfer_subtitle(1);
+        app.container_target = Some(ContainerFormat::Mp4);
+        assert_that!(app.subtitle_changes.is_empty()).is_false();
+
+        // Act: a second sidecar shows up beside the same, unchanged, media file.
+        std::fs::write(directory.join("movie.nld.srt"), b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert: the sidecar list is rebuilt and the subtitle work that referred to
+        // the old one is dropped, while the container change stays staged.
+        assert_that!(app.sidecars.len()).is_equal_to(2);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_settings_popup.is_none()).is_true();
+        assert_that!(app.container_target).contains(ContainerFormat::Mp4);
+        assert_that!(app.notice.clone())
+            .contains("Matching subtitle sidecars changed; reloaded them.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn reconcile_files_should_flag_a_staged_files_edits_stale_when_it_changes_on_disk() {
         // Regression test for the confirmed staleness rule: if a staged (non-open)
@@ -7589,6 +8477,254 @@ mod tests {
         edit.original_stream_order = stream_order;
         edit.track_groups = track_groups_for(info);
         edit
+    }
+
+    #[test]
+    fn every_kind_of_staged_change_on_its_own_should_count_as_staging_something() {
+        // Arrange: this predicate decides whether a staged entry survives a partial
+        // revert. Each arm of its `||` chain is a different kind of edit, and an arm that
+        // stopped counting would drop the whole entry — silently discarding the user's
+        // remaining staged work for that file rather than keeping it listed.
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let base = || {
+            let mut edit = staged_edit(fingerprint, vec![0, 1, 2]);
+            edit.original_stream_order = vec![0, 1, 2];
+            edit
+        };
+
+        // Act / Assert: a bare entry with the order untouched stages nothing.
+        assert!(
+            !staged_edit_stages_anything(&base()),
+            "an edit with nothing changed must not count as staged",
+        );
+
+        // Act / Assert: each kind of change alone is enough.
+        let mut container = base();
+        container.container_target = Some(ContainerFormat::Mp4);
+        assert!(staged_edit_stages_anything(&container), "container target");
+
+        let mut metadata = base();
+        metadata.container_metadata = Some(ContainerMetadata::default());
+        assert!(staged_edit_stages_anything(&metadata), "container metadata");
+
+        let mut deleted = base();
+        deleted.deleted_streams = BTreeSet::from([1]);
+        assert!(staged_edit_stages_anything(&deleted), "deleted track");
+
+        let mut sidecars = base();
+        sidecars.default_sidecars = BTreeSet::from([0]);
+        assert!(staged_edit_stages_anything(&sidecars), "default sidecar");
+
+        let mut video = base();
+        video.video_settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                codec: VideoCodec::H264,
+                resolution: VideoResolution::Original,
+            },
+        )]);
+        assert!(staged_edit_stages_anything(&video), "video settings");
+
+        let mut reordered = base();
+        reordered.stream_order = vec![1, 0, 2];
+        assert!(staged_edit_stages_anything(&reordered), "reordered tracks");
+
+        let mut defaults = base();
+        defaults.default_streams = BTreeSet::from([1]);
+        assert!(staged_edit_stages_anything(&defaults), "default track");
+
+        let mut subtitles = base();
+        subtitles.subtitle_changes = BTreeMap::from([(
+            SubtitleSource::Embedded(2),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(2),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::Ass),
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: None,
+            },
+        )]);
+        assert!(staged_edit_stages_anything(&subtitles), "subtitle change");
+    }
+
+    #[test]
+    fn the_summary_should_describe_each_kind_of_subtitle_change_in_its_own_words() {
+        // Arrange: this is the list the user reads before committing a save, and each
+        // subtitle operation reads differently — importing a sidecar, converting a track
+        // in place, and exporting one out are three very different outcomes for their
+        // files. Collapsing them to one phrasing would have the user approve a save that
+        // does something other than what they read.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+        ]));
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let mut staged = staged_edit(fingerprint, vec![0, 1, 2]);
+        staged.original_stream_order = vec![0, 1, 2];
+        let change = |source: SubtitleSource, embedded_target, export_target, import_into_media| {
+            SubtitleChange {
+                source,
+                source_format: SubtitleFormat::SubRip,
+                embedded_target,
+                export_target,
+                import_into_media,
+                ocr_language: None,
+                metadata: None,
+            }
+        };
+        let sidecar = PathBuf::from("/videos/movie.eng.srt");
+        staged.subtitle_changes = BTreeMap::from([
+            // A sidecar pulled into the container.
+            (
+                SubtitleSource::Sidecar(sidecar.clone()),
+                change(
+                    SubtitleSource::Sidecar(sidecar),
+                    Some(SubtitleFormat::Ass),
+                    None,
+                    true,
+                ),
+            ),
+            // An embedded track converted in place.
+            (
+                SubtitleSource::Embedded(1),
+                change(
+                    SubtitleSource::Embedded(1),
+                    Some(SubtitleFormat::Ass),
+                    None,
+                    false,
+                ),
+            ),
+            // An embedded track written out to a sidecar.
+            (
+                SubtitleSource::Embedded(2),
+                change(
+                    SubtitleSource::Embedded(2),
+                    None,
+                    Some(SubtitleFormat::WebVtt),
+                    false,
+                ),
+            ),
+        ]);
+
+        // Act
+        let lines = staged_edit_summary(Path::new("/videos/movie.mkv"), &info, &staged);
+
+        // Assert: three distinct descriptions, each naming its source the way the user
+        // sees it — a sidecar by filename, an embedded track by index.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Importing movie.eng.srt as ASS"),
+            "sidecar import must be described by filename: {lines:?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Converting subtitle track #1 in the media to ASS"),
+            "an in-place conversion must say it happens in the media: {lines:?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Exporting subtitle track #2 as WebVTT"),
+            "an export must be described as leaving the media: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn the_summary_should_spell_out_a_subtitles_metadata_including_what_was_cleared() {
+        // Arrange: metadata edits are the easiest to stage by accident and the hardest to
+        // see in the track list, so the summary spells out every value — including a
+        // cleared title, which must read as "no title" rather than silently vanishing and
+        // leaving the user thinking the title was left alone.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+        ]));
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let mut staged = staged_edit(fingerprint, vec![0, 1]);
+        staged.original_stream_order = vec![0, 1];
+        staged.subtitle_changes = BTreeMap::from([(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: Some(SubtitleMetadata {
+                    language: "nld".to_string(),
+                    title: None,
+                    forced: true,
+                    cc: false,
+                    hearing_impaired: true,
+                    original: false,
+                    commentary: true,
+                }),
+            },
+        )]);
+
+        // Act
+        let lines = staged_edit_summary(Path::new("/videos/movie.mkv"), &info, &staged);
+        let metadata_line = lines
+            .iter()
+            .find(|line| line.starts_with("Updating subtitle track #1 metadata"))
+            .unwrap_or_else(|| panic!("a metadata line must be present: {lines:?}"));
+
+        // Assert: every set flag is named, the cleared title is spelled out, and flags
+        // that are off are absent rather than listed as disabled.
+        assert!(metadata_line.contains("language NLD"), "{metadata_line}");
+        assert!(metadata_line.contains("no title"), "{metadata_line}");
+        assert!(metadata_line.contains("Forced"), "{metadata_line}");
+        assert!(
+            metadata_line.contains("Hearing impaired"),
+            "{metadata_line}",
+        );
+        assert!(metadata_line.contains("Commentary"), "{metadata_line}");
+        assert!(!metadata_line.contains("CC"), "{metadata_line}");
+        assert!(!metadata_line.contains("Original"), "{metadata_line}");
+    }
+
+    #[test]
+    fn a_subtitle_change_that_changes_nothing_should_not_keep_a_file_staged() {
+        // Arrange: a subtitle entry left behind after the user undid what it described —
+        // same format, no export, no import, no metadata. `has_effect` is what tells this
+        // apart from a real change, and treating the entry's mere presence as an edit
+        // would leave the file marked staged forever with nothing to save.
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let mut edit = staged_edit(fingerprint, vec![0, 1]);
+        edit.original_stream_order = vec![0, 1];
+        edit.subtitle_changes = BTreeMap::from([(
+            SubtitleSource::Embedded(1),
+            SubtitleChange {
+                source: SubtitleSource::Embedded(1),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: Some(SubtitleFormat::SubRip),
+                export_target: None,
+                import_into_media: false,
+                ocr_language: None,
+                metadata: None,
+            },
+        )]);
+
+        // Act / Assert
+        assert!(!staged_edit_stages_anything(&edit));
     }
 
     #[test]
@@ -8493,6 +9629,68 @@ mod tests {
         // Everything else: untouched.
         assert_that!(staged.container_target).is_equal_to(Some(ContainerFormat::Mp4));
         assert_that!(staged.video_settings.contains_key(&0)).is_true();
+
+        std::fs::remove_dir_all(app.directory.clone()).unwrap();
+    }
+
+    /// A subtitle change is pinned to the group, not to a stream index — a sidecar
+    /// import has no index at all — so acknowledging a subtitle conflict has to clear
+    /// the whole subtitle side of the edit and leave every other kind of change alone.
+    #[test]
+    fn acknowledging_a_subtitle_conflict_should_clear_the_whole_subtitle_side_of_the_edit() {
+        // Arrange
+        let mut app = test_file_app(&["a.mkv"]);
+        let file = app.files[0].clone();
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+             "tags": {"language": "eng"}},
+        ]));
+        app.cache
+            .insert(CacheKey::for_file(&file), ProbeOutcome::Video(info.clone()));
+        let sidecar_path = app.directory.join("a.dan.srt");
+        let mut edit = staged_edit_with_groups(file.fingerprint, vec![0, 1], &info);
+        edit.conflict_groups = BTreeSet::from(["subtitle"]);
+        edit.container_target = Some(ContainerFormat::Mp4);
+        edit.video_settings.insert(
+            0,
+            VideoSettings {
+                codec: VideoCodec::Hevc,
+                resolution: VideoResolution::Original,
+            },
+        );
+        edit.subtitle_changes.insert(
+            SubtitleSource::Sidecar(sidecar_path.clone()),
+            SubtitleChange {
+                source: SubtitleSource::Sidecar(sidecar_path),
+                source_format: SubtitleFormat::SubRip,
+                embedded_target: None,
+                export_target: None,
+                import_into_media: true,
+                ocr_language: None,
+                metadata: None,
+            },
+        );
+        edit.default_sidecars.insert(0);
+        edit.left_subtitle_order = vec![TrackRef::Embedded(1)];
+        app.staged_edits.insert(file.path.clone(), edit);
+        assert_that!(app.maybe_open_conflict_dialog()).is_true();
+        app.conflict_opened_at = Some(Instant::now() - CONFLICT_COUNTDOWN);
+
+        // Act
+        app.acknowledge_conflicts();
+
+        // Assert
+        let staged = &app.staged_edits[&file.path];
+        assert_that!(staged.subtitle_changes.is_empty()).is_true();
+        assert_that!(staged.default_sidecars.is_empty()).is_true();
+        assert_that!(staged.left_subtitle_order.is_empty()).is_true();
+        assert_that!(staged.conflict_groups.is_empty()).is_true();
+        // The video side of the same edit is untouched.
+        assert_that!(staged.container_target).is_equal_to(Some(ContainerFormat::Mp4));
+        assert_that!(staged.video_settings.contains_key(&0)).is_true();
+        assert_that!(app.dialog).is_none();
 
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
     }
@@ -9605,6 +10803,138 @@ mod tests {
             .is_equal_to("Processed 1 of 3 files (1 failed, 1 cancelled).");
         assert_that!(summarize_batch_outcome(2, 1, 0, 1).as_str())
             .is_equal_to("Processed 1 of 2 files (1 cancelled).");
+        // A short count with nothing to blame it on still has to read as a sentence
+        // rather than trailing an empty "()".
+        assert_that!(summarize_batch_outcome(3, 2, 0, 0).as_str())
+            .is_equal_to("Processed 2 of 3 files.");
+        assert_that!(summarize_batch_outcome(3, 0, 3, 0).as_str())
+            .is_equal_to("Processed 0 of 3 files (3 failed).");
+    }
+
+    #[test]
+    fn an_undetermined_language_should_be_reported_for_whichever_subtitle_still_has_one() {
+        // Arrange
+        let app = test_file_app(&["movie.mkv"]);
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+             "tags": {"language": "und"}},
+        ]));
+        let undetermined_sidecar = test_sidecar(&app, "movie.und.srt", "und");
+        let source = SubtitleSource::Embedded(1);
+        let mut retagged = SubtitleMetadata {
+            language: "dan".to_string(),
+            title: None,
+            forced: false,
+            cc: false,
+            hearing_impaired: false,
+            original: false,
+            commentary: false,
+        };
+        let change = |source: SubtitleSource, metadata: SubtitleMetadata| {
+            BTreeMap::from([(
+                source.clone(),
+                SubtitleChange {
+                    source,
+                    source_format: SubtitleFormat::SubRip,
+                    embedded_target: None,
+                    export_target: None,
+                    import_into_media: false,
+                    ocr_language: None,
+                    metadata: Some(metadata),
+                },
+            )])
+        };
+
+        // Act
+        let embedded =
+            subtitle_language_error_for(Some(&info), &BTreeSet::new(), &BTreeMap::new(), &[]);
+        let deleted = subtitle_language_error_for(
+            Some(&info),
+            &BTreeSet::from([1_u64]),
+            &BTreeMap::new(),
+            &[],
+        );
+        let relabelled = subtitle_language_error_for(
+            Some(&info),
+            &BTreeSet::new(),
+            &change(source, retagged.clone()),
+            &[],
+        );
+        let sidecar = subtitle_language_error_for(
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            std::slice::from_ref(&undetermined_sidecar),
+        );
+        retagged.language = "nld".to_string();
+        let relabelled_sidecar = subtitle_language_error_for(
+            None,
+            &BTreeSet::new(),
+            &change(
+                SubtitleSource::Sidecar(undetermined_sidecar.path.clone()),
+                retagged,
+            ),
+            std::slice::from_ref(&undetermined_sidecar),
+        );
+        let nothing_open =
+            subtitle_language_error_for(None, &BTreeSet::new(), &BTreeMap::new(), &[]);
+
+        // Assert
+        assert_that!(embedded.as_deref())
+            .contains("Choose a language for subtitle track #1; Undetermined is not allowed.");
+        assert_that!(deleted).is_none();
+        assert_that!(relabelled).is_none();
+        assert_that!(sidecar.as_deref())
+            .contains("Choose a language for movie.und.srt; Undetermined is not allowed.");
+        assert_that!(relabelled_sidecar).is_none();
+        assert_that!(nothing_open).is_none();
+    }
+
+    #[test]
+    fn a_container_conversion_should_report_a_missing_ffmpeg_before_anything_else() {
+        // Arrange
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "vp9"},
+        ]));
+        let with_muxer = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_muxers: BTreeSet::from(["mp4".to_string()]),
+            ..ToolCapabilities::default()
+        };
+        let conflicts = |capabilities: &ToolCapabilities, info: Option<&MediaInfo>| {
+            container_conflicts_for_plan(
+                capabilities,
+                info,
+                &[0],
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                ContainerFormat::Mp4,
+            )
+        };
+
+        // Act
+        let no_ffmpeg = conflicts(&ToolCapabilities::default(), Some(&info));
+        let no_muxer = conflicts(
+            &ToolCapabilities {
+                ffmpeg: true,
+                ..ToolCapabilities::default()
+            },
+            Some(&info),
+        );
+        let unprobed = conflicts(&with_muxer, None);
+        let codec = conflicts(&with_muxer, Some(&info));
+
+        // Assert: the tool-level reasons come first, and a file that has not been
+        // probed yet contributes no per-track conflicts at all.
+        assert_that!(no_ffmpeg[0].as_str()).is_equal_to("FFmpeg is not available in PATH.");
+        assert_that!(no_muxer[0].as_str())
+            .is_equal_to("The installed FFmpeg build does not provide the MP4 muxer.");
+        assert_that!(unprobed).is_empty();
+        assert_that!(codec.len()).is_equal_to(1);
+        assert_that!(codec[0].as_str()).contains("MP4 can't contain VP9 video track #0.");
     }
 
     #[test]
@@ -10169,6 +11499,198 @@ mod tests {
         assert_that!(app.dialog).is_equal_to(None);
 
         // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_sidecars_hearing_impaired_and_cc_checkboxes_should_behave_as_one_choice() {
+        // Arrange: a sidecar's filename can only say one accessibility thing — `.cc.`,
+        // `.sdh.` and `.hi.` all parse to the same idea. The two checkboxes are therefore
+        // folded into one for external subtitles: turning on Hearing impaired must clear
+        // CC rather than leave both set, which would round-trip to a filename claiming
+        // something the user never chose.
+        let mut app = test_file_app(&["movie.mkv", "movie.eng.srt"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.eng.srt", "eng")];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Sidecar(0))
+            .unwrap();
+        app.open_track_settings();
+        assert!(
+            app.subtitle_settings_popup.is_some(),
+            "the sidecar's settings popup should be open",
+        );
+        let metadata = |app: &App| {
+            app.subtitle_metadata_for(&SubtitleSource::Sidecar(app.sidecars[0].path.clone()))
+                .unwrap()
+        };
+
+        // Act / Assert: from clear, the folded checkbox turns on as hearing-impaired —
+        // the spelling this codebase writes into filenames — and leaves CC alone.
+        app.toggle_subtitle_checkbox(SubtitleSettingsField::HearingImpaired);
+        let turned_on = metadata(&app);
+        assert!(turned_on.hearing_impaired, "the flag should be set");
+        assert!(!turned_on.cc, "the two must never both be set on a sidecar");
+
+        // Act / Assert: toggling it again clears it.
+        app.toggle_subtitle_checkbox(SubtitleSettingsField::HearingImpaired);
+        let turned_off = metadata(&app);
+        assert!(!turned_off.hearing_impaired && !turned_off.cc);
+
+        // Act / Assert: with CC set instead, the folded checkbox already reads as "on",
+        // so pressing it turns the whole accessibility flag off rather than adding a
+        // second one — leaving both set would round-trip to a filename claiming a
+        // combination the parser cannot express.
+        app.toggle_subtitle_checkbox(SubtitleSettingsField::Cc);
+        assert!(metadata(&app).cc, "CC should have been set");
+        app.toggle_subtitle_checkbox(SubtitleSettingsField::HearingImpaired);
+        let collapsed = metadata(&app);
+        assert!(
+            !collapsed.cc && !collapsed.hearing_impaired,
+            "the folded checkbox must clear both, got {collapsed:?}",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn column_movement_should_refuse_to_push_a_track_further_than_its_own_side() {
+        // Arrange: the two columns mean "stays in the media" (left) and "becomes a
+        // sidecar" (right). The cursor crosses between them only in the direction that
+        // matches where the selected track is actually going — an embedded track already
+        // marked for export lives on the right, so pushing it right again is meaningless
+        // and must not silently jump the cursor somewhere unrelated.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        // Two embedded subtitles, so exporting one still leaves the left column
+        // populated — an empty column is refused for its own reason, covered separately.
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.eng.srt", "eng")];
+        app.set_subtitle_columns_side_by_side(true);
+        let select = |app: &mut App, track: TrackRef| {
+            app.selected_stream = app
+                .track_rows()
+                .iter()
+                .position(|row| *row == track)
+                .unwrap();
+        };
+
+        // Act / Assert: an ordinary embedded subtitle sits left — it cannot go further
+        // left, and the cursor stays exactly where it was.
+        select(&mut app, TrackRef::Embedded(1));
+        let before = app.selected_stream;
+        assert_that!(app.move_subtitle_column(-1)).is_false();
+        assert_eq!(app.selected_stream, before, "a refused move must not move");
+
+        // Act / Assert: an unimported sidecar sits right — it cannot go further right.
+        select(&mut app, TrackRef::Sidecar(0));
+        let before = app.selected_stream;
+        assert_that!(app.move_subtitle_column(1)).is_false();
+        assert_eq!(app.selected_stream, before);
+
+        // Act / Assert: once the embedded track is staged for export it belongs to the
+        // right column, so the refused direction flips.
+        select(&mut app, TrackRef::Embedded(1));
+        app.transfer_subtitle(1);
+        assert!(
+            app.is_stream_exported(1),
+            "the track should now be exported"
+        );
+        select(&mut app, TrackRef::Embedded(1));
+        let before = app.selected_stream;
+        assert_that!(app.move_subtitle_column(1)).is_false();
+        assert_eq!(app.selected_stream, before);
+        // And it can now be walked back to the left column.
+        assert_that!(app.move_subtitle_column(-1)).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn column_movement_should_do_nothing_when_one_column_is_empty() {
+        // Arrange: with no sidecars there is no right-hand column to move into. Indexing
+        // into the empty target column is what the emptiness guard prevents — without it
+        // this panics rather than declining.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "subtitle"}
+            ]),
+        );
+        app.sidecars = Vec::new();
+        app.set_subtitle_columns_side_by_side(true);
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+
+        // Act / Assert
+        assert_that!(app.move_subtitle_column(1)).is_false();
+        assert_that!(app.move_subtitle_column(-1)).is_false();
+        assert_that!(app.selected_track()).contains(TrackRef::Embedded(1));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn column_movement_should_ignore_a_track_that_is_not_a_subtitle() {
+        // Arrange: the video and audio rows share the left column visually but have no
+        // counterpart on the right. Moving from one must decline rather than drag the
+        // cursor onto an unrelated sidecar.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video"},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "subtitle"}
+            ]),
+        );
+        app.sidecars = vec![test_sidecar(&app, "movie.eng.srt", "eng")];
+        app.set_subtitle_columns_side_by_side(true);
+
+        // Act / Assert
+        for track in [
+            TrackRef::Container,
+            TrackRef::Embedded(0),
+            TrackRef::Embedded(1),
+        ] {
+            app.selected_stream = app
+                .track_rows()
+                .iter()
+                .position(|row| *row == track)
+                .unwrap();
+            let before = app.selected_stream;
+            assert_that!(app.move_subtitle_column(1)).is_false();
+            assert_that!(app.move_subtitle_column(-1)).is_false();
+            assert_eq!(
+                app.selected_stream, before,
+                "{track:?} must not move between subtitle columns",
+            );
+        }
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -11368,6 +12890,12 @@ mod tests {
             // reach ffmpeg and fail there once libx265 was already opening.
             ("1920", "10", "Width and height must be at least 16 pixels."),
             ("10", "1080", "Width and height must be at least 16 pixels."),
+            // Odd dimensions in either axis: the yuv420p chroma subsampling every
+            // common encoder uses needs both to be even, and each axis is its own
+            // condition, so an unguarded one only surfaces once ffmpeg is already running.
+            ("1281", "720", "Width and height must be even."),
+            ("1280", "721", "Width and height must be even."),
+            ("1281", "721", "Width and height must be even."),
         ];
 
         for (width, height, expected) in cases {
@@ -11384,6 +12912,125 @@ mod tests {
             // Act / Assert
             assert_that!(app.custom_resolution_error().as_deref()).contains(expected);
         }
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg`/`G` in the custom editor mean whichever list is actually in front of the
+    /// user: the scaling dropdown when it is open, the field list when it is not — and
+    /// neither while a dimension is being typed, where they are ordinary text.
+    #[test]
+    fn gg_and_g_in_the_custom_editor_should_address_whichever_list_is_in_front() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        let draft = |app: &App| {
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .clone()
+                .unwrap()
+        };
+
+        // Act / Assert: with a dimension being typed, the field list must not move.
+        app.start_custom_resolution_input();
+        let field_before = draft(&app).field;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(draft(&app).field).is_equal_to(field_before);
+
+        // Act / Assert: once typing stops, they walk the field list.
+        app.finish_custom_resolution_input();
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(draft(&app).field).is_equal_to(CustomResolutionField::Scaling);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(draft(&app).field).is_equal_to(CustomResolutionField::Width);
+
+        // Act / Assert: with the scaling dropdown open they address its options.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        let editor = popup.custom_resolution.as_mut().unwrap();
+        editor.field = CustomResolutionField::Scaling;
+        editor.scaling_dropdown_open = true;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(draft(&app).scaling_cursor)
+            .is_equal_to(CustomScaling::OPTIONS.len().saturating_sub(1));
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(draft(&app).scaling_cursor).is_equal_to(0);
+        // The field list is untouched while the dropdown owns the keys.
+        assert_that!(draft(&app).field).is_equal_to(CustomResolutionField::Scaling);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The custom editor is prefilled with the source dimensions, so pressing Enter on
+    /// it unchanged is the easiest thing in the dialog to do by accident. It must stage
+    /// "Original" rather than a scale filter that resizes 1920×1080 to 1920×1080 —
+    /// which would force a full re-encode for no change at all.
+    #[test]
+    fn a_custom_size_equal_to_the_source_should_stage_no_scaling_at_all() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        open_custom_resolution_editor(&mut app);
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.width = TextInputState::new("1920".to_string());
+        draft.height = TextInputState::new("1080".to_string());
+
+        // Act: leaving the editor is what commits the draft.
+        assert_that!(app.custom_resolution_error()).is_none();
+        app.finish_custom_resolution_input();
+        app.escape_video_settings();
+
+        // Assert: nothing is staged at all, because staging "resize to the size it
+        // already is" would force a full re-encode for no change.
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::Dropdown);
+        assert_that!(app.video_settings.is_empty()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolution_choices_should_disable_scaling_when_the_source_dimensions_are_unknown() {
+        // Arrange: a video stream ffprobe reported without width/height (a partially
+        // written or damaged file does this). Every resolution choice is a comparison
+        // against the source, so with no source there is nothing to scale relative to.
+        // Offering them anyway would let the user stage a downscale that is really an
+        // upscale, which only fails once the encoder is running.
+        let app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act
+        let choices = app.resolution_choices(0);
+
+        // Assert: the choices are still listed (so the user sees why), but none of the
+        // scaling ones can be selected, and there are no dimensions to report.
+        assert_that!(app.video_source_dimensions(0)).is_none();
+        assert!(!choices.is_empty(), "the list must still be shown");
+        assert!(
+            choices
+                .iter()
+                .filter(|choice| choice.value
+                    != ResolutionChoiceValue::Resolution(VideoResolution::Original))
+                .all(|choice| !choice.enabled),
+            "no scaling choice may be selectable without source dimensions: {choices:?}",
+        );
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -11474,6 +13121,52 @@ mod tests {
 
         // Assert
         assert_that!(warning.as_deref()).contains("MP4 can't contain SubRip/SRT or ASS subtitles.");
+    }
+
+    /// The warning line is all the container list has room for, so each reason has to
+    /// collapse to its own one-liner rather than showing the raw per-track conflicts.
+    #[test]
+    fn container_warning_should_lead_with_the_reason_conversion_is_impossible() {
+        // Arrange
+        let choice = |conflicts: Vec<String>| ContainerChoice {
+            value: Some(ContainerFormat::WebM),
+            label: "WebM".to_string(),
+            current: false,
+            staged: false,
+            conflicts,
+        };
+
+        // Act
+        let none = choice(Vec::new()).warning();
+        let no_ffmpeg = choice(vec![
+            "FFmpeg is not available; container conversion is disabled.".to_string(),
+            "WebM can't contain AAC audio track #1.".to_string(),
+        ])
+        .warning();
+        let no_muxer = choice(vec![
+            "This FFmpeg build has no webm muxer.".to_string(),
+            "WebM can't contain AAC audio track #1.".to_string(),
+        ])
+        .warning();
+        // A conflict phrased some other way still has to warn about something.
+        let unparseable = choice(vec!["Something else went wrong.".to_string()]).warning();
+        let several_kinds = choice(vec![
+            "WebM can't contain H264 video track #0.".to_string(),
+            "WebM can't contain AAC audio track #1.".to_string(),
+            "WebM can't contain SUBRIP subtitle track #2.".to_string(),
+            "WebM can't contain TTF attachment track #3.".to_string(),
+        ])
+        .warning();
+
+        // Assert
+        assert_that!(none).is_none();
+        assert_that!(no_ffmpeg.as_deref()).contains("Can't convert: FFmpeg is not available.");
+        assert_that!(no_muxer.as_deref())
+            .contains("Can't convert: FFmpeg does not support this container.");
+        assert_that!(unparseable.as_deref()).contains("WebM can't contain one or more tracks.");
+        assert_that!(several_kinds.as_deref()).contains(
+            "WebM can't contain H.264 video or AAC audio or SubRip/SRT subtitles or TTF attachments.",
+        );
     }
 
     #[test]
@@ -13063,6 +14756,501 @@ mod tests {
         ));
         assert_that!(input.insert('2', digits)).is_equal_to(InputEdit::Changed);
         assert_that!(input.value.as_str()).is_equal_to("afé2");
+    }
+
+    /// The shared shape of the popup fields (title, container metadata): plain text, a
+    /// generous cap, and backspace on empty does nothing.
+    fn text_config() -> TextInputConfig {
+        TextInputConfig {
+            width: 12,
+            max_len: 16,
+            accepts: CharClass::Text,
+            exit_on_empty_backspace: false,
+        }
+    }
+
+    #[test]
+    fn track_group_lists_should_read_as_prose_with_one_trailing_noun() {
+        // Arrange / Act / Assert: this string is spliced into the conflict notice and the
+        // staged-edit validation message, so each arm of the join is user-visible text.
+        // Getting the split wrong produces "video, audio, tracks" or a bare "and audio".
+        assert_eq!(describe_track_groups(&BTreeSet::new()), "tracks");
+        assert_eq!(
+            describe_track_groups(&BTreeSet::from(["audio"])),
+            "audio tracks"
+        );
+        assert_eq!(
+            describe_track_groups(&BTreeSet::from(["video", "audio"])),
+            "audio and video tracks",
+        );
+        assert_eq!(
+            describe_track_groups(&BTreeSet::from(["video", "audio", "subtitle"])),
+            "audio, subtitle and video tracks",
+        );
+    }
+
+    #[test]
+    fn track_counts_should_be_singular_for_one_and_plural_for_the_rest() {
+        // Arrange / Act / Assert: "Deleting 1 audio tracks" is the kind of wording slip
+        // that reads as a bug in the summary the user confirms a destructive save against.
+        assert_eq!(track_count_label("audio", 1), "audio track");
+        assert_eq!(track_count_label("audio", 2), "audio tracks");
+        assert_eq!(track_count_label("subtitle", 0), "subtitle tracks");
+    }
+
+    #[test]
+    fn the_edit_summary_should_describe_moves_deletions_and_default_changes_per_group() {
+        // Arrange: one file with every kind of staged change at once — an audio track
+        // moved, a subtitle deleted, and the default audio switched. The summary is what
+        // the user reads before committing a remux, so each change must be listed under
+        // its own group rather than collapsed or double-counted.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "audio"},
+            {"index": 3, "codec_type": "subtitle"},
+            {"index": 4, "codec_type": "subtitle"}
+        ]));
+
+        // Act: audio 1 and 2 swapped, subtitle 4 deleted, default audio moved 1 -> 2.
+        let lines = edit_summary(
+            &info,
+            &[0, 1, 2, 3, 4],
+            &[0, 2, 1, 3],
+            &BTreeSet::from([1, 2]),
+            &BTreeSet::from([4]),
+            &BTreeSet::from([1]),
+            &BTreeSet::from([2]),
+        );
+        let rendered: Vec<&str> = lines.iter().map(|(_, text)| text.as_str()).collect();
+
+        // Assert: each change is described once, counted correctly, and attributed to the
+        // right group — the untouched video track contributes nothing.
+        assert_that!(rendered).contains_exactly_in_given_order([
+            "Moving 2 audio tracks",
+            "Deleting 1 subtitle track",
+            "Changing the default audio track",
+        ]);
+        assert!(
+            lines.iter().all(|(group, _)| *group != "video"),
+            "an untouched group must not appear: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn the_edit_summary_should_stay_empty_when_nothing_was_actually_staged() {
+        // Arrange: a track marked as "moved" that ended up back in its original position —
+        // the state left behind by moving a track down and then up again. Reporting it as
+        // a change would make an untouched file look edited and offer a pointless remux.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "audio"}
+        ]));
+
+        // Act
+        let lines = edit_summary(
+            &info,
+            &[0, 1, 2],
+            &[0, 1, 2],
+            &BTreeSet::from([1, 2]),
+            &BTreeSet::new(),
+            &BTreeSet::from([1]),
+            &BTreeSet::from([1]),
+        );
+
+        // Assert
+        assert_that!(lines).is_empty();
+    }
+
+    #[test]
+    fn a_deleted_track_should_not_also_count_as_a_default_change() {
+        // Arrange: deleting the default audio track. The default genuinely goes away, but
+        // reporting "Changing the default audio track" alongside "Deleting 1 audio track"
+        // would double-report one action — the default filters exclude deleted indices on
+        // both sides precisely so this reads as the single deletion it is.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "audio"},
+            {"index": 2, "codec_type": "audio"}
+        ]));
+
+        // Act
+        let lines = edit_summary(
+            &info,
+            &[0, 1, 2],
+            &[0, 2],
+            &BTreeSet::new(),
+            &BTreeSet::from([1]),
+            &BTreeSet::from([1]),
+            &BTreeSet::from([1]),
+        );
+        let rendered: Vec<&str> = lines.iter().map(|(_, text)| text.as_str()).collect();
+
+        // Assert
+        assert_that!(rendered).contains_exactly_in_given_order(["Deleting 1 audio track"]);
+    }
+
+    #[test]
+    fn a_dialogs_actions_should_be_inert_unless_that_dialog_is_the_one_showing() {
+        // Arrange: every confirm dialog's choose/activate/dismiss methods are guarded on
+        // its own `Dialog` variant. Those guards are what stop a keystroke arriving for
+        // one dialog from driving another — the dangerous shape being an Enter meant for
+        // a harmless prompt reaching `activate_reset` (which discards staged edits) or
+        // `confirm_process_all` (which launches a batch remux over the user's files).
+        // Each is exercised here from a *different* dialog and from no dialog at all.
+        for context in [None, Some(Dialog::Keybindings)] {
+            let mut app = test_file_app(&["movie.mkv"]);
+            let directory = app.directory.clone();
+            app.dialog = context;
+            // Something staged, so a reset that wrongly fired would have work to undo.
+            app.toggle_delete_selected_stream();
+            app.layer = Layer::Streams;
+            app.selected_stream = 2;
+            app.toggle_delete_selected_stream();
+            let staged_before = app.deleted_streams.clone();
+
+            // Act: drive every dialog's controls while its dialog is not showing.
+            app.choose_confirm_process_all(1);
+            app.activate_confirm_process_all();
+            app.confirm_process_all();
+            app.choose_reset(1);
+            app.activate_reset();
+            app.dismiss_reset();
+            app.choose_cancel_edit(1);
+            app.choose_cancel_edit_endpoint(true);
+            app.activate_cancel_edit();
+            app.dismiss_cancel_edit();
+
+            // Assert: the dialog state is exactly where it started, no batch was launched,
+            // and nothing staged was discarded.
+            assert_eq!(
+                app.dialog, context,
+                "no guarded action may open or close a dialog from {context:?}",
+            );
+            assert!(
+                app.active_batch.is_none(),
+                "no batch may start from {context:?}",
+            );
+            assert_eq!(
+                app.deleted_streams, staged_before,
+                "staged edits must survive stray dialog keys from {context:?}",
+            );
+            assert_eq!(
+                app.confirm_process_all_choice,
+                ConfirmProcessAllChoice::Start
+            );
+            assert_eq!(app.reset_choice, ResetChoice::default());
+            assert_eq!(app.cancel_edit_choice, CancelEditChoice::KeepProcessing);
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_zero_direction_should_not_move_any_dialogs_button_focus() {
+        // Arrange: the choose_* methods take a signed direction and treat zero as "no
+        // movement". Without that guard a zero would fall into the `is_positive()` else
+        // branch and silently focus the left-hand button — moving focus onto a
+        // destructive choice the user never arrowed to.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+
+        // Act / Assert: process-all, parked on the right-hand button.
+        app.dialog = Some(Dialog::ConfirmProcessAll);
+        app.choose_confirm_process_all(1);
+        assert_eq!(
+            app.confirm_process_all_choice,
+            ConfirmProcessAllChoice::Cancel
+        );
+        app.choose_confirm_process_all(0);
+        assert_eq!(
+            app.confirm_process_all_choice,
+            ConfirmProcessAllChoice::Cancel,
+            "a zero step must not move process-all focus",
+        );
+
+        // Act / Assert: reset.
+        app.dialog = Some(Dialog::ConfirmReset);
+        app.choose_reset(1);
+        assert_eq!(app.reset_choice, ResetChoice::ResetEdits);
+        app.choose_reset(0);
+        assert_eq!(
+            app.reset_choice,
+            ResetChoice::ResetEdits,
+            "a zero step must not move reset focus",
+        );
+
+        // Act / Assert: cancel-processing.
+        app.dialog = Some(Dialog::ConfirmCancel);
+        app.choose_cancel_edit(1);
+        assert_eq!(app.cancel_edit_choice, CancelEditChoice::CancelProcessing);
+        app.choose_cancel_edit(0);
+        assert_eq!(
+            app.cancel_edit_choice,
+            CancelEditChoice::CancelProcessing,
+            "a zero step must not move cancel focus",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dropdown_cursor_should_skip_disabled_entries_without_wrapping_past_either_end() {
+        // Arrange: dropdown lists (codecs, containers, scaling modes) grey out choices the
+        // current file cannot use, and the cursor has to step over them. Landing on a
+        // disabled entry would let Enter stage a codec ffmpeg will refuse; wrapping would
+        // send a held arrow key back around the list instead of stopping.
+        let enabled = |position: usize| !matches!(position, 1 | 2 | 4);
+
+        // Act / Assert: forward from 0 skips the disabled pair and lands on 3.
+        assert_eq!(move_cursor(0, 6, 1, enabled), 3);
+        // Backward from 3 skips them again on the way to 0.
+        assert_eq!(move_cursor(3, 6, -1, enabled), 0);
+        // From the last enabled entry, forward has only a disabled entry left, so it
+        // stays put rather than wrapping to the top or stopping on the disabled one.
+        assert_eq!(move_cursor(5, 6, 1, enabled), 5);
+        assert_eq!(move_cursor(3, 6, 1, enabled), 5);
+        // Backward from the first entry cannot go below zero.
+        assert_eq!(move_cursor(0, 6, -1, enabled), 0);
+    }
+
+    #[test]
+    fn dropdown_cursor_should_stand_still_for_an_empty_list_or_a_zero_step() {
+        // Arrange / Act / Assert: an empty list has nowhere to move, and a zero direction
+        // is not a movement. Both must return the cursor untouched — the loop below them
+        // would otherwise never terminate on a zero step.
+        assert_eq!(move_cursor(0, 0, 1, |_| true), 0);
+        assert_eq!(move_cursor(0, 0, -1, |_| true), 0);
+        assert_eq!(move_cursor(2, 5, 0, |_| true), 2);
+    }
+
+    #[test]
+    fn dropdown_cursor_should_stay_put_when_every_remaining_entry_is_disabled() {
+        // Arrange: a list where only the current position is selectable — a container
+        // whose every alternative is incompatible with the staged tracks. The cursor has
+        // nowhere legal to go and must not creep onto a disabled row.
+        let only_middle = |position: usize| position == 2;
+
+        // Act / Assert
+        assert_eq!(move_cursor(2, 5, 1, only_middle), 2);
+        assert_eq!(move_cursor(2, 5, -1, only_middle), 2);
+    }
+
+    #[test]
+    fn dropdown_endpoints_should_land_on_the_first_and_last_selectable_entry() {
+        // Arrange: `gg`/`G` jump to the ends of a dropdown, which must mean the first and
+        // last *selectable* entry — jumping onto a greyed-out row would leave Enter
+        // staging something the file cannot accept.
+        let enabled = |position: usize| !matches!(position, 0 | 1 | 5);
+
+        // Act / Assert
+        assert_eq!(cursor_endpoint(6, false, enabled), Some(2));
+        assert_eq!(cursor_endpoint(6, true, enabled), Some(4));
+
+        // With everything selectable the ends are the literal ends.
+        assert_eq!(cursor_endpoint(6, false, |_| true), Some(0));
+        assert_eq!(cursor_endpoint(6, true, |_| true), Some(5));
+    }
+
+    #[test]
+    fn dropdown_endpoints_should_report_nothing_when_no_entry_can_be_selected() {
+        // Arrange / Act / Assert: an empty list, and a list where every entry is disabled,
+        // both have no endpoint to jump to. `None` is what keeps the caller from moving
+        // the cursor at all rather than defaulting it to row zero.
+        assert_eq!(cursor_endpoint(0, false, |_| true), None);
+        assert_eq!(cursor_endpoint(0, true, |_| true), None);
+        assert_eq!(cursor_endpoint(4, false, |_| false), None);
+        assert_eq!(cursor_endpoint(4, true, |_| false), None);
+    }
+
+    #[test]
+    fn every_editing_command_should_be_inert_while_the_field_is_in_navigation_mode() {
+        // Arrange: a field that has not been activated is showing a value, not editing
+        // one — the same keys are navigating the list behind it. Any command that slipped
+        // through would edit a title the user is only looking at, silently staging a
+        // change they never typed.
+        let config = text_config();
+        let mut input = TextInputState::new("Chapter One".to_string());
+        input.cursor = 5;
+
+        // Act / Assert: every mutating entry point reports Unchanged and leaves the value
+        // and cursor exactly as they were.
+        for (label, edit) in [
+            ("insert_str", input.insert_str("xyz", config)),
+            ("delete_word_before", input.delete_word_before(config)),
+            ("clear_to_start", input.clear_to_start(config)),
+            ("backspace", input.backspace(config)),
+            ("delete", input.delete(config)),
+            ("move_cursor", input.move_cursor(-1, config)),
+            ("move_home", input.move_home(true, config)),
+        ] {
+            assert_that!(edit).is_equal_to(InputEdit::Unchanged);
+            assert_eq!(
+                input.value, "Chapter One",
+                "{label} must not edit the value"
+            );
+            assert_eq!(input.cursor, 5, "{label} must not move the cursor");
+        }
+    }
+
+    #[test]
+    fn pasting_should_flatten_carriage_returns_and_tabs_alongside_newlines() {
+        // Arrange: `pasting_should_fold_line_breaks_and_drop_characters_the_field_refuses`
+        // covers `\n`; the same arm also folds `\r` and `\t`, which is what a clipboard
+        // copied from a Windows-authored file or a tab-separated table actually carries.
+        // Left raw, they reach ffmpeg as container metadata and break the metadata line.
+        let config = text_config();
+        let mut input = TextInputState::new(String::new());
+        input.activate();
+
+        // Act
+        let edit = input.insert_str("a\r\nb\tc", config);
+
+        // Assert: each break became its own space, none were dropped or merged.
+        assert_that!(edit).is_equal_to(InputEdit::Changed);
+        assert_eq!(input.value, "a  b c");
+    }
+
+    #[test]
+    fn pasting_a_run_with_nothing_acceptable_should_report_no_change_rather_than_an_edit() {
+        // Arrange: a digits-only field receiving a paste of pure letters. Reporting
+        // `Changed` would mark the file as edited and redraw for an edit that never
+        // happened; `Unchanged` is only correct when there was also nothing to reject.
+        let config = TextInputConfig {
+            accepts: CharClass::Digits,
+            ..text_config()
+        };
+        let mut input = TextInputState::new("720".to_string());
+        input.activate();
+        input.move_home(true, config);
+
+        // Act: an empty paste has nothing to accept and nothing to reject.
+        let empty = input.insert_str("", config);
+        // A paste of only rejected characters has something to report.
+        let letters = input.insert_str("abc", config);
+
+        // Assert
+        assert_that!(empty).is_equal_to(InputEdit::Unchanged);
+        assert_that!(letters).is_equal_to(InputEdit::Rejected(InputReject::Character(
+            CharClass::Digits,
+        )));
+        assert_eq!(input.value, "720");
+    }
+
+    #[test]
+    fn word_fields_should_refuse_whitespace_that_text_fields_accept() {
+        // Arrange: the language search filters a word list, so a space would only ever
+        // produce zero matches while looking like a typed character. Plain text fields
+        // must still take it.
+        assert!(CharClass::Text.accepts(' '));
+        assert!(!CharClass::Word.accepts(' '));
+        assert!(!CharClass::Word.accepts('\t'));
+        assert!(CharClass::Word.accepts('a'));
+        // Control characters are refused by both.
+        assert!(!CharClass::Text.accepts('\u{7}'));
+        assert!(!CharClass::Word.accepts('\u{7}'));
+    }
+
+    #[test]
+    fn ctrl_w_should_delete_the_trailing_whitespace_and_the_word_behind_it() {
+        // Arrange: `Ctrl-w` after a trailing space must consume the space *and* the word
+        // before it, as a shell does. Stopping at the space would need two presses to
+        // remove one word, which is the bug the whitespace-skipping loop prevents.
+        let config = text_config();
+        let mut input = TextInputState::new("one two ".to_string());
+        input.activate();
+        input.move_home(true, config);
+
+        // Act
+        let edit = input.delete_word_before(config);
+
+        // Assert
+        assert_that!(edit).is_equal_to(InputEdit::Changed);
+        assert_eq!(input.value, "one ");
+        assert_eq!(input.cursor, 4);
+
+        // Act / Assert: again from the end removes the remaining word and its space.
+        input.move_home(true, config);
+        input.delete_word_before(config);
+        assert_eq!(input.value, "");
+        assert_eq!(input.cursor, 0);
+
+        // Act / Assert: with the cursor already at the start there is no word behind it.
+        assert_that!(input.delete_word_before(config)).is_equal_to(InputEdit::Unchanged);
+    }
+
+    #[test]
+    fn ctrl_u_should_clear_only_what_is_behind_the_cursor() {
+        // Arrange: `Ctrl-u` clears to the start, leaving anything after the cursor — a
+        // regression that cleared the whole field would silently discard the tail the
+        // user meant to keep.
+        let config = text_config();
+        let mut input = TextInputState::new("keep this".to_string());
+        input.activate();
+        input.move_home(false, config);
+        for _ in 0..5 {
+            input.move_cursor(1, config);
+        }
+
+        // Act
+        let edit = input.clear_to_start(config);
+
+        // Assert
+        assert_that!(edit).is_equal_to(InputEdit::Changed);
+        assert_eq!(input.value, "this");
+        assert_eq!(input.cursor, 0);
+
+        // Act / Assert: with the cursor already at the start there is nothing before it.
+        assert_that!(input.clear_to_start(config)).is_equal_to(InputEdit::Unchanged);
+        assert_eq!(input.value, "this");
+    }
+
+    #[test]
+    fn delete_should_do_nothing_once_the_cursor_is_past_the_last_character() {
+        // Arrange: forward-delete at the end of the value has nothing ahead of it.
+        // Indexing one past the end here would panic mid-edit.
+        let config = text_config();
+        let mut input = TextInputState::new("abc".to_string());
+        input.activate();
+        input.move_home(true, config);
+
+        // Act / Assert
+        assert_that!(input.delete(config)).is_equal_to(InputEdit::Unchanged);
+        assert_eq!(input.value, "abc");
+
+        // And from one character back it removes exactly that character.
+        input.move_cursor(-1, config);
+        assert_that!(input.delete(config)).is_equal_to(InputEdit::Changed);
+        assert_eq!(input.value, "ab");
+    }
+
+    #[test]
+    fn cursor_movement_should_stop_at_both_ends_rather_than_wrapping_or_overflowing() {
+        // Arrange: held arrow keys drive the cursor past both ends. Saturating is what
+        // keeps `char_byte_index` in range — an overflow or a wrap here is a panic during
+        // ordinary typing.
+        let config = text_config();
+        let mut input = TextInputState::new("ab".to_string());
+        input.activate();
+        input.move_home(false, config);
+
+        // Act / Assert: left at the start stays put, and still reports Changed because
+        // the field is active and consumed the key.
+        assert_that!(input.move_cursor(-1, config)).is_equal_to(InputEdit::Changed);
+        assert_eq!(input.cursor, 0);
+
+        // Act / Assert: right past the end clamps to the character count.
+        for _ in 0..10 {
+            input.move_cursor(1, config);
+        }
+        assert_eq!(input.cursor, 2);
+
+        // Act / Assert: Home and End land on the two ends exactly.
+        input.move_home(false, config);
+        assert_eq!(input.cursor, 0);
+        input.move_home(true, config);
+        assert_eq!(input.cursor, 2);
     }
 
     #[test]

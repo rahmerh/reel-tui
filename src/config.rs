@@ -57,17 +57,23 @@ impl Config {
     /// Deliberately `reel`, not `reel-tui` like the cache directory — the user asked
     /// for this exact path.
     pub fn config_dir() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-            let path = PathBuf::from(path);
-            if !path.as_os_str().is_empty() {
-                return Some(path.join("reel"));
-            }
+        Self::config_dir_from(
+            std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
+
+    /// Resolves the config directory from the two environment variables that can name
+    /// it. Split out from `config_dir` for the same reason as
+    /// `DiskCache::cache_dir_from`: mutating the process environment from a test is racy
+    /// under the threaded test runner and `unsafe` in this edition. An empty value is
+    /// treated as unset rather than as the relative path it literally is.
+    fn config_dir_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+        if let Some(path) = xdg_config_home.filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path).join("reel"));
         }
-        if let Ok(home) = std::env::var("HOME") {
-            let path = PathBuf::from(home);
-            if !path.as_os_str().is_empty() {
-                return Some(path.join(".config").join("reel"));
-            }
+        if let Some(home) = home.filter(|home| !home.is_empty()) {
+            return Some(PathBuf::from(home).join(".config").join("reel"));
         }
         None
     }
@@ -211,6 +217,100 @@ mod tests {
         // Zero is clamped up to 1: a pool with zero workers would never process
         // anything sent to it.
         assert_eq!(config.remux_workers, 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn config_dir_should_prefer_xdg_config_home_and_fall_back_to_home() {
+        // Arrange / Act / Assert: deliberately `reel`, not `reel-tui` like the cache
+        // directory — the user asked for this exact path, so a "consistency" fix that
+        // renamed it would silently orphan their existing config file.
+        assert_eq!(
+            Config::config_dir_from(Some("/xdg"), Some("/home/bas")),
+            Some(PathBuf::from("/xdg/reel")),
+        );
+        assert_eq!(
+            Config::config_dir_from(None, Some("/home/bas")),
+            Some(PathBuf::from("/home/bas/.config/reel")),
+        );
+        assert_eq!(Config::config_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn config_dir_should_treat_an_empty_variable_as_unset() {
+        // Arrange / Act / Assert: `XDG_CONFIG_HOME=` from a shell profile must not
+        // resolve the config to a relative `reel/` inside the launch directory.
+        assert_eq!(
+            Config::config_dir_from(Some(""), Some("/home/bas")),
+            Some(PathBuf::from("/home/bas/.config/reel")),
+        );
+        assert_eq!(Config::config_dir_from(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn the_config_file_should_sit_inside_the_config_directory() {
+        // Arrange / Act / Assert: the pairing `load()` depends on.
+        assert_eq!(
+            Config::config_dir_from(Some("/xdg"), None).map(|dir| dir.join("config.toml")),
+            Some(PathBuf::from("/xdg/reel/config.toml")),
+        );
+    }
+
+    #[test]
+    fn config_should_default_when_the_file_is_valid_toml_but_holds_no_worker_settings() {
+        // Arrange: a config file the user created for some other purpose, or one whose
+        // `[workers]` table they commented out. Valid TOML with nothing relevant in it
+        // must leave every worker count at its default rather than collapsing to zero.
+        let directory = scratch("empty-toml");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"# nothing configured yet\n").unwrap();
+
+        // Act
+        let config = Config::load_from(&path);
+
+        // Assert
+        assert_eq!(config, Config::default());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn config_should_keep_non_network_defaults_when_only_the_network_table_is_set() {
+        // Arrange: the mirror of `config_should_keep_individual_defaults_for_unspecified_fields`
+        // — setting only the nested network table must not reset the top-level pair, which
+        // is the pairing most likely to break if the nested defaults were folded in wrongly.
+        let directory = scratch("network-only");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[workers.network]\nremux = 2\n").unwrap();
+
+        // Act
+        let config = Config::load_from(&path);
+
+        // Assert
+        assert_eq!(
+            config,
+            Config {
+                network_remux_workers: 2,
+                ..Config::default()
+            }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn config_should_clamp_the_network_worker_counts_too() {
+        // Arrange: the clamp is applied per field, so the network pair needs its own
+        // proof — an unclamped 999999 there would spawn the thread flood the limit exists
+        // to prevent, on the mount type least able to absorb it.
+        let directory = scratch("clamp-network");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[workers.network]\ntranscode = 999999\nremux = 0\n").unwrap();
+
+        // Act
+        let config = Config::load_from(&path);
+
+        // Assert
+        assert_eq!(config.network_transcode_workers, MAX_WORKERS);
+        assert_eq!(config.network_remux_workers, 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
