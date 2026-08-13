@@ -56,3 +56,4 @@ reel /path/to/media
 
 - **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
 - **Audio track conversion**: Audio track format conversion, equivalent to current video track editing.
+- **Video track metadata editing**: Edit metadata attached to individual video tracks.
