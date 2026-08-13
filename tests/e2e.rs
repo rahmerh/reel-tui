@@ -4,12 +4,13 @@
 //! Excluded from `cargo test` (see `test = false` in `Cargo.toml`); run with
 //! `cargo test --test e2e`.
 //!
-//! Every scenario here reproduces a failure that actually reached
+//! Regression scenarios here originated in failures that reached
 //! `~/.cache/reel-tui/edit_errors.log` during real use. The existing unit tests all
 //! passed while those bugs were live, because they either build `TrackEdits` by hand
-//! (skipping the `App` seam where several of them originated) or use `ffv1`/
+//! (bypassing the `App` seam where several of them originated) or use `ffv1`/
 //! `pcm_s16le` fixtures too simple to express the codec/container conflicts that
-//! actually broke. The failure each test reproduces is quoted in its comment.
+//! actually broke. Those scenarios quote the original failure in their comments;
+//! feature-level scenarios cover complete user workflows independently of unit tests.
 
 // `tests/e2e.rs` is a crate root, so submodules would otherwise resolve against
 // `tests/` and collide with any future sibling suite.
@@ -18,15 +19,782 @@ mod fixtures;
 #[path = "e2e/harness.rs"]
 mod harness;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
-use fixtures::{MediaSpec, SubtitleSpec, write_media};
+use fixtures::{
+    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment,
+    write_vobsub_media,
+};
 use harness::{
     Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
 };
-use reel_tui::app::TrackRef;
+use reel_tui::app::{
+    AudioSettingsField, ContainerSettingsField, Layer, SubtitleSettingsField, TrackRef,
+};
+
+/// Browsing is the front door to every edit. This scenario covers the real directory
+/// monitor, probe worker, file search (including a sidecar-only match), fold commands,
+/// track navigation, and the rendered container/audio inspection views as one workflow.
+#[test]
+fn browsing_searching_and_inspecting_media_should_use_the_live_file_tree() {
+    let test = "browsing_searching_and_inspecting_media_should_use_the_live_file_tree";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("browse-inspect");
+    write_media(
+        &scratch.join("alpha.mkv"),
+        &MediaSpec::mkv().audio(&["eng"]),
+    );
+    write_media(
+        &scratch.join("bravo.mkv"),
+        &MediaSpec::mkv().audio(&["eng"]),
+    );
+    fs::write(
+        scratch.join("bravo.nld.srt"),
+        "1\n00:00:00,000 --> 00:00:00,500\nNederlandse ondertiteling\n\n",
+    )
+    .unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.wait_until("both media files to appear", |state| state.files.len() == 2);
+
+    app.press(key(KeyCode::Char('z')));
+    app.press(key(KeyCode::Char('R')));
+    app.pump();
+    assert!(
+        app.screen().contains("bravo.nld.srt"),
+        "unfolding should reveal the matched sidecar\nscreen:\n{}",
+        app.screen()
+    );
+
+    app.press(key(KeyCode::Char('/')));
+    for character in "nld".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.pump();
+    assert_eq!(app.app.file_panel_entries().len(), 1);
+    assert_eq!(
+        app.app
+            .selected_file()
+            .map(|file| file.display_name.as_str()),
+        Some("bravo.mkv"),
+        "a sidecar-only match should retain its parent media file"
+    );
+    assert!(app.screen().contains("bravo.nld.srt"));
+    assert!(!app.screen().contains("alpha.mkv"));
+
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Esc));
+    assert!(app.app.file_search.value.is_empty());
+    app.open("bravo.mkv");
+
+    app.select_track_row(0);
+    app.press(key(KeyCode::Char('i')));
+    assert_eq!(app.app.layer, Layer::StreamDetails);
+    app.pump();
+    let container = app.screen();
+    assert!(container.contains("Container information"));
+    assert!(container.contains("Format: MKV"));
+    assert!(container.contains("Duration:"));
+
+    app.press(key(KeyCode::Char('i')));
+    assert_eq!(app.app.layer, Layer::Streams);
+    let audio_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(1))
+        .expect("the fixture should expose its audio track");
+    app.select_track_row(audio_row);
+    app.press(key(KeyCode::Char('i')));
+    app.pump();
+    let audio = app.screen();
+    assert!(audio.contains("Audio #1"));
+    assert!(audio.contains("Language: English"));
+    assert!(audio.contains("Format: AAC"));
+    assert!(audio.contains("Channels: Stereo"));
+    assert!(audio.contains("Sample rate: 48 kHz"));
+}
+
+/// Container metadata is edited in the same popup as format conversion, but its
+/// text-editor path and FFmpeg mapping are independent. Exercise every exposed field
+/// through key handling and verify the values from the container written on disk.
+#[test]
+fn editing_container_metadata_should_persist_every_exposed_field() {
+    let test = "editing_container_metadata_should_persist_every_exposed_field";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("container-metadata");
+    write_media(&scratch.join("clip.mkv"), &MediaSpec::mkv().audio(&["eng"]));
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    app.open_container_settings();
+    for (field, value) in [
+        (ContainerSettingsField::Title, "The Test Reel"),
+        (ContainerSettingsField::Comment, "E2E container comment"),
+        (ContainerSettingsField::Date, "2026"),
+        (ContainerSettingsField::Genre, "Documentary"),
+        (ContainerSettingsField::Artist, "Reel Director"),
+    ] {
+        app.type_container_metadata(field, value);
+    }
+    app.close_container_settings();
+
+    assert!(
+        app.app.container_metadata.is_some(),
+        "editing metadata through the popup should stage a media edit"
+    );
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(after.container_title().as_deref(), Some("The Test Reel"));
+    assert_eq!(
+        after.container_comment().as_deref(),
+        Some("E2E container comment")
+    );
+    assert_eq!(after.container_date().as_deref(), Some("2026"));
+    assert_eq!(after.container_genre().as_deref(), Some("Documentary"));
+    assert_eq!(after.container_artist().as_deref(), Some("Reel Director"));
+}
+
+/// Track order is staged from the visual rows but applied by FFmpeg stream mapping.
+/// Reorder two independent stream groups and verify both orders in the saved file so
+/// neither group can accidentally overwrite or mask the other one's edit.
+#[test]
+fn reordering_audio_and_subtitle_tracks_should_persist_both_group_orders() {
+    let test = "reordering_audio_and_subtitle_tracks_should_persist_both_group_orders";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("track-order");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().audio(&["eng", "nld"]).subtitles(vec![
+            SubtitleSpec::new("fra", "subrip"),
+            SubtitleSpec::new("deu", "subrip"),
+        ]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    for stream_index in [1, 3] {
+        let row = app
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(stream_index))
+            .unwrap_or_else(|| panic!("stream #{stream_index} should have a track row"));
+        app.select_track_row(row);
+        app.press(harness::ctrl('j'));
+    }
+    assert_eq!(
+        app.app.stream_order,
+        [0, 2, 1, 4, 3],
+        "both the first audio and first subtitle should move below their neighbor"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        stream_languages_of_type(&after, "audio"),
+        ["nld", "eng"],
+        "the audio order should match the track list"
+    );
+    assert_eq!(
+        stream_languages_of_type(&after, "subtitle"),
+        ["deu", "fra"],
+        "the subtitle order should match the track list"
+    );
+}
+
+/// Subtitle metadata has container-dependent visibility and disposition semantics.
+/// Edit every field Matroska exposes, move the single-default flag from its neighbor,
+/// and verify both the edited and untouched tracks after the real remux.
+#[test]
+fn editing_subtitle_metadata_should_persist_flags_and_preserve_its_neighbor() {
+    let test = "editing_subtitle_metadata_should_persist_flags_and_preserve_its_neighbor";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-metadata");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().audio(&["eng"]).subtitles(vec![
+            SubtitleSpec {
+                language: "eng",
+                codec: "subrip",
+                default: true,
+            },
+            SubtitleSpec::new("nld", "subrip"),
+        ]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let edited_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(3))
+        .expect("the second subtitle should have a row");
+    app.open_subtitle_settings(edited_row);
+    app.choose_subtitle_language("spanish", "spa");
+    app.type_subtitle_title("Director subtitles");
+    for field in [
+        SubtitleSettingsField::Default,
+        SubtitleSettingsField::Forced,
+        SubtitleSettingsField::HearingImpaired,
+        SubtitleSettingsField::Original,
+        SubtitleSettingsField::Commentary,
+    ] {
+        app.toggle_subtitle_field(field);
+    }
+    assert!(
+        !app.app
+            .visible_subtitle_fields()
+            .contains(&SubtitleSettingsField::Cc),
+        "Matroska's unsupported CC flag must not appear editable"
+    );
+    app.close_subtitle_settings();
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    let subtitles = after
+        .streams
+        .iter()
+        .filter(|stream| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("subtitle")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(subtitles.len(), 2);
+    let untouched = subtitles[0];
+    let edited = subtitles[1];
+
+    assert_eq!(stream_tag(untouched, "language"), Some("eng"));
+    assert_eq!(stream_tag(untouched, "title"), None);
+    assert!(!stream_disposition(untouched, "default"));
+    for flag in ["forced", "hearing_impaired", "original", "comment"] {
+        assert!(
+            !stream_disposition(untouched, flag),
+            "the neighboring subtitle unexpectedly gained {flag}"
+        );
+    }
+
+    assert_eq!(stream_tag(edited, "language"), Some("spa"));
+    assert_eq!(stream_tag(edited, "title"), Some("Director subtitles"));
+    for flag in [
+        "default",
+        "forced",
+        "hearing_impaired",
+        "original",
+        "comment",
+    ] {
+        assert!(
+            stream_disposition(edited, flag),
+            "the edited subtitle is missing {flag}: {edited:?}"
+        );
+    }
+}
+
+/// Export an embedded subtitle through the column-transfer key, including filename
+/// metadata that cannot be checked by probing the remuxed media alone.
+#[test]
+fn exporting_an_embedded_subtitle_should_publish_a_named_sidecar_and_remove_the_track() {
+    let test = "exporting_an_embedded_subtitle_should_publish_a_named_sidecar_and_remove_the_track";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-export");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng"])
+            .subtitles(vec![SubtitleSpec::new("nld", "subrip")]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let subtitle_row = app.first_subtitle_row();
+    app.open_subtitle_settings(subtitle_row);
+    app.toggle_subtitle_field(SubtitleSettingsField::Forced);
+    app.toggle_subtitle_field(SubtitleSettingsField::HearingImpaired);
+    app.close_subtitle_settings();
+
+    app.press(harness::ctrl('l'));
+    assert!(
+        app.app.is_stream_exported(2),
+        "Ctrl-l should move the embedded subtitle to the external column"
+    );
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let sidecar = app.path("clip.nld.forced.sdh.srt");
+    assert!(
+        sidecar.exists(),
+        "the exported sidecar should encode language and flags in its filename; files: {:?}",
+        fs::read_dir(app.directory())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>()
+    );
+    let body = fs::read_to_string(&sidecar).expect("the exported SRT should be readable text");
+    assert!(body.contains("nld subtitle line"));
+    assert!(
+        stream_indices_of_type(&probe(&app.path("clip.mkv")), "subtitle").is_empty(),
+        "exporting should remove the embedded copy"
+    );
+}
+
+/// Import a metadata-bearing sidecar through the opposite transfer key, then edit
+/// the fields that become available only after it is staged as embedded. The save
+/// must consume the sidecar and preserve all metadata on the new media track.
+#[test]
+fn importing_a_sidecar_should_embed_it_with_filename_and_popup_metadata() {
+    let test = "importing_a_sidecar_should_embed_it_with_filename_and_popup_metadata";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-import");
+    write_media(&scratch.join("clip.mkv"), &MediaSpec::mkv().audio(&["eng"]));
+    fs::write(
+        scratch.join("clip.spa.forced.sdh.srt"),
+        "1\n00:00:00,000 --> 00:00:00,500\nImportado\n\n",
+    )
+    .unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let sidecar_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Sidecar(0))
+        .expect("the sidecar should have an external track row");
+    app.select_track_row(sidecar_row);
+    app.press(harness::ctrl('h'));
+    assert!(
+        app.app.is_sidecar_imported(0),
+        "Ctrl-h should move the sidecar to the embedded column"
+    );
+
+    let imported_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Sidecar(0))
+        .expect("the staged import should still have a selectable row");
+    app.open_subtitle_settings(imported_row);
+    app.type_subtitle_title("Imported subtitles");
+    app.toggle_subtitle_field(SubtitleSettingsField::Default);
+    app.close_subtitle_settings();
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    assert!(
+        !app.path("clip.spa.forced.sdh.srt").exists(),
+        "a successfully imported sidecar should be consumed"
+    );
+    let after = probe(&app.path("clip.mkv"));
+    let subtitle = after
+        .streams
+        .iter()
+        .find(|stream| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("subtitle")
+        })
+        .expect("the imported subtitle should be embedded");
+    assert_eq!(stream_tag(subtitle, "language"), Some("spa"));
+    assert_eq!(stream_tag(subtitle, "title"), Some("Imported subtitles"));
+    for flag in ["default", "forced", "hearing_impaired"] {
+        assert!(
+            stream_disposition(subtitle, flag),
+            "the imported subtitle is missing {flag}: {subtitle:?}"
+        );
+    }
+}
+
+/// A save started from the file list must collect edits staged in different files,
+/// dispatch every staged item, and leave an unstaged neighbor byte-identical.
+#[test]
+fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_media() {
+    let test = "processing_all_should_save_multiple_staged_files_without_touching_unstaged_media";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("multi-file-batch");
+    for name in ["alpha.mkv", "bravo.mkv", "untouched.mkv"] {
+        write_media(
+            &scratch.join(name),
+            &MediaSpec::mkv().audio(&["eng", "nld"]),
+        );
+    }
+    let untouched_before = fs::read(scratch.join("untouched.mkv")).unwrap();
+
+    let mut app = Harness::start(scratch);
+    for name in ["alpha.mkv", "bravo.mkv"] {
+        app.open(name);
+        let second_audio = app
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(2))
+            .expect("the second audio should have a track row");
+        app.select_track_row(second_audio);
+        app.press(key(KeyCode::Char('d')));
+        assert!(
+            app.app.deleted_streams.contains(&2),
+            "{name} should stage its second audio for deletion"
+        );
+        app.press(key(KeyCode::Esc));
+        assert_eq!(app.app.layer, Layer::Files);
+    }
+    // Moving off the second edited file snapshots its live edit into `staged_edits`,
+    // exactly as moving off the first one did.
+    app.press(key(KeyCode::Char('j')));
+    app.pump();
+    assert_eq!(
+        app.app
+            .selected_file()
+            .map(|file| file.display_name.as_str()),
+        Some("untouched.mkv")
+    );
+    app.wait_until("the unstaged neighbor to finish probing", |state| {
+        !state.loading && matches!(state.outcome, Some(reel_tui::probe::ProbeOutcome::Video(_)))
+    });
+    assert_eq!(
+        app.app.staged_edits.len(),
+        2,
+        "both edited files should remain staged from the file list"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+    assert!(
+        app.app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Processed 2 files")),
+        "the completion notice should account for the whole batch: {:?}",
+        app.app.notice
+    );
+
+    for name in ["alpha.mkv", "bravo.mkv"] {
+        assert_eq!(
+            stream_indices_of_type(&probe(&app.path(name)), "audio").len(),
+            1,
+            "{name} should have had exactly one audio track removed"
+        );
+    }
+    assert_eq!(
+        fs::read(app.path("untouched.mkv")).unwrap(),
+        untouched_before,
+        "processing staged files must not rewrite an unstaged neighbor"
+    );
+}
+
+/// Cancelling is cooperative across the UI, shared batch flag, FFmpeg process, and
+/// transaction cleanup. Use a real long-running transcode so the confirmation path
+/// can stop active work, then prove the original and staged edit both survive.
+#[test]
+fn cancelling_an_active_transcode_should_preserve_the_source_and_staged_edit() {
+    let test = "cancelling_an_active_transcode_should_preserve_the_source_and_staged_edit";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("cancel-transcode");
+    let mut spec = MediaSpec::mkv().size(1280, 720).audio(&["eng"]);
+    spec.duration = 60.0;
+    write_media(&scratch.join("clip.mkv"), &spec);
+    let before = fs::read(scratch.join("clip.mkv")).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    app.set_custom_resolution("640", "360");
+
+    app.press(harness::ctrl('s'));
+    assert_eq!(
+        app.app.dialog,
+        Some(reel_tui::app::Dialog::ConfirmProcessAll)
+    );
+    app.press(key(KeyCode::Enter));
+    assert_eq!(app.app.dialog, Some(reel_tui::app::Dialog::BatchProcessing));
+
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(reel_tui::app::Dialog::ConfirmCancel));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Enter));
+    assert_eq!(app.app.dialog, Some(reel_tui::app::Dialog::BatchProcessing));
+    assert!(
+        app.app
+            .active_batch
+            .as_ref()
+            .is_some_and(|batch| batch.cancelled.load(std::sync::atomic::Ordering::Relaxed)),
+        "confirming cancellation should signal the worker"
+    );
+
+    app.wait_until("the cancelled transcode to finish cleanup", |state| {
+        state.active_batch.is_none()
+    });
+    assert!(
+        app.app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("cancelled")),
+        "the completed cancellation should be reported: {:?}",
+        app.app.notice
+    );
+    assert_eq!(
+        fs::read(app.path("clip.mkv")).unwrap(),
+        before,
+        "cancelling must preserve the original byte-for-byte"
+    );
+    assert!(
+        !app.app.video_settings.is_empty()
+            || app.app.staged_edits.contains_key(&app.path("clip.mkv")),
+        "a cancelled edit should remain staged for a later retry"
+    );
+    app.assert_no_temp_leftovers();
+}
+
+/// Codec selection is a separate video-popup path from the already-covered custom
+/// resolution editor. Drive the dropdown into a genuine HEVC encode and verify that
+/// the neighboring audio stream is copied without losing its metadata.
+#[test]
+fn changing_the_video_codec_should_encode_only_the_selected_track() {
+    let test = "changing_the_video_codec_should_encode_only_the_selected_track";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:libx265", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("video-codec");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().size(160, 120).audio(&["nld"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let video_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(0))
+        .expect("the video track should have a row");
+    app.choose_video_codec(video_row, "HEVC / H.265");
+    assert!(
+        !app.app.video_settings.is_empty(),
+        "the codec dropdown should stage a video encode"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(codec_names(&after), ["hevc", "aac"]);
+    assert_eq!(stream_tag(&after.streams[1], "language"), Some("nld"));
+    assert!(stream_disposition(&after.streams[1], "default"));
+}
+
+/// If another program replaces a staged file, only edits for track groups whose
+/// structure changed should be discarded. Container metadata is independent of the
+/// changed audio group and must remain processable after the conflict is acknowledged.
+#[test]
+fn an_external_track_change_should_revert_only_the_conflicting_edits() {
+    let test = "an_external_track_change_should_revert_only_the_conflicting_edits";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("external-conflict");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().audio(&["eng", "nld"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let second_audio = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(2))
+        .expect("the second audio should have a track row");
+    app.select_track_row(second_audio);
+    app.press(key(KeyCode::Char('d')));
+    app.open_container_settings();
+    app.type_container_metadata(ContainerSettingsField::Title, "Keep this title");
+    app.close_container_settings();
+
+    let replacement = app.directory().join(".replacement.mkv");
+    write_media(&replacement, &MediaSpec::mkv().audio(&["fra"]));
+    fs::rename(&replacement, app.path("clip.mkv")).unwrap();
+
+    app.wait_until("the external track conflict to be detected", |state| {
+        state.dialog == Some(reel_tui::app::Dialog::ResolveConflicts)
+    });
+    let path = app.path("clip.mkv");
+    assert_eq!(app.app.conflicting_paths(), [path.clone()]);
+    assert!(
+        app.app
+            .conflicting_change_summary(&path)
+            .iter()
+            .any(|line| line.to_ascii_lowercase().contains("audio")),
+        "the removed audio track should be identified as the conflicting edit"
+    );
+    assert!(
+        app.app
+            .kept_change_summary(&path)
+            .iter()
+            .any(|line| line.contains("container metadata: title")),
+        "the independent title edit should be listed as kept"
+    );
+
+    app.press(key(KeyCode::Enter));
+    assert_eq!(
+        app.app.dialog,
+        Some(reel_tui::app::Dialog::ResolveConflicts),
+        "the conflict acknowledgement should remain guarded during its countdown"
+    );
+    app.wait_until(
+        "the conflict acknowledgement countdown to finish",
+        |state| state.conflict_countdown().is_none(),
+    );
+    app.press(key(KeyCode::Enter));
+    assert_eq!(app.app.dialog, None);
+    assert!(app.app.conflicting_paths().is_empty());
+    assert!(
+        app.app.deleted_streams.is_empty(),
+        "the stale audio deletion should have been reverted"
+    );
+    assert!(
+        app.app.container_metadata.is_some(),
+        "the unrelated container title should remain staged"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&path);
+    assert_eq!(stream_languages_of_type(&after, "audio"), ["fra"]);
+    assert_eq!(after.container_title().as_deref(), Some("Keep this title"));
+}
+
+/// Bitmap subtitles cross every expensive subtitle boundary: extraction, OCR,
+/// conversion, validation, sidecar publication, and removal from the media. Drive the
+/// whole path from the TUI using a genuine VobSub source and real Tesseract.
+#[test]
+fn exporting_vobsub_as_srt_should_run_real_ocr_and_publish_valid_text() {
+    let test = "exporting_vobsub_as_srt_should_run_real_ocr_and_publish_valid_text";
+    require_tools(
+        test,
+        &["ffmpeg:libx264", "ffmpeg:aac", "seconv", "tesseract"],
+    );
+
+    let scratch = Scratch::new("vobsub-ocr");
+    write_vobsub_media(&scratch.join("clip.mkv"), "eng");
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let subtitle_row = app.first_subtitle_row();
+    app.select_track_row(subtitle_row);
+    app.press(harness::ctrl('l'));
+    assert!(app.app.is_stream_exported(2));
+    app.convert_subtitle_to(subtitle_row, "SubRip / SRT");
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let sidecar = app.path("clip.eng.srt");
+    assert!(
+        sidecar.exists(),
+        "OCR should publish an English SRT sidecar"
+    );
+    let body = fs::read_to_string(&sidecar).expect("the OCR output should be text");
+    assert!(
+        body.contains("-->") && !body.trim().is_empty(),
+        "the published file should contain valid-looking subtitle timing: {body:?}"
+    );
+    assert!(
+        stream_indices_of_type(&probe(&app.path("clip.mkv")), "subtitle").is_empty(),
+        "the exported bitmap track should be removed from the media"
+    );
+}
+
+/// Chapters and attachments are not editable track groups, but every ordinary remux
+/// must carry them through untouched. Delete an audio stream to force a real rewrite
+/// and verify both less-common structures survive alongside the intended edit.
+#[test]
+fn remuxing_tracks_should_preserve_chapters_and_attachments() {
+    let test = "remuxing_tracks_should_preserve_chapters_and_attachments";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("preserve-container-data");
+    write_media_with_chapter_and_attachment(&scratch.join("clip.mkv"));
+    let before = probe(&scratch.join("clip.mkv"));
+    assert_eq!(
+        before.chapters.len(),
+        1,
+        "fixture should contain one chapter"
+    );
+    assert_eq!(
+        stream_indices_of_type(&before, "attachment").len(),
+        1,
+        "fixture should contain one attachment"
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let second_audio = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(2))
+        .expect("the second audio should have a row");
+    app.select_track_row(second_audio);
+    app.press(key(KeyCode::Char('d')));
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(stream_indices_of_type(&after, "audio").len(), 1);
+    assert_eq!(
+        after.chapters.len(),
+        1,
+        "the chapter should survive the remux"
+    );
+    assert_eq!(
+        after.chapters[0]
+            .get("tags")
+            .and_then(|tags| tags.get("title"))
+            .and_then(serde_json::Value::as_str),
+        Some("Opening")
+    );
+    let attachments = after
+        .streams
+        .iter()
+        .filter(|stream| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("attachment")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attachments.len(),
+        1,
+        "the attachment should survive the remux"
+    );
+    assert_eq!(stream_tag(attachments[0], "filename"), Some("notes.txt"));
+    assert_eq!(stream_tag(attachments[0], "mimetype"), Some("text/plain"));
+}
 
 /// > SourceChanged: test2.mp4 — The file's tracks changed: track(s) [7] are both kept
 /// > and marked for deletion. Reopen it and try again.
@@ -399,6 +1167,142 @@ fn a_custom_downscale_should_reach_the_encoder_with_the_requested_dimensions() {
     );
 }
 
+/// > Failed: test2.mp4 (container: MP4) — The remuxed track at position 3 (source
+/// > track #3) has the wrong default flag: expected false, found true.
+/// > Staged defaults: {0, 1}.
+///
+/// Audio editing crosses the same fragile app → staged edit → worker → ffmpeg seam
+/// that produced the recorded default-disposition failure. This drives every
+/// meaningful visible Matroska audio field through the popup, including moving the
+/// default flag between neighboring audio tracks, and then verifies the real encoded
+/// file. The hidden quality and sample-rate controls must resolve to a balanced AC-3
+/// bitrate and automatically downsample the incompatible 96 kHz source. The edited
+/// track starts as Original, reproducing the save-time conflict that appeared only
+/// after another supported Matroska role was selected.
+#[test]
+fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor() {
+    let test = "editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor";
+    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:ac3"]) {
+        return;
+    }
+
+    let scratch = Scratch::new("audio-settings");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng", "fra"])
+            .video_disposition("original")
+            .audio_dispositions(&["default", "original"])
+            .audio_sample_rate(96_000),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    app.pump();
+    assert_eq!(
+        app.screen().matches("[OG]").count(),
+        2,
+        "Original should be visible on both the video and audio overview rows:\n{}",
+        app.screen()
+    );
+    let edited_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(2))
+        .expect("the second audio track should have a row");
+    app.open_audio_settings(edited_row);
+
+    // K opens contextual help for the highlighted audio field and the panel follows
+    // navigation, just as it does in the other metadata editors.
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    assert!(app.app.audio_settings_popup.as_ref().unwrap().help_visible);
+    assert!(
+        app.screen().contains("Information about Codec")
+            && app.screen().contains("audio format written to the output"),
+        "Codec help should be rendered beside the audio editor:\n{}",
+        app.screen()
+    );
+    app.press(key(KeyCode::Char('j')));
+    app.pump();
+    assert!(
+        app.screen().contains("Information about Channel layout")
+            && app.screen().contains("upmixing is not implemented"),
+        "help should follow the highlighted audio field:\n{}",
+        app.screen()
+    );
+
+    app.choose_audio_setting(AudioSettingsField::Codec, "Dolby Digital (AC-3)");
+    app.choose_audio_setting(AudioSettingsField::ChannelLayout, "Mono");
+    app.choose_audio_language("dutch", "nld");
+    app.type_audio_title("Director commentary");
+    for field in [
+        AudioSettingsField::Default,
+        AudioSettingsField::Commentary,
+        AudioSettingsField::HearingImpaired,
+        AudioSettingsField::AudioDescription,
+    ] {
+        app.toggle_audio_field(field);
+    }
+
+    let staged = app
+        .app
+        .effective_audio_settings(2)
+        .expect("the popup should have staged audio settings");
+    assert!(staged.metadata.original && !staged.metadata.dubbed);
+    assert!(
+        app.app.selected_container_conflicts().is_empty(),
+        "supported Matroska roles should not conflict: {:?}",
+        app.app.selected_container_conflicts()
+    );
+    assert_eq!(
+        app.app.default_streams.iter().copied().collect::<Vec<_>>(),
+        vec![2],
+        "making audio #2 default should clear that flag from audio #1"
+    );
+
+    app.close_audio_settings();
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        codec_names(&after),
+        ["h264", "aac", "ac3"],
+        "only the selected audio track should have been transcoded"
+    );
+    let untouched = &after.streams[1];
+    let edited = &after.streams[2];
+
+    assert_eq!(stream_number(untouched, "channels"), Some(2));
+    assert_eq!(stream_number(untouched, "sample_rate"), Some(96_000));
+    assert_eq!(stream_tag(untouched, "language"), Some("eng"));
+    assert_eq!(stream_tag(untouched, "title"), None);
+    assert!(!stream_disposition(untouched, "default"));
+    for role in ["comment", "hearing_impaired", "visual_impaired"] {
+        assert!(
+            !stream_disposition(untouched, role),
+            "the neighboring audio track unexpectedly gained {role}"
+        );
+    }
+
+    assert_eq!(stream_number(edited, "channels"), Some(1));
+    assert_eq!(stream_number(edited, "sample_rate"), Some(48_000));
+    assert_eq!(stream_number(edited, "bit_rate"), Some(128_000));
+    assert_eq!(stream_tag(edited, "language"), Some("nld"));
+    assert_eq!(stream_tag(edited, "title"), Some("Director commentary"));
+    for role in ["default", "comment", "hearing_impaired", "visual_impaired"] {
+        assert!(
+            stream_disposition(edited, role),
+            "the edited audio track is missing {role}: {edited:?}"
+        );
+    }
+    assert!(stream_disposition(edited, "original"));
+    assert!(!stream_disposition(edited, "dub"));
+}
+
 /// > Failed: test.mp4 (container: MKV) — Could not extract subtitle for conversion:
 /// > [matroska] Subtitle codec mov_text (94213) is not supported.
 ///
@@ -496,4 +1400,35 @@ fn a_conversion_onto_an_existing_file_should_refuse_without_touching_it() {
         "the source should still be there after a refused conversion"
     );
     app.assert_no_temp_leftovers();
+}
+
+fn stream_number(stream: &BTreeMap<String, serde_json::Value>, key: &str) -> Option<u64> {
+    stream.get(key).and_then(|value| match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(number) => number.parse().ok(),
+        _ => None,
+    })
+}
+
+fn stream_tag<'a>(stream: &'a BTreeMap<String, serde_json::Value>, key: &str) -> Option<&'a str> {
+    stream
+        .get("tags")
+        .and_then(|tags| tags.get(key))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn stream_disposition(stream: &BTreeMap<String, serde_json::Value>, key: &str) -> bool {
+    stream
+        .get("disposition")
+        .and_then(|disposition| disposition.get(key))
+        .and_then(serde_json::Value::as_i64)
+        == Some(1)
+}
+
+fn stream_languages_of_type(info: &reel_tui::probe::MediaInfo, kind: &str) -> Vec<String> {
+    info.streams
+        .iter()
+        .filter(|stream| stream.get("codec_type").and_then(serde_json::Value::as_str) == Some(kind))
+        .map(|stream| stream_tag(stream, "language").unwrap_or("und").to_string())
+        .collect()
 }

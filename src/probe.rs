@@ -619,8 +619,8 @@ mod tests {
         assert_that!(result).is_err();
     }
 
-    /// A helper mirroring `edit.rs`'s: an ffprobe-dependent test is worthless noise on a
-    /// machine without FFmpeg, so it announces the skip rather than failing.
+    /// An ffprobe-dependent test must fail when its prerequisite is missing; an
+    /// unexecuted test must never be reported as passing.
     fn require_tools(test: &str, tools: &[&str]) -> bool {
         for tool in tools {
             let available = Command::new(tool)
@@ -629,10 +629,10 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .status()
                 .is_ok_and(|status| status.success());
-            if !available {
-                eprintln!("SKIPPED {test}: {tool} is not available");
-                return false;
-            }
+            assert!(
+                available,
+                "{test} requires {tool}; install the missing test prerequisite"
+            );
         }
         true
     }
