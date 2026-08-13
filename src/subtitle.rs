@@ -547,7 +547,11 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
             let mut fields = line.split_whitespace();
             let flags = fields.next()?;
             let name = fields.next()?;
-            (flags.contains('E') || flags.starts_with('S')).then(|| name.to_string())
+            (flags.contains('E')
+                || flags.starts_with('V')
+                || flags.starts_with('A')
+                || flags.starts_with('S'))
+            .then(|| name.to_string())
         })
         .collect()
 }
@@ -1719,8 +1723,8 @@ mod tests {
 
         assert_that!(capabilities.contains("srt")).is_true();
         assert_that!(capabilities.contains("webvtt")).is_true();
-        assert_that!(capabilities.contains("libx264")).is_false();
-        assert_that!(capabilities.contains("aac")).is_false();
+        assert_that!(capabilities.contains("libx264")).is_true();
+        assert_that!(capabilities.contains("aac")).is_true();
 
         let muxer_output = " File formats:
   D. = Demuxing supported

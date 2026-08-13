@@ -16,11 +16,15 @@ use ratatui::widgets::ListState;
 
 use crate::{
     edit::{
-        ContainerFormat, ContainerMetadata, CustomResolution, CustomScaling, EditEvent,
-        EditOutcome, EditRequest, MINIMUM_CUSTOM_DIMENSION, SaveDestination, VideoCodec,
-        VideoResolution, VideoSettings, container_conflict_streams, container_conflicts,
-        imported_subtitle_conflicts, plan_requires_transcode, stream_index,
-        subtitle_metadata_conflicts, validate_edit,
+        AudioChannelLayout, AudioCodec, AudioMetadata, AudioQuality, AudioRole, AudioSampleRate,
+        AudioSettings, CHANNEL_UPMIX_NOT_IMPLEMENTED, ContainerFormat, ContainerMetadata,
+        CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
+        MINIMUM_CUSTOM_DIMENSION, SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED, SaveDestination,
+        VideoCodec, VideoResolution, VideoSettings, audio_bitrate_kbps, audio_requires_transcode,
+        audio_stream_title, container_conflict_streams_with_audio, container_conflicts_with_audio,
+        current_container_conflicts_with_audio, effective_audio_codec, imported_subtitle_conflicts,
+        plan_requires_transcode_with_audio, stream_channels, stream_disposition, stream_index,
+        stream_sample_rate, subtitle_metadata_conflicts, validate_edit_with_audio,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -153,6 +157,8 @@ pub enum InputEdit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextInputSite {
     ContainerMetadata,
+    AudioTitle,
+    AudioLanguageSearch,
     SubtitleTitle,
     LanguageSearch,
     CustomResolution,
@@ -425,6 +431,7 @@ impl SearchState {
 pub enum Dialog {
     Keybindings,
     ContainerSettings,
+    AudioSettings,
     VideoSettings,
     SubtitleSettings,
     /// A confirm-cancel prompt over whichever processing view is showing
@@ -680,6 +687,92 @@ pub enum VideoSettingsMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AudioSettingsField {
+    #[default]
+    Codec,
+    ChannelLayout,
+    Quality,
+    SampleRate,
+    Language,
+    Title,
+    Default,
+    Commentary,
+    HearingImpaired,
+    AudioDescription,
+    Original,
+    Dubbed,
+}
+
+impl AudioSettingsField {
+    pub const ALL: [Self; 12] = [
+        Self::Codec,
+        Self::ChannelLayout,
+        Self::Quality,
+        Self::SampleRate,
+        Self::Language,
+        Self::Title,
+        Self::Default,
+        Self::Commentary,
+        Self::HearingImpaired,
+        Self::AudioDescription,
+        Self::Original,
+        Self::Dubbed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codec => "Codec",
+            Self::ChannelLayout => "Channel layout",
+            Self::Quality => "Quality",
+            Self::SampleRate => "Sample rate",
+            Self::Language => "Language",
+            Self::Title => "Title",
+            Self::Default => "Default",
+            Self::Commentary => "Commentary",
+            Self::HearingImpaired => "Hearing impaired",
+            Self::AudioDescription => "Audio description",
+            Self::Original => "Original",
+            Self::Dubbed => "Dubbed",
+        }
+    }
+
+    pub fn role(self) -> Option<AudioRole> {
+        match self {
+            Self::Commentary => Some(AudioRole::Commentary),
+            Self::HearingImpaired => Some(AudioRole::HearingImpaired),
+            Self::AudioDescription => Some(AudioRole::AudioDescription),
+            Self::Original => Some(AudioRole::Original),
+            Self::Dubbed => Some(AudioRole::Dubbed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AudioSettingsMode {
+    #[default]
+    Summary,
+    Dropdown,
+    LanguageDropdown,
+    TitleEdit,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioSettingsPopup {
+    pub stream_index: u64,
+    pub field: AudioSettingsField,
+    pub mode: AudioSettingsMode,
+    pub help_visible: bool,
+    pub codec_cursor: usize,
+    pub channel_cursor: usize,
+    pub quality_cursor: usize,
+    pub sample_rate_cursor: usize,
+    pub language_cursor: usize,
+    pub language_search: SearchState,
+    pub title_input: TextInputState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CustomResolutionField {
     #[default]
     Width,
@@ -867,6 +960,15 @@ pub struct VideoCodecChoice {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioChoice<T> {
+    pub value: T,
+    pub label: String,
+    pub current: bool,
+    pub enabled: bool,
+    pub reason: Option<String>,
+}
+
 /// How long `Dialog::ResolveConflicts`' button stays inert after the notice appears,
 /// counting down inside the label. Long enough that a keystroke already in flight when
 /// the notice popped up can't acknowledge it, and that the reverted-changes list gets
@@ -916,6 +1018,8 @@ pub struct App {
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
     pub default_sidecars: BTreeSet<usize>,
+    pub audio_settings: BTreeMap<u64, AudioSettings>,
+    pub audio_settings_popup: Option<AudioSettingsPopup>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub video_settings_popup: Option<VideoSettingsPopup>,
     pub sidecars: Vec<SidecarEntry>,
@@ -1041,6 +1145,8 @@ impl App {
             deleted_streams: BTreeSet::new(),
             default_streams: BTreeSet::new(),
             default_sidecars: BTreeSet::new(),
+            audio_settings: BTreeMap::new(),
+            audio_settings_popup: None,
             video_settings: BTreeMap::new(),
             video_settings_popup: None,
             sidecars: Vec::new(),
@@ -1722,6 +1828,7 @@ impl App {
                     &staged.original_default_streams,
                     &staged.track_groups,
                     &staged.moved_streams,
+                    &staged.audio_settings,
                     &staged.video_settings,
                     &staged.subtitle_changes,
                     &BTreeSet::new(),
@@ -2629,6 +2736,7 @@ impl App {
             self.media_info(),
             &self.stream_order,
             &self.deleted_streams,
+            &self.audio_settings,
             &self.video_settings,
             &self.subtitle_changes,
             &self.sidecars,
@@ -2644,6 +2752,7 @@ impl App {
             self.container_target,
             &self.stream_order,
             &self.deleted_streams,
+            &self.audio_settings,
             &self.video_settings,
             &self.subtitle_changes,
             &self.sidecars,
@@ -2656,9 +2765,10 @@ impl App {
         };
         let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
         let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
-        container_conflict_streams(
+        container_conflict_streams_with_audio(
             info,
             &stream_order,
+            &self.audio_settings,
             &self.video_settings,
             &subtitle_changes,
             target,
@@ -2740,6 +2850,7 @@ impl App {
             &staged.original_default_streams,
             &staged.track_groups,
             &staged.moved_streams,
+            &staged.audio_settings,
             &staged.video_settings,
             &staged.subtitle_changes,
             staged.container_target,
@@ -2787,6 +2898,7 @@ impl App {
             &self.original_default_streams,
             &self.track_groups,
             &self.moved_streams,
+            &self.audio_settings,
             &self.video_settings,
             &self.subtitle_changes,
             self.container_target,
@@ -3111,6 +3223,18 @@ impl App {
             return Some(TextInputSite::ContainerMetadata);
         }
         if self
+            .audio_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == AudioSettingsMode::TitleEdit)
+        {
+            return Some(TextInputSite::AudioTitle);
+        }
+        if self.audio_settings_popup.as_ref().is_some_and(|popup| {
+            popup.mode == AudioSettingsMode::LanguageDropdown && popup.language_search.is_active
+        }) {
+            return Some(TextInputSite::AudioLanguageSearch);
+        }
+        if self
             .subtitle_settings_popup
             .as_ref()
             .is_some_and(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
@@ -3144,6 +3268,14 @@ impl App {
             TextInputSite::ContainerMetadata => Some((
                 &mut self.container_settings_popup.as_mut()?.text_input,
                 TextInputConfig::CONTAINER_METADATA,
+            )),
+            TextInputSite::AudioTitle => Some((
+                &mut self.audio_settings_popup.as_mut()?.title_input,
+                TextInputConfig::SUBTITLE_TITLE,
+            )),
+            TextInputSite::AudioLanguageSearch => Some((
+                &mut self.audio_settings_popup.as_mut()?.language_search.input,
+                TextInputConfig::LANGUAGE_SEARCH,
             )),
             TextInputSite::SubtitleTitle => Some((
                 &mut self.subtitle_settings_popup.as_mut()?.title_input,
@@ -3215,6 +3347,11 @@ impl App {
             InputEdit::Unchanged => return,
         }
         match site {
+            TextInputSite::AudioLanguageSearch => {
+                if let Some(popup) = self.audio_settings_popup.as_mut() {
+                    popup.language_cursor = 0;
+                }
+            }
             TextInputSite::LanguageSearch => {
                 if let Some(popup) = self.subtitle_settings_popup.as_mut() {
                     popup.language_cursor = 0;
@@ -3228,6 +3365,7 @@ impl App {
                 self.reselect_file_after_view_change(selected_path.clone(), selected_path);
             }
             TextInputSite::ContainerMetadata
+            | TextInputSite::AudioTitle
             | TextInputSite::SubtitleTitle
             | TextInputSite::CustomResolution => {}
         }
@@ -3280,6 +3418,394 @@ impl App {
         self.edit_active_text(|input, config| input.move_home(end, config));
     }
 
+    fn original_audio_settings(&self, index: u64) -> Option<AudioSettings> {
+        let stream = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))?;
+        (stream_kind(stream) == Some("audio")).then(|| AudioSettings {
+            codec: AudioCodec::Original,
+            channel_layout: AudioChannelLayout::Original,
+            quality: AudioQuality::Source,
+            sample_rate: AudioSampleRate::Original,
+            metadata: AudioMetadata {
+                language: stream_language(stream),
+                title: audio_stream_title(stream),
+                commentary: stream_commentary(stream),
+                hearing_impaired: stream_hearing_impaired(stream),
+                audio_description: stream_disposition(stream, "visual_impaired"),
+                original: stream_original(stream),
+                dubbed: stream_disposition(stream, "dub"),
+            },
+        })
+    }
+
+    pub fn effective_audio_settings(&self, index: u64) -> Option<AudioSettings> {
+        self.audio_settings
+            .get(&index)
+            .cloned()
+            .or_else(|| self.original_audio_settings(index))
+    }
+
+    fn store_audio_settings(&mut self, index: u64, mut settings: AudioSettings) {
+        settings.metadata.language = canonical_language_code(&settings.metadata.language)
+            .unwrap_or_else(|| "und".to_string());
+        if self.original_audio_settings(index).as_ref() == Some(&settings) {
+            self.audio_settings.remove(&index);
+        } else {
+            self.audio_settings.insert(index, settings);
+        }
+    }
+
+    pub fn open_audio_settings(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        let Some(index) = self.selected_stream_index() else {
+            return;
+        };
+        if self.deleted_streams.contains(&index) {
+            self.notice =
+                Some("Unmark this track for deletion before changing its audio settings.".into());
+            return;
+        }
+        if !self
+            .selected_stream_info()
+            .is_some_and(|stream| stream_kind(stream) == Some("audio"))
+        {
+            self.notice = Some("Audio settings are only available for audio tracks.".into());
+            return;
+        }
+        let Some(settings) = self.effective_audio_settings(index) else {
+            return;
+        };
+        let codecs = self.audio_codec_choices(index);
+        let channels = self.audio_channel_choices(index);
+        let qualities = self.audio_quality_choices(index);
+        let sample_rates = self.audio_sample_rate_choices(index);
+        let languages = self.audio_language_choices_for(index, "");
+        let language_cursor = languages
+            .iter()
+            .position(|choice| choice.code == settings.metadata.language)
+            .unwrap_or(0);
+        self.audio_settings_popup = Some(AudioSettingsPopup {
+            stream_index: index,
+            field: AudioSettingsField::Codec,
+            mode: AudioSettingsMode::Summary,
+            help_visible: false,
+            codec_cursor: codecs
+                .iter()
+                .position(|choice| choice.value == settings.codec)
+                .unwrap_or(0),
+            channel_cursor: channels
+                .iter()
+                .position(|choice| choice.value == settings.channel_layout)
+                .unwrap_or(0),
+            quality_cursor: qualities
+                .iter()
+                .position(|choice| choice.value == settings.quality)
+                .unwrap_or(0),
+            sample_rate_cursor: sample_rates
+                .iter()
+                .position(|choice| choice.value == settings.sample_rate)
+                .unwrap_or(0),
+            language_cursor,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new(settings.metadata.title.unwrap_or_default()),
+        });
+        self.notice = None;
+        self.dialog = Some(Dialog::AudioSettings);
+    }
+
+    pub fn toggle_audio_field_help(&mut self) {
+        if let Some(popup) = self.audio_settings_popup.as_mut() {
+            popup.help_visible = !popup.help_visible;
+        }
+    }
+
+    pub fn audio_codec_choices(&self, index: u64) -> Vec<AudioChoice<AudioCodec>> {
+        let source_name = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))
+            .and_then(|stream| stream.get("codec_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let source_codec = AudioCodec::from_codec_name(source_name);
+        let container = self.effective_container();
+        let mut choices = Vec::with_capacity(AudioCodec::TARGETS.len() + 1);
+        if source_codec.is_none() {
+            let rejected = container
+                .filter(|container| !container.supports_codec("audio", source_name, false));
+            choices.push(AudioChoice {
+                value: AudioCodec::Original,
+                label: source_name.to_ascii_uppercase(),
+                current: true,
+                enabled: rejected.is_none(),
+                reason: rejected.map(|container| {
+                    format!(
+                        "{} cannot contain {} audio",
+                        container.label(),
+                        source_name.to_ascii_uppercase()
+                    )
+                }),
+            });
+        }
+        choices.extend(AudioCodec::TARGETS.into_iter().map(|codec| {
+            let current = source_codec == Some(codec);
+            let encoder_missing = codec.encoder().is_some_and(|encoder| {
+                !self.subtitle_capabilities.ffmpeg_encoders.contains(encoder)
+            });
+            let rejected = container.filter(|container| {
+                !container.supports_codec("audio", codec.codec_name().unwrap(), false)
+            });
+            let reason = if encoder_missing && !current {
+                Some("FFmpeg encoder is unavailable".to_string())
+            } else {
+                rejected.map(|container| {
+                    format!(
+                        "{} cannot contain {} audio",
+                        container.label(),
+                        codec.label()
+                    )
+                })
+            };
+            AudioChoice {
+                value: if current { AudioCodec::Original } else { codec },
+                label: codec.label().to_string(),
+                current,
+                enabled: reason.is_none(),
+                reason,
+            }
+        }));
+        choices
+    }
+
+    pub fn effective_audio_codec_for(&self, index: u64) -> Option<AudioCodec> {
+        let stream = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))?;
+        let settings = self.effective_audio_settings(index)?;
+        effective_audio_codec(stream, &settings)
+    }
+
+    pub fn audio_channel_choices(&self, index: u64) -> Vec<AudioChoice<AudioChannelLayout>> {
+        let source_channels = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))
+            .and_then(stream_channels);
+        let codec = self.effective_audio_codec_for(index);
+        let mut choices = Vec::new();
+        if !matches!(source_channels, Some(1 | 2 | 6 | 8)) {
+            choices.push(AudioChoice {
+                value: AudioChannelLayout::Original,
+                label: source_channels
+                    .map(|channels| format!("{channels} channels"))
+                    .unwrap_or_else(|| "Original".to_string()),
+                current: true,
+                enabled: source_channels.is_some(),
+                reason: source_channels
+                    .is_none()
+                    .then(|| "Source layout is unavailable".into()),
+            });
+        }
+        choices.extend(AudioChannelLayout::TARGETS.into_iter().map(|layout| {
+            let channels = layout.channels().unwrap();
+            let current = source_channels == Some(channels);
+            let reason = if source_channels.is_none() {
+                Some("Source layout is unavailable".to_string())
+            } else if source_channels.is_some_and(|source| channels > source) {
+                Some(CHANNEL_UPMIX_NOT_IMPLEMENTED.to_string())
+            } else {
+                codec
+                    .filter(|codec| !codec.supports_channels(channels))
+                    .map(|codec| format!("{} does not support this layout", codec.label()))
+            };
+            AudioChoice {
+                value: if current {
+                    AudioChannelLayout::Original
+                } else {
+                    layout
+                },
+                label: layout.label().to_string(),
+                current,
+                enabled: reason.is_none(),
+                reason,
+            }
+        }));
+        choices
+    }
+
+    pub fn audio_quality_choices(&self, index: u64) -> Vec<AudioChoice<AudioQuality>> {
+        let Some(codec) = self.effective_audio_codec_for(index) else {
+            return Vec::new();
+        };
+        if codec.is_lossless() {
+            return Vec::new();
+        }
+        let Some(settings) = self.effective_audio_settings(index) else {
+            return Vec::new();
+        };
+        let source = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index));
+        let channels = settings
+            .channel_layout
+            .channels()
+            .or_else(|| source.and_then(stream_channels))
+            .unwrap_or(2);
+        let mut choices = Vec::new();
+        let bitrate = source
+            .and_then(|stream| stream.get("bit_rate"))
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => value.parse::<u64>().ok(),
+                serde_json::Value::Number(value) => value.as_u64(),
+                _ => None,
+            })
+            .map(|rate| format!(" ({} kbps)", rate / 1_000))
+            .unwrap_or_default();
+        choices.push(AudioChoice {
+            value: AudioQuality::Source,
+            label: format!("Source{bitrate}"),
+            current: settings.quality == AudioQuality::Source,
+            enabled: true,
+            reason: None,
+        });
+        choices.extend(AudioQuality::PRESETS.into_iter().map(|quality| {
+            let bitrate = audio_bitrate_kbps(codec, channels, quality);
+            AudioChoice {
+                value: quality,
+                label: bitrate
+                    .map(|rate| format!("{} ({rate} kbps)", quality.label()))
+                    .unwrap_or_else(|| quality.label().to_string()),
+                current: false,
+                enabled: bitrate.is_some(),
+                reason: bitrate
+                    .is_none()
+                    .then(|| format!("{} does not support this layout", codec.label())),
+            }
+        }));
+        choices
+    }
+
+    pub fn audio_sample_rate_choices(&self, index: u64) -> Vec<AudioChoice<AudioSampleRate>> {
+        let source_rate = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))
+            .and_then(stream_sample_rate);
+        let codec = self.effective_audio_codec_for(index);
+        let mut choices = Vec::new();
+        if !source_rate.is_some_and(|rate| AudioSampleRate::TARGETS.contains(&rate)) {
+            choices.push(AudioChoice {
+                value: AudioSampleRate::Original,
+                label: source_rate
+                    .map(|rate| AudioSampleRate::Hz(rate).label())
+                    .unwrap_or_else(|| "Original".to_string()),
+                current: true,
+                enabled: source_rate
+                    .is_some_and(|rate| codec.is_none_or(|codec| codec.supports_sample_rate(rate))),
+                reason: source_rate
+                    .is_none()
+                    .then(|| "Source sample rate is unavailable".to_string()),
+            });
+        }
+        choices.extend(AudioSampleRate::TARGETS.into_iter().map(|rate| {
+            let current = source_rate == Some(rate);
+            let reason = if source_rate.is_none() {
+                Some("Source sample rate is unavailable".to_string())
+            } else if source_rate.is_some_and(|source| rate > source) {
+                Some(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED.to_string())
+            } else {
+                codec
+                    .filter(|codec| !codec.supports_sample_rate(rate))
+                    .map(|codec| format!("{} does not support this rate", codec.label()))
+            };
+            AudioChoice {
+                value: if current {
+                    AudioSampleRate::Original
+                } else {
+                    AudioSampleRate::Hz(rate)
+                },
+                label: AudioSampleRate::Hz(rate).label(),
+                current,
+                enabled: reason.is_none(),
+                reason,
+            }
+        }));
+        choices
+    }
+
+    fn audio_language_choices_for(&self, index: u64, query: &str) -> Vec<LanguageChoice> {
+        let mut choices = common_language_choices();
+        choices.insert(
+            0,
+            LanguageChoice {
+                code: "und".to_string(),
+                two_letter: String::new(),
+                name: "Undetermined".to_string(),
+            },
+        );
+        if let Some(current) = self
+            .effective_audio_settings(index)
+            .and_then(|settings| language_choice(&settings.metadata.language))
+            && !choices.iter().any(|choice| choice.code == current.code)
+        {
+            choices.push(current);
+        }
+        choices.retain(|choice| choice.matches(query));
+        choices
+    }
+
+    pub fn filtered_audio_languages(&self) -> Vec<LanguageChoice> {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return Vec::new();
+        };
+        self.audio_language_choices_for(popup.stream_index, &popup.language_search.value)
+    }
+
+    pub fn audio_field_visible(&self, field: AudioSettingsField) -> bool {
+        !matches!(
+            field,
+            AudioSettingsField::Quality | AudioSettingsField::SampleRate
+        )
+    }
+
+    pub fn visible_audio_fields(&self) -> Vec<AudioSettingsField> {
+        AudioSettingsField::ALL
+            .into_iter()
+            .filter(|field| self.audio_field_visible(*field))
+            .collect()
+    }
+
+    pub fn audio_field_reason(&self, field: AudioSettingsField) -> Option<String> {
+        let popup = self.audio_settings_popup.as_ref()?;
+        let settings = self.effective_audio_settings(popup.stream_index)?;
+        let original = self.original_audio_settings(popup.stream_index)?;
+        let container = self.effective_container()?;
+        match field {
+            AudioSettingsField::Language
+                if !container.supports_audio_language() && settings.metadata.language == "und" =>
+            {
+                Some(format!(
+                    "{} cannot store audio language metadata",
+                    container.label()
+                ))
+            }
+            field
+                if field.role().is_some_and(|role| {
+                    !container.supports_audio_role(role)
+                        && !settings.metadata.get_role(role)
+                        && !original.metadata.get_role(role)
+                }) =>
+            {
+                Some(format!(
+                    "{} cannot store the {} audio role",
+                    container.label(),
+                    field.label()
+                ))
+            }
+            _ => None,
+        }
+    }
+
     pub fn open_video_settings(&mut self) {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
@@ -3329,9 +3855,7 @@ impl App {
                     .selected_stream_info()
                     .is_some_and(|stream| stream_kind(stream) == Some("audio")) =>
             {
-                if self.layer == Layer::Streams && self.dialog.is_none() {
-                    self.notice = Some("Editing audio tracks is not implemented yet.".into());
-                }
+                self.open_audio_settings();
             }
             Some(TrackRef::Embedded(index))
                 if self
@@ -4103,6 +4627,360 @@ impl App {
         self.request_process_all();
     }
 
+    pub fn move_audio_settings_cursor(&mut self, direction: isize) {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return;
+        };
+        match popup.mode {
+            AudioSettingsMode::Summary => {
+                let fields = self.visible_audio_fields();
+                let position = fields
+                    .iter()
+                    .position(|field| *field == popup.field)
+                    .unwrap_or(0);
+                let next = move_cursor(position, fields.len(), direction, |_| true);
+                self.audio_settings_popup.as_mut().unwrap().field = fields[next];
+            }
+            AudioSettingsMode::Dropdown => {
+                let index = popup.stream_index;
+                let field = popup.field;
+                match field {
+                    AudioSettingsField::Codec => {
+                        let choices = self.audio_codec_choices(index);
+                        let popup = self.audio_settings_popup.as_mut().unwrap();
+                        popup.codec_cursor =
+                            move_cursor(popup.codec_cursor, choices.len(), direction, |position| {
+                                choices[position].enabled
+                            });
+                    }
+                    AudioSettingsField::ChannelLayout => {
+                        let choices = self.audio_channel_choices(index);
+                        let popup = self.audio_settings_popup.as_mut().unwrap();
+                        popup.channel_cursor = move_cursor(
+                            popup.channel_cursor,
+                            choices.len(),
+                            direction,
+                            |position| choices[position].enabled,
+                        );
+                    }
+                    AudioSettingsField::Quality => {
+                        let choices = self.audio_quality_choices(index);
+                        let popup = self.audio_settings_popup.as_mut().unwrap();
+                        popup.quality_cursor = move_cursor(
+                            popup.quality_cursor,
+                            choices.len(),
+                            direction,
+                            |position| choices[position].enabled,
+                        );
+                    }
+                    AudioSettingsField::SampleRate => {
+                        let choices = self.audio_sample_rate_choices(index);
+                        let popup = self.audio_settings_popup.as_mut().unwrap();
+                        popup.sample_rate_cursor = move_cursor(
+                            popup.sample_rate_cursor,
+                            choices.len(),
+                            direction,
+                            |position| choices[position].enabled,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            AudioSettingsMode::LanguageDropdown => {
+                let choices = self.filtered_audio_languages();
+                let popup = self.audio_settings_popup.as_mut().unwrap();
+                popup.language_cursor =
+                    move_cursor(popup.language_cursor, choices.len(), direction, |_| true);
+            }
+            AudioSettingsMode::TitleEdit => {}
+        }
+    }
+
+    pub fn move_audio_settings_to_endpoint(&mut self, end: bool) {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return;
+        };
+        match popup.mode {
+            AudioSettingsMode::Summary => {
+                let fields = self.visible_audio_fields();
+                if let Some(field) = if end { fields.last() } else { fields.first() } {
+                    self.audio_settings_popup.as_mut().unwrap().field = *field;
+                }
+            }
+            AudioSettingsMode::Dropdown => {
+                let index = popup.stream_index;
+                let field = popup.field;
+                let endpoint = match field {
+                    AudioSettingsField::Codec => {
+                        let choices = self.audio_codec_choices(index);
+                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
+                    }
+                    AudioSettingsField::ChannelLayout => {
+                        let choices = self.audio_channel_choices(index);
+                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
+                    }
+                    AudioSettingsField::Quality => {
+                        let choices = self.audio_quality_choices(index);
+                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
+                    }
+                    AudioSettingsField::SampleRate => {
+                        let choices = self.audio_sample_rate_choices(index);
+                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
+                    }
+                    _ => None,
+                };
+                if let Some(endpoint) = endpoint {
+                    let popup = self.audio_settings_popup.as_mut().unwrap();
+                    match field {
+                        AudioSettingsField::Codec => popup.codec_cursor = endpoint,
+                        AudioSettingsField::ChannelLayout => popup.channel_cursor = endpoint,
+                        AudioSettingsField::Quality => popup.quality_cursor = endpoint,
+                        AudioSettingsField::SampleRate => popup.sample_rate_cursor = endpoint,
+                        _ => {}
+                    }
+                }
+            }
+            AudioSettingsMode::LanguageDropdown => {
+                let len = self.filtered_audio_languages().len();
+                if len > 0 {
+                    self.audio_settings_popup.as_mut().unwrap().language_cursor =
+                        if end { len - 1 } else { 0 };
+                }
+            }
+            AudioSettingsMode::TitleEdit => {}
+        }
+    }
+
+    pub fn activate_audio_settings(&mut self) {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return;
+        };
+        let index = popup.stream_index;
+        let field = popup.field;
+        let mode = popup.mode;
+        if mode == AudioSettingsMode::Summary {
+            if let Some(reason) = self.audio_field_reason(field) {
+                self.notice = Some(reason);
+                return;
+            }
+            match field {
+                AudioSettingsField::Codec
+                | AudioSettingsField::ChannelLayout
+                | AudioSettingsField::Quality
+                | AudioSettingsField::SampleRate => {
+                    self.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
+                }
+                AudioSettingsField::Language => {
+                    let current = self
+                        .effective_audio_settings(index)
+                        .map(|settings| settings.metadata.language)
+                        .unwrap_or_else(|| "und".to_string());
+                    let choices = self.audio_language_choices_for(index, "");
+                    let popup = self.audio_settings_popup.as_mut().unwrap();
+                    popup.language_search.clear();
+                    popup.language_cursor = choices
+                        .iter()
+                        .position(|choice| choice.code == current)
+                        .unwrap_or(0);
+                    popup.mode = AudioSettingsMode::LanguageDropdown;
+                }
+                AudioSettingsField::Title => self.start_audio_title_input(),
+                AudioSettingsField::Default => self.toggle_audio_default(index),
+                field => {
+                    if let Some(role) = field.role()
+                        && let Some(mut settings) = self.effective_audio_settings(index)
+                    {
+                        let enabled = settings.metadata.get_role(role);
+                        settings.metadata.set_role(role, !enabled);
+                        self.store_audio_settings(index, settings);
+                    }
+                }
+            }
+            return;
+        }
+        if mode == AudioSettingsMode::LanguageDropdown {
+            let choices = self.filtered_audio_languages();
+            let cursor = popup.language_cursor;
+            if let Some(choice) = choices.get(cursor)
+                && let Some(mut settings) = self.effective_audio_settings(index)
+            {
+                settings.metadata.language.clone_from(&choice.code);
+                self.store_audio_settings(index, settings);
+                let popup = self.audio_settings_popup.as_mut().unwrap();
+                popup.language_search.clear();
+                popup.mode = AudioSettingsMode::Summary;
+            }
+            return;
+        }
+        if mode != AudioSettingsMode::Dropdown {
+            return;
+        }
+        let Some(mut settings) = self.effective_audio_settings(index) else {
+            return;
+        };
+        match field {
+            AudioSettingsField::Codec => {
+                let cursor = popup.codec_cursor;
+                let choices = self.audio_codec_choices(index);
+                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
+                    return;
+                };
+                settings.codec = choice.value;
+            }
+            AudioSettingsField::ChannelLayout => {
+                let cursor = popup.channel_cursor;
+                let choices = self.audio_channel_choices(index);
+                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
+                    return;
+                };
+                settings.channel_layout = choice.value;
+            }
+            AudioSettingsField::Quality => {
+                let cursor = popup.quality_cursor;
+                let choices = self.audio_quality_choices(index);
+                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
+                    return;
+                };
+                settings.quality = choice.value;
+            }
+            AudioSettingsField::SampleRate => {
+                let cursor = popup.sample_rate_cursor;
+                let choices = self.audio_sample_rate_choices(index);
+                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
+                    return;
+                };
+                settings.sample_rate = choice.value;
+            }
+            _ => return,
+        }
+        self.store_audio_settings(index, settings);
+        self.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Summary;
+    }
+
+    fn toggle_audio_default(&mut self, index: u64) {
+        if !self.default_streams.remove(&index) {
+            let audio_indices = self
+                .media_info()
+                .into_iter()
+                .flat_map(|info| info.streams.iter())
+                .filter(|stream| stream_kind(stream) == Some("audio"))
+                .filter_map(stream_index)
+                .collect::<Vec<_>>();
+            for audio_index in audio_indices {
+                self.default_streams.remove(&audio_index);
+            }
+            self.default_streams.insert(index);
+        }
+    }
+
+    pub fn start_audio_title_input(&mut self) {
+        self.clear_text_input_reject();
+        let Some(popup) = self.audio_settings_popup.as_mut() else {
+            return;
+        };
+        if popup.mode != AudioSettingsMode::Summary || popup.field != AudioSettingsField::Title {
+            return;
+        }
+        popup.title_input.activate();
+        popup.mode = AudioSettingsMode::TitleEdit;
+    }
+
+    fn commit_audio_title(&mut self) {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return;
+        };
+        let index = popup.stream_index;
+        let title = popup.title_input.value.trim().to_string();
+        if let Some(mut settings) = self.effective_audio_settings(index) {
+            settings.metadata.title = (!title.is_empty()).then_some(title);
+            self.store_audio_settings(index, settings);
+        }
+    }
+
+    pub fn start_audio_language_search(&mut self) {
+        self.clear_text_input_reject();
+        let Some(popup) = self
+            .audio_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == AudioSettingsMode::LanguageDropdown)
+        else {
+            return;
+        };
+        popup.language_search.activate();
+    }
+
+    pub fn cancel_audio_language_search(&mut self) {
+        let Some(popup) = self.audio_settings_popup.as_mut() else {
+            return;
+        };
+        popup.language_search.clear();
+        popup.language_cursor = 0;
+    }
+
+    pub fn escape_audio_settings(&mut self) {
+        let Some(mode) = self.audio_settings_popup.as_ref().map(|popup| popup.mode) else {
+            self.dialog = None;
+            return;
+        };
+        match mode {
+            AudioSettingsMode::TitleEdit => {
+                self.commit_audio_title();
+                let popup = self.audio_settings_popup.as_mut().unwrap();
+                popup.title_input.deactivate();
+                popup.mode = AudioSettingsMode::Summary;
+            }
+            AudioSettingsMode::Dropdown | AudioSettingsMode::LanguageDropdown => {
+                let popup = self.audio_settings_popup.as_mut().unwrap();
+                popup.language_search.clear();
+                popup.mode = AudioSettingsMode::Summary;
+            }
+            AudioSettingsMode::Summary => {
+                self.audio_settings_popup = None;
+                self.dialog = None;
+            }
+        }
+    }
+
+    pub fn save_from_audio_settings(&mut self) {
+        if self
+            .audio_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == AudioSettingsMode::TitleEdit)
+        {
+            self.commit_audio_title();
+        }
+        self.audio_settings_popup = None;
+        self.dialog = None;
+        self.request_process_all();
+    }
+
+    pub fn audio_field_changed(&self, field: AudioSettingsField) -> bool {
+        let Some(popup) = self.audio_settings_popup.as_ref() else {
+            return false;
+        };
+        let Some(current) = self.effective_audio_settings(popup.stream_index) else {
+            return false;
+        };
+        let Some(original) = self.original_audio_settings(popup.stream_index) else {
+            return false;
+        };
+        match field {
+            AudioSettingsField::Codec => current.codec != original.codec,
+            AudioSettingsField::ChannelLayout => current.channel_layout != original.channel_layout,
+            AudioSettingsField::Quality => current.quality != original.quality,
+            AudioSettingsField::SampleRate => current.sample_rate != original.sample_rate,
+            AudioSettingsField::Language => current.metadata.language != original.metadata.language,
+            AudioSettingsField::Title => current.metadata.title != original.metadata.title,
+            AudioSettingsField::Default => {
+                self.default_streams.contains(&popup.stream_index)
+                    != self.original_default_streams.contains(&popup.stream_index)
+            }
+            field => field.role().is_some_and(|role| {
+                current.metadata.get_role(role) != original.metadata.get_role(role)
+            }),
+        }
+    }
+
     pub fn move_video_settings_cursor(&mut self, direction: isize) {
         let Some(popup) = self.video_settings_popup.as_ref() else {
             return;
@@ -4826,7 +5704,12 @@ impl App {
                 .difference(&staged.deleted_streams)
                 .copied()
                 .collect::<BTreeSet<_>>();
-            let transcode = plan_requires_transcode(info, &stream_order, &staged.video_settings);
+            let transcode = plan_requires_transcode_with_audio(
+                info,
+                &stream_order,
+                &staged.audio_settings,
+                &staged.video_settings,
+            );
             let request = EditRequest {
                 path: path.clone(),
                 destination: SaveDestination::ReplaceOriginal,
@@ -4836,6 +5719,7 @@ impl App {
                 deleted_streams: staged.deleted_streams.clone(),
                 default_streams,
                 default_sidecars: staged.default_sidecars.clone(),
+                audio_settings: staged.audio_settings.clone(),
                 video_settings: staged.video_settings.clone(),
                 subtitle_changes: staged.subtitle_changes.values().cloned().collect(),
                 left_subtitle_order: staged.left_subtitle_order.clone(),
@@ -5206,6 +6090,9 @@ impl App {
         };
         staged.moved_streams.retain(|index| !was_in_group(index));
         staged
+            .audio_settings
+            .retain(|index, _| !was_in_group(index));
+        staged
             .video_settings
             .retain(|index, _| !was_in_group(index));
         // Subtitle changes are pinned to a group rather than an index — a sidecar
@@ -5227,6 +6114,7 @@ impl App {
             &staged.original_default_streams,
             &staged.track_groups,
             &staged.moved_streams,
+            &staged.audio_settings,
             &staged.video_settings,
             &staged.subtitle_changes,
             &reverted,
@@ -5556,6 +6444,7 @@ impl App {
                     deleted_streams: self.deleted_streams.clone(),
                     default_streams: self.default_streams.clone(),
                     default_sidecars: self.default_sidecars.clone(),
+                    audio_settings: self.audio_settings.clone(),
                     video_settings: self.video_settings.clone(),
                     subtitle_changes: self.subtitle_changes.clone(),
                     left_subtitle_order: self.left_subtitle_order.clone(),
@@ -5600,6 +6489,7 @@ impl App {
         self.deleted_streams = staged.deleted_streams.clone();
         self.default_streams = staged.default_streams.clone();
         self.default_sidecars = staged.default_sidecars.clone();
+        self.audio_settings = staged.audio_settings.clone();
         self.video_settings = staged.video_settings.clone();
         self.subtitle_changes = staged.subtitle_changes.clone();
         self.left_subtitle_order = staged.left_subtitle_order.clone();
@@ -5608,6 +6498,7 @@ impl App {
         self.original_stream_order = staged.original_stream_order.clone();
         self.original_default_streams = staged.original_default_streams.clone();
         self.track_groups = staged.track_groups.clone();
+        self.audio_settings_popup = None;
         self.video_settings_popup = None;
         self.subtitle_settings_popup = None;
         self.container_settings_popup = None;
@@ -5688,6 +6579,7 @@ impl App {
             }
             TrackRef::Embedded(index) => {
                 self.deleted_streams.remove(&index);
+                self.audio_settings.remove(&index);
                 self.video_settings.remove(&index);
                 let originally_default = self.original_default_streams.contains(&index);
                 if originally_default {
@@ -5730,6 +6622,11 @@ impl App {
                     self.reset_video_field(field);
                 }
             }
+            Some(Dialog::AudioSettings) => {
+                if let Some(field) = self.audio_settings_popup.as_ref().map(|popup| popup.field) {
+                    self.reset_audio_field(field);
+                }
+            }
             Some(Dialog::SubtitleSettings) => {
                 if let Some(field) = self
                     .subtitle_settings_popup
@@ -5768,6 +6665,46 @@ impl App {
             ContainerSettingsField::Format => unreachable!(),
         }
         self.container_metadata = (metadata != original).then_some(metadata);
+    }
+
+    fn reset_audio_field(&mut self, field: AudioSettingsField) {
+        let Some(index) = self
+            .audio_settings_popup
+            .as_ref()
+            .map(|popup| popup.stream_index)
+        else {
+            return;
+        };
+        if field == AudioSettingsField::Default {
+            if self.original_default_streams.contains(&index) {
+                self.default_streams.insert(index);
+            } else {
+                self.default_streams.remove(&index);
+            }
+            return;
+        }
+        let Some(original) = self.original_audio_settings(index) else {
+            return;
+        };
+        let Some(mut settings) = self.effective_audio_settings(index) else {
+            return;
+        };
+        match field {
+            AudioSettingsField::Codec => settings.codec = original.codec,
+            AudioSettingsField::ChannelLayout => settings.channel_layout = original.channel_layout,
+            AudioSettingsField::Quality => settings.quality = original.quality,
+            AudioSettingsField::SampleRate => settings.sample_rate = original.sample_rate,
+            AudioSettingsField::Language => settings.metadata.language = original.metadata.language,
+            AudioSettingsField::Title => settings.metadata.title = original.metadata.title,
+            AudioSettingsField::Default => unreachable!(),
+            field => {
+                let role = field.role().expect("audio role field");
+                settings
+                    .metadata
+                    .set_role(role, original.metadata.get_role(role));
+            }
+        }
+        self.store_audio_settings(index, settings);
     }
 
     /// Resets one `VideoSettings` field (`Codec` or `Resolution`) to `Original`,
@@ -5884,6 +6821,8 @@ impl App {
         self.original_default_streams = defaults;
         self.default_sidecars.clear();
         self.deleted_streams.clear();
+        self.audio_settings.clear();
+        self.audio_settings_popup = None;
         self.video_settings.clear();
         self.video_settings_popup = None;
         self.subtitle_changes.clear();
@@ -5903,6 +6842,8 @@ impl App {
         self.default_streams.clear();
         self.original_default_streams.clear();
         self.default_sidecars.clear();
+        self.audio_settings.clear();
+        self.audio_settings_popup = None;
         self.video_settings.clear();
         self.video_settings_popup = None;
         self.subtitle_changes.clear();
@@ -5933,6 +6874,7 @@ impl App {
             &self.original_default_streams,
             &self.default_streams,
         ));
+        changed.extend(self.audio_settings.keys().copied());
         changed.extend(self.video_settings.keys().copied());
         changed.extend(
             self.subtitle_changes
@@ -5959,6 +6901,7 @@ impl App {
                 self.media_info(),
             )
             .is_empty()
+            || !self.audio_settings.is_empty()
             || !self.video_settings.is_empty()
             || self
                 .subtitle_changes
@@ -6235,6 +7178,7 @@ fn container_conflicts_for_plan(
     info: Option<&MediaInfo>,
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
+    audio_settings: &BTreeMap<u64, AudioSettings>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
     sidecars: &[SidecarEntry],
@@ -6254,9 +7198,10 @@ fn container_conflicts_for_plan(
     };
     let order = final_stream_order(info, stream_order, deleted_streams);
     let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
-    conflicts.extend(container_conflicts(
+    conflicts.extend(container_conflicts_with_audio(
         info,
         &order,
+        audio_settings,
         video_settings,
         &changes,
         target,
@@ -6278,6 +7223,7 @@ fn staged_container_conflicts(
     container_target: Option<ContainerFormat>,
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
+    audio_settings: &BTreeMap<u64, AudioSettings>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
     sidecars: &[SidecarEntry],
@@ -6288,6 +7234,7 @@ fn staged_container_conflicts(
             info,
             stream_order,
             deleted_streams,
+            audio_settings,
             video_settings,
             subtitle_changes,
             sidecars,
@@ -6308,7 +7255,22 @@ fn staged_container_conflicts(
         };
     };
     let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
-    let mut conflicts = imported_subtitle_conflicts(&changes, sidecars, target);
+    let order = info
+        .map(|info| final_stream_order(info, stream_order, deleted_streams))
+        .unwrap_or_default();
+    let mut conflicts = info
+        .map(|info| {
+            current_container_conflicts_with_audio(
+                info,
+                &order,
+                audio_settings,
+                video_settings,
+                &[],
+                target,
+            )
+        })
+        .unwrap_or_default();
+    conflicts.extend(imported_subtitle_conflicts(&changes, sidecars, target));
     if let Some(info) = info {
         conflicts.extend(subtitle_metadata_conflicts(
             info, &changes, sidecars, target, false,
@@ -6342,6 +7304,7 @@ fn validate_staged_edit(
     original_default_streams: &BTreeSet<u64>,
     track_groups: &BTreeMap<u64, &'static str>,
     moved_streams: &BTreeSet<u64>,
+    audio_settings: &BTreeMap<u64, AudioSettings>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
     container_target: Option<ContainerFormat>,
@@ -6355,6 +7318,7 @@ fn validate_staged_edit(
         original_default_streams,
         track_groups,
         moved_streams,
+        audio_settings,
         video_settings,
         subtitle_changes,
         &BTreeSet::new(),
@@ -6371,13 +7335,33 @@ fn validate_staged_edit(
         .difference(&reconciled.deleted_streams)
         .copied()
         .collect();
-    validate_edit(
+    validate_edit_with_audio(
         info,
         &order,
         &reconciled.deleted_streams,
         &defaults,
+        audio_settings,
         video_settings,
     )?;
+    for (index, settings) in audio_settings {
+        let Some(stream) = stream_by_index(info, *index) else {
+            continue;
+        };
+        if !audio_requires_transcode(stream, settings) {
+            continue;
+        }
+        let codec = effective_audio_codec(stream, settings)
+            .expect("validate_edit_with_audio accepts only encodable audio codecs");
+        let encoder = codec
+            .encoder()
+            .expect("audio target codecs always provide an encoder");
+        if !subtitle_capabilities.ffmpeg_encoders.contains(encoder) {
+            return Err(format!(
+                "The installed FFmpeg build does not provide the {} encoder.",
+                codec.label()
+            ));
+        }
+    }
     if let Some(error) = subtitle_language_error_for(
         Some(info),
         &reconciled.deleted_streams,
@@ -6401,6 +7385,7 @@ fn validate_staged_edit(
         container_target,
         &reconciled.stream_order,
         &reconciled.deleted_streams,
+        audio_settings,
         video_settings,
         subtitle_changes,
         sidecars,
@@ -6461,6 +7446,7 @@ fn reconcile_untouched_groups(
     original_default_streams: &BTreeSet<u64>,
     track_groups: &BTreeMap<u64, &'static str>,
     moved_streams: &BTreeSet<u64>,
+    audio_settings: &BTreeMap<u64, AudioSettings>,
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
     force_untouched: &BTreeSet<&'static str>,
@@ -6480,6 +7466,7 @@ fn reconcile_untouched_groups(
     let touched_indices: BTreeSet<u64> = moved_streams
         .iter()
         .chain(deleted_streams.iter())
+        .chain(audio_settings.keys())
         .chain(video_settings.keys())
         .chain(default_streams.symmetric_difference(original_default_streams))
         .copied()
@@ -6853,6 +7840,54 @@ fn staged_edit_summary_entries(
             ));
         }
     }
+    for (index, settings) in &staged.audio_settings {
+        let source = stream_by_index(info, *index);
+        let codec = source
+            .and_then(|stream| effective_audio_codec(stream, settings))
+            .map(AudioCodec::label)
+            .unwrap_or("original codec");
+        let channels = settings
+            .channel_layout
+            .channels()
+            .or_else(|| source.and_then(stream_channels));
+        let mut details = vec![codec.to_string()];
+        if settings.channel_layout != AudioChannelLayout::Original {
+            details.push(settings.channel_layout.label().to_string());
+        }
+        if settings.quality != AudioQuality::Source
+            && let Some(channels) = channels
+            && let Some(rate) = source
+                .and_then(|stream| effective_audio_codec(stream, settings))
+                .and_then(|codec| audio_bitrate_kbps(codec, channels, settings.quality))
+        {
+            details.push(format!("{} ({rate} kbps)", settings.quality.label()));
+        }
+        if let AudioSampleRate::Hz(rate) = settings.sample_rate {
+            details.push(AudioSampleRate::Hz(rate).label());
+        }
+        let technical_change = settings.codec != AudioCodec::Original
+            || settings.channel_layout != AudioChannelLayout::Original
+            || settings.quality != AudioQuality::Source
+            || settings.sample_rate != AudioSampleRate::Original;
+        if technical_change {
+            lines.push((
+                "audio",
+                format!("Encoding audio track #{index} as {}", details.join(" · ")),
+            ));
+        }
+        let original = source.map(|stream| AudioMetadata {
+            language: stream_language(stream),
+            title: audio_stream_title(stream),
+            commentary: stream_commentary(stream),
+            hearing_impaired: stream_hearing_impaired(stream),
+            audio_description: stream_disposition(stream, "visual_impaired"),
+            original: stream_original(stream),
+            dubbed: stream_disposition(stream, "dub"),
+        });
+        if original.as_ref() != Some(&settings.metadata) {
+            lines.push(("audio", format!("Updating audio track #{index} metadata")));
+        }
+    }
     for (index, settings) in &staged.video_settings {
         let codec = match settings.codec {
             VideoCodec::Original => stream_by_index(info, *index)
@@ -6953,6 +7988,7 @@ fn staged_edit_stages_anything(staged: &StagedEdit) -> bool {
         || staged.container_metadata.is_some()
         || !staged.deleted_streams.is_empty()
         || !staged.default_sidecars.is_empty()
+        || !staged.audio_settings.is_empty()
         || !staged.video_settings.is_empty()
         || staged.stream_order != staged.original_stream_order
         || staged.default_streams != staged.original_default_streams
@@ -7432,6 +8468,14 @@ mod tests {
         ToolCapabilities {
             ffmpeg: true,
             ffmpeg_encoders: BTreeSet::from([
+                "aac".to_string(),
+                "ac3".to_string(),
+                "eac3".to_string(),
+                "libopus".to_string(),
+                "flac".to_string(),
+                "alac".to_string(),
+                "libmp3lame".to_string(),
+                "libvorbis".to_string(),
                 "subrip".to_string(),
                 "ass".to_string(),
                 "webvtt".to_string(),
@@ -8452,6 +9496,7 @@ mod tests {
             deleted_streams: Default::default(),
             default_streams: Default::default(),
             default_sidecars: Default::default(),
+            audio_settings: Default::default(),
             video_settings: Default::default(),
             subtitle_changes: Default::default(),
             left_subtitle_order: Vec::new(),
@@ -9279,138 +10324,6 @@ mod tests {
             .is_equal_to(Some(newer_dispatched_fingerprint));
 
         std::fs::remove_dir_all(app.directory.clone()).unwrap();
-    }
-
-    #[test]
-    #[ignore]
-    fn tmp_repro_ctrl_s() {
-        use crate::input::{InputState, handle_key};
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let src = std::path::PathBuf::from(std::env::var("REEL_FIXTURES").unwrap());
-        let directory = std::env::temp_dir().join("reel-tui-ctrl-s-repro");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        let target = directory.join("movie.mkv");
-        std::fs::copy(src.join("two_append.mkv"), &target).unwrap();
-        std::fs::copy(src.join("two_append.mkv"), directory.join("other.mkv")).unwrap();
-
-        let (probe_tx, _p) = std::sync::mpsc::channel::<ProbeRequest>();
-        let (conflict_tx, _c) = std::sync::mpsc::channel::<ProbeRequest>();
-        let (edit_tx, _e) = std::sync::mpsc::channel::<EditRequest>();
-        let mut app = App::new(
-            directory.clone(),
-            probe_tx,
-            conflict_tx,
-            edit_tx.clone(),
-            edit_tx,
-        )
-        .unwrap();
-        let mut input = InputState::default();
-
-        // Open movie.mkv for real.
-        app.select_file_position(Some(0));
-        app.outcome = Some(crate::probe::probe_file(&target, false));
-        app.loading = false;
-        app.reset_track_edits();
-        app.layer = Layer::Streams;
-        println!("opened: layer={:?} rows={:?}", app.layer, app.track_rows());
-
-        // Stage a deletion on an audio track, exactly as pressing d would.
-        let audio_row = app
-            .track_rows()
-            .iter()
-            .position(|row| *row == TrackRef::Embedded(2))
-            .unwrap();
-        app.selected_stream = audio_row;
-        handle_key(
-            &mut app,
-            &mut input,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-        );
-        println!(
-            "after d: deleted={:?} has_track_edits={} status={:?}",
-            app.deleted_streams,
-            app.has_track_edits(),
-            app.staged_file_status(&target)
-        );
-
-        // Ctrl+S from the Streams layer.
-        handle_key(
-            &mut app,
-            &mut input,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-        );
-        println!(
-            "after ctrl+s #1: dialog={:?} notice={:?} error={:?} staged_keys={:?}",
-            app.dialog,
-            app.notice,
-            app.edit_error,
-            app.staged_edits.keys().collect::<Vec<_>>()
-        );
-
-        app.dismiss_dialog();
-
-        // Now the sequence from the screenshot: source replaced under a staged edit,
-        // conflict notice, acknowledge, then edit again and Ctrl+S.
-        std::fs::copy(src.join("one.mkv"), &target).unwrap();
-        app.reconcile_files(scan_directory(&directory).unwrap());
-        let fresh = app
-            .files
-            .iter()
-            .find(|f| f.path == target)
-            .unwrap()
-            .fingerprint;
-        let (tx, rx) = std::sync::mpsc::channel::<ProbeResponse>();
-        tx.send(ProbeResponse {
-            generation: 0,
-            path: target.clone(),
-            fingerprint: fresh,
-            outcome: crate::probe::probe_file(&target, false),
-        })
-        .unwrap();
-        app.receive_conflict_probe_results(&rx);
-        println!("conflicts: {:?}", app.conflicting_paths());
-        app.maybe_open_conflict_dialog();
-        app.conflict_opened_at = Some(Instant::now() - CONFLICT_COUNTDOWN);
-        app.acknowledge_conflicts();
-        println!(
-            "after ack: dialog={:?} staged={:?} live_deleted={:?} has_edits={}",
-            app.dialog,
-            app.staged_edits.keys().collect::<Vec<_>>(),
-            app.deleted_streams,
-            app.has_track_edits()
-        );
-
-        // Make a fresh change on the open file.
-        let row = app
-            .track_rows()
-            .iter()
-            .position(|row| *row == TrackRef::Embedded(1))
-            .unwrap();
-        app.selected_stream = row;
-        handle_key(
-            &mut app,
-            &mut input,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-        );
-        println!(
-            "after 2nd d: deleted={:?} has_edits={} status={:?}",
-            app.deleted_streams,
-            app.has_track_edits(),
-            app.staged_file_status(&target)
-        );
-        handle_key(
-            &mut app,
-            &mut input,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-        );
-        println!(
-            "after ctrl+s #2: dialog={:?} notice={:?} error={:?}",
-            app.dialog, app.notice, app.edit_error
-        );
-
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -10304,6 +11217,76 @@ mod tests {
     }
 
     #[test]
+    fn confirm_process_all_should_send_staged_audio_settings_to_the_transcode_worker() {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-confirm-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
+        let (transcode_tx, transcode_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let (remux_tx, remux_rx) = std::sync::mpsc::channel::<EditRequest>();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            transcode_tx,
+            remux_tx,
+        )
+        .unwrap();
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "disposition": {"default": 1}},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"},
+             "disposition": {"default": 1}}
+        ]));
+        app.outcome = Some(ProbeOutcome::Video(info.clone()));
+        app.loading = false;
+        app.reset_track_edits();
+        app.layer = Layer::Streams;
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let file = app.files[0].clone();
+        app.cache
+            .insert(CacheKey::for_file(&file), ProbeOutcome::Video(info));
+        let settings = AudioSettings {
+            codec: AudioCodec::Ac3,
+            channel_layout: AudioChannelLayout::Mono,
+            quality: AudioQuality::Balanced,
+            sample_rate: AudioSampleRate::Hz(32_000),
+            metadata: AudioMetadata {
+                language: "nld".to_string(),
+                title: Some("Director commentary".to_string()),
+                commentary: true,
+                hearing_impaired: false,
+                audio_description: false,
+                original: false,
+                dubbed: false,
+            },
+        };
+        app.audio_settings.insert(1, settings.clone());
+
+        app.request_process_all();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+        app.confirm_process_all();
+
+        let request = transcode_rx
+            .try_recv()
+            .expect("technical audio settings should route to the transcode worker");
+        assert_that!(request.audio_settings.get(&1)).contains(&settings);
+        assert!(remux_rx.try_recv().is_err());
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn confirm_process_all_should_filter_deleted_tracks_out_of_the_dispatched_stream_order() {
         // Regression test: `StagedEdit::stream_order` is the raw display order and
         // still contains deleted tracks (`final_stream_order` is what actually drops
@@ -10610,6 +11593,7 @@ mod tests {
                 deleted_streams: BTreeSet::new(),
                 default_streams: BTreeSet::new(),
                 default_sidecars: BTreeSet::new(),
+                audio_settings: BTreeMap::new(),
                 video_settings: BTreeMap::new(),
                 subtitle_changes: BTreeMap::new(),
                 left_subtitle_order: Vec::new(),
@@ -10908,6 +11892,7 @@ mod tests {
                 info,
                 &[0],
                 &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 &[],
@@ -11472,7 +12457,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_settings_on_an_audio_track_should_say_it_is_not_implemented() {
+    fn opening_settings_on_an_audio_track_should_open_the_audio_editor() {
         // Arrange
         let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
@@ -11480,7 +12465,8 @@ mod tests {
             &mut app,
             serde_json::json!([
                 {"index": 0, "codec_type": "video"},
-                {"index": 1, "codec_type": "audio"}
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
             ]),
         );
         app.layer = Layer::Streams;
@@ -11493,12 +12479,223 @@ mod tests {
         // Act
         app.open_track_settings();
 
-        // Assert: the footer explains it rather than the keypress doing nothing.
-        assert_that!(app.notice.as_deref())
-            .is_equal_to(Some("Editing audio tracks is not implemented yet."));
-        assert_that!(app.dialog).is_equal_to(None);
+        // Assert
+        assert_that!(app.notice).is_none();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::AudioSettings));
+        assert_that!(
+            app.audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.stream_index)
+        )
+        .is_equal_to(Some(1));
 
         // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_choices_should_keep_upmixing_and_upsampling_visible_but_disabled() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+
+        let layouts = app.audio_channel_choices(1);
+        let surround = layouts
+            .iter()
+            .find(|choice| choice.value == AudioChannelLayout::Surround71)
+            .unwrap();
+        let rates = app.audio_sample_rate_choices(1);
+        let high_rate = rates
+            .iter()
+            .find(|choice| choice.value == AudioSampleRate::Hz(96_000))
+            .unwrap();
+
+        assert_that!(surround.enabled).is_false();
+        assert_that!(surround.reason.as_deref()).contains(CHANNEL_UPMIX_NOT_IMPLEMENTED);
+        assert_that!(high_rate.enabled).is_false();
+        assert_that!(high_rate.reason.as_deref()).contains(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED);
+        assert_that!(layouts.iter().filter(|choice| choice.current).count()).is_equal_to(1);
+        assert_that!(rates.iter().filter(|choice| choice.current).count()).is_equal_to(1);
+        assert_that!(app.audio_field_visible(AudioSettingsField::Quality)).is_false();
+        assert_that!(app.audio_field_visible(AudioSettingsField::SampleRate)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_audio_codec_should_not_silently_rewrite_an_incompatible_quality() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Quality;
+        app.activate_audio_settings();
+        let balanced = app
+            .audio_quality_choices(1)
+            .iter()
+            .position(|choice| choice.value == AudioQuality::Balanced)
+            .unwrap();
+        app.audio_settings_popup.as_mut().unwrap().quality_cursor = balanced;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
+        app.activate_audio_settings();
+        let flac = app
+            .audio_codec_choices(1)
+            .iter()
+            .position(|choice| choice.value == AudioCodec::Flac)
+            .unwrap();
+        app.audio_settings_popup.as_mut().unwrap().codec_cursor = flac;
+        app.activate_audio_settings();
+
+        let settings = &app.audio_settings[&1];
+        assert_that!(settings.codec).is_equal_to(AudioCodec::Flac);
+        assert_that!(settings.quality).is_equal_to(AudioQuality::Balanced);
+        assert_that!(app.audio_field_visible(AudioSettingsField::Quality)).is_false();
+        assert_that!(app.staged_file_status(&app.files[0].path)).is_equal_to(
+            StagedFileStatus::Invalid(
+                "Lossless audio codecs do not use a bitrate quality preset.".to_string(),
+            ),
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_metadata_and_default_should_stage_without_changing_neighboring_audio() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"},
+                 "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "fra"},
+                 "disposition": {"default": 0}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(2));
+        app.open_audio_settings();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.start_audio_title_input();
+        for character in "Director commentary".chars() {
+            app.input_text_char(character);
+        }
+        app.escape_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Commentary;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Default;
+        app.activate_audio_settings();
+
+        assert_that!(app.audio_settings[&2].metadata.title.as_deref())
+            .contains("Director commentary");
+        assert_that!(app.audio_settings[&2].metadata.commentary).is_true();
+        assert_that!(app.default_streams.clone()).is_equal_to(BTreeSet::from([2]));
+        assert_that!(app.audio_settings.contains_key(&1)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn adding_supported_roles_to_original_matroska_audio_should_not_create_a_conflict() {
+        // Arrange: this is the real failure shape. The source track is already marked
+        // Original; editing any other role causes the complete effective metadata set
+        // to be validated, so Matroska must accept that untouched source role too.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"},
+                 "disposition": {"default": 1, "original": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "nld"},
+                 "disposition": {"default": 0}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+
+        // Act
+        for field in [
+            AudioSettingsField::Commentary,
+            AudioSettingsField::HearingImpaired,
+            AudioSettingsField::AudioDescription,
+        ] {
+            app.audio_settings_popup.as_mut().unwrap().field = field;
+            app.activate_audio_settings();
+        }
+
+        // Assert: all selected roles and the pre-existing Original role coexist, the
+        // neighboring track stays unstaged, and the save-time conflict gate is clear.
+        let metadata = &app.audio_settings[&1].metadata;
+        assert!(metadata.commentary && metadata.hearing_impaired);
+        assert!(metadata.audio_description && metadata.original);
+        assert!(!metadata.dubbed);
+        assert_that!(app.audio_settings.contains_key(&2)).is_false();
+        assert_that!(app.selected_container_conflicts()).is_empty();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn original_and_dubbed_audio_roles_should_replace_each_other() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"},
+                 "disposition": {"original": 1}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Dubbed;
+        app.activate_audio_settings();
+        let dubbed = &app.audio_settings[&1].metadata;
+        assert!(dubbed.dubbed && !dubbed.original);
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Original;
+        app.activate_audio_settings();
+        let original = &app
+            .effective_audio_settings(1)
+            .expect("the original role should be restored")
+            .metadata;
+        assert!(original.original && !original.dubbed);
+        assert_that!(app.selected_container_conflicts()).is_empty();
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -14191,6 +15388,30 @@ mod tests {
                     text_input: active,
                 });
             }
+            TextInputSite::AudioTitle | TextInputSite::AudioLanguageSearch => {
+                let language_search = SearchState {
+                    input: active.clone(),
+                    match_count: 0,
+                    field_width: 0,
+                };
+                app.audio_settings_popup = Some(AudioSettingsPopup {
+                    stream_index: 1,
+                    field: AudioSettingsField::Title,
+                    mode: if site == TextInputSite::AudioTitle {
+                        AudioSettingsMode::TitleEdit
+                    } else {
+                        AudioSettingsMode::LanguageDropdown
+                    },
+                    help_visible: false,
+                    codec_cursor: 0,
+                    channel_cursor: 0,
+                    quality_cursor: 0,
+                    sample_rate_cursor: 0,
+                    language_cursor: 0,
+                    language_search,
+                    title_input: active,
+                });
+            }
             TextInputSite::SubtitleTitle | TextInputSite::LanguageSearch => {
                 let language_search = SearchState {
                     input: active.clone(),
@@ -14242,8 +15463,10 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 6] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 8] = [
         TextInputSite::ContainerMetadata,
+        TextInputSite::AudioTitle,
+        TextInputSite::AudioLanguageSearch,
         TextInputSite::SubtitleTitle,
         TextInputSite::LanguageSearch,
         TextInputSite::CustomResolution,
@@ -14265,6 +15488,8 @@ mod tests {
             assert_that!(app.active_text_input()).is_equal_to(Some(site));
             let expected = match site {
                 TextInputSite::ContainerMetadata => TextInputConfig::CONTAINER_METADATA,
+                TextInputSite::AudioTitle => TextInputConfig::SUBTITLE_TITLE,
+                TextInputSite::AudioLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
@@ -14436,10 +15661,12 @@ mod tests {
             let mut app = test_file_app(&["movie.mkv"]);
             let directory = app.directory.clone();
             enter_text_input(&mut app, site);
-            // Two fields refuse the space that would otherwise separate the words, so
-            // for them a single run is the whole "word".
+            // Search and numeric fields refuse the space that would otherwise separate
+            // the words, so for them a single run is the whole "word".
             let (typed, after_word) = match site {
-                TextInputSite::LanguageSearch => ("onetwo", ""),
+                TextInputSite::LanguageSearch | TextInputSite::AudioLanguageSearch => {
+                    ("onetwo", "")
+                }
                 TextInputSite::CustomResolution => ("1234", ""),
                 _ => ("one two", "one "),
             };

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode};
+use crate::app::{
+    App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -167,6 +169,135 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                         _ if input.is_double_g(key) => {
                             app.move_container_settings_to_endpoint(false)
                         }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(Dialog::AudioSettings) => {
+            let mode = app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode)
+                .unwrap_or_default();
+            match mode {
+                AudioSettingsMode::TitleEdit => {
+                    input.reset_sequence();
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            app.save_from_audio_settings()
+                        }
+                        (KeyCode::Esc | KeyCode::Enter, _) => app.escape_audio_settings(),
+                        _ => {
+                            handle_text_input_key(app, key);
+                        }
+                    }
+                }
+                AudioSettingsMode::LanguageDropdown => {
+                    let searching = app
+                        .audio_settings_popup
+                        .as_ref()
+                        .is_some_and(|popup| popup.language_search.is_active);
+                    if searching {
+                        input.reset_sequence();
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                app.save_from_audio_settings()
+                            }
+                            (KeyCode::Esc, _) => app.cancel_audio_language_search(),
+                            (KeyCode::Down, KeyModifiers::NONE)
+                            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                app.move_audio_settings_cursor(1)
+                            }
+                            (KeyCode::Up, KeyModifiers::NONE)
+                            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                app.move_audio_settings_cursor(-1)
+                            }
+                            (KeyCode::Enter, _) => app.activate_audio_settings(),
+                            _ => {
+                                handle_text_input_key(app, key);
+                            }
+                        }
+                    } else {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                input.reset_sequence();
+                                app.toggle_audio_field_help();
+                            }
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                input.reset_sequence();
+                                app.save_from_audio_settings();
+                            }
+                            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.start_audio_language_search();
+                            }
+                            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_cursor(1)
+                            }
+                            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_cursor(-1)
+                            }
+                            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_to_endpoint(true);
+                            }
+                            (KeyCode::Enter, _) => {
+                                input.reset_sequence();
+                                app.activate_audio_settings();
+                            }
+                            _ if is_back_key(key) => {
+                                input.reset_sequence();
+                                app.escape_audio_settings();
+                            }
+                            _ if input.is_double_g(key) => {
+                                app.move_audio_settings_to_endpoint(false)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AudioSettingsMode::Summary | AudioSettingsMode::Dropdown => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            input.reset_sequence();
+                            app.toggle_audio_field_help();
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            input.reset_sequence();
+                            app.save_from_audio_settings();
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.start_audio_title_input();
+                        }
+                        (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.reset_focused_field();
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_cursor(-1)
+                        }
+                        (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_to_endpoint(true);
+                        }
+                        (KeyCode::Enter, _) => {
+                            input.reset_sequence();
+                            app.activate_audio_settings();
+                        }
+                        _ if is_back_key(key) => {
+                            input.reset_sequence();
+                            app.escape_audio_settings();
+                        }
+                        _ if input.is_double_g(key) => app.move_audio_settings_to_endpoint(false),
                         _ => {}
                     }
                 }
@@ -741,6 +872,7 @@ mod tests {
     use crate::subtitle::SubtitleSource;
     use kernal::prelude::*;
     use std::{
+        collections::BTreeSet,
         fs,
         path::PathBuf,
         sync::mpsc,
@@ -750,7 +882,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{
-            CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
+            AudioSettingsField, CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
             ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField, ResetScope,
             SubtitleSettingsField, TextInputState, VideoSettingsField, VideoSettingsMode,
             VideoSettingsPopup,
@@ -803,6 +935,44 @@ mod tests {
             .unwrap(),
         ));
         app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|track| *track == crate::app::TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
+        (app, directory)
+    }
+
+    fn audio_settings_app() -> (App, PathBuf) {
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                     "channels": 2, "sample_rate": "48000",
+                     "tags": {"language": "eng"}, "disposition": {"default": 1}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.subtitle_capabilities.ffmpeg = true;
+        app.subtitle_capabilities.ffmpeg_encoders = BTreeSet::from([
+            "aac".to_string(),
+            "ac3".to_string(),
+            "eac3".to_string(),
+            "libopus".to_string(),
+            "flac".to_string(),
+            "alac".to_string(),
+            "libmp3lame".to_string(),
+            "libvorbis".to_string(),
+        ]);
+        app.subtitle_capabilities.ffmpeg_muxers = BTreeSet::from(["matroska".to_string()]);
+        app.stream_order = vec![0, 1];
+        app.default_streams.insert(1);
         app.layer = Layer::Streams;
         app.selected_stream = app
             .track_rows()
@@ -1903,6 +2073,115 @@ mod tests {
     }
 
     #[test]
+    fn audio_popup_keys_should_drive_dropdown_search_title_and_role_fields() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+        assert_eq!(app.dialog, Some(Dialog::AudioSettings));
+
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Dropdown,
+        );
+        let initial_codec = app.audio_settings_popup.as_ref().unwrap().codec_cursor;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert!(app.audio_settings_popup.as_ref().unwrap().codec_cursor > initial_codec);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in "dut".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        assert!(app.filtered_audio_languages().len() < 10);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(app.audio_settings[&1].metadata.language, "nld");
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for character in "Commentary".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings[&1].metadata.title.as_deref(),
+            Some("Commentary")
+        );
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Commentary;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert!(app.audio_settings[&1].metadata.commentary);
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().field,
+            AudioSettingsField::Dubbed
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().field,
+            AudioSettingsField::Codec
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_field_help_should_toggle_follow_navigation_and_leave_text_input_alone() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+        let shifted_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+
+        // Help opens from the summary and follows the highlighted field into a
+        // dropdown without taking focus away from the audio editor.
+        handle_key(&mut app, &mut input, shifted_k);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.field, AudioSettingsField::ChannelLayout);
+        assert_eq!(popup.mode, AudioSettingsMode::Dropdown);
+
+        // K can close and reopen help while navigating a dropdown.
+        handle_key(&mut app, &mut input, shifted_k);
+        assert!(!app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, shifted_k);
+        assert!(app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Once an actual input is active, K remains ordinary text.
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, shifted_k);
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.language_search.value, "K");
+
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, shifted_k);
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.mode, AudioSettingsMode::TitleEdit);
+        assert_eq!(popup.title_input.value, "K");
+
+        // A newly opened popup starts with its help closed.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        app.open_track_settings();
+        assert!(!app.audio_settings_popup.as_ref().unwrap().help_visible);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn language_dropdown_keys_should_search_move_and_commit() {
         // Arrange: the language list is long enough that typing is the only practical way
         // through it, so search, movement and the endpoint jumps all have to work inside
@@ -2170,6 +2449,7 @@ mod tests {
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
                 default_sidecars: Default::default(),
+                audio_settings: Default::default(),
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
@@ -2208,6 +2488,7 @@ mod tests {
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
                 default_sidecars: Default::default(),
+                audio_settings: Default::default(),
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
@@ -2284,6 +2565,7 @@ mod tests {
                     deleted_streams: Default::default(),
                     default_streams: Default::default(),
                     default_sidecars: Default::default(),
+                    audio_settings: Default::default(),
                     video_settings: Default::default(),
                     subtitle_changes: Default::default(),
                     left_subtitle_order: Vec::new(),
