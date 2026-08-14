@@ -36,10 +36,8 @@ jobs:
             exit 1
           fi
 
-      - name: Install ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - name: Install test prerequisites
+        uses: ./.github/actions/media-tools
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -131,6 +129,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+      # A separate cargo target with `test = false`, so the run above does not
+      # reach it. Publishing without it would ship the real remux paths untested.
+      - name: Run end-to-end tests
+        run: cargo test --locked --test e2e
 
       - name: Build release binary
         run: cargo build --release --locked

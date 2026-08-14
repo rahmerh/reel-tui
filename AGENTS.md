@@ -40,6 +40,8 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - **seconv 5.1.0** — gates subtitle conversion and OCR, not startup. 5.0.0 cannot read a VobSub `.idx` ("Unable to determine subtitle format"). **Cannot be version-gated**: the 5.1.0 build reports `5.0.0` from `--version`, so `subtitle::seconv_is_supported` probes the `--help` listing for `--no-vobsub-isolate-colors` instead. Also needs `libicu` present, or it aborts in `Bootstrap.Initialize`.
 - **Tesseract 4.0** — gates OCR only. Verified working on 4.0.0, 4.1.1, and 5.3.x. 3.x is unreachable regardless: `seconv` needs a newer glibc than any distribution shipping it.
 
+CI installs these from `.github/actions/media-tools`, never from the runner's distribution packages — `ubuntu-latest` ships FFmpeg 6.1.1, which is below the floor. `.github/workflows/ci.yml` runs both suites on every push and pull request to `main`; `publish.yml` runs on release tags only and is not a substitute for it.
+
 ## Adaptive Filesystem & Performance Architecture
 
 `reel-tui` automatically detects whether the target directory resides on a local disk or a remote network mount (NFS, SMB, etc.):

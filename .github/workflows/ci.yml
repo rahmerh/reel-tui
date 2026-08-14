@@ -1,0 +1,53 @@
+name: CI
+
+# Nothing ran on `main` before this: `publish.yml` triggers only on release tags,
+# so the first time a change met CI was the moment it was being published. Two
+# failures reached `main` that way and only surfaced when a tag was cut.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install test prerequisites
+        uses: ./.github/actions/media-tools
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      # A separate cargo target with `test = false`, so `cargo test` above does
+      # not reach it. It is the only suite that exercises the real remux paths.
+      - name: Run end-to-end tests
+        run: cargo test --locked --test e2e

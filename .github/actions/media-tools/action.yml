@@ -1,0 +1,59 @@
+name: Install media tools
+description: >-
+  Installs the external tools reel requires, at or above the floors recorded in
+  AGENTS.md. The runner's own packages are deliberately not used for FFmpeg:
+  ubuntu-latest ships 6.1.1, which is below the 8.1 floor and which reel refuses
+  to run against.
+
+runs:
+  using: composite
+  steps:
+    - name: Install FFmpeg 8.1+
+      shell: bash
+      run: |
+        set -euo pipefail
+        # BtbN publishes per-branch static GPL builds. `n8.1-latest` tracks the
+        # 8.1 release branch, so this stays at the floor rather than drifting
+        # onto master and testing something no user has.
+        url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz"
+        curl -fsSL "$url" | tar -xJ
+        sudo install -m 0755 ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg /usr/local/bin/ffmpeg
+        sudo install -m 0755 ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffprobe /usr/local/bin/ffprobe
+        rm -rf ffmpeg-n8.1-latest-linux64-gpl-8.1
+        # /usr/local/bin precedes /usr/bin on the runner, but an apt ffmpeg
+        # arriving later would silently shadow this, so fail loudly now.
+        ffmpeg -version | head -1
+        ffprobe -version | head -1
+        case "$(ffprobe -version | head -1)" in
+          *"version n8.1"*|*"version n8.2"*|*"version n9"*) ;;
+          *) echo "Resolved ffprobe is below the 8.1 floor" >&2; exit 1 ;;
+        esac
+
+    - name: Install Tesseract 4.0+ and libicu
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # libicu is seconv's, not Tesseract's: without it seconv aborts in
+        # Bootstrap.Initialize the moment it has to render a subtitle image.
+        sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libicu-dev
+        tesseract --version | head -1
+
+    - name: Install seconv 5.1.0+
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Pinned rather than tracking latest: seconv ships beta releases daily,
+        # and a release-time publish is the wrong place to discover one broke.
+        url="https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.1.0/SeConv-Linux-x64.tar.gz"
+        sudo mkdir -p /opt/seconv
+        curl -fsSL "$url" | sudo tar -xz -C /opt/seconv
+        sudo chmod +x /opt/seconv/seconv
+        # A symlink, not a copy: seconv loads libSkiaSharp.so from beside its
+        # real path, and resolves that through the link.
+        sudo ln -sf /opt/seconv/seconv /usr/local/bin/seconv
+        # `--version` reports 5.0.0 even on 5.1.0, so it proves nothing beyond
+        # the binary running. The help listing is what distinguishes them.
+        seconv --version
+        seconv --help | grep -q -- --no-vobsub-isolate-colors \
+          || { echo "seconv is older than 5.1.0" >&2; exit 1; }
