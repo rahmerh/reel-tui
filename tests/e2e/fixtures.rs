@@ -43,6 +43,8 @@ pub struct MediaSpec {
     pub audio_languages: Vec<&'static str>,
     pub audio_dispositions: Vec<&'static str>,
     pub audio_codec: &'static str,
+    pub audio_codecs: Vec<&'static str>,
+    pub audio_titles: Vec<Option<&'static str>>,
     pub audio_sample_rate: u32,
     pub subtitles: Vec<SubtitleSpec>,
 }
@@ -59,6 +61,8 @@ impl Default for MediaSpec {
             audio_languages: vec!["eng"],
             audio_dispositions: Vec::new(),
             audio_codec: "aac",
+            audio_codecs: Vec::new(),
+            audio_titles: Vec::new(),
             audio_sample_rate: 48_000,
             subtitles: Vec::new(),
         }
@@ -103,6 +107,16 @@ impl MediaSpec {
         self
     }
 
+    pub fn audio_codecs(mut self, codecs: &[&'static str]) -> Self {
+        self.audio_codecs = codecs.to_vec();
+        self
+    }
+
+    pub fn audio_titles(mut self, titles: &[Option<&'static str>]) -> Self {
+        self.audio_titles = titles.to_vec();
+        self
+    }
+
     pub fn subtitles(mut self, subtitles: Vec<SubtitleSpec>) -> Self {
         self.subtitles = subtitles;
         self
@@ -120,6 +134,14 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
         .expect("fixture path needs a stem");
 
     let mut srt_paths = Vec::new();
+    assert!(
+        spec.audio_codecs.is_empty() || spec.audio_codecs.len() == spec.audio_languages.len(),
+        "per-track audio codecs must match the audio-track count"
+    );
+    assert!(
+        spec.audio_titles.is_empty() || spec.audio_titles.len() == spec.audio_languages.len(),
+        "audio titles must match the audio-track count"
+    );
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         let srt_path = parent.join(format!(".fixture-{stem}-{index}.srt"));
         fs::write(&srt_path, srt_body(subtitle.language, spec.duration)).unwrap();
@@ -164,7 +186,13 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
     if let Some(disposition) = spec.video_disposition {
         command.args(["-disposition:v:0", disposition]);
     }
-    command.args(["-c:a", spec.audio_codec]);
+    if spec.audio_codecs.is_empty() {
+        command.args(["-c:a", spec.audio_codec]);
+    } else {
+        for (index, codec) in spec.audio_codecs.iter().enumerate() {
+            command.arg(format!("-c:a:{index}")).arg(codec);
+        }
+    }
 
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         command.args([&format!("-c:s:{index}"), subtitle.codec]);
@@ -180,6 +208,11 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
                 .copied()
                 .unwrap_or(if index == 0 { "default" } else { "0" }),
         );
+        if let Some(Some(title)) = spec.audio_titles.get(index) {
+            command
+                .arg(format!("-metadata:s:a:{index}"))
+                .arg(format!("title={title}"));
+        }
     }
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         command

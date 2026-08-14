@@ -621,7 +621,7 @@ mod tests {
 
     /// An ffprobe-dependent test must fail when its prerequisite is missing; an
     /// unexecuted test must never be reported as passing.
-    fn require_tools(test: &str, tools: &[&str]) -> bool {
+    fn require_tools(test: &str, tools: &[&str]) {
         for tool in tools {
             let available = Command::new(tool)
                 .arg("-version")
@@ -634,7 +634,6 @@ mod tests {
                 "{test} requires {tool}; install the missing test prerequisite"
             );
         }
-        true
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -854,12 +853,10 @@ mod tests {
 
     #[test]
     fn probe_file_should_report_a_non_media_file_as_not_video_carrying_ffprobes_reason() {
-        if !require_tools(
+        require_tools(
             "probe_file_should_report_a_non_media_file_as_not_video_carrying_ffprobes_reason",
             &["ffprobe"],
-        ) {
-            return;
-        }
+        );
 
         // Arrange: a text file with a media extension — what a stray `.srt` rename or a
         // partially downloaded file looks like when the user selects it.
@@ -885,12 +882,10 @@ mod tests {
 
     #[test]
     fn probe_file_should_report_a_missing_file_as_not_video() {
-        if !require_tools(
+        require_tools(
             "probe_file_should_report_a_missing_file_as_not_video",
             &["ffprobe"],
-        ) {
-            return;
-        }
+        );
 
         // Arrange / Act: a path that has been deleted between the directory scan and the
         // probe — the race a watched directory hits routinely.
@@ -908,12 +903,10 @@ mod tests {
 
     #[test]
     fn probe_file_should_read_a_real_file_when_told_it_lives_on_a_network_mount() {
-        if !require_tools(
+        require_tools(
             "probe_file_should_read_a_real_file_when_told_it_lives_on_a_network_mount",
             &["ffmpeg", "ffprobe"],
-        ) {
-            return;
-        }
+        );
 
         // Arrange: the network path adds `-probesize`/`-analyzeduration` to keep ffprobe
         // from seeking deep over the wire. Those bounds must still be wide enough to
@@ -965,12 +958,10 @@ mod tests {
 
     #[test]
     fn probe_any_file_should_accept_a_file_with_no_video_stream() {
-        if !require_tools(
+        require_tools(
             "probe_any_file_should_accept_a_file_with_no_video_stream",
             &["ffmpeg", "ffprobe"],
-        ) {
-            return;
-        }
+        );
 
         // Arrange: `probe_any_file` exists precisely to inspect things `probe_file` would
         // reject — subtitle sidecars and audio-only output — so a missing video stream
@@ -1006,12 +997,10 @@ mod tests {
 
     #[test]
     fn probe_any_file_should_surface_ffprobes_reason_for_a_file_it_cannot_read() {
-        if !require_tools(
+        require_tools(
             "probe_any_file_should_surface_ffprobes_reason_for_a_file_it_cannot_read",
             &["ffprobe"],
-        ) {
-            return;
-        }
+        );
 
         // Arrange: the converted-subtitle check runs this against ffmpeg's own output, so
         // when it fails the message is the only clue the user gets about what went wrong.

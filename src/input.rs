@@ -2130,6 +2130,142 @@ mod tests {
     }
 
     #[test]
+    fn every_audio_editor_key_path_should_stay_scoped_to_its_mode() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('K')));
+        assert!(app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().language_cursor,
+            0
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Summary,
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, ctrl('n'));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, ctrl('p'));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert!(
+            !app.audio_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .is_active
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Summary,
+        );
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+
+        let (mut save_from_title, title_directory) = audio_settings_app();
+        save_from_title.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(
+            &mut save_from_title,
+            &mut InputState::default(),
+            key(KeyCode::Char('i')),
+        );
+        handle_key(
+            &mut save_from_title,
+            &mut InputState::default(),
+            key(KeyCode::Char('T')),
+        );
+        handle_key(&mut save_from_title, &mut InputState::default(), ctrl('s'));
+        assert!(save_from_title.audio_settings_popup.is_none());
+        assert_eq!(
+            save_from_title.audio_settings[&1].metadata.title.as_deref(),
+            Some("T")
+        );
+
+        let (mut save_from_search, search_directory) = audio_settings_app();
+        save_from_search
+            .audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .field = AudioSettingsField::Language;
+        handle_key(
+            &mut save_from_search,
+            &mut InputState::default(),
+            key(KeyCode::Enter),
+        );
+        handle_key(
+            &mut save_from_search,
+            &mut InputState::default(),
+            key(KeyCode::Char('/')),
+        );
+        handle_key(&mut save_from_search, &mut InputState::default(), ctrl('s'));
+        assert!(save_from_search.audio_settings_popup.is_none());
+
+        let (mut save_from_language, language_directory) = audio_settings_app();
+        save_from_language
+            .audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .field = AudioSettingsField::Language;
+        handle_key(
+            &mut save_from_language,
+            &mut InputState::default(),
+            key(KeyCode::Enter),
+        );
+        handle_key(
+            &mut save_from_language,
+            &mut InputState::default(),
+            ctrl('s'),
+        );
+        assert!(save_from_language.audio_settings_popup.is_none());
+
+        let (mut save_from_summary, summary_directory) = audio_settings_app();
+        handle_key(
+            &mut save_from_summary,
+            &mut InputState::default(),
+            ctrl('s'),
+        );
+        assert!(save_from_summary.audio_settings_popup.is_none());
+
+        drop((
+            app,
+            save_from_title,
+            save_from_search,
+            save_from_language,
+            save_from_summary,
+        ));
+        for directory in [
+            directory,
+            title_directory,
+            search_directory,
+            language_directory,
+            summary_directory,
+        ] {
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn audio_field_help_should_toggle_follow_navigation_and_leave_text_input_alone() {
         let (mut app, directory) = audio_settings_app();
         let mut input = InputState::default();

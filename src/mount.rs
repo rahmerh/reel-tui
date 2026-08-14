@@ -30,25 +30,30 @@ fn network_mode_override(value: &str) -> Option<MountType> {
 }
 
 pub fn detect_mount_type(path: &Path) -> MountType {
-    if let Ok(value) = env::var("REEL_NETWORK_MODE")
-        && let Some(override_type) = network_mode_override(&value)
-    {
+    let override_value = env::var("REEL_NETWORK_MODE").ok();
+    #[cfg(target_os = "linux")]
+    let mounts_content = fs::read_to_string("/proc/mounts").ok();
+    #[cfg(not(target_os = "linux"))]
+    let mounts_content: Option<String> = None;
+    detect_mount_type_from(path, override_value.as_deref(), mounts_content.as_deref())
+}
+
+fn detect_mount_type_from(
+    path: &Path,
+    override_value: Option<&str>,
+    mounts_content: Option<&str>,
+) -> MountType {
+    if let Some(override_type) = override_value.and_then(network_mode_override) {
         return override_type;
     }
-
     #[cfg(target_os = "linux")]
-    {
-        if let Ok(mounts_content) = fs::read_to_string("/proc/mounts")
-            && let Some(is_net) = check_proc_mounts(&mounts_content, path)
-        {
-            return if is_net {
-                MountType::Network
-            } else {
-                MountType::Local
-            };
-        }
+    if let Some(is_network) = mounts_content.and_then(|mounts| check_proc_mounts(mounts, path)) {
+        return if is_network {
+            MountType::Network
+        } else {
+            MountType::Local
+        };
     }
-
     MountType::Local
 }
 
@@ -190,6 +195,36 @@ mod tests {
                 "{value:?} must fall through to real detection",
             );
         }
+    }
+
+    #[test]
+    fn mount_detection_should_apply_overrides_then_proc_mounts_then_local_fallback() {
+        let mounts = "/dev/sda1 / ext4 rw 0 0\n//nas/media /mnt/media cifs rw 0 0\n";
+
+        assert_eq!(
+            detect_mount_type_from(Path::new("/local/movie.mkv"), Some("yes"), Some(mounts)),
+            MountType::Network,
+        );
+        assert_eq!(
+            detect_mount_type_from(Path::new("/mnt/media/movie.mkv"), Some("off"), Some(mounts),),
+            MountType::Local,
+        );
+        assert_eq!(
+            detect_mount_type_from(
+                Path::new("/mnt/media/movie.mkv"),
+                Some("maybe"),
+                Some(mounts)
+            ),
+            MountType::Network,
+        );
+        assert_eq!(
+            detect_mount_type_from(Path::new("/local/movie.mkv"), None, Some(mounts)),
+            MountType::Local,
+        );
+        assert_eq!(
+            detect_mount_type_from(Path::new("/any/movie.mkv"), None, None),
+            MountType::Local,
+        );
     }
 
     #[test]

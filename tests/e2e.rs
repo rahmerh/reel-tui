@@ -806,9 +806,7 @@ fn remuxing_tracks_should_preserve_chapters_and_attachments() {
 #[test]
 fn deleting_a_track_should_save_instead_of_claiming_the_file_changed() {
     let test = "deleting_a_track_should_save_instead_of_claiming_the_file_changed";
-    if !require_tools(test, &["ffmpeg"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg"]);
 
     let scratch = Scratch::new("delete");
     write_media(
@@ -872,9 +870,7 @@ fn deleting_a_track_should_save_instead_of_claiming_the_file_changed() {
 #[test]
 fn saving_a_deleted_track_should_not_restage_it_against_the_file_it_just_wrote() {
     let test = "saving_a_deleted_track_should_not_restage_it_against_the_file_it_just_wrote";
-    if !require_tools(test, &["ffmpeg"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg"]);
 
     let scratch = Scratch::new("restage");
     write_media(
@@ -958,9 +954,7 @@ fn saving_a_deleted_track_should_not_restage_it_against_the_file_it_just_wrote()
 #[test]
 fn converting_subrip_subtitles_to_mp4_should_be_refused_with_an_actionable_message() {
     let test = "converting_subrip_subtitles_to_mp4_should_be_refused_with_an_actionable_message";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subrip-mp4");
     write_media(
@@ -1010,9 +1004,7 @@ fn converting_subrip_subtitles_to_mp4_should_be_refused_with_an_actionable_messa
 #[test]
 fn converting_subrip_to_movtext_should_let_the_mp4_conversion_succeed() {
     let test = "converting_subrip_to_movtext_should_let_the_mp4_conversion_succeed";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]);
 
     let scratch = Scratch::new("subrip-movtext");
     write_media(
@@ -1070,9 +1062,7 @@ fn converting_subrip_to_movtext_should_let_the_mp4_conversion_succeed() {
 #[test]
 fn mp4_forcing_a_default_flag_onto_a_lone_subtitle_should_not_fail_validation() {
     let test = "mp4_forcing_a_default_flag_onto_a_lone_subtitle_should_not_fail_validation";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]);
 
     let scratch = Scratch::new("lone-default");
     // One subtitle, explicitly *not* default — the exact shape that made the MP4
@@ -1125,9 +1115,7 @@ fn mp4_forcing_a_default_flag_onto_a_lone_subtitle_should_not_fail_validation() 
 #[test]
 fn a_custom_downscale_should_reach_the_encoder_with_the_requested_dimensions() {
     let test = "a_custom_downscale_should_reach_the_encoder_with_the_requested_dimensions";
-    if !require_tools(test, &["ffmpeg:libx264"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264"]);
 
     let scratch = Scratch::new("downscale");
     write_media(
@@ -1182,9 +1170,7 @@ fn a_custom_downscale_should_reach_the_encoder_with_the_requested_dimensions() {
 #[test]
 fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor() {
     let test = "editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:ac3"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:ac3"]);
 
     let scratch = Scratch::new("audio-settings");
     write_media(
@@ -1303,6 +1289,85 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     assert!(!stream_disposition(edited, "dub"));
 }
 
+/// > [1786639801] Failed: /home/bas/Downloads/reel/test.mkv (destination:
+/// > ReplaceOriginal, container: MP4, stream_order: [0, 1, 2, 3], deleted_streams:
+/// > {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+/// > 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38}, default_streams:
+/// > {0, 1}, audio_settings: 2, video_settings: 0, subtitle_changes:
+/// > [#3(embedded_target=Some(MovText), export_target=None, import=false,
+/// > metadata=false)]) — The audio track at position 1 has the wrong metadata.
+///
+/// MP4 cannot store Matroska's Original audio role, but conversion should normalize
+/// that metadata automatically instead of making the user clear a field the target
+/// container cannot expose. Drive the same mixed copy/transcode workflow through the
+/// TUI and prove supported metadata on both audio tracks survives the real round trip.
+#[test]
+fn converting_audio_metadata_to_mp4_should_drop_unsupported_roles_and_preserve_its_neighbor() {
+    let test =
+        "converting_audio_metadata_to_mp4_should_drop_unsupported_roles_and_preserve_its_neighbor";
+    require_tools(
+        test,
+        &["ffmpeg:libx264", "ffmpeg:flac", "ffmpeg:aac", "ffmpeg:alac"],
+    );
+
+    let scratch = Scratch::new("audio-metadata-mp4");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng", "nld"])
+            .audio_codecs(&["flac", "aac"])
+            .audio_titles(&[Some("Main mix"), Some("Director commentary")])
+            .audio_dispositions(&["default+original+comment", "comment"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    app.choose_container_format("MP4");
+    let first_audio_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(1))
+        .expect("the FLAC audio track should have a row");
+    app.open_audio_settings(first_audio_row);
+    assert!(
+        !app.app
+            .visible_audio_fields()
+            .contains(&AudioSettingsField::Original),
+        "MP4's unsupported Original role should not be editable"
+    );
+    let effective = app
+        .app
+        .effective_audio_settings(1)
+        .expect("the selected audio track should have effective settings");
+    assert!(!effective.metadata.original);
+    assert!(effective.metadata.commentary);
+    app.choose_audio_setting(AudioSettingsField::Codec, "ALAC");
+    app.close_audio_settings();
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let output = app.path("clip.mp4");
+    assert!(output.exists(), "the converted MP4 should exist");
+    let after = probe(&output);
+    assert_eq!(codec_names(&after), ["h264", "alac", "aac"]);
+    let converted = &after.streams[1];
+    let neighbor = &after.streams[2];
+    assert_eq!(stream_tag(converted, "language"), Some("eng"));
+    assert_eq!(stream_tag(converted, "handler_name"), Some("Main mix"));
+    assert!(stream_disposition(converted, "comment"));
+    assert!(!stream_disposition(converted, "original"));
+    assert_eq!(stream_tag(neighbor, "language"), Some("nld"));
+    assert_eq!(
+        stream_tag(neighbor, "handler_name"),
+        Some("Director commentary")
+    );
+    assert!(stream_disposition(neighbor, "comment"));
+    assert!(!stream_disposition(neighbor, "original"));
+}
+
 /// > Failed: test.mp4 (container: MKV) — Could not extract subtitle for conversion:
 /// > [matroska] Subtitle codec mov_text (94213) is not supported.
 ///
@@ -1313,9 +1378,7 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
 #[test]
 fn converting_an_mp4_with_movtext_subtitles_to_mkv_should_succeed() {
     let test = "converting_an_mp4_with_movtext_subtitles_to_mkv_should_succeed";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:mov_text"]);
 
     let scratch = Scratch::new("movtext-mkv");
     write_media(
@@ -1364,9 +1427,7 @@ fn converting_an_mp4_with_movtext_subtitles_to_mkv_should_succeed() {
 #[test]
 fn a_conversion_onto_an_existing_file_should_refuse_without_touching_it() {
     let test = "a_conversion_onto_an_existing_file_should_refuse_without_touching_it";
-    if !require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]) {
-        return;
-    }
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("collision");
     write_media(&scratch.join("clip.mp4"), &MediaSpec::mp4().audio(&["eng"]));

@@ -560,22 +560,6 @@ impl Harness {
                     .map(|choice| (choice.label, choice.enabled, choice.reason))
                     .collect(),
             ),
-            AudioSettingsField::Quality => (
-                popup.quality_cursor,
-                self.app
-                    .audio_quality_choices(popup.stream_index)
-                    .into_iter()
-                    .map(|choice| (choice.label, choice.enabled, choice.reason))
-                    .collect(),
-            ),
-            AudioSettingsField::SampleRate => (
-                popup.sample_rate_cursor,
-                self.app
-                    .audio_sample_rate_choices(popup.stream_index)
-                    .into_iter()
-                    .map(|choice| (choice.label, choice.enabled, choice.reason))
-                    .collect(),
-            ),
             field => panic!("{} does not have an audio dropdown", field.label()),
         }
     }
@@ -1067,7 +1051,7 @@ pub fn ctrl(code: char) -> KeyEvent {
 /// Mirrors `require_tools` in `src/edit.rs`'s test module, which integration tests
 /// cannot reach because it lives inside a `#[cfg(test)]` block. Accepts either a bare
 /// program name or `program:encoder`.
-pub fn require_tools(test: &str, tools: &[&str]) -> bool {
+pub fn require_tools(test: &str, tools: &[&str]) {
     for tool in tools {
         let (program, encoder) = match tool.split_once(':') {
             Some((program, encoder)) => (program, Some(encoder)),
@@ -1102,7 +1086,6 @@ pub fn require_tools(test: &str, tools: &[&str]) -> bool {
             "{test} requires {tool}; install the missing test prerequisite"
         );
     }
-    true
 }
 
 /// Convenience for asserting on a produced file's streams.

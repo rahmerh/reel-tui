@@ -257,6 +257,20 @@ mod tests {
     }
 
     #[test]
+    fn live_config_paths_should_resolve_from_the_process_environment() {
+        let directory = Config::config_dir().expect("the test process must have a config home");
+
+        assert_eq!(
+            directory.file_name().and_then(|name| name.to_str()),
+            Some("reel")
+        );
+        assert_eq!(
+            Config::config_file_path(),
+            Some(directory.join("config.toml"))
+        );
+    }
+
+    #[test]
     fn config_should_default_when_the_file_is_valid_toml_but_holds_no_worker_settings() {
         // Arrange: a config file the user created for some other purpose, or one whose
         // `[workers]` table they commented out. Valid TOML with nothing relevant in it
