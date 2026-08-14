@@ -22,11 +22,15 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 
 `tests/e2e.rs` drives the real application: it replays the `main.rs` event loop in-process, feeds synthetic `KeyEvent`s through the same `handle_key`, renders through the same `ui::render` into a `TestBackend`, and runs genuine `ffprobe`/`ffmpeg` subprocesses against real files. Nothing in the crate is mocked; only crossterm's terminal setup and byte decoding are bypassed.
 
-- It is a **separate cargo test target with `test = false`**, so `cargo test` does not run it. Run it with `cargo test --test e2e`.
-- Every scenario reproduces a failure that actually reached `~/.cache/reel-tui/edit_errors.log` in real use, and quotes that log line in its doc comment. That log is the first place to look when hunting for a regression worth locking in.
+- It is a **separate cargo test target with `test = false`**, so ordinary `cargo test` does not run it; use the restricted execution rules below.
+- **Comprehensive e2e coverage is the target, and the current gaps are testing debt to fill incrementally.** Whenever work touches a functional area that lacks an overarching scenario in `tests/e2e.rs`, add one as part of that work.
+- **Every new or materially changed functional behavior must be covered by at least one overarching scenario in `tests/e2e.rs`.** The scenario must exercise the behavior through the real application workflow independently of module-local unit tests and make meaningful assertions about the observable result. Coverage overlap is explicitly welcome and does not waive either layer. Purely visual styling or layout changes do not require their own e2e scenario, but do require focused rendering/unit coverage.
+- **Tests never skip.** Do not use `#[ignore]`, conditional early returns, environment-based success paths, or any other mechanism that reports an unexecuted test as passing. Required programs, codecs, language data, and other external capabilities are test-environment prerequisites; fail immediately with an actionable missing-prerequisite message.
+- **E2E execution is deliberately restricted.** Run an individual scenario only while creating or directly changing that scenario. Run the complete e2e suite only once as the final verification immediately before merging a branch. Do not run e2e tests during ordinary implementation, routine verification, or on every edit. Minutes of wall clock for the final suite is fine: use real codecs, containers, subprocesses, and OCR rather than reducing fidelity for speed.
+- When a regression scenario comes from a failure in `~/.cache/reel-tui/edit_errors.log`, quote that log line in its doc comment. That log is the first place to look when hunting for an edit regression worth locking in; UI and workflow regressions need not originate there.
 - Fixtures are built by `tests/e2e/fixtures.rs` over `lavfi` sources, parameterised by codec and container. Codec/container realism is the point: the bugs this suite exists for come from combinations like `subrip` into MP4 or `mov_text` into Matroska, which the simpler `ffv1`/`pcm_s16le` unit fixtures cannot express.
-- The harness redirects `XDG_CACHE_HOME` to throwaway storage, so runs never touch the user's real probe cache or failure log.
-- When adding a scenario, verify it actually catches the regression by reintroducing the bug and watching it fail. A test that passes against broken code is worse than no test.
+- The harness redirects `XDG_CACHE_HOME` to throwaway storage, so runs never touch the user's real probe cache or failure log. The unit-test binary is covered separately: `DiskCache::cache_dir()` returns throwaway storage under `cfg(test)` (`src/cache.rs`). **Both halves are load-bearing** — without them a test run rewrites `~/.cache/reel-tui/probe_cache.json` with `/tmp` fixture paths and fills `edit_errors.log` with deliberately-failing test edits, which is exactly the log this file tells you to read first. Never add a test that resolves the real cache directory.
+- **Prove every new test fails against the code it is meant to catch.** Break the behavior deliberately — revert the fix, or invert the condition the scenario exercises — confirm the test fails, then restore it. This applies to e2e scenarios and unit tests alike. A test that passes against broken code is worse than no test, because it converts an unchecked path into a checked-looking one. State in the change summary which tests were proven this way and how they were broken. A feature-level e2e scenario still need not reproduce every defect in that feature; focused regression coverage belongs in the unit suite.
 
 ## Adaptive Filesystem & Performance Architecture
 
@@ -45,7 +49,8 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - `cargo build --release`: compile an optimized release binary.
 - `cargo install --path .`: install or replace the `reel` executable in `~/.cargo/bin/reel`. Always run this after making changes.
 - `cargo test`: run all module-local unit tests. Excludes the e2e suite.
-- `cargo test --test e2e`: run the end-to-end suite (requires `ffmpeg`/`ffprobe`; individual tests self-skip when an encoder is missing).
+- `cargo test --test e2e <scenario> -- --exact`: run one scenario only while creating or directly changing that scenario.
+- `cargo test --test e2e`: run the complete end-to-end suite only as the final pre-merge gate. Its required `ffmpeg`/`ffprobe` programs and encoders must be installed; missing prerequisites fail the suite.
 - `cargo fmt --check`: verify standard Rust formatting.
 - `cargo clippy --all-targets -- -D warnings`: run strict linting used by CI.
 - `cargo publish --dry-run`: validate packaging without publishing.
@@ -54,18 +59,34 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 
 Use `rustfmt` defaults (four-space indentation) and keep Clippy warning-free. Follow Rust conventions: `snake_case` for functions, variables, and modules; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Prefer small, responsibility-focused functions and propagate recoverable failures with `anyhow::Result`. Preserve terminal cleanup guarantees and keep blocking `ffmpeg`/`ffprobe` work off the UI event loop.
 
+**No inline control help text**: never add a hint/help line (e.g. "↑↓ select · Enter apply") to a dialog, popup, or view's render function, no matter how new or small. All keybinding help lives solely in the global keybindings popup (`?`, `Dialog::Keybindings`/`keybindings_text()` in `src/ui.rs`). If a new view's keys aren't already covered by that popup's generic entries, extend `keybindings_text()` rather than adding local hint text.
+
 ## Testing & Reinstallation Guidelines
 
-Add tests in the module affected by the change, using descriptive behavior names such as `cancelled_edit_preserves_original`. Use temporary paths for filesystem cases and deterministic JSON fixtures for probe parsing. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before submitting.
+Add tests in the module affected by the change, using descriptive behavior names such as `cancelled_edit_preserves_original`. Use temporary paths for filesystem cases and deterministic JSON fixtures for probe parsing. No test in any suite may be ignored or conditionally skipped. During ordinary work, run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; reserve the complete e2e suite for the final pre-merge gate.
 
 ### Coverage and Regression Policy
 
 - Maintain a project target of at least **90% measured line coverage**, and prefer coverage comfortably above 90%. Measure branch coverage as well when the installed Rust coverage tooling supports it, and improve weak branch coverage rather than relying on the line percentage alone.
-- Until the repository reaches 90%, changes must not reduce overall coverage. New or modified production paths should be covered comprehensively and should improve coverage where practical, especially in modules below the target.
-- Every bug fix must include a focused regression test that fails before the fix and passes afterward. Reproduce the complete failure mode, including effects on neighboring or untouched data; do not test only the value directly changed by the user.
+- New or modified production paths must have **100% line and branch coverage from module-local unit tests**. E2E coverage is a separate requirement and does not substitute for unit coverage. Existing uncovered code remains debt, but touching it means covering the affected paths completely.
+- Every bug fix must include a focused module-local regression unit test that fails before the fix and passes afterward. Reproduce the complete failure mode, including effects on neighboring or untouched data; do not test only the value directly changed by the user. The affected functional area must also have an overarching e2e scenario; add one if it does not, but that scenario need not reproduce the exact defect.
 - Cover meaningful success, failure, cancellation, validation, and transaction/rollback paths. For FFmpeg and ffprobe behavior, include integration tests using small deterministic media fixtures when unit tests cannot verify the real command semantics.
-- Treat coverage as a diagnostic floor, not proof of correctness. Do not inflate it with assertion-free tests, broad exclusions, or tests that execute code without validating observable behavior.
-- Report the measured coverage method and totals with completed changes. If coverage cannot be measured in the current environment, state that explicitly rather than estimating it.
+- Treat coverage as a diagnostic floor, not proof of correctness. Do not inflate it with assertion-free tests, broad exclusions, or tests that execute code without validating observable behavior. **Covering unreachable code is inflation too**: before writing a test to reach the coverage bar, check that the application can actually reach the path. If it cannot, delete the path instead of testing it, and say so.
+- Report the unit-test coverage method and totals with completed ordinary changes. Report merged unit-and-e2e coverage only at the final pre-merge gate. If coverage cannot be measured in the current environment, state that explicitly rather than estimating it.
+- **Measuring final pre-merge coverage.** Branch coverage needs `-Z coverage-options=branch`, which only nightly `rustc` accepts, so it runs under `cargo +nightly llvm-cov --branch`. Because the unit and e2e suites are separate targets, the merged commands below run the complete e2e suite and therefore must only be used immediately before merging a branch:
+
+  ```sh
+  cargo +nightly llvm-cov clean --workspace
+  cargo +nightly llvm-cov --no-report --branch            # unit tests
+  cargo +nightly llvm-cov --no-report --branch --test e2e # e2e suite
+  cargo +nightly llvm-cov report --branch --summary-only
+  ```
+
+  A plain `cargo llvm-cov` run silently excludes the e2e suite (its target sets `test = false`), which understates `edit.rs` in particular — the remux paths it covers are the ones only e2e reaches.
+
+  Do **not** set `LLVM_COV`/`LLVM_PROFDATA` to the system `/usr/bin` binaries for these runs: the Arch system LLVM is older than nightly's and fails with `raw profile version mismatch`. Rustup supplies matching `llvm-tools` for the toolchain automatically. (That override was only needed back when the machine had no rustup at all.)
+
+  Note that `llvm-cov` counts branches inside `#[cfg(test)]` modules as well as production code, so a test containing loops or `match`es raises the denominator along with the numerator. Treat the per-file trend, not the absolute percentage, as the signal.
 
 **Mandatory Reinstall Step**: After making changes and successfully passing tests, ALWAYS run `cargo install --path .` so the updated `reel` binary is immediately installed to `~/.cargo/bin/reel`.
 

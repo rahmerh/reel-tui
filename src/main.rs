@@ -1,30 +1,42 @@
 use std::time::Duration;
+use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use reel_tui::app::App;
+use reel_tui::cli;
 use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
 use reel_tui::input::{InputOutcome, InputState, handle_key};
+use reel_tui::notification::completion_notification_sender;
 use reel_tui::probe::{spawn_conflict_probe_worker, spawn_probe_worker};
 use reel_tui::{config, mount, ui};
 
-fn main() -> Result<()> {
-    let target_dir = match std::env::args().nth(1) {
-        Some(path) => std::path::PathBuf::from(path),
-        None => std::env::current_dir()?,
-    };
+fn main() -> ExitCode {
+    cli::dispatch(
+        std::env::args_os().skip(1),
+        std::env::current_dir,
+        run,
+        std::io::stdout(),
+        std::io::stderr(),
+    )
+}
+
+fn run(target_dir: PathBuf) -> Result<()> {
     let target_dir = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
     let directory_rx = spawn_directory_monitor(target_dir.clone());
     let (request_tx, result_rx) = spawn_probe_worker();
     let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
-    let worker_config = config::Config::load();
+    let app_config = config::Config::load();
     let is_network_mount = mount::is_network_mount(&target_dir);
-    let (transcode_workers, remux_workers) = worker_config.effective_workers(is_network_mount);
+    let (transcode_workers, remux_workers) = app_config.effective_workers(is_network_mount);
     let (transcode_tx, remux_tx, edit_rx) =
         spawn_edit_worker_pools(transcode_workers, remux_workers);
     let mut app = App::new(target_dir, request_tx, conflict_tx, transcode_tx, remux_tx)?;
+    app.set_completion_notification_sender(completion_notification_sender(
+        app_config.notifications,
+    ));
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {

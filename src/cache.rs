@@ -23,18 +23,63 @@ pub struct DiskCache {
 }
 
 impl DiskCache {
+    /// Where `probe_cache.json` and `edit_errors.log` live.
+    ///
+    /// The unit-test binary is redirected to throwaway storage wholesale. `App::new`
+    /// calls `load()`, `receive_probe_results` calls `save()`, and `log_edit_failure`
+    /// appends to `edit_errors.log` — so without this, every `cargo test` run rewrote
+    /// the user's real probe cache with `/tmp` fixture paths and appended each test's
+    /// deliberately-failing edit to the real failure log. That log is the first place
+    /// AGENTS.md says to look when hunting a regression, and it had reached 1132 lines
+    /// of which 925 were test noise.
+    ///
+    /// The e2e binary links this crate compiled *without* `cfg(test)`, so it is not
+    /// covered here; it redirects `XDG_CACHE_HOME` itself (`tests/e2e/harness.rs`).
+    /// Between the two, no test run can reach the user's real cache directory.
     pub fn cache_dir() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("XDG_CACHE_HOME") {
-            let path = PathBuf::from(path);
-            if !path.as_os_str().is_empty() {
-                return Some(path.join("reel-tui"));
-            }
+        #[cfg(test)]
+        {
+            Some(Self::test_cache_dir())
         }
-        if let Ok(home) = std::env::var("HOME") {
-            let path = PathBuf::from(home);
-            if !path.as_os_str().is_empty() {
-                return Some(path.join(".cache").join("reel-tui"));
-            }
+        #[cfg(not(test))]
+        {
+            Self::cache_dir_from(
+                std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            )
+        }
+    }
+
+    /// A single throwaway directory shared by the whole unit-test binary, cleared once
+    /// per run so no run inherits the previous one's cached probes. A `OnceLock` rather
+    /// than an environment variable: `set_var` is `unsafe` in this edition and racy
+    /// under the threaded test runner, and this needs no such trade-off.
+    #[cfg(test)]
+    fn test_cache_dir() -> PathBuf {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join("reel-tui-unit-test-cache");
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::create_dir_all(&dir);
+            dir
+        })
+        .clone()
+    }
+
+    /// Resolves the cache directory from the two environment variables that can name it.
+    /// Split out from `cache_dir` so the precedence and the empty-value handling can be
+    /// tested directly — mutating the process environment from a test is racy under the
+    /// threaded test runner and `unsafe` in this edition.
+    ///
+    /// An empty value is treated as unset rather than as the relative path it literally
+    /// is: `XDG_CACHE_HOME=` would otherwise resolve to `reel-tui/` in whatever directory
+    /// `reel` happens to be launched from, scattering cache files across the user's disk.
+    fn cache_dir_from(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+        if let Some(path) = xdg_cache_home.filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path).join("reel-tui"));
+        }
+        if let Some(home) = home.filter(|home| !home.is_empty()) {
+            return Some(PathBuf::from(home).join(".cache").join("reel-tui"));
         }
         None
     }
@@ -269,6 +314,207 @@ mod tests {
         ));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Regression test for a real leak: `cargo test` was rewriting the user's real
+    /// `probe_cache.json` with `/tmp` fixture paths and appending every deliberately
+    /// failing test edit to their real `edit_errors.log` — the log AGENTS.md points at
+    /// as the first place to look when hunting a regression, found holding 925 lines of
+    /// test noise against 207 real ones. Nothing in the unit-test binary may resolve to
+    /// a directory the user actually keeps data in.
+    #[test]
+    fn the_unit_test_binary_should_never_resolve_to_a_real_cache_directory() {
+        // Act
+        let resolved = DiskCache::cache_dir().unwrap();
+
+        // Assert: throwaway storage, and specifically not either directory the real
+        // resolver would have picked.
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "the test cache must live in throwaway storage, got {resolved:?}",
+        );
+        let real = DiskCache::cache_dir_from(
+            std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        );
+        if let Some(real) = real {
+            assert_ne!(
+                resolved, real,
+                "the test cache must not be the directory the real resolver picks",
+            );
+        }
+        // And the file the cache actually writes lands inside it.
+        assert!(DiskCache::cache_file_path().unwrap().starts_with(&resolved));
+    }
+
+    #[test]
+    fn cache_dir_should_prefer_xdg_cache_home_and_fall_back_to_home() {
+        // Arrange / Act / Assert: XDG wins when both are set, `$HOME/.cache` is the
+        // fallback, and with neither set there is nowhere to write — which must be `None`
+        // rather than a relative path.
+        assert_eq!(
+            DiskCache::cache_dir_from(Some("/xdg"), Some("/home/bas")),
+            Some(PathBuf::from("/xdg/reel-tui")),
+        );
+        assert_eq!(
+            DiskCache::cache_dir_from(None, Some("/home/bas")),
+            Some(PathBuf::from("/home/bas/.cache/reel-tui")),
+        );
+        assert_eq!(DiskCache::cache_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn cache_dir_should_treat_an_empty_variable_as_unset() {
+        // Arrange / Act / Assert: `XDG_CACHE_HOME=` is a common way to accidentally unset
+        // a variable in a shell profile or systemd unit. Taking it literally would resolve
+        // the cache to a relative `reel-tui/` inside whatever directory `reel` was
+        // launched from, writing cache files into the user's media folders.
+        assert_eq!(
+            DiskCache::cache_dir_from(Some(""), Some("/home/bas")),
+            Some(PathBuf::from("/home/bas/.cache/reel-tui")),
+        );
+        assert_eq!(DiskCache::cache_dir_from(Some(""), Some("")), None);
+        assert_eq!(DiskCache::cache_dir_from(None, Some("")), None);
+    }
+
+    #[test]
+    fn cache_file_path_should_sit_inside_the_cache_directory() {
+        // Arrange / Act / Assert: the pairing the e2e harness relies on when it redirects
+        // `XDG_CACHE_HOME` to keep tests off the user's real cache.
+        assert_eq!(
+            DiskCache::cache_dir_from(Some("/xdg"), None)
+                .map(|dir| dir.join("probe_cache.json"))
+                .as_deref(),
+            Some(Path::new("/xdg/reel-tui/probe_cache.json")),
+        );
+    }
+
+    #[test]
+    fn disk_cache_should_drop_a_stored_entry_whose_video_stream_is_only_cover_art() {
+        // Arrange: an MP3 with embedded artwork probes as having a video stream. The cache
+        // must apply the same attached-picture rule the live probe does — otherwise the
+        // first launch correctly hides the file and every launch after it, served from
+        // cache, offers an audio file for track editing.
+        let directory = scratch("cover-art");
+        let path = PathBuf::from("/media/song.mp3");
+        let mut cache = DiskCache::default();
+        cache.insert(
+            path.clone(),
+            10,
+            None,
+            ProbeOutcome::Video(MediaInfo {
+                format: BTreeMap::from([("format_name".to_string(), json!("mp3"))]),
+                streams: vec![BTreeMap::from([
+                    ("codec_type".to_string(), json!("video")),
+                    ("codec_name".to_string(), json!("mjpeg")),
+                    ("disposition".to_string(), json!({"attached_pic": 1})),
+                ])],
+                chapters: vec![],
+            }),
+        );
+
+        // Act
+        cache.save_to(&directory).unwrap();
+        let loaded = DiskCache::load_from(&directory.join("probe_cache.json"));
+
+        // Assert: rejected both on load and by an in-memory `get`.
+        assert!(loaded.entries.is_empty());
+        assert!(cache.get(&path, 10, None).is_none());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disk_cache_should_drop_a_stored_entry_that_is_really_a_still_image() {
+        // Arrange: a PNG cached back when it looked like a one-frame video. Same failure
+        // as cover art — a cached answer must not outlive the rule that produced it.
+        let directory = scratch("still-image");
+        let path = PathBuf::from("/media/poster.png");
+        let mut cache = DiskCache::default();
+        cache.insert(
+            path.clone(),
+            10,
+            None,
+            ProbeOutcome::Video(MediaInfo {
+                format: BTreeMap::from([("format_name".to_string(), json!("image2"))]),
+                streams: vec![BTreeMap::from([
+                    ("codec_type".to_string(), json!("video")),
+                    ("codec_name".to_string(), json!("png")),
+                ])],
+                chapters: vec![],
+            }),
+        );
+
+        // Act
+        cache.save_to(&directory).unwrap();
+        let loaded = DiskCache::load_from(&directory.join("probe_cache.json"));
+
+        // Assert
+        assert!(loaded.entries.is_empty());
+        assert!(cache.get(&path, 10, None).is_none());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disk_cache_should_keep_a_real_video_that_also_carries_cover_art() {
+        // Arrange: a film with an embedded poster has both an attached picture and a real
+        // video stream. The rule is "has at least one genuine video stream", not "has no
+        // cover art" — getting that backwards would hide ordinary films from the list.
+        let directory = scratch("video-with-cover");
+        let path = PathBuf::from("/media/film.mkv");
+        let mut cache = DiskCache::default();
+        cache.insert(
+            path.clone(),
+            10,
+            None,
+            ProbeOutcome::Video(MediaInfo {
+                format: BTreeMap::from([("format_name".to_string(), json!("matroska"))]),
+                streams: vec![
+                    BTreeMap::from([
+                        ("codec_type".to_string(), json!("video")),
+                        ("codec_name".to_string(), json!("mjpeg")),
+                        ("disposition".to_string(), json!({"attached_pic": 1})),
+                    ]),
+                    BTreeMap::from([
+                        ("codec_type".to_string(), json!("video")),
+                        ("codec_name".to_string(), json!("h264")),
+                    ]),
+                ],
+                chapters: vec![],
+            }),
+        );
+
+        // Act
+        cache.save_to(&directory).unwrap();
+        let loaded = DiskCache::load_from(&directory.join("probe_cache.json"));
+
+        // Assert: kept, and still served.
+        assert_eq!(loaded.entries.len(), 1);
+        assert!(loaded.get(&path, 10, None).is_some());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disk_cache_should_reject_an_entry_whose_modification_time_is_now_unknown() {
+        // Arrange: a fingerprint recorded with a timestamp, queried with none — what
+        // happens when a filesystem stops reporting mtime (some network mounts do). The
+        // safe answer is a miss and a re-probe, not a stale hit.
+        let mut cache = DiskCache::default();
+        let path = PathBuf::from("/media/video.mkv");
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        cache.insert(path.clone(), 1024, Some(modified), video("video"));
+
+        // Act / Assert
+        assert!(cache.get(&path, 1024, None).is_none());
+        assert!(cache.get(&path, 1024, Some(modified)).is_some());
+        // A path that was never cached at all is a miss, not a panic.
+        assert!(
+            cache
+                .get(Path::new("/media/other.mkv"), 1024, None)
+                .is_none()
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::app::TrackRef;
-use crate::edit::{ContainerFormat, ContainerMetadata, VideoSettings};
+use crate::edit::{AudioSettings, ContainerFormat, ContainerMetadata, VideoSettings};
 use crate::files::FileFingerprint;
 use crate::subtitle::{SubtitleChange, SubtitleSource};
 
@@ -50,6 +50,7 @@ pub struct StagedEdit {
     pub deleted_streams: BTreeSet<u64>,
     pub default_streams: BTreeSet<u64>,
     pub default_sidecars: BTreeSet<usize>,
+    pub audio_settings: BTreeMap<u64, AudioSettings>,
     pub video_settings: BTreeMap<u64, VideoSettings>,
     pub subtitle_changes: BTreeMap<SubtitleSource, SubtitleChange>,
     pub left_subtitle_order: Vec<TrackRef>,

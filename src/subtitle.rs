@@ -547,7 +547,17 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
             let mut fields = line.split_whitespace();
             let flags = fields.next()?;
             let name = fields.next()?;
-            (flags.contains('E') || flags.starts_with('S')).then(|| name.to_string())
+            // `ffmpeg -encoders` prints its flag legend in the same shape as its entries
+            // (" V..... = Video"), so without this the legend contributes a capability
+            // literally named "=".
+            if name == "=" {
+                return None;
+            }
+            (flags.contains('E')
+                || flags.starts_with('V')
+                || flags.starts_with('A')
+                || flags.starts_with('S'))
+            .then(|| name.to_string())
         })
         .collect()
 }
@@ -1032,6 +1042,213 @@ mod tests {
     }
 
     #[test]
+    fn a_sidecar_whose_language_token_is_not_a_language_should_not_be_matched() {
+        // Arrange: the token after the media stem is only a language if it looks like one.
+        // Accepting anything here would attach unrelated files — `movie.backup.srt`,
+        // `movie.2024-01-01.srt` — to the film as subtitle tracks the user never added,
+        // and then offer to mux them in.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-sidecar-bad-language-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let media_by_stem = media_paths_by_stem(std::slice::from_ref(&media));
+
+        // Act / Assert
+        for filename in [
+            // Too short to be a language tag.
+            "movie.e.srt",
+            // Too long.
+            "movie.abcdefghi.srt",
+            // Characters a language tag never contains.
+            "movie.en_us.srt",
+            "movie.en us.srt",
+            "movie.en+gb.srt",
+        ] {
+            assert!(
+                parse_sidecar_for_media(filename, SubtitleFormat::SubRip, &media_by_stem).is_none(),
+                "{filename} must not be matched as a subtitle for the film",
+            );
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_sidecar_for_a_different_film_should_not_be_matched() {
+        // Arrange: name matching is by stem prefix, so a file that merely starts with
+        // similar text must not attach. `movie2.eng.srt` belongs to another film.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-sidecar-other-film-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let media_by_stem = media_paths_by_stem(std::slice::from_ref(&media));
+
+        // Act / Assert
+        for filename in [
+            "movie2.eng.srt",
+            "other.eng.srt",
+            // The stem alone, with no language token at all.
+            "movie.srt",
+            // No extension to strip.
+            "movie",
+        ] {
+            assert!(
+                parse_sidecar_for_media(filename, SubtitleFormat::SubRip, &media_by_stem).is_none(),
+                "{filename} must not be matched",
+            );
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_number_should_be_read_but_junk_after_it_should_reject_the_file() {
+        // Arrange: `movie.eng.2.srt` is the second English subtitle — the numbering this
+        // codebase writes itself when exporting duplicates, so it must round-trip. A
+        // token that is neither a flag nor a number after that is not a name this scheme
+        // produces, and attaching it anyway would misreport what the file is.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-sidecar-number-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let media_by_stem = media_paths_by_stem(std::slice::from_ref(&media));
+
+        // Act / Assert: the number is read.
+        let (_, parsed) =
+            parse_sidecar_for_media("movie.eng.2.srt", SubtitleFormat::SubRip, &media_by_stem)
+                .unwrap();
+        assert_that!(parsed.number).is_equal_to(Some(2));
+        assert_that!(parsed.forced).is_false();
+        assert_that!(parsed.hearing_impaired).is_false();
+
+        // Act / Assert: a flag and a number together still parse, in either order.
+        let (_, parsed) = parse_sidecar_for_media(
+            "movie.eng.forced.3.srt",
+            SubtitleFormat::SubRip,
+            &media_by_stem,
+        )
+        .unwrap();
+        assert_that!(parsed.number).is_equal_to(Some(3));
+        assert_that!(parsed.forced).is_true();
+
+        // Act / Assert: an unrecognised token after the number is rejected outright.
+        assert!(
+            parse_sidecar_for_media(
+                "movie.eng.2.backup.srt",
+                SubtitleFormat::SubRip,
+                &media_by_stem,
+            )
+            .is_none(),
+            "a trailing unknown token after the number must reject the file",
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_undetermined_language_tag_should_not_be_treated_as_a_real_language() {
+        // Arrange / Act / Assert: `und` is ffmpeg's placeholder for "no language set",
+        // not a language. Canonicalising it into a real code would label every untagged
+        // track as if the user had chosen that language.
+        assert_that!(canonical_language_code("und")).is_none();
+        assert_that!(canonical_language_code("UND")).is_none();
+        assert_that!(canonical_language_code("")).is_none();
+        assert_that!(canonical_language_code("   ")).is_none();
+        // A real tag still resolves, so the guard is not over-broad.
+        assert_that!(canonical_language_code("en").as_deref()).contains("eng");
+    }
+
+    /// The `.idx` is half the subtitle, so pairing it up is what keeps it out of the
+    /// file list — otherwise it shows as a media file the user can open.
+    #[test]
+    fn partition_sidecars_should_claim_the_idx_companion_alongside_its_sub() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-vobsub-pair-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let subtitle = file(&directory, "movie.eng.sub");
+        let index = file(&directory, "movie.eng.idx");
+
+        // Act
+        let (visible, sidecars) =
+            partition_sidecars(vec![media.clone(), subtitle.clone(), index.clone()]);
+
+        // Assert
+        assert_that!(visible.len()).is_equal_to(1);
+        assert_that!(visible[0].path.clone()).is_equal_to(media.path.clone());
+        let entries = sidecars.get(&media.path).unwrap();
+        assert_that!(entries).has_length(1);
+        assert_that!(entries[0].format).is_equal_to(SubtitleFormat::VobSub);
+        assert_that!(entries[0].companion.clone()).contains(index.path);
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_flag_token_should_not_be_read_as_a_duplicate_number() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-sidecar-tokens-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let media = file(&directory, "movie.mkv");
+        let repeated = file(&directory, "movie.eng.forced.forced.srt");
+
+        // Act
+        let (_, sidecars) = partition_sidecars(vec![media.clone(), repeated]);
+
+        // Assert: the second `forced` is consumed as the (unparseable) number slot
+        // rather than rejecting the file outright.
+        let entries = sidecars.get(&media.path).unwrap();
+        assert_that!(entries[0].forced).is_true();
+        assert_that!(entries[0].number).is_none();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_blank_or_undetermined_language_should_normalize_to_und() {
+        // Act / Assert
+        assert_that!(normalized_language("")).is_equal_to("und");
+        assert_that!(normalized_language("   ")).is_equal_to("und");
+        assert_that!(normalized_language("und")).is_equal_to("und");
+        assert_that!(normalized_language("UND")).is_equal_to("und");
+        assert_that!(normalized_language("  eng  ")).is_equal_to("eng");
+    }
+
+    #[test]
     fn partition_sidecars_should_require_idx_companion_when_file_is_vobsub() {
         // Arrange
         let directory = std::env::temp_dir().join(format!(
@@ -1206,6 +1423,91 @@ mod tests {
         assert_that!(srt_without_seconv.reason.as_deref().unwrap()).contains("seconv");
         assert_that!(srt_without_language.enabled).is_false();
         assert_that!(srt_without_language.reason.as_deref().unwrap()).contains("Tesseract");
+    }
+
+    #[test]
+    fn converting_between_two_different_image_formats_should_never_be_offered() {
+        // Arrange: PGS and VobSub are both bitmap formats, so "converting" one to the
+        // other means OCR to text and re-rendering back to bitmaps — two lossy steps that
+        // produce visibly worse subtitles than the source. It is refused regardless of
+        // which tools are installed, so a fully-equipped machine is used here.
+        let capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "dvdsub".to_string()]),
+            ffmpeg_muxers: BTreeSet::new(),
+            seconv: true,
+            tesseract_languages: vec!["eng".to_string()],
+        };
+
+        // Act
+        let from_pgs = capabilities.format_choices(SubtitleFormat::Pgs, Some("mkv"), false, false);
+        let vobsub = from_pgs
+            .iter()
+            .find(|choice| choice.value == Some(SubtitleFormat::VobSub))
+            .unwrap();
+
+        // Assert
+        assert_that!(vobsub.enabled).is_false();
+        assert_that!(vobsub.reason.as_deref().unwrap()).contains("cross-image");
+    }
+
+    #[test]
+    fn extracting_an_embedded_vobsub_unchanged_should_still_require_seconv() {
+        // Arrange: pulling VobSub out of a container to a sidecar is not a no-op even
+        // though the format is unchanged — the `.sub`/`.idx` pair has to be written, which
+        // is seconv's job. Treating "same format" as always-available would offer an
+        // export that fails once the user commits to it.
+        let mut capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from(["dvdsub".to_string()]),
+            ffmpeg_muxers: BTreeSet::new(),
+            seconv: false,
+            tesseract_languages: Vec::new(),
+        };
+
+        // Act: extracting_embedded is what makes the same-format entry a real conversion.
+        let without_seconv = capabilities.format_choices(SubtitleFormat::VobSub, None, true, true);
+        capabilities.seconv = true;
+        let with_seconv = capabilities.format_choices(SubtitleFormat::VobSub, None, true, true);
+        let find = |choices: &[FormatChoice]| {
+            choices
+                .iter()
+                .find(|choice| choice.format == SubtitleFormat::VobSub)
+                .cloned()
+                .unwrap()
+        };
+
+        // Assert
+        let blocked = find(&without_seconv);
+        assert_that!(blocked.enabled).is_false();
+        assert_that!(blocked.reason.as_deref().unwrap()).contains("seconv");
+        assert_that!(find(&with_seconv).enabled).is_true();
+    }
+
+    #[test]
+    fn text_conversions_should_be_refused_outright_when_ffmpeg_is_missing() {
+        // Arrange: without ffmpeg there is nothing to convert text subtitles with. The
+        // reason must name ffmpeg specifically — "FFmpeg encoder is unavailable" would
+        // send the user looking for a codec when the whole binary is absent.
+        let capabilities = ToolCapabilities {
+            ffmpeg: false,
+            ffmpeg_encoders: BTreeSet::new(),
+            ffmpeg_muxers: BTreeSet::new(),
+            seconv: true,
+            tesseract_languages: vec!["eng".to_string()],
+        };
+
+        // Act
+        let choices =
+            capabilities.format_choices(SubtitleFormat::SubRip, Some("mkv"), false, false);
+        let ass = choices
+            .iter()
+            .find(|choice| choice.value == Some(SubtitleFormat::Ass))
+            .unwrap();
+
+        // Assert
+        assert_that!(ass.enabled).is_false();
+        assert_that!(ass.reason.as_deref().unwrap()).contains("requires ffmpeg in PATH");
     }
 
     #[test]
@@ -1427,8 +1729,11 @@ mod tests {
 
         assert_that!(capabilities.contains("srt")).is_true();
         assert_that!(capabilities.contains("webvtt")).is_true();
-        assert_that!(capabilities.contains("libx264")).is_false();
-        assert_that!(capabilities.contains("aac")).is_false();
+        assert_that!(capabilities.contains("libx264")).is_true();
+        assert_that!(capabilities.contains("aac")).is_true();
+        // The flag legend is printed in the same shape as a real entry, so it must not
+        // contribute a capability of its own.
+        assert_that!(capabilities.contains("=")).is_false();
 
         let muxer_output = " File formats:
   D. = Demuxing supported

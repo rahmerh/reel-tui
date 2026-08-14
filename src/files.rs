@@ -51,6 +51,13 @@ pub enum DirectorySnapshot {
 const NETWORK_SCAN_CONCURRENCY: usize = 8;
 
 pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
+    scan_directory_as(directory, crate::mount::is_network_mount(directory))
+}
+
+/// The body of `scan_directory` with the mount type passed in rather than detected, so
+/// both stat strategies can be exercised against the same directory. Which one runs must
+/// never change the resulting listing — only how long it takes to produce it.
+fn scan_directory_as(directory: &Path, is_network: bool) -> Result<Vec<FileEntry>> {
     let mut candidates = Vec::new();
 
     for entry in fs::read_dir(directory)? {
@@ -73,7 +80,7 @@ pub fn scan_directory(directory: &Path) -> Result<Vec<FileEntry>> {
         candidates.push((entry.path(), display_name));
     }
 
-    let mut files = if crate::mount::is_network_mount(directory) {
+    let mut files = if is_network {
         stat_candidates_concurrently(candidates)
     } else {
         candidates
@@ -137,16 +144,22 @@ fn stat_candidates_concurrently(candidates: Vec<(PathBuf, String)>) -> Vec<FileE
     files
 }
 
+/// How long the monitor waits between full rescans. A network mount pays a round trip
+/// per `stat`, so rescanning it at the local cadence turns idle browsing into constant
+/// traffic — see the adaptive-filesystem notes in AGENTS.md.
+fn reconcile_interval(is_network: bool) -> Duration {
+    if is_network {
+        NETWORK_RECONCILE_INTERVAL
+    } else {
+        RECONCILE_INTERVAL
+    }
+}
+
 pub fn spawn_directory_monitor(directory: PathBuf) -> Receiver<DirectorySnapshot> {
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let is_network = crate::mount::is_network_mount(&directory);
-        let reconcile_interval = if is_network {
-            NETWORK_RECONCILE_INTERVAL
-        } else {
-            RECONCILE_INTERVAL
-        };
+        let reconcile_interval = reconcile_interval(crate::mount::is_network_mount(&directory));
 
         let (event_tx, event_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(event_tx).ok();
@@ -194,6 +207,15 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+
+    /// Rescanning a network share at the local cadence is the difference between idle
+    /// browsing and a `stat` storm, so the two intervals must stay far apart.
+    #[test]
+    fn a_network_directory_should_be_rescanned_far_less_often_than_a_local_one() {
+        // Act / Assert
+        assert_that!(reconcile_interval(false)).is_equal_to(Duration::from_secs(1));
+        assert_that!(reconcile_interval(true)).is_equal_to(Duration::from_secs(10));
+    }
 
     #[test]
     fn scan_directory_should_return_regular_files_in_case_insensitive_order_when_directory_contains_files_and_folder()
@@ -317,6 +339,227 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn both_stat_strategies_should_produce_the_same_listing_for_the_same_directory() {
+        // Arrange: a network mount stats concurrently across a thread pool, a local disk
+        // sequentially. The concurrent path chunks the candidates and reassembles them,
+        // which is where a file could be dropped or duplicated — and on a network share
+        // the user would simply see media go missing from the list with no error.
+        // More files than `NETWORK_SCAN_CONCURRENCY` so the chunking really runs, plus the
+        // entries the scan is supposed to filter out either way.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-scan-strategies-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("subfolder")).unwrap();
+        for index in 0..(NETWORK_SCAN_CONCURRENCY * 2 + 3) {
+            fs::write(directory.join(format!("movie-{index:02}.mkv")), b"media").unwrap();
+        }
+        // A work file the scan must hide, and a directory it must skip.
+        fs::write(directory.join(".reel-tui-123-work.mkv"), b"work").unwrap();
+
+        // Act
+        let local = scan_directory_as(&directory, false).unwrap();
+        let network = scan_directory_as(&directory, true).unwrap();
+
+        // Assert: identical listings, in the same order, with the same fingerprints.
+        let describe = |files: &[FileEntry]| {
+            files
+                .iter()
+                .map(|file| (file.display_name.clone(), file.fingerprint.length))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(describe(&local), describe(&network));
+        assert_eq!(local.len(), NETWORK_SCAN_CONCURRENCY * 2 + 3);
+        assert!(
+            local
+                .iter()
+                .all(|file| !file.display_name.starts_with(".reel-tui-")),
+            "work files must be hidden by both strategies",
+        );
+        assert!(
+            local.iter().all(|file| file.display_name != "subfolder"),
+            "directories must be skipped by both strategies",
+        );
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_should_return_an_error_when_the_directory_cannot_be_read() {
+        // Arrange / Act: the directory the user was browsing gets unmounted or removed
+        // out from under `reel` — on a network share, an unreachable server does this
+        // routinely. The monitor turns this into a `DirectorySnapshot::Error` for the
+        // status line, so it must surface as `Err` rather than an empty listing that
+        // would read as "this directory has no media".
+        let result = scan_directory(Path::new("/nonexistent/reel-tui/directory"));
+
+        // Assert
+        assert_that!(result).is_err();
+    }
+
+    #[test]
+    fn scan_directory_should_return_an_error_when_the_path_is_a_file_rather_than_a_directory() {
+        // Arrange: `reel` is pointed at a file path instead of a directory.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-not-a-directory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("movie.mkv");
+        fs::write(&file, b"media").unwrap();
+
+        // Act
+        let result = scan_directory(&file);
+
+        // Assert
+        assert_that!(result).is_err();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stat_candidates_concurrently_should_take_the_sequential_path_for_zero_or_one_candidate() {
+        // Arrange: spawning a thread scope to stat a single file costs more than the stat
+        // it is hiding, so one candidate (the common case for a directory holding a single
+        // film) short-circuits to the sequential path. That short-circuit must return the
+        // same thing the threaded path would.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-network-scan-single-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("only.mkv");
+        fs::write(&path, b"not really media").unwrap();
+
+        // Act
+        let none = stat_candidates_concurrently(Vec::new());
+        let one = stat_candidates_concurrently(vec![(path.clone(), "only.mkv".to_string())]);
+
+        // Assert: an empty directory yields nothing, and the lone file comes back fully
+        // populated rather than with a zeroed fingerprint.
+        assert_that!(none).is_empty();
+        assert_that!(one.len()).is_equal_to(1);
+        assert_that!(one[0].path.clone()).is_equal_to(path);
+        assert_that!(one[0].fingerprint.length).is_equal_to(b"not really media".len() as u64);
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stat_candidates_concurrently_should_return_nothing_when_the_only_candidate_is_gone() {
+        // Arrange: the single-candidate fast path has its own `filter_map`, so the
+        // vanished-file case has to be proven there too, not just on the threaded path.
+        let missing = std::env::temp_dir().join(format!(
+            "reel-tui-single-missing-{}-{}.mkv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Act
+        let files = stat_candidates_concurrently(vec![(missing, "gone.mkv".to_string())]);
+
+        // Assert
+        assert_that!(files).is_empty();
+    }
+
+    #[test]
+    fn directory_monitor_should_stay_silent_while_the_directory_is_unchanged() {
+        // Arrange: the monitor rescans on a fixed interval whether or not anything moved.
+        // Resending an identical snapshot would make `App` rebuild its file list — and
+        // re-probe the selection — once a second forever on an idle directory, which on a
+        // network mount is the exact stat thrashing the adaptive interval exists to stop.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-monitor-idle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        File::create(directory.join("film.mkv")).unwrap();
+        let receiver = spawn_directory_monitor(directory.clone());
+
+        // Act: take the initial snapshot, then leave the directory completely alone for
+        // longer than the local reconcile interval.
+        let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(first, DirectorySnapshot::Files(_)));
+        let repeat = receiver.recv_timeout(RECONCILE_INTERVAL * 3);
+
+        // Assert: nothing further arrives, because nothing changed.
+        assert!(
+            repeat.is_err(),
+            "an unchanged directory must not resend its snapshot, got {repeat:?}",
+        );
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_monitor_should_report_an_error_snapshot_when_the_directory_disappears() {
+        // Arrange: the directory is removed while `reel` is watching it — an unmounted
+        // share, or a folder deleted in another window. The monitor must keep running and
+        // report the failure, not exit silently and leave the UI frozen on a stale listing.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-monitor-vanish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        File::create(directory.join("film.mkv")).unwrap();
+        let receiver = spawn_directory_monitor(directory.clone());
+        let _ = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Act
+        fs::remove_dir_all(&directory).unwrap();
+
+        // Assert
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_error = false;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match receiver.recv_timeout(remaining) {
+                Ok(DirectorySnapshot::Error(message)) => {
+                    assert!(!message.is_empty(), "the error must explain itself");
+                    saw_error = true;
+                    break;
+                }
+                Ok(DirectorySnapshot::Files(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_error,
+            "a directory that disappears must produce an error snapshot",
+        );
     }
 
     #[test]

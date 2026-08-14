@@ -37,9 +37,20 @@ pub struct MediaSpec {
     pub height: u32,
     pub duration: f32,
     pub video_codec: &'static str,
-    /// Language tag per audio track; the first is marked default.
+    pub video_disposition: Option<&'static str>,
+    /// Language tag per audio track; the first is marked default unless an explicit
+    /// disposition is supplied for it.
     pub audio_languages: Vec<&'static str>,
+    pub audio_dispositions: Vec<&'static str>,
     pub audio_codec: &'static str,
+    pub audio_codecs: Vec<&'static str>,
+    pub audio_titles: Vec<Option<&'static str>>,
+    pub audio_sample_rate: u32,
+    /// Writes a `tmcd` timecode track, which ffprobe reports as a `data` stream whose
+    /// codec Reel's container table does not list. Cameras produce these constantly, so
+    /// it is the realistic shape of "content the file has always held and no edit
+    /// touches".
+    pub timecode: Option<&'static str>,
     pub subtitles: Vec<SubtitleSpec>,
 }
 
@@ -51,8 +62,14 @@ impl Default for MediaSpec {
             height: 48,
             duration: 1.0,
             video_codec: "libx264",
+            video_disposition: None,
             audio_languages: vec!["eng"],
+            audio_dispositions: Vec::new(),
             audio_codec: "aac",
+            audio_codecs: Vec::new(),
+            audio_titles: Vec::new(),
+            audio_sample_rate: 48_000,
+            timecode: None,
             subtitles: Vec::new(),
         }
     }
@@ -70,6 +87,11 @@ impl MediaSpec {
         }
     }
 
+    pub fn timecode(mut self, timecode: &'static str) -> Self {
+        self.timecode = Some(timecode);
+        self
+    }
+
     pub fn size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
@@ -78,6 +100,31 @@ impl MediaSpec {
 
     pub fn audio(mut self, languages: &[&'static str]) -> Self {
         self.audio_languages = languages.to_vec();
+        self
+    }
+
+    pub fn video_disposition(mut self, disposition: &'static str) -> Self {
+        self.video_disposition = Some(disposition);
+        self
+    }
+
+    pub fn audio_sample_rate(mut self, rate: u32) -> Self {
+        self.audio_sample_rate = rate;
+        self
+    }
+
+    pub fn audio_dispositions(mut self, dispositions: &[&'static str]) -> Self {
+        self.audio_dispositions = dispositions.to_vec();
+        self
+    }
+
+    pub fn audio_codecs(mut self, codecs: &[&'static str]) -> Self {
+        self.audio_codecs = codecs.to_vec();
+        self
+    }
+
+    pub fn audio_titles(mut self, titles: &[Option<&'static str>]) -> Self {
+        self.audio_titles = titles.to_vec();
         self
     }
 
@@ -98,6 +145,14 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
         .expect("fixture path needs a stem");
 
     let mut srt_paths = Vec::new();
+    assert!(
+        spec.audio_codecs.is_empty() || spec.audio_codecs.len() == spec.audio_languages.len(),
+        "per-track audio codecs must match the audio-track count"
+    );
+    assert!(
+        spec.audio_titles.is_empty() || spec.audio_titles.len() == spec.audio_languages.len(),
+        "audio titles must match the audio-track count"
+    );
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         let srt_path = parent.join(format!(".fixture-{stem}-{index}.srt"));
         fs::write(&srt_path, srt_body(subtitle.language, spec.duration)).unwrap();
@@ -113,7 +168,10 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
     );
     command.args(["-f", "lavfi", "-i", &video_source]);
 
-    let audio_source = format!("anullsrc=r=48000:cl=stereo:d={}", spec.duration);
+    let audio_source = format!(
+        "anullsrc=r={}:cl=stereo:d={}",
+        spec.audio_sample_rate, spec.duration
+    );
     for _ in &spec.audio_languages {
         command.args(["-f", "lavfi", "-i", &audio_source]);
     }
@@ -136,7 +194,16 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
     if spec.video_codec.starts_with("libx26") {
         command.args(["-pix_fmt", "yuv420p", "-preset", "ultrafast"]);
     }
-    command.args(["-c:a", spec.audio_codec]);
+    if let Some(disposition) = spec.video_disposition {
+        command.args(["-disposition:v:0", disposition]);
+    }
+    if spec.audio_codecs.is_empty() {
+        command.args(["-c:a", spec.audio_codec]);
+    } else {
+        for (index, codec) in spec.audio_codecs.iter().enumerate() {
+            command.arg(format!("-c:a:{index}")).arg(codec);
+        }
+    }
 
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         command.args([&format!("-c:s:{index}"), subtitle.codec]);
@@ -146,9 +213,17 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
         command
             .arg(format!("-metadata:s:a:{index}"))
             .arg(format!("language={language}"));
-        command
-            .arg(format!("-disposition:a:{index}"))
-            .arg(if index == 0 { "default" } else { "0" });
+        command.arg(format!("-disposition:a:{index}")).arg(
+            spec.audio_dispositions
+                .get(index)
+                .copied()
+                .unwrap_or(if index == 0 { "default" } else { "0" }),
+        );
+        if let Some(Some(title)) = spec.audio_titles.get(index) {
+            command
+                .arg(format!("-metadata:s:a:{index}"))
+                .arg(format!("title={title}"));
+        }
     }
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         command
@@ -157,6 +232,10 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
         command
             .arg(format!("-disposition:s:{index}"))
             .arg(if subtitle.default { "default" } else { "0" });
+    }
+
+    if let Some(timecode) = spec.timecode {
+        command.args(["-timecode", timecode]);
     }
 
     command.args(["-f", spec.muxer]);
@@ -173,6 +252,120 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
     for srt_path in srt_paths {
         let _ = fs::remove_file(srt_path);
     }
+}
+
+/// Builds a Matroska file carrying a genuine VobSub bitmap subtitle. FFmpeg cannot
+/// render text subtitles into bitmap subtitles, so `seconv` creates the `.idx`/`.sub`
+/// pair first and FFmpeg muxes that pair unchanged. This is the source shape needed
+/// to exercise Reel's real OCR path.
+pub fn write_vobsub_media(path: &Path, language: &str) {
+    let parent = path.parent().expect("fixture path needs a parent");
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("fixture path needs a stem");
+    let text = parent.join(format!(".fixture-{stem}-bitmap.srt"));
+    fs::write(&text, "1\n00:00:00,200 --> 00:00:01,800\nHELLO WORLD\n\n").unwrap();
+    let rendered = Command::new("seconv")
+        .arg(&text)
+        .arg("vobsub")
+        .arg("--overwrite")
+        .current_dir(parent)
+        .output()
+        .expect("seconv should be runnable");
+    let idx = text.with_extension("idx");
+    let sub = text.with_extension("sub");
+    assert!(
+        rendered.status.success() && idx.exists() && sub.exists(),
+        "seconv failed to render the VobSub fixture: {}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg("color=c=black:s=320x240:r=10:d=2")
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=2", "-i"])
+        .arg(&idx)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:s:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "copy",
+            "-metadata:s:s:0",
+        ])
+        .arg(format!("language={language}"))
+        .arg(path)
+        .output()
+        .expect("ffmpeg should be runnable");
+    assert!(
+        output.status.success(),
+        "failed to mux VobSub fixture {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for temporary in [text, idx, sub] {
+        fs::remove_file(temporary).unwrap();
+    }
+}
+
+/// Adds a real chapter and attachment stream to an ordinary Matroska fixture. These
+/// structures sit outside the common video/audio/subtitle groups and are therefore
+/// easy for an otherwise-successful remux to drop accidentally.
+pub fn write_media_with_chapter_and_attachment(path: &Path) {
+    write_media(path, &MediaSpec::mkv().audio(&["eng", "nld"]));
+    let parent = path.parent().expect("fixture path needs a parent");
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("fixture path needs a stem");
+    let chapters = parent.join(format!(".fixture-{stem}-chapters.ffmeta"));
+    let attachment = parent.join(format!(".fixture-{stem}-notes.txt"));
+    let enhanced = parent.join(format!(".fixture-{stem}-enhanced.mkv"));
+    fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Opening\n",
+    )
+    .unwrap();
+    fs::write(&attachment, "attachment must survive the remux\n").unwrap();
+
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(path)
+        .args(["-f", "ffmetadata", "-i"])
+        .arg(&chapters)
+        .args(["-map", "0", "-map_chapters", "1", "-c", "copy", "-attach"])
+        .arg(&attachment)
+        .args([
+            "-metadata:s:t:0",
+            "mimetype=text/plain",
+            "-metadata:s:t:0",
+            "filename=notes.txt",
+        ])
+        .arg(&enhanced)
+        .output()
+        .expect("ffmpeg should be runnable");
+    assert!(
+        output.status.success(),
+        "failed to add chapter and attachment to {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::rename(&enhanced, path).unwrap();
+    fs::remove_file(chapters).unwrap();
+    fs::remove_file(attachment).unwrap();
 }
 
 fn srt_body(language: &str, duration: f32) -> String {

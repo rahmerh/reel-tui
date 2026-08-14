@@ -20,7 +20,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use reel_tui::app::{App, Dialog, Layer, ResolutionChoiceValue, TrackRef};
+use reel_tui::app::{
+    App, AudioSettingsField, AudioSettingsMode, ContainerSettingsField, ContainerSettingsMode,
+    Dialog, Layer, ResolutionChoiceValue, SubtitleSettingsField, SubtitleSettingsMode, TrackRef,
+    VideoSettingsMode,
+};
 use reel_tui::edit::{EditEvent, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
@@ -305,6 +309,380 @@ impl Harness {
         );
     }
 
+    /// Replaces one container metadata value through the popup's ordinary text
+    /// editor. The popup must already be open so a scenario can edit several fields
+    /// in one visit, just like a user would.
+    pub fn type_container_metadata(&mut self, field: ContainerSettingsField, value: &str) {
+        assert_ne!(
+            field,
+            ContainerSettingsField::Format,
+            "Format is a dropdown rather than container metadata"
+        );
+        let target = ContainerSettingsField::ALL
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("container field should be listed");
+        for _ in 0..ContainerSettingsField::ALL.len() * 2 {
+            let current = self
+                .app
+                .container_settings_popup
+                .as_ref()
+                .map(|popup| popup.field)
+                .expect("container settings should be open");
+            let position = ContainerSettingsField::ALL
+                .iter()
+                .position(|candidate| *candidate == current)
+                .expect("focused container field should be listed");
+            match position.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        assert_eq!(
+            self.app
+                .container_settings_popup
+                .as_ref()
+                .map(|popup| popup.field),
+            Some(field),
+            "could not focus {}",
+            field.label()
+        );
+
+        self.press(key(KeyCode::Char('i')));
+        assert_eq!(
+            self.app
+                .container_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(ContainerSettingsMode::TextEdit),
+            "i on {} should enter ordinary text editing",
+            field.label()
+        );
+        self.press(ctrl('u'));
+        for character in value.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    pub fn close_container_settings(&mut self) {
+        self.press(key(KeyCode::Esc));
+        assert_eq!(self.app.dialog, None, "Esc should close container settings");
+    }
+
+    /// Opens the audio settings popup for the embedded track at `row`.
+    pub fn open_audio_settings(&mut self, row: usize) {
+        self.select_track_row(row);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::AudioSettings),
+            "Enter on row {row} should open audio settings"
+        );
+    }
+
+    /// Selects a technical audio setting through the popup's real dropdown.
+    pub fn choose_audio_setting(&mut self, field: AudioSettingsField, label: &str) {
+        self.focus_audio_field(field);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(AudioSettingsMode::Dropdown),
+            "Enter on {} should open its dropdown",
+            field.label()
+        );
+
+        let (_, choices) = self.audio_choice_state();
+        let target = choices
+            .iter()
+            .position(|(choice, _, _)| choice == label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {} choice labelled {label}; choices: {:?}",
+                    field.label(),
+                    choices
+                        .iter()
+                        .map(|(choice, _, _)| choice)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            choices[target].1,
+            "{label} is not selectable: {:?}",
+            choices[target].2
+        );
+
+        for _ in 0..choices.len() * 2 {
+            let (cursor, _) = self.audio_choice_state();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        let (cursor, choices) = self.audio_choice_state();
+        assert_eq!(
+            choices.get(cursor).map(|(choice, _, _)| choice.as_str()),
+            Some(label),
+            "could not move the {} dropdown onto {label}",
+            field.label()
+        );
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Filters the audio language dropdown and selects the expected ISO 639-2 code.
+    pub fn choose_audio_language(&mut self, query: &str, code: &str) {
+        self.focus_audio_field(AudioSettingsField::Language);
+        self.press(key(KeyCode::Enter));
+        self.press(key(KeyCode::Char('/')));
+        for character in query.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+
+        let choices = self.app.filtered_audio_languages();
+        let target = choices
+            .iter()
+            .position(|choice| choice.code == code)
+            .unwrap_or_else(|| {
+                panic!(
+                    "language search {query:?} did not offer {code}; choices: {:?}",
+                    choices
+                        .iter()
+                        .map(|choice| (&choice.code, &choice.name))
+                        .collect::<Vec<_>>()
+                )
+            });
+        for _ in 0..choices.len() * 2 {
+            let cursor = self
+                .app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.language_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Down)),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Up)),
+            };
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Replaces the audio title through the popup's ordinary text editor.
+    pub fn type_audio_title(&mut self, title: &str) {
+        self.focus_audio_field(AudioSettingsField::Title);
+        self.press(key(KeyCode::Char('i')));
+        assert_eq!(
+            self.app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(AudioSettingsMode::TitleEdit),
+            "i on Title should enter ordinary text editing"
+        );
+        self.press(ctrl('u'));
+        for character in title.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Toggles a checkbox field through the audio popup.
+    pub fn toggle_audio_field(&mut self, field: AudioSettingsField) {
+        self.focus_audio_field(field);
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Closes the audio popup while retaining its staged changes.
+    pub fn close_audio_settings(&mut self) {
+        self.press(key(KeyCode::Esc));
+        assert_eq!(self.app.dialog, None, "Esc should close audio settings");
+    }
+
+    fn focus_audio_field(&mut self, field: AudioSettingsField) {
+        let fields = self.app.visible_audio_fields();
+        let target = fields
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap_or_else(|| panic!("{} is not visible", field.label()));
+        for _ in 0..fields.len() * 2 {
+            let current = self
+                .app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.field)
+                .expect("audio settings should be open");
+            let position = fields
+                .iter()
+                .position(|candidate| *candidate == current)
+                .expect("the focused audio field should be visible");
+            match position.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        assert_eq!(
+            self.app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.field),
+            Some(field),
+            "could not focus {}",
+            field.label()
+        );
+    }
+
+    fn audio_choice_state(&self) -> (usize, Vec<(String, bool, Option<String>)>) {
+        let popup = self
+            .app
+            .audio_settings_popup
+            .as_ref()
+            .expect("audio settings should be open");
+        match popup.field {
+            AudioSettingsField::Codec => (
+                popup.codec_cursor,
+                self.app
+                    .audio_codec_choices(popup.stream_index)
+                    .into_iter()
+                    .map(|choice| (choice.label, choice.enabled, choice.reason))
+                    .collect(),
+            ),
+            AudioSettingsField::ChannelLayout => (
+                popup.channel_cursor,
+                self.app
+                    .audio_channel_choices(popup.stream_index)
+                    .into_iter()
+                    .map(|choice| (choice.label, choice.enabled, choice.reason))
+                    .collect(),
+            ),
+            field => panic!("{} does not have an audio dropdown", field.label()),
+        }
+    }
+
+    /// Opens subtitle settings for the track at `row`.
+    pub fn open_subtitle_settings(&mut self, row: usize) {
+        self.select_track_row(row);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::SubtitleSettings),
+            "Enter on row {row} should open subtitle settings"
+        );
+    }
+
+    /// Filters the subtitle language dropdown and selects the expected ISO 639-2
+    /// code through the same search and navigation path as the live TUI.
+    pub fn choose_subtitle_language(&mut self, query: &str, code: &str) {
+        self.focus_subtitle_field(SubtitleSettingsField::Language);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(SubtitleSettingsMode::LanguageDropdown)
+        );
+        self.press(key(KeyCode::Char('/')));
+        for character in query.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+
+        let choices = self.app.filtered_subtitle_languages();
+        let target = choices
+            .iter()
+            .position(|choice| choice.code == code)
+            .unwrap_or_else(|| {
+                panic!(
+                    "language search {query:?} did not offer {code}; choices: {:?}",
+                    choices
+                        .iter()
+                        .map(|choice| (&choice.code, &choice.name))
+                        .collect::<Vec<_>>()
+                )
+            });
+        for _ in 0..choices.len() * 2 {
+            let cursor = self
+                .app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.language_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Down)),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Up)),
+            };
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    pub fn type_subtitle_title(&mut self, title: &str) {
+        self.focus_subtitle_field(SubtitleSettingsField::Title);
+        self.press(key(KeyCode::Char('i')));
+        assert_eq!(
+            self.app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(SubtitleSettingsMode::TitleEdit),
+            "i on Title should enter ordinary text editing"
+        );
+        self.press(ctrl('u'));
+        for character in title.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    pub fn toggle_subtitle_field(&mut self, field: SubtitleSettingsField) {
+        self.focus_subtitle_field(field);
+        self.press(key(KeyCode::Enter));
+    }
+
+    pub fn close_subtitle_settings(&mut self) {
+        self.press(key(KeyCode::Esc));
+        assert_eq!(self.app.dialog, None, "Esc should close subtitle settings");
+    }
+
+    fn focus_subtitle_field(&mut self, field: SubtitleSettingsField) {
+        let fields = self.app.visible_subtitle_fields();
+        let target = fields
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap_or_else(|| panic!("{} is not visible", field.label()));
+        for _ in 0..fields.len() * 2 {
+            let current = self
+                .app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.field)
+                .expect("subtitle settings should be open");
+            let position = fields
+                .iter()
+                .position(|candidate| *candidate == current)
+                .expect("focused subtitle field should be visible");
+            match position.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        assert_eq!(
+            self.app
+                .subtitle_settings_popup
+                .as_ref()
+                .map(|popup| popup.field),
+            Some(field),
+            "could not focus {}",
+            field.label()
+        );
+    }
+
     /// Stages a subtitle codec conversion on the subtitle track at `row`, the way the
     /// app's own conflict message tells the user to ("Convert it to MOV Text").
     pub fn convert_subtitle_to(&mut self, row: usize, label: &str) {
@@ -470,6 +848,76 @@ impl Harness {
         );
     }
 
+    /// Selects a video codec through the video settings popup's real dropdown.
+    pub fn choose_video_codec(&mut self, row: usize, label: &str) {
+        self.select_track_row(row);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::VideoSettings),
+            "Enter on row {row} should open video settings"
+        );
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(VideoSettingsMode::Dropdown)
+        );
+
+        let index = self
+            .app
+            .video_settings_popup
+            .as_ref()
+            .map(|popup| popup.stream_index)
+            .expect("video settings should be open");
+        let choices = self.app.video_codec_choices(index);
+        let target = choices
+            .iter()
+            .position(|choice| choice.label == label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no video codec labelled {label}; choices: {:?}",
+                    choices
+                        .iter()
+                        .map(|choice| &choice.label)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            choices[target].enabled,
+            "{label} is not selectable: {:?}",
+            choices[target].reason
+        );
+        for _ in 0..choices.len() * 2 {
+            let cursor = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.codec_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        let cursor = self
+            .app
+            .video_settings_popup
+            .as_ref()
+            .map(|popup| popup.codec_cursor)
+            .unwrap_or_default();
+        assert_eq!(
+            choices.get(cursor).map(|choice| choice.label.as_str()),
+            Some(label)
+        );
+        self.press(key(KeyCode::Enter));
+        self.press(key(KeyCode::Esc));
+        assert_eq!(self.app.dialog, None, "Esc should close video settings");
+    }
+
     /// The codec choices the open subtitle settings popup is currently offering.
     fn subtitle_choices(&self) -> Vec<reel_tui::subtitle::FormatChoice> {
         let popup = self
@@ -557,7 +1005,7 @@ impl Harness {
     pub fn assert_batch_succeeded(&self) {
         let notice = self.app.notice.clone().unwrap_or_default();
         assert!(
-            notice.contains("saved"),
+            notice.contains("saved") || notice.contains("Processed"),
             "expected a success notice, got {notice:?}\nscreen:\n{}",
             self.screen()
         );
@@ -603,7 +1051,7 @@ pub fn ctrl(code: char) -> KeyEvent {
 /// Mirrors `require_tools` in `src/edit.rs`'s test module, which integration tests
 /// cannot reach because it lives inside a `#[cfg(test)]` block. Accepts either a bare
 /// program name or `program:encoder`.
-pub fn require_tools(test: &str, tools: &[&str]) -> bool {
+pub fn require_tools(test: &str, tools: &[&str]) {
     for tool in tools {
         let (program, encoder) = match tool.split_once(':') {
             Some((program, encoder)) => (program, Some(encoder)),
@@ -617,17 +1065,27 @@ pub fn require_tools(test: &str, tools: &[&str]) -> bool {
                 .status()
                 .is_ok_and(|status| status.success())
         };
-        // ffmpeg spells it `-version`, most other tools `--version`.
+        // ffmpeg spells it `-version`, most other tools `--version`. The encoder
+        // form has to consult `-encoders`: `ffmpeg -h encoder=<name>` exits 0 for
+        // any name, including ones it has never heard of.
         let available = match encoder {
-            Some(encoder) => succeeds(&["-v", "error", "-h", &format!("encoder={encoder}")]),
+            Some(encoder) => Command::new(program)
+                .args(["-hide_banner", "-encoders"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .filter_map(|line| line.split_whitespace().nth(1))
+                            .any(|name| name == encoder)
+                }),
             None => succeeds(&["-version"]) || succeeds(&["--version"]),
         };
-        if !available {
-            eprintln!("SKIPPED {test}: {tool} is not available");
-            return false;
-        }
+        assert!(
+            available,
+            "{test} requires {tool}; install the missing test prerequisite"
+        );
     }
-    true
 }
 
 /// Convenience for asserting on a produced file's streams.

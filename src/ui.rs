@@ -13,14 +13,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CancelEditChoice, CharClass, ConfirmProcessAllChoice, ContainerChoice,
-        ContainerSettingsField, ContainerSettingsMode, ContainerSettingsPopup,
-        CustomResolutionField, Dialog, InputReject, Layer, ResetChoice, SearchState,
-        StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
-        SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
-        VideoSettingsField, VideoSettingsMode, describe_track_groups,
+        App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
+        ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
+        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer, ResetChoice,
+        SearchState, StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField,
+        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
+        TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
-    edit::{ContainerFormat, stream_index},
+    edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
     subtitle::{
@@ -275,6 +275,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         defaults: &app.default_streams,
                         default_sidecars: &app.default_sidecars,
                         changed: &changed,
+                        audio_settings: &app.audio_settings,
                         subtitle_changes: &app.subtitle_changes,
                         source_container: app.source_container(),
                         container_target: app.container_target,
@@ -387,6 +388,7 @@ fn media_text(
         defaults,
         default_sidecars,
         changed,
+        audio_settings,
         subtitle_changes,
         source_container,
         container_target,
@@ -436,8 +438,12 @@ fn media_text(
                 if selected == Some(selection_index) {
                     selected_line = Some(lines.len());
                 }
+                let staged_audio = (kind == "audio")
+                    .then(|| stream_index(stream).and_then(|index| audio_settings.get(&index)))
+                    .flatten()
+                    .map(|settings| audio_stream_for_display(stream, settings));
                 lines.push(stream_line(
-                    stream,
+                    staged_audio.as_ref().unwrap_or(stream),
                     selection_index,
                     selected == Some(selection_index),
                     stream_index(stream).is_some_and(|index| deleted.contains(&index)),
@@ -716,6 +722,7 @@ struct MediaTextState<'a> {
     defaults: &'a std::collections::BTreeSet<u64>,
     default_sidecars: &'a std::collections::BTreeSet<usize>,
     changed: &'a std::collections::BTreeSet<u64>,
+    audio_settings: &'a std::collections::BTreeMap<u64, AudioSettings>,
     subtitle_changes: &'a std::collections::BTreeMap<
         crate::subtitle::SubtitleSource,
         crate::subtitle::SubtitleChange,
@@ -1149,6 +1156,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_container_settings_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::AudioSettings {
+        render_audio_settings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::VideoSettings {
         render_video_settings_dialog(frame, app);
         return;
@@ -1178,11 +1189,20 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_resolve_conflicts_dialog(frame, app);
         return;
     }
+    // Matched exhaustively rather than falling through to the error popup: every dialog
+    // above returns, so a new `Dialog` variant that forgets to must fail to compile here
+    // instead of silently rendering itself as an editing error.
     let (title, body, color) = match dialog {
-        Dialog::Keybindings | Dialog::ContainerSettings | Dialog::VideoSettings => unreachable!(),
-        Dialog::SubtitleSettings | Dialog::ConfirmCancel => unreachable!(),
-        Dialog::ConfirmProcessAll | Dialog::BatchProcessing => unreachable!(),
-        Dialog::ConfirmReset | Dialog::ResolveConflicts => unreachable!(),
+        Dialog::Keybindings
+        | Dialog::ContainerSettings
+        | Dialog::AudioSettings
+        | Dialog::VideoSettings
+        | Dialog::SubtitleSettings
+        | Dialog::ConfirmCancel
+        | Dialog::ConfirmProcessAll
+        | Dialog::BatchProcessing
+        | Dialog::ConfirmReset
+        | Dialog::ResolveConflicts => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -1357,7 +1377,7 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
 
 fn container_choice_line(choice: &ContainerChoice, cursor: bool, last: bool) -> Line<'static> {
     let changed = choice.staged && !choice.current;
-    let mut line = subtitle_codec_line(&choice.label, cursor, changed, true, last);
+    let mut line = dropdown_line(&choice.label, cursor, choice.staged, true, changed, last);
     if let Some(warning) = choice.warning() {
         let target_prefix = format!("{} ", choice.label);
         let warning = warning.strip_prefix(&target_prefix).unwrap_or(&warning);
@@ -1578,9 +1598,13 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "Enter",
-        "Edit container, video, or subtitle settings",
+        "Edit container, video, audio, or subtitle settings",
     );
-    keybinding(&mut lines, "K", "Explain the highlighted subtitle field");
+    keybinding(
+        &mut lines,
+        "K",
+        "Explain the highlighted container, audio, or subtitle field",
+    );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
@@ -2175,6 +2199,260 @@ fn processing_info_line(description: String) -> Line<'static> {
     )
 }
 
+fn audio_field_help_title(field: AudioSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+fn audio_field_help_text(popup: &crate::app::AudioSettingsPopup) -> Text<'static> {
+    let description = match popup.field {
+        AudioSettingsField::Codec => {
+            "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality."
+        }
+        AudioSettingsField::ChannelLayout => {
+            "Sets the number and arrangement of output channels, such as Mono, Stereo, or 5.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not implemented."
+        }
+        AudioSettingsField::Language => {
+            "Identifies the language spoken on this audio track to players and media libraries. It changes metadata only; it does not translate or dub the audio."
+        }
+        AudioSettingsField::Title => {
+            "An optional name shown by players, such as “English 5.1” or “Director commentary.” Use it to distinguish audio tracks that otherwise look alike."
+        }
+        AudioSettingsField::Default => {
+            "Marks this as the audio track a player should prefer automatically.\n\nReel allows only 1 default audio track and automatically clears the flag from any other audio track when this one is selected."
+        }
+        AudioSettingsField::Commentary => {
+            "Marks the track as commentary rather than the main programme audio, for example a director or cast commentary. This flag is metadata only; it does not change the audio content."
+        }
+        AudioSettingsField::HearingImpaired => {
+            "Marks the track as an accessibility mix intended for listeners with hearing loss, often with clearer or emphasized dialogue. This flag is metadata only; it does not alter the mix."
+        }
+        AudioSettingsField::AudioDescription => {
+            "Marks the track as containing spoken descriptions of visual action for blind or low-vision listeners. This flag is metadata only; it does not add narration."
+        }
+        AudioSettingsField::Original => {
+            "Marks the track as the work’s original-language or original-production audio. This flag is metadata only and is mutually exclusive with Dubbed."
+        }
+        AudioSettingsField::Dubbed => {
+            "Marks the track as a dubbed version whose dialogue was re-recorded, usually in another language. This flag is metadata only and is mutually exclusive with Original."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
+fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.audio_settings_popup.as_ref() else {
+        return;
+    };
+    let Some(settings) = app.effective_audio_settings(popup.stream_index) else {
+        return;
+    };
+    let selected = |field| popup.field == field;
+    let changed = |field| app.audio_field_changed(field);
+    let expanded = |field| popup.mode == AudioSettingsMode::Dropdown && selected(field);
+    let mut lines = Vec::new();
+    let mut field_lines = Vec::new();
+    let mut dropdown_start = None;
+
+    for field in app.visible_audio_fields() {
+        let previous_field = field_lines.last().map(|(field, _)| *field);
+        let follows_expanded_field = previous_field == Some(popup.field)
+            && matches!(
+                popup.mode,
+                AudioSettingsMode::Dropdown | AudioSettingsMode::LanguageDropdown
+            );
+        let starts_group = matches!(
+            field,
+            AudioSettingsField::Language
+                | AudioSettingsField::Default
+                | AudioSettingsField::HearingImpaired
+                | AudioSettingsField::Original
+        );
+        if previous_field.is_some() && (follows_expanded_field || starts_group) {
+            lines.push(Line::from(""));
+        }
+        let line_index = lines.len();
+        field_lines.push((field, line_index));
+        match field {
+            AudioSettingsField::Codec => {
+                let choices = app.audio_codec_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.value == settings.codec)
+                    .map(|choice| choice.label.as_str())
+                    .unwrap_or("Unknown");
+                lines.push(setting_line(
+                    field.label(),
+                    label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let label = choice.reason.as_ref().map_or_else(
+                            || choice.label.clone(),
+                            |reason| format!("{} — {reason}", choice.label),
+                        );
+                        lines.push(dropdown_line(
+                            &label,
+                            position == popup.codec_cursor,
+                            choice.value == settings.codec,
+                            choice.enabled,
+                            changed(field) && choice.value == settings.codec,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            AudioSettingsField::ChannelLayout => {
+                let choices = app.audio_channel_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.value == settings.channel_layout)
+                    .map(|choice| choice.label.as_str())
+                    .unwrap_or("Unknown");
+                lines.push(setting_line(
+                    field.label(),
+                    label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let label = choice.reason.as_ref().map_or_else(
+                            || choice.label.clone(),
+                            |reason| format!("{} — {reason}", choice.label),
+                        );
+                        lines.push(dropdown_line(
+                            &label,
+                            position == popup.channel_cursor,
+                            choice.value == settings.channel_layout,
+                            choice.enabled,
+                            changed(field) && choice.value == settings.channel_layout,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            AudioSettingsField::Language => {
+                let language = language_choice(&settings.metadata.language)
+                    .map(|choice| choice.label())
+                    .unwrap_or_else(|| "Undetermined (und)".to_string());
+                lines.push(setting_line(
+                    field.label(),
+                    &language,
+                    selected(field),
+                    changed(field),
+                    popup.mode == AudioSettingsMode::LanguageDropdown,
+                ));
+                if popup.mode == AudioSettingsMode::LanguageDropdown {
+                    lines.push(text_field_line(
+                        TextField::new(
+                            "Search",
+                            FieldValue::Editing(&popup.language_search.input),
+                            TextInputConfig::LANGUAGE_SEARCH.width,
+                        )
+                        .selected(popup.language_search.is_active)
+                        .placeholder("type to filter")
+                        .suffix(match_suffix(app.filtered_audio_languages().len()))
+                        .reject(app.text_input_reject(TextInputSite::AudioLanguageSearch)),
+                    ));
+                    dropdown_start = Some(lines.len());
+                    let choices = app.filtered_audio_languages();
+                    let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+                    let end = (start + 10).min(choices.len());
+                    let last = end.saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate().take(end).skip(start) {
+                        lines.push(dropdown_line(
+                            &choice.label(),
+                            position == popup.language_cursor,
+                            choice.code == settings.metadata.language,
+                            true,
+                            changed(field) && choice.code == settings.metadata.language,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            AudioSettingsField::Title => {
+                lines.push(text_field_line(
+                    TextField::new(
+                        field.label(),
+                        FieldValue::Editing(&popup.title_input),
+                        TextInputConfig::SUBTITLE_TITLE.width,
+                    )
+                    .selected(selected(field))
+                    .changed(changed(field))
+                    .placeholder("name shown in player menus")
+                    .reject(app.text_input_reject(TextInputSite::AudioTitle)),
+                ));
+            }
+            AudioSettingsField::Default => lines.push(subtitle_checkbox_line(
+                field.label(),
+                app.default_streams.contains(&popup.stream_index),
+                selected(field),
+                changed(field),
+                None,
+            )),
+            field => {
+                let checked = field
+                    .role()
+                    .is_some_and(|role| settings.metadata.get_role(role));
+                lines.push(subtitle_checkbox_line(
+                    field.label(),
+                    checked,
+                    selected(field),
+                    changed(field),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let focus_line = match popup.mode {
+        AudioSettingsMode::Dropdown => {
+            let cursor = if popup.field == AudioSettingsField::Codec {
+                popup.codec_cursor
+            } else {
+                popup.channel_cursor
+            };
+            dropdown_start.unwrap_or(0) + cursor
+        }
+        AudioSettingsMode::LanguageDropdown => {
+            let choices = app.filtered_audio_languages();
+            let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+            dropdown_start.unwrap_or(0) + popup.language_cursor.saturating_sub(start)
+        }
+        AudioSettingsMode::Summary | AudioSettingsMode::TitleEdit => field_lines
+            .iter()
+            .find_map(|(field, line)| (*field == popup.field).then_some(*line))
+            .unwrap_or(0),
+    };
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: format!(" Audio track #{} settings ", popup.stream_index),
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    audio_field_help_text(popup),
+                    audio_field_help_title(popup.field),
+                )
+            }),
+            min_height: 14,
+        },
+    );
+}
+
 fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.video_settings_popup.as_ref() else {
         return;
@@ -2222,12 +2500,13 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                 Some(reason) => format!("{} — {reason}", choice.label),
                 None => choice.label.clone(),
             };
-            lines.push(subtitle_codec_line(
+            let selected = choice.value == settings.codec;
+            lines.push(dropdown_line(
                 &label,
                 position == popup.codec_cursor,
-                settings.codec != crate::edit::VideoCodec::Original
-                    && choice.value == settings.codec,
+                selected,
                 choice.enabled,
+                settings.codec != crate::edit::VideoCodec::Original && selected,
                 position == last_index,
             ));
         }
@@ -2419,11 +2698,12 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                 Some(reason) => format!("{} — {reason}", choice.label),
                 None => choice.label.clone(),
             };
-            lines.push(subtitle_codec_line(
+            lines.push(dropdown_line(
                 &label,
                 position == popup.codec_cursor,
-                codec_staged(choice),
+                codec_selected(choice),
                 choice.enabled,
+                codec_staged(choice),
                 position == last_index,
             ));
         }
@@ -2598,8 +2878,8 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
 }
 
 /// A settings popup: a scrolling field list, optionally beside a help panel explaining
-/// the focused field. The container, subtitle and any future settings dialog differ only
-/// in what they put in these fields — the geometry, scrolling and chrome are shared.
+/// the focused field. The container, audio, subtitle and any future settings dialog differ
+/// only in what they put in these fields — the geometry, scrolling and chrome are shared.
 struct SettingsDialog {
     text: Text<'static>,
     title: String,
@@ -3224,23 +3504,6 @@ fn tree_guide_span(last: bool) -> Span<'static> {
     Span::styled(guide, Style::default().fg(Color::DarkGray))
 }
 
-fn subtitle_codec_line(
-    label: &str,
-    cursor: bool,
-    staged: bool,
-    enabled: bool,
-    last: bool,
-) -> Line<'static> {
-    let label_style = choice_style(cursor, staged, enabled);
-    let spans = vec![
-        tree_guide_span(last),
-        Span::styled(label.to_string(), label_style),
-    ];
-    // Base the line on the label's own style so the guide glyph inherits the cursor
-    // row's highlight background rather than leaving a gap at the start of the bar.
-    Line::from(spans).style(label_style)
-}
-
 fn dropdown_line(
     label: &str,
     cursor: bool,
@@ -3311,8 +3574,15 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
                 ));
             }
             if kind == "audio" {
+                let staged = app
+                    .audio_settings
+                    .get(&index)
+                    .map(|settings| audio_stream_for_display(stream, settings));
                 return Some((
-                    Text::from(audio_information_lines(stream, default)),
+                    Text::from(audio_information_lines(
+                        staged.as_ref().unwrap_or(stream),
+                        default,
+                    )),
                     format!(" Audio #{index_label} "),
                 ));
             }
@@ -3579,6 +3849,66 @@ fn audio_information_lines(stream: &BTreeMap<String, Value>, default: bool) -> V
     append_information_group(&mut lines, technical);
 
     lines
+}
+
+fn audio_stream_for_display(
+    stream: &BTreeMap<String, Value>,
+    settings: &AudioSettings,
+) -> BTreeMap<String, Value> {
+    let mut staged = stream.clone();
+    if let Some(codec) = settings.codec.codec_name() {
+        staged.insert("codec_name".to_string(), Value::String(codec.to_string()));
+    }
+    if let Some(channels) = settings.channel_layout.channels() {
+        staged.insert("channels".to_string(), Value::from(channels));
+        let layout = if channels == 8 {
+            "7.1"
+        } else if channels == 6 {
+            "5.1"
+        } else if channels == 2 {
+            "stereo"
+        } else {
+            "mono"
+        };
+        staged.insert(
+            "channel_layout".to_string(),
+            Value::String(layout.to_string()),
+        );
+    }
+    let tags = staged
+        .entry("tags".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(tags) = tags.as_object_mut() {
+        tags.insert(
+            "language".to_string(),
+            Value::String(settings.metadata.language.clone()),
+        );
+        match &settings.metadata.title {
+            Some(title) => {
+                tags.insert("title".to_string(), Value::String(title.clone()));
+            }
+            None => {
+                tags.remove("title");
+                tags.remove("name");
+                tags.remove("handler_name");
+            }
+        }
+    }
+    let dispositions = staged
+        .entry("disposition".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(dispositions) = dispositions.as_object_mut() {
+        for (name, enabled) in [
+            ("comment", settings.metadata.commentary),
+            ("hearing_impaired", settings.metadata.hearing_impaired),
+            ("visual_impaired", settings.metadata.audio_description),
+            ("original", settings.metadata.original),
+            ("dub", settings.metadata.dubbed),
+        ] {
+            dispositions.insert(name.to_string(), Value::from(u8::from(enabled)));
+        }
+    }
+    staged
 }
 
 fn audio_format_description(stream: &BTreeMap<String, Value>) -> String {
@@ -4181,12 +4511,13 @@ fn disposition_flag_tag(
     stream: &std::collections::BTreeMap<String, Value>,
     default: bool,
 ) -> Option<String> {
-    const FLAGS: [(&str, &str); 5] = [
+    const FLAGS: [(&str, &str); 6] = [
         ("forced", "F"),
         ("hearing_impaired", "HI"),
         ("visual_impaired", "VI"),
         ("comment", "CM"),
         ("dub", "DUB"),
+        ("original", "OG"),
     ];
 
     let mut active = Vec::new();
@@ -4312,6 +4643,8 @@ fn truncate_end(value: &str, width: usize) -> String {
 mod tests {
     use kernal::prelude::*;
 
+    use crate::edit::{AudioChannelLayout, AudioCodec, AudioMetadata};
+
     use super::*;
 
     /// A scratch directory holding `files`, and an `App` pointed at it. Every render test
@@ -4342,6 +4675,288 @@ mod tests {
         )
         .unwrap();
         (app, directory)
+    }
+
+    /// Draws `draw` into a throwaway terminal and returns the glyphs as one string, the
+    /// same flattening the render tests below already do by hand.
+    fn drawn(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn the_file_list_should_show_the_search_line_only_while_a_filter_is_in_play() {
+        // Arrange
+        let (mut app, directory) = test_app("file-search-line", &["alpha.mkv", "beta.mkv"]);
+
+        // Act
+        let unfiltered = drawn(80, 20, |frame| render(frame, &mut app));
+        app.start_file_search();
+        app.paste_text("bet");
+        let searching = drawn(80, 20, |frame| render(frame, &mut app));
+        // The line stays up after the search is committed, because the filter is still
+        // hiding files.
+        app.finish_file_search();
+        let committed = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&unfiltered).does_not_contain("Search");
+        assert_that!(&searching).contains("Search");
+        assert_that!(&searching).contains("bet");
+        assert_that!(&committed).contains("Search");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_keybindings_popup_should_show_its_own_search_line() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-search-line", &["movie.mkv"]);
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act
+        let unfiltered = drawn(80, 24, |frame| render(frame, &mut app));
+        app.start_keybindings_search();
+        let empty = drawn(80, 24, |frame| render(frame, &mut app));
+        app.paste_text("zzq");
+        let searching = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&unfiltered).does_not_contain("type to filter");
+        assert_that!(&empty).contains("type to filter");
+        assert_that!(&searching).contains("zzq");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file being written shows a measured gauge; a finished one shows a full bar and
+    /// a cancelled one an empty bar, so the list reads at a glance without the labels.
+    #[test]
+    fn the_batch_dialog_should_gauge_each_files_own_progress() {
+        // Arrange
+        let (mut app, directory) = test_app("batch-gauges", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        let item = |name: &str, status, fraction| crate::staging::BatchItem {
+            path: app.directory.join(name),
+            label: Some("Saving".to_string()),
+            fraction,
+            status,
+            output_path: None,
+        };
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![
+                item(
+                    "running.mkv",
+                    crate::staging::BatchItemStatus::Running,
+                    Some(0.42),
+                ),
+                item("done.mkv", crate::staging::BatchItemStatus::Completed, None),
+                item(
+                    "stopped.mkv",
+                    crate::staging::BatchItemStatus::Cancelled,
+                    None,
+                ),
+            ],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&text).contains("42%");
+        assert_that!(&text).contains("running.mkv");
+        assert_that!(&text).contains("done.mkv");
+        assert_that!(&text).contains("stopped.mkv");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The field being typed into has to show the live buffer; every other field keeps
+    /// showing its stored value, or the dialog looks like it edits all of them at once.
+    #[test]
+    fn the_container_metadata_field_being_edited_should_show_the_live_buffer() {
+        // Arrange
+        let (mut app, directory) = test_app("container-text-edit", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"tags": {"title": "Stored title", "genre": "Stored genre"}},
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+            }))
+            .unwrap(),
+        ));
+        let mut text_input = TextInputState::new("Half-typed".to_string());
+        text_input.activate();
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Title,
+            mode: ContainerSettingsMode::TextEdit,
+            help_visible: false,
+            format_cursor: 0,
+            text_input,
+        });
+
+        // Act
+        let text = drawn(80, 20, |frame| {
+            render_container_settings_dialog(frame, &app)
+        });
+
+        // Assert
+        assert_that!(&text).contains("Half-typed");
+        assert_that!(&text).does_not_contain("Stored title");
+        assert_that!(&text).contains("Stored genre");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The overview row is for scanning, so it says what it can and stays quiet about
+    /// what it cannot: a bare channel count when ffprobe gave no layout, and nothing at
+    /// all for a track whose type it could not even determine.
+    #[test]
+    fn the_overview_row_should_fall_back_to_a_channel_count_and_stay_quiet_when_unknown() {
+        // Arrange
+        let row = |stream: serde_json::Value| {
+            let stream =
+                serde_json::from_value::<std::collections::BTreeMap<String, Value>>(stream)
+                    .unwrap();
+            stream_line(&stream, 0, false, false, false, false, false)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+
+        // Act / Assert: a layout wins when it is there.
+        assert_that!(&row(serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac",
+            "channels": 6, "channel_layout": "5.1",
+        })))
+        .contains("5.1");
+
+        // Act / Assert: without one, the count still says something useful.
+        let counted = row(serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+        }));
+        assert_that!(&counted).contains("2 ch");
+
+        // Act / Assert: an attachment names its type…
+        assert_that!(&row(serde_json::json!({
+            "index": 3, "codec_type": "attachment", "codec_name": "ttf",
+        })))
+        .contains("attachment");
+
+        // Act / Assert: …but a stream with no `codec_type` has nothing to name.
+        assert_that!(&row(
+            serde_json::json!({"index": 4, "codec_name": "bin_data"})
+        ))
+        .does_not_contain("unknown ");
+    }
+
+    /// The dropdown marks the option that is currently staged, and "Fit & pad" is the
+    /// default — so it is the selected option without being a *change*, and must not
+    /// carry the changed styling that tells the user they altered something.
+    #[test]
+    fn the_scaling_dropdown_should_mark_a_non_default_choice_as_changed() {
+        // Arrange
+        let draft = |scaling| crate::app::CustomResolutionDraft {
+            field: CustomResolutionField::Scaling,
+            width: TextInputState::new("1280".to_string()),
+            height: TextInputState::new("720".to_string()),
+            scaling,
+            scaling_cursor: 0,
+            scaling_dropdown_open: true,
+        };
+
+        // Act
+        let default = custom_scaling_lines(&draft(crate::edit::CustomScaling::FitPad));
+        let stretched = custom_scaling_lines(&draft(crate::edit::CustomScaling::Stretch));
+
+        // Assert: both list every option under the field row.
+        assert_that!(default.len()).is_equal_to(crate::edit::CustomScaling::OPTIONS.len() + 1);
+        let styled_as_changed = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.style == changed_style())
+        };
+        assert_that!(styled_as_changed(&default)).is_false();
+        assert_that!(styled_as_changed(&stretched)).is_true();
+    }
+
+    /// `i` opens the details popup for whatever row is focused, and each track kind has
+    /// its own panel — a subtitle's is the one that has to reflect staged conversions
+    /// rather than only what is in the file.
+    #[test]
+    fn the_details_popup_should_describe_each_kind_of_track_it_is_opened_on() {
+        // Arrange
+        let (mut app, directory) = test_app("details-popup-kinds", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}},
+                ],
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.layer = Layer::Streams;
+        let focus = |app: &mut App, track| {
+            app.selected_stream = app
+                .track_rows()
+                .iter()
+                .position(|row| *row == track)
+                .unwrap();
+        };
+
+        // Act / Assert
+        focus(&mut app, crate::app::TrackRef::Embedded(0));
+        let (_, video_title) = details_popup_content(&app).unwrap();
+        assert_that!(video_title.as_str()).is_equal_to(" Video #0 ");
+
+        focus(&mut app, crate::app::TrackRef::Embedded(1));
+        let (_, audio_title) = details_popup_content(&app).unwrap();
+        assert_that!(audio_title.as_str()).is_equal_to(" Audio #1 ");
+
+        focus(&mut app, crate::app::TrackRef::Embedded(2));
+        let (subtitle_text, subtitle_title) = details_popup_content(&app).unwrap();
+        assert_that!(subtitle_title.as_str()).is_equal_to(" Subtitle #2 ");
+        assert_that!(subtitle_text.to_string()).contains("English");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cover_art_track_should_be_labelled_as_such_in_its_details() {
+        // Arrange
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 1,
+            "codec_type": "video",
+            "codec_name": "mjpeg",
+            "disposition": {"attached_pic": 1},
+        }))
+        .unwrap();
+        let plain = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "h264",
+        }))
+        .unwrap();
+
+        // Act / Assert
+        assert_that!(video_roles(&stream, false)).is_equal_to(vec!["Cover art".to_string()]);
+        assert_that!(video_roles(&plain, true)).is_equal_to(vec!["Default".to_string()]);
     }
 
     /// An app with a probed file: one video, one audio, two embedded subtitles and two
@@ -4444,6 +5059,19 @@ mod tests {
                     custom_resolution: None,
                 });
             }
+            Dialog::AudioSettings => {
+                app.audio_settings_popup = Some(crate::app::AudioSettingsPopup {
+                    stream_index: 1,
+                    field: crate::app::AudioSettingsField::Codec,
+                    mode: crate::app::AudioSettingsMode::Summary,
+                    help_visible: true,
+                    codec_cursor: 0,
+                    channel_cursor: 0,
+                    language_cursor: 0,
+                    language_search: SearchState::default(),
+                    title_input: TextInputState::new(String::new()),
+                });
+            }
             Dialog::SubtitleSettings => {
                 app.subtitle_settings_popup = Some(SubtitleSettingsPopup {
                     source: SubtitleSource::Embedded(2),
@@ -4498,6 +5126,7 @@ mod tests {
                         deleted_streams: Default::default(),
                         default_streams: Default::default(),
                         default_sidecars: Default::default(),
+                        audio_settings: Default::default(),
                         video_settings: Default::default(),
                         subtitle_changes: Default::default(),
                         left_subtitle_order: Vec::new(),
@@ -4542,6 +5171,7 @@ mod tests {
                         deleted_streams: Default::default(),
                         default_streams: Default::default(),
                         default_sidecars: Default::default(),
+                        audio_settings: Default::default(),
                         video_settings: Default::default(),
                         subtitle_changes: Default::default(),
                         left_subtitle_order: Vec::new(),
@@ -4561,10 +5191,11 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 10] = [
+        const DIALOGS: [(Dialog, &str); 11] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
+            (Dialog::AudioSettings, "Audio track #1 settings"),
             (Dialog::SubtitleSettings, "Subtitle track #2"),
             (Dialog::ConfirmCancel, "Are you sure you want to cancel"),
             (Dialog::Error, "ffmpeg exited with status 1"),
@@ -4655,6 +5286,7 @@ mod tests {
                     deleted_streams: Default::default(),
                     default_streams: Default::default(),
                     default_sidecars: Default::default(),
+                    audio_settings: Default::default(),
                     video_settings: Default::default(),
                     subtitle_changes: Default::default(),
                     left_subtitle_order: Vec::new(),
@@ -4730,6 +5362,7 @@ mod tests {
             deleted_streams: std::collections::BTreeSet::from([1]),
             default_streams: std::collections::BTreeSet::from([2]),
             default_sidecars: Default::default(),
+            audio_settings: Default::default(),
             video_settings: Default::default(),
             subtitle_changes: Default::default(),
             left_subtitle_order: Vec::new(),
@@ -4883,6 +5516,7 @@ mod tests {
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
                 default_sidecars: Default::default(),
+                audio_settings: Default::default(),
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
@@ -5038,6 +5672,7 @@ mod tests {
                     deleted_streams: Default::default(),
                     default_streams: Default::default(),
                     default_sidecars: Default::default(),
+                    audio_settings: Default::default(),
                     video_settings: Default::default(),
                     subtitle_changes: Default::default(),
                     left_subtitle_order: Vec::new(),
@@ -5133,6 +5768,7 @@ mod tests {
                 defaults: &app.default_streams,
                 default_sidecars: &app.default_sidecars,
                 changed: &changed,
+                audio_settings: &app.audio_settings,
                 subtitle_changes: &app.subtitle_changes,
                 source_container: app.source_container(),
                 container_target: app.container_target,
@@ -5971,6 +6607,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert_that!(&text).contains("▿ Format");
+        assert_that!(&text).contains("> MKV");
         assert_that!(&text).contains("├── ");
         // Trailing space distinguishes a real closing guide from the popup's own
         // unbroken border corner ("└────...┘"), which also contains a bare "└──".
@@ -6169,6 +6806,10 @@ mod tests {
         let last_option_row = (0..buffer.area.height)
             .find(|&y| row_text(y).contains("└── "))
             .expect("closing tree guide should be rendered");
+        assert!(
+            (0..buffer.area.height).any(|y| row_text(y).contains("> SubRip / SRT")),
+            "the effective subtitle codec should have the shared dropdown marker"
+        );
         assert_that!(row_text(last_option_row + 1)).does_not_contain("Language");
         assert_that!(row_text(last_option_row + 2)).contains("Language");
 
@@ -6481,6 +7122,12 @@ mod tests {
             .contains("deaf or hard-of-hearing")
             .contains("canonical .sdh");
 
+        // Forced is the other flag a sidecar carries in its filename rather than in
+        // any container, so its help has to say where the choice actually goes.
+        popup.field = SubtitleSettingsField::Forced;
+        let forced = subtitle_field_help_text(&app, &popup).to_string();
+        assert_that!(forced).contains(".forced file name marker");
+
         popup.source = SubtitleSource::Embedded(1);
         popup.field = SubtitleSettingsField::Original;
         let original = subtitle_field_help_text(&app, &popup).to_string();
@@ -6737,6 +7384,212 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_below_the_minimum_size_should_say_so_instead_of_drawing_a_broken_layout() {
+        // Arrange: the split layout needs room for two panes and a status line. Below the
+        // minimum, ratatui's constraints collapse panes to zero width and the frame draws
+        // as unreadable fragments — so the whole UI is replaced by an instruction the user
+        // can act on. Both dimensions are checked independently.
+        for (width, height, case) in [
+            (49, 40, "too narrow"),
+            (140, 9, "too short"),
+            (20, 5, "too small in both"),
+        ] {
+            let (mut app, directory) = probed_app("render-too-small");
+
+            // Act
+            let screen = draw(&mut app, width, height).join(" ");
+
+            // Assert: the instruction is shown and the normal furniture is not.
+            assert!(
+                screen.contains("Terminal too small"),
+                "{case} ({width}×{height}) should report the size; screen was:\n{screen}",
+            );
+            assert!(
+                !screen.contains("Files ("),
+                "{case} must not also draw the file pane; screen was:\n{screen}",
+            );
+
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn shrinking_below_the_minimum_should_drop_the_side_by_side_subtitle_columns() {
+        // Arrange: the side-by-side subtitle layout is the widest thing the UI draws. If
+        // it stayed enabled through a resize below the minimum, the first frame drawn
+        // after growing back would still be laid out for a width that had gone away.
+        let (mut app, directory) = probed_app("render-too-small-columns");
+        app.set_subtitle_columns_side_by_side(true);
+        assert!(app.subtitle_columns_side_by_side);
+
+        // Act
+        let _ = draw(&mut app, 40, 8);
+
+        // Assert
+        assert!(
+            !app.subtitle_columns_side_by_side,
+            "a too-small frame must turn the wide layout off",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_at_exactly_the_minimum_size_should_draw_the_real_layout() {
+        // Arrange: the boundary itself must be usable — an off-by-one in the guard would
+        // refuse to draw at the very size the message tells the user to resize to.
+        let (mut app, directory) = probed_app("render-minimum");
+
+        // Act
+        let screen = draw(&mut app, 50, 10).join(" ");
+
+        // Assert
+        assert!(
+            !screen.contains("Terminal too small"),
+            "50×10 is the documented minimum and must draw; screen was:\n{screen}",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wrapping_should_break_between_words_without_exceeding_the_width() {
+        // Arrange / Act: the conflict dialog wraps filenames and reasons into a fixed
+        // column. Measuring in display columns rather than bytes is what keeps an accented
+        // or CJK filename from overrunning the popup border.
+        let lines = wrap_value("one two three four", 9);
+
+        // Assert: broken at spaces, and no line wider than the column.
+        assert_that!(lines.clone()).contains_exactly_in_given_order([
+            "one two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ]);
+        assert!(
+            lines.iter().all(|line| line.width() <= 9),
+            "no wrapped line may exceed the width: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn wrapping_should_split_a_single_word_too_long_to_fit() {
+        // Arrange: a long filename with no spaces — the common case in this dialog, since
+        // media filenames rarely contain any. Leaving it whole would push it straight
+        // through the popup's right border.
+        let lines = wrap_value("averylongfilenamewithnospaces.mkv", 10);
+
+        // Assert: split into full-width pieces that reassemble to the original.
+        assert!(
+            lines.iter().all(|line| line.width() <= 10),
+            "an over-long word must be split to fit: {lines:?}",
+        );
+        assert_that!(lines.concat()).is_equal_to("averylongfilenamewithnospaces.mkv".to_string());
+    }
+
+    #[test]
+    fn wrapping_should_measure_wide_characters_by_the_columns_they_occupy() {
+        // Arrange: CJK characters take two terminal columns each, so a width of 6 fits
+        // three of them, not six. Counting chars instead of columns would double the
+        // rendered width and corrupt the popup's layout.
+        let lines = wrap_value("日本語字幕", 6);
+
+        // Assert
+        assert!(
+            lines.iter().all(|line| line.width() <= 6),
+            "wide characters must be measured in columns: {lines:?}",
+        );
+        assert_that!(lines.concat()).is_equal_to("日本語字幕".to_string());
+    }
+
+    #[test]
+    fn wrapping_should_always_produce_at_least_one_line() {
+        // Arrange / Act / Assert: an empty or whitespace-only value must still yield one
+        // (empty) line — callers index the result to build rows, and an empty vector would
+        // silently drop the label those rows were being built for.
+        assert_that!(wrap_value("", 10)).is_equal_to(vec![String::new()]);
+        assert_that!(wrap_value("   ", 10)).is_equal_to(vec![String::new()]);
+        // A value that fits comes back as one line, unpadded.
+        assert_that!(wrap_value("short", 10)).is_equal_to(vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn format_bytes_should_stay_in_plain_bytes_and_stop_climbing_at_gibibytes() {
+        // Arrange / Act / Assert: the smallest unit prints whole bytes (a "512.0 B" reads
+        // as a rounding artefact), and the ladder stops at GiB rather than running off the
+        // end of the unit table on a large file.
+        assert_that!(format_bytes(0.0)).is_equal_to("0 B".to_string());
+        assert_that!(format_bytes(512.0)).is_equal_to("512 B".to_string());
+        // Exactly one KiB is the first step up.
+        assert_that!(format_bytes(1024.0)).is_equal_to("1.0 KiB".to_string());
+        // A 4 TiB file still reports in GiB, the largest unit available.
+        assert_that!(format_bytes(4.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0))
+            .is_equal_to("4096.0 GiB".to_string());
+    }
+
+    #[test]
+    fn format_bitrate_should_fall_back_to_kilobits_below_a_megabit() {
+        // Arrange / Act / Assert: audio tracks sit well under a megabit, and printing
+        // "0.1 Mb/s" for a 128 kb/s track loses the precision that makes the number useful.
+        assert_that!(format_bitrate(128_000.0)).is_equal_to("128 kb/s".to_string());
+        assert_that!(format_bitrate(999_999.0)).is_equal_to("1000 kb/s".to_string());
+    }
+
+    #[test]
+    fn format_sample_rate_should_drop_the_decimal_only_for_whole_kilohertz() {
+        // Arrange / Act / Assert: 48 kHz is the common case and must not read "48.0 kHz",
+        // while 44.1 kHz must keep the tenth that distinguishes it from 44 kHz.
+        assert_that!(format_sample_rate(48_000.0)).is_equal_to("48 kHz".to_string());
+        assert_that!(format_sample_rate(44_100.0)).is_equal_to("44.1 kHz".to_string());
+        // Below a kilohertz it stays in hertz rather than printing "0.8 kHz".
+        assert_that!(format_sample_rate(800.0)).is_equal_to("800 Hz".to_string());
+    }
+
+    #[test]
+    fn format_frame_rate_should_reject_rates_it_cannot_divide() {
+        // Arrange / Act / Assert: ffprobe reports `0/0` for streams with no meaningful
+        // frame rate (audio, some attached pictures). Dividing anyway yields NaN, which
+        // would render as "NaN" in the stream details next to real numbers.
+        assert_that!(format_frame_rate("0/0")).is_none();
+        assert_that!(format_frame_rate("25/0")).is_none();
+        // Malformed input is refused rather than guessed at.
+        assert_that!(format_frame_rate("25")).is_none();
+        assert_that!(format_frame_rate("abc/def")).is_none();
+        // A whole rate prints without a decimal tail.
+        assert_that!(format_frame_rate("25/1").as_deref()).contains("25");
+    }
+
+    #[test]
+    fn truncating_should_keep_the_informative_end_of_the_value() {
+        // Arrange / Act / Assert: `truncate` keeps the tail (filenames differ at the end),
+        // `truncate_end` keeps the head. Both must stay within the width they are given —
+        // overrunning by one cell corrupts the row's layout.
+        assert_that!(truncate("movie.mkv", 20)).is_equal_to("movie.mkv".to_string());
+        assert_that!(truncate("a-very-long-filename.mkv", 10))
+            .is_equal_to("…ename.mkv".to_string());
+        assert_that!(truncate_end("a-very-long-filename.mkv", 10))
+            .is_equal_to("a-very-lo…".to_string());
+        // Both fill exactly the width they were given, never one cell more.
+        assert_eq!(truncate("a-very-long-filename.mkv", 10).chars().count(), 10);
+        assert_eq!(
+            truncate_end("a-very-long-filename.mkv", 10).chars().count(),
+            10,
+        );
+    }
+
+    #[test]
+    fn truncating_into_no_usable_width_should_produce_no_overflow() {
+        // Arrange / Act / Assert: a pane dragged down to nothing hands these a width of
+        // one or zero. Returning the ellipsis plus a tail there would overrun the cell and
+        // smear the row across the one beside it.
+        assert_that!(truncate("movie.mkv", 1)).is_equal_to("…".to_string());
+        assert_that!(truncate_end("movie.mkv", 1)).is_equal_to("…".to_string());
+        assert_that!(truncate("movie.mkv", 0)).is_equal_to(String::new());
+        assert_that!(truncate_end("movie.mkv", 0)).is_equal_to(String::new());
+        // A value that already fits in one cell is returned untouched.
+        assert_that!(truncate("x", 1)).is_equal_to("x".to_string());
+    }
+
+    #[test]
     fn format_bitrate_should_use_megabits_when_value_exceeds_one_megabit() {
         // Arrange
         let bits = 4_200_000.0;
@@ -6823,7 +7676,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_line_should_include_track_essentials_when_audio_metadata_is_present() {
+    fn stream_line_should_include_track_essentials_and_original_for_audio_and_video() {
         // Arrange
         let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
@@ -6849,12 +7702,26 @@ mod tests {
             .contains("5.1")
             .contains("English")
             .does_not_contain("ENG")
-            .contains("[D]")
-            // Title and sample rate are `i`-panel detail; `original` has never been
-            // shown on an audio row.
+            .contains("[D/OG]")
+            // Title and sample rate remain `i`-panel detail.
             .does_not_contain("Main")
-            .does_not_contain("48")
-            .does_not_contain("OG");
+            .does_not_contain("48");
+
+        // The same generic disposition formatter draws video rows, so Original must
+        // not quietly remain audio-only.
+        let video = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "disposition": {"original": 1}
+            }),
+        )
+        .unwrap();
+        let video_line = stream_line(&video, 0, false, false, false, false, false).to_string();
+        assert_that!(video_line).contains("H264").contains("[OG]");
     }
 
     #[test]
@@ -7754,6 +8621,347 @@ mod tests {
     }
 
     #[test]
+    fn staged_audio_settings_should_reach_the_overview_and_information_popup() {
+        let (mut app, directory) = probed_app("staged-audio-display");
+        app.audio_settings.insert(
+            1,
+            crate::edit::AudioSettings {
+                codec: crate::edit::AudioCodec::Ac3,
+                channel_layout: crate::edit::AudioChannelLayout::Mono,
+                metadata: crate::edit::AudioMetadata {
+                    language: "nld".to_string(),
+                    title: Some("Director commentary".to_string()),
+                    commentary: true,
+                    hearing_impaired: false,
+                    audio_description: false,
+                    original: false,
+                    dubbed: false,
+                },
+            },
+        );
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+
+        let (overview, _) = overview(&app, false);
+        let (information, _) = details_popup_content(&app).unwrap();
+        let information = information
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_that!(overview.join("\n").as_str())
+            .contains("AC3")
+            .contains("mono")
+            .contains("Dutch")
+            .contains("[CM]");
+        assert_that!(information.as_str())
+            .contains("Title: Director commentary")
+            .contains("Language: Dutch")
+            .contains("Role: Commentary")
+            .contains("Format: Dolby Digital (AC-3)")
+            .contains("Channels: Mono");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_popup_should_hide_quality_and_sample_rate_without_inline_help() {
+        let (mut app, directory) = probed_app("audio-popup-simple");
+        app.audio_settings.insert(
+            1,
+            crate::edit::AudioSettings {
+                codec: crate::edit::AudioCodec::Ac3,
+                channel_layout: crate::edit::AudioChannelLayout::Original,
+                metadata: crate::edit::AudioMetadata {
+                    language: "eng".to_string(),
+                    title: None,
+                    commentary: false,
+                    hearing_impaired: false,
+                    audio_description: false,
+                    original: false,
+                    dubbed: false,
+                },
+            },
+        );
+        open_dialog(&mut app, Dialog::AudioSettings);
+
+        let lines = draw(&mut app, 120, 38);
+        let screen = lines.join("\n");
+
+        assert_that!(screen.as_str())
+            .contains("Audio track #1 settings")
+            .contains("Codec")
+            .contains("Dolby Digital (AC-3)")
+            .contains("Channel layout")
+            .contains("Audio description")
+            .does_not_contain("Quality")
+            .does_not_contain("Sample rate")
+            .does_not_contain("select ·")
+            .does_not_contain("Enter apply");
+        let row = |label: &str| lines.iter().rposition(|line| line.contains(label)).unwrap();
+        assert_eq!(row("Language"), row("Channel layout") + 2);
+        assert_eq!(row("Default"), row("Title") + 2);
+        assert_eq!(row("Hearing impaired"), row("Commentary") + 2);
+        assert_eq!(row("Original"), row("Audio description") + 2);
+        assert_eq!(row("Dubbed"), row("Original") + 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_settings_dialog_should_render_every_editor_mode_and_guard() {
+        let (mut app, directory) = probed_app("audio-popup-modes");
+        assert!(
+            drawn(100, 30, |frame| render_audio_settings_dialog(frame, &app))
+                .trim()
+                .is_empty()
+        );
+
+        open_dialog(&mut app, Dialog::AudioSettings);
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 99;
+        assert!(
+            drawn(100, 30, |frame| render_audio_settings_dialog(frame, &app))
+                .trim()
+                .is_empty()
+        );
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 1;
+        if let Some(ProbeOutcome::Video(info)) = app.outcome.as_mut() {
+            info.streams[1].insert("channels".to_string(), Value::from(2));
+            info.streams[1].insert(
+                "sample_rate".to_string(),
+                Value::String("48000".to_string()),
+            );
+        }
+        app.subtitle_capabilities.ffmpeg_encoders.clear();
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = AudioSettingsMode::Dropdown;
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+        {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = AudioSettingsField::Language;
+            popup.mode = AudioSettingsMode::LanguageDropdown;
+        }
+        let original_language = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(original_language.as_str()).contains("English (eng)");
+
+        app.subtitle_capabilities.ffmpeg_encoders = crate::edit::AudioCodec::TARGETS
+            .into_iter()
+            .filter_map(crate::edit::AudioCodec::encoder)
+            .map(str::to_string)
+            .collect();
+        app.audio_settings.insert(
+            1,
+            crate::edit::AudioSettings {
+                codec: crate::edit::AudioCodec::Ac3,
+                channel_layout: crate::edit::AudioChannelLayout::Mono,
+                metadata: crate::edit::AudioMetadata {
+                    language: "nld".to_string(),
+                    title: Some("Commentary".to_string()),
+                    commentary: true,
+                    hearing_impaired: true,
+                    audio_description: true,
+                    original: true,
+                    dubbed: false,
+                },
+            },
+        );
+
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = AudioSettingsMode::Dropdown;
+            popup.codec_cursor = 1;
+            popup.channel_cursor = 1;
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+
+        {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = AudioSettingsField::Language;
+            popup.mode = AudioSettingsMode::LanguageDropdown;
+            popup.language_cursor = 12;
+            popup.language_search.input.activate();
+        }
+        let languages = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(languages.as_str())
+            .contains("Search")
+            .contains("matches");
+        app.audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .language_search
+            .input
+            .value = "no language matches".to_string();
+        let empty = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(empty.as_str()).contains("no matches");
+
+        for field in AudioSettingsField::ALL {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = if field == AudioSettingsField::Title {
+                AudioSettingsMode::TitleEdit
+            } else {
+                AudioSettingsMode::Summary
+            };
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+
+        app.audio_settings_popup.as_mut().unwrap().help_visible = false;
+        app.container_target = Some(ContainerFormat::Mp4);
+        let mp4 = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(mp4.as_str()).does_not_contain("Original");
+        app.container_target = Some(ContainerFormat::WebM);
+        let webm = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(webm.as_str()).does_not_contain("Commentary");
+
+        app.audio_settings_popup = None;
+        app.video_settings.insert(
+            0,
+            crate::edit::VideoSettings {
+                codec: crate::edit::VideoCodec::Hevc,
+                resolution: crate::edit::VideoResolution::Original,
+            },
+        );
+        let choices = app.video_codec_choices(0);
+        app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Codec,
+            mode: VideoSettingsMode::Dropdown,
+            codec_cursor: choices
+                .iter()
+                .position(|choice| choice.value == crate::edit::VideoCodec::Hevc)
+                .unwrap(),
+            resolution_cursor: 0,
+            custom_resolution: None,
+        });
+        let video = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(video.as_str()).contains("HEVC");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_audio_display_should_cover_every_technical_and_metadata_shape() {
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "aac",
+            "channels": 8,
+            "tags": "not an object",
+            "disposition": "not an object"
+        }))
+        .unwrap();
+        for (layout, expected) in [
+            (AudioChannelLayout::Surround71, "7.1"),
+            (AudioChannelLayout::Surround51, "5.1"),
+            (AudioChannelLayout::Stereo, "stereo"),
+            (AudioChannelLayout::Mono, "mono"),
+        ] {
+            let staged = audio_stream_for_display(
+                &stream,
+                &AudioSettings {
+                    codec: AudioCodec::Ac3,
+                    channel_layout: layout,
+                    metadata: AudioMetadata {
+                        language: "eng".to_string(),
+                        title: None,
+                        commentary: true,
+                        hearing_impaired: true,
+                        audio_description: true,
+                        original: true,
+                        dubbed: true,
+                    },
+                },
+            );
+            assert_eq!(string(&staged, "channel_layout"), Some(expected));
+        }
+
+        let titled_stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "aac",
+            "channels": 2,
+            "tags": {"title": "Old title"},
+            "disposition": {}
+        }))
+        .unwrap();
+        let mut titled = AudioSettings {
+            codec: AudioCodec::Original,
+            channel_layout: AudioChannelLayout::Original,
+            metadata: AudioMetadata {
+                language: "eng".to_string(),
+                title: None,
+                commentary: false,
+                hearing_impaired: false,
+                audio_description: false,
+                original: false,
+                dubbed: false,
+            },
+        };
+        titled.metadata.title = Some("New title".to_string());
+        let staged = audio_stream_for_display(&titled_stream, &titled);
+        assert_eq!(stream_title(&staged).as_deref(), Some("New title"));
+
+        titled.metadata.title = None;
+        let original = audio_stream_for_display(&titled_stream, &titled);
+        assert_eq!(string(&original, "codec_name"), Some("aac"));
+    }
+
+    #[test]
+    fn audio_field_help_should_explain_every_field() {
+        let (mut app, directory) = probed_app("audio-field-help");
+        open_dialog(&mut app, Dialog::AudioSettings);
+        let expected = [
+            (AudioSettingsField::Codec, "avoids re-encoding"),
+            (
+                AudioSettingsField::ChannelLayout,
+                "upmixing is not implemented",
+            ),
+            (AudioSettingsField::Language, "does not translate or dub"),
+            (AudioSettingsField::Title, "distinguish audio tracks"),
+            (AudioSettingsField::Default, "only 1 default audio track"),
+            (
+                AudioSettingsField::Commentary,
+                "director or cast commentary",
+            ),
+            (
+                AudioSettingsField::HearingImpaired,
+                "listeners with hearing loss",
+            ),
+            (AudioSettingsField::AudioDescription, "blind or low-vision"),
+            (
+                AudioSettingsField::Original,
+                "mutually exclusive with Dubbed",
+            ),
+            (
+                AudioSettingsField::Dubbed,
+                "mutually exclusive with Original",
+            ),
+        ];
+
+        for (field, phrase) in expected {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            let popup = app.audio_settings_popup.as_ref().unwrap();
+            assert_that!(audio_field_help_text(popup).to_string().as_str()).contains(phrase);
+            assert_eq!(
+                audio_field_help_title(field),
+                format!(" Information about {} ", field.label())
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn subtitle_information_lines_should_explain_embedded_text_subtitles() {
         // Arrange
         let stream = serde_json::from_value(serde_json::json!({
@@ -7820,6 +9028,126 @@ mod tests {
         assert_that!(language_name("fre").as_deref()).contains("French");
         assert_that!(language_name("en-US").as_deref()).contains("English");
         assert_that!(language_name("qaa").as_deref()).contains("Unknown language (QAA)");
+    }
+
+    #[test]
+    fn language_name_should_give_up_rather_than_invent_a_name() {
+        // Arrange / Act / Assert: `und` and an empty tag mean "no language set", and must
+        // stay absent from the details rather than appear as a language the file does not
+        // claim. A long non-code tag is passed through verbatim — it is more likely to be
+        // a human-readable name the muxer wrote than something to translate.
+        assert_that!(language_name("und")).is_none();
+        assert_that!(language_name("")).is_none();
+        assert_that!(language_name("   ")).is_none();
+        assert_that!(language_name("und-US")).is_none();
+        // Longer than a code and not translatable: shown as written.
+        assert_that!(language_name("Brazilian Portuguese").as_deref())
+            .contains("Brazilian Portuguese");
+    }
+
+    #[test]
+    fn video_resolution_should_name_the_tier_only_for_a_standard_height() {
+        // Arrange: the tier label is how a user recognises "4K" at a glance, but a
+        // cropped or anamorphic film has a height matching no tier and must simply omit
+        // it rather than be mislabelled as the nearest one.
+        let stream = |width: u64, height: u64| {
+            BTreeMap::from([
+                ("width".to_string(), Value::from(width)),
+                ("height".to_string(), Value::from(height)),
+            ])
+        };
+
+        // Act / Assert: each standard height gets its label.
+        for (height, tier) in [
+            (4320, "8K"),
+            (2160, "4K"),
+            (1440, "1440p"),
+            (1080, "1080p"),
+            (720, "720p"),
+            (576, "576p"),
+            (480, "480p"),
+        ] {
+            let described = video_resolution_description(&stream(1920, height)).unwrap();
+            assert!(
+                described.ends_with(tier),
+                "height {height} must be labelled {tier}, got {described:?}",
+            );
+        }
+
+        // Act / Assert: a letterboxed height carries the dimensions and no tier.
+        let cropped = video_resolution_description(&stream(1920, 800)).unwrap();
+        assert_that!(cropped.as_str()).is_equal_to("1920×800");
+
+        // Act / Assert: a stream with no dimensions has nothing to describe.
+        assert_that!(video_resolution_description(&BTreeMap::new())).is_none();
+    }
+
+    #[test]
+    fn video_resolution_should_drop_a_placeholder_aspect_ratio() {
+        // Arrange: ffprobe writes `0:1` or `N/A` when it has no aspect ratio. Printing
+        // those verbatim puts "0:1" in the details next to real values.
+        let with_placeholder = BTreeMap::from([
+            ("width".to_string(), Value::from(1920)),
+            ("height".to_string(), Value::from(1080)),
+            ("display_aspect_ratio".to_string(), Value::from("0:1")),
+        ]);
+        let with_real = BTreeMap::from([
+            ("width".to_string(), Value::from(1920)),
+            ("height".to_string(), Value::from(1080)),
+            ("display_aspect_ratio".to_string(), Value::from("16:9")),
+        ]);
+
+        // Act / Assert
+        assert_that!(
+            video_resolution_description(&with_placeholder)
+                .unwrap()
+                .as_str()
+        )
+        .is_equal_to("1920×1080 · 1080p");
+        assert_that!(video_resolution_description(&with_real).unwrap().as_str())
+            .is_equal_to("1920×1080 · 16:9 · 1080p");
+    }
+
+    #[test]
+    fn audio_codec_descriptions_should_cover_the_pcm_family_and_fall_back_in_caps() {
+        // Arrange / Act / Assert: PCM arrives under many codec names (`pcm_s16le`,
+        // `pcm_s24be`, …) that all mean the same thing to the user, so they collapse to
+        // one label rather than leaking the sample format. Anything unrecognised is shown
+        // upper-cased rather than dropped, so a new codec still names itself.
+        let stream = |codec: &str| BTreeMap::from([("codec_name".to_string(), Value::from(codec))]);
+        for codec in ["pcm_s16le", "pcm_s24be", "pcm_f32le"] {
+            assert_that!(audio_format_description(&stream(codec)))
+                .is_equal_to("PCM · Uncompressed".to_string());
+        }
+        // An unrecognised codec is upper-cased rather than dropped.
+        assert_that!(audio_format_description(&stream("nellymoser")))
+            .is_equal_to("NELLYMOSER".to_string());
+        assert_that!(audio_format_description(&stream("flac")))
+            .is_equal_to("FLAC · Lossless".to_string());
+        // A stream with no codec at all still describes itself.
+        assert_that!(audio_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
+    }
+
+    #[test]
+    fn audio_channel_description_should_fall_back_to_the_channel_count() {
+        // Arrange: some containers report a channel count but no layout, and some report
+        // a layout string this code does not recognise. Either way the user must still be
+        // told mono from stereo rather than shown nothing.
+        let count_only = BTreeMap::from([("channels".to_string(), Value::from(2))]);
+        let unknown_layout = BTreeMap::from([
+            ("channel_layout".to_string(), Value::from("hexadecagonal")),
+            ("channels".to_string(), Value::from(1)),
+        ]);
+        let numeric_layout =
+            BTreeMap::from([("channel_layout".to_string(), Value::from("5.1(side)"))]);
+
+        // Act / Assert
+        assert_that!(audio_channel_description(&count_only).as_deref()).contains("Stereo");
+        assert_that!(audio_channel_description(&unknown_layout).as_deref()).contains("Mono");
+        assert_that!(audio_channel_description(&numeric_layout).as_deref())
+            .contains("5.1 surround");
+        // Nothing to go on at all stays absent rather than guessing.
+        assert_that!(audio_channel_description(&BTreeMap::new())).is_none();
     }
 
     #[test]
@@ -8366,7 +9694,7 @@ mod tests {
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted subtitle field",
+            "Explain the highlighted container, audio, or subtitle field",
             "i",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
@@ -8468,32 +9796,25 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_codec_line_should_distinguish_staged_and_available_codecs() {
+    fn codec_dropdown_line_should_distinguish_selected_staged_and_available_codecs() {
         // Act
-        let available = subtitle_codec_line("WebVTT", false, false, true, false);
-        let staged = subtitle_codec_line("ASS", false, true, true, false);
-        let staged_cursor = subtitle_codec_line("ASS", true, true, true, true);
+        let available = dropdown_line("WebVTT", false, false, true, false, false);
+        let staged = dropdown_line("ASS", false, true, true, true, false);
+        let staged_cursor = dropdown_line("ASS", true, true, true, true, true);
 
-        // Assert — no "(original)" tag is ever shown, regardless of state.
+        // Assert — the effective codec uses the shared dropdown marker, and no
+        // "(original)" tag is ever shown regardless of state.
         assert_that!(available.to_string())
             .does_not_contain("●")
+            .does_not_contain("> WebVTT")
             .does_not_contain("(original)");
-        assert_eq!(available.spans[1].style.fg, Some(Color::White));
-        assert_eq!(staged.spans[1].style.fg, Some(Color::Yellow));
-        assert!(
-            staged.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
-        assert_eq!(staged_cursor.spans[1].style.fg, Some(Color::White));
-        assert_eq!(staged_cursor.spans[1].style.bg, Some(Color::Cyan));
-        assert!(
-            staged_cursor.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
+        assert_that!(staged.to_string()).contains("> ASS");
+        assert_eq!(available.style.fg, Some(Color::White));
+        assert_eq!(staged.style.fg, Some(Color::Yellow));
+        assert!(staged.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(staged_cursor.style.fg, Some(Color::White));
+        assert_eq!(staged_cursor.style.bg, Some(Color::Cyan));
+        assert!(staged_cursor.style.add_modifier.contains(Modifier::ITALIC));
 
         // The guide glyph flips between the two tree connectors based on `last`.
         assert_eq!(available.spans[0].content, "  ├── ");
@@ -8878,7 +10199,9 @@ mod tests {
                 "streams": [
                     {"index": 0, "codec_type": "video", "codec_name": "h264"},
                     {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
-                     "tags": {"language": "eng"}}
+                     "tags": {"language": "eng"}},
+                    {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                     "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
                 ]
             }))
             .unwrap(),
@@ -8946,6 +10269,27 @@ mod tests {
             });
         }
         app.container_settings_popup = None;
+
+        // Act / Assert: every audio field.
+        for field in AudioSettingsField::ALL {
+            app.audio_settings_popup = Some(crate::app::AudioSettingsPopup {
+                stream_index: 2,
+                field,
+                mode: AudioSettingsMode::Summary,
+                help_visible: true,
+                codec_cursor: 0,
+                channel_cursor: 0,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::new(String::new()),
+            });
+            let popup = app.audio_settings_popup.as_ref().unwrap();
+            let help = audio_field_help_text(popup);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_audio_settings_dialog(frame, &app)
+            });
+        }
+        app.audio_settings_popup = None;
 
         // Act / Assert: subtitle fields.
         for field in [
@@ -9024,6 +10368,10 @@ mod tests {
         };
         let codec_row = row_of("Codec");
         let resolution_row = row_of("Resolution");
+        assert!(
+            (0..buffer.area.height).any(|y| row_text(y).contains("> HEVC / H.265")),
+            "the effective video codec should have the shared dropdown marker"
+        );
         for option in ["H.264", "AV1"] {
             let option_row = row_of(option);
             assert!(

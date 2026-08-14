@@ -122,6 +122,28 @@ impl MediaInfo {
     }
 }
 
+/// The tuned flags a probe uses on a network mount. `ffprobe` will otherwise read and
+/// seek as far as it likes to identify a file, which on a share turns one file
+/// selection into seconds of round trips; capping it trades a little certainty about
+/// exotic files for a listing that keeps up with the cursor.
+fn apply_network_probe_flags(command: &mut Command, is_network: bool) {
+    if is_network {
+        command.args(["-probesize", "2000000", "-analyzeduration", "3000000"]);
+    }
+}
+
+/// What to report when `ffprobe` exits non-zero. It usually explains itself on stderr,
+/// but a build that fails without a word would otherwise surface as an empty message,
+/// which reads as a bug in reel rather than a file `ffprobe` could not handle.
+fn ffprobe_failure_detail(stderr: &[u8], fallback: &str) -> String {
+    let detail = String::from_utf8_lossy(stderr).trim().to_string();
+    if detail.is_empty() {
+        fallback.to_string()
+    } else {
+        detail
+    }
+}
+
 pub fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
     let is_network = crate::mount::is_network_mount(path);
     let mut command = Command::new("ffprobe");
@@ -134,9 +156,7 @@ pub fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
         "-show_streams",
         "-show_chapters",
     ]);
-    if is_network {
-        command.args(["-probesize", "2000000", "-analyzeduration", "3000000"]);
-    }
+    apply_network_probe_flags(&mut command, is_network);
     let output = command.arg(path).output().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "ffprobe was not found in PATH. Install FFmpeg to inspect media.".to_string()
@@ -145,12 +165,10 @@ pub fn probe_any_file(path: &Path) -> Result<MediaInfo, String> {
         }
     })?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "ffprobe could not recognize this subtitle output".to_string()
-        } else {
-            detail
-        });
+        return Err(ffprobe_failure_detail(
+            &output.stderr,
+            "ffprobe could not recognize this subtitle output",
+        ));
     }
     let value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Could not parse ffprobe output: {error}"))?;
@@ -303,9 +321,7 @@ pub(crate) fn probe_file(path: &Path, is_network: bool) -> ProbeOutcome {
         "-show_streams",
         "-show_chapters",
     ]);
-    if is_network {
-        command.args(["-probesize", "2000000", "-analyzeduration", "3000000"]);
-    }
+    apply_network_probe_flags(&mut command, is_network);
     let output = match command.arg(path).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -317,12 +333,10 @@ pub(crate) fn probe_file(path: &Path, is_network: bool) -> ProbeOutcome {
     };
 
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return ProbeOutcome::NotVideo(if detail.is_empty() {
-            "ffprobe could not recognize this as a media file".to_string()
-        } else {
-            detail
-        });
+        return ProbeOutcome::NotVideo(ffprobe_failure_detail(
+            &output.stderr,
+            "ffprobe could not recognize this as a media file",
+        ));
     }
 
     let value: Value = match serde_json::from_slice(&output.stdout) {
@@ -343,6 +357,49 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+
+    /// Probing a network share without the caps turns each file selection into seconds
+    /// of round trips; applying them to a local file would cap a probe that costs
+    /// nothing. Both call sites share this, so both stay in step.
+    #[test]
+    fn only_a_network_probe_should_carry_the_capped_read_flags() {
+        // Arrange
+        let arguments = |is_network| {
+            let mut command = Command::new("ffprobe");
+            apply_network_probe_flags(&mut command, is_network);
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // Act / Assert
+        assert_that!(arguments(false)).is_empty();
+        assert_that!(arguments(true)).is_equal_to(vec![
+            "-probesize".to_string(),
+            "2000000".to_string(),
+            "-analyzeduration".to_string(),
+            "3000000".to_string(),
+        ]);
+    }
+
+    /// An empty message would reach the file list as a blank "not a video" reason,
+    /// which reads as a bug in reel rather than as something `ffprobe` refused.
+    #[test]
+    fn a_silent_ffprobe_failure_should_still_produce_a_reason() {
+        // Act / Assert
+        assert_that!(ffprobe_failure_detail(b"", "nothing to say").as_str())
+            .is_equal_to("nothing to say");
+        assert_that!(ffprobe_failure_detail(b"   \n\t ", "nothing to say").as_str())
+            .is_equal_to("nothing to say");
+        assert_that!(
+            ffprobe_failure_detail(b"  movie.mkv: Invalid data found\n", "nothing to say").as_str()
+        )
+        .is_equal_to("movie.mkv: Invalid data found");
+        // Whatever ffprobe wrote wins even when it is not valid UTF-8.
+        assert_that!(ffprobe_failure_detail(b"bad \xff byte", "nothing to say").as_str())
+            .contains("bad");
+    }
 
     #[test]
     fn probe_worker_should_coalesce_queued_requests_and_answer_only_the_newest() {
@@ -479,6 +536,29 @@ mod tests {
     }
 
     #[test]
+    fn conflict_probe_worker_should_stop_when_its_results_are_no_longer_wanted() {
+        // Arrange / Act: the mirror of
+        // `probe_worker_should_stop_when_its_results_are_no_longer_wanted` for the
+        // background staleness worker. It has its own thread and its own send, so it
+        // needs its own proof that a dropped receiver ends the loop — otherwise `reel`
+        // exits leaving this thread spinning on a dead channel.
+        let (requests, responses) = spawn_conflict_probe_worker();
+        drop(responses);
+
+        // Assert: sending still succeeds (the channel outlives one send), and the worker
+        // shuts down rather than looping forever.
+        let _ = requests.send(ProbeRequest {
+            generation: 0,
+            path: std::path::PathBuf::from("/nonexistent/movie.mkv"),
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            is_network_mount: false,
+        });
+    }
+
+    #[test]
     fn from_json_should_preserve_streams_chapters_and_format_when_input_contains_video() {
         // Arrange
         let value: Value = serde_json::from_str(
@@ -537,6 +617,407 @@ mod tests {
 
         // Assert
         assert_that!(result).is_err();
+    }
+
+    /// An ffprobe-dependent test must fail when its prerequisite is missing; an
+    /// unexecuted test must never be reported as passing.
+    fn require_tools(test: &str, tools: &[&str]) {
+        for tool in tools {
+            let available = Command::new(tool)
+                .arg("-version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(
+                available,
+                "{test} requires {tool}; install the missing test prerequisite"
+            );
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-probe-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn from_json_unchecked_should_reject_a_document_that_is_not_a_json_object() {
+        // Arrange: ffprobe is expected to answer with an object. A bare array or scalar
+        // means the output was not what we asked for — truncated, or not ffprobe at all —
+        // and must surface as an error rather than silently becoming an empty MediaInfo
+        // that reports a real file as having no streams.
+        for document in ["[]", "\"unexpected\"", "42", "null", "true"] {
+            let value: Value = serde_json::from_str(document).unwrap();
+
+            // Act
+            let result = MediaInfo::from_json_unchecked(value);
+
+            // Assert
+            assert_that!(result).is_err();
+        }
+    }
+
+    #[test]
+    fn from_json_unchecked_should_default_sections_that_are_present_but_mistyped() {
+        // Arrange: a document whose `streams`/`chapters`/`format` keys hold the wrong JSON
+        // type, plus a stream entry that is not an object. Every one of these must degrade
+        // to empty rather than panic, so a malformed probe cannot take the UI down.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": ["not an object", 7, {"codec_type": "video"}],
+                "chapters": "not an array",
+                "format": ["not an object"]
+            }"#,
+        )
+        .unwrap();
+
+        // Act
+        let info = MediaInfo::from_json_unchecked(value).unwrap();
+
+        // Assert: only the one well-formed stream survives; the rest default to empty.
+        assert_that!(info.streams).has_length(1);
+        assert_that!(info.chapters).is_empty();
+        assert_that!(info.format).is_empty();
+    }
+
+    #[test]
+    fn from_json_unchecked_should_default_sections_that_are_missing_entirely() {
+        // Arrange: `-show_chapters` on a container without chapters omits the key rather
+        // than returning an empty array.
+        let value: Value = serde_json::from_str("{}").unwrap();
+
+        // Act
+        let info = MediaInfo::from_json_unchecked(value).unwrap();
+
+        // Assert
+        assert_that!(info.streams).is_empty();
+        assert_that!(info.chapters).is_empty();
+        assert_that!(info.format).is_empty();
+    }
+
+    #[test]
+    fn is_still_image_should_detect_every_recognised_image_container() {
+        // Arrange / Act / Assert: each of these container names is checked by its own
+        // branch, so a name dropped from the list would otherwise go unnoticed — the
+        // failure mode is a cover scan or screenshot being offered for track editing.
+        for format_name in [
+            "image2",
+            "png_pipe",
+            "jpeg_pipe",
+            "webp_pipe",
+            "bmp_pipe",
+            "tiff_pipe",
+            "gif",
+            "tty",
+        ] {
+            let stream = BTreeMap::from([("codec_type".to_string(), Value::from("video"))]);
+            let format = BTreeMap::from([("format_name".to_string(), Value::from(format_name))]);
+
+            assert!(
+                is_still_image(&stream, &format),
+                "{format_name} must be recognised as a still image container",
+            );
+        }
+    }
+
+    #[test]
+    fn is_still_image_should_detect_an_image_codec_in_a_container_without_duration() {
+        // Arrange: a single frame muxed into an ordinary container reports an image codec
+        // and no usable duration.
+        for codec_name in ["png", "mjpeg", "webp", "bmp", "tiff", "gif", "svg", "tga"] {
+            let stream = BTreeMap::from([("codec_name".to_string(), Value::from(codec_name))]);
+            let format = BTreeMap::from([("format_name".to_string(), Value::from("matroska"))]);
+
+            assert!(
+                is_still_image(&stream, &format),
+                "{codec_name} with no duration must be recognised as a still image",
+            );
+        }
+    }
+
+    #[test]
+    fn is_still_image_should_keep_an_image_codec_that_actually_runs_for_a_duration() {
+        // Arrange: an MJPEG *video* — an image codec, but a real timeline of frames. The
+        // duration is what separates it from a single embedded frame, and treating it as
+        // a still would hide a genuinely editable file from the user.
+        let stream = BTreeMap::from([("codec_name".to_string(), Value::from("mjpeg"))]);
+        let format = BTreeMap::from([
+            ("format_name".to_string(), Value::from("avi")),
+            ("duration".to_string(), Value::from("42.5")),
+        ]);
+
+        // Act / Assert
+        assert!(!is_still_image(&stream, &format));
+    }
+
+    #[test]
+    fn is_still_image_should_keep_an_ordinary_video_stream() {
+        // Arrange: the common case — neither an image container nor an image codec.
+        let stream = BTreeMap::from([("codec_name".to_string(), Value::from("h264"))]);
+        let format = BTreeMap::from([("format_name".to_string(), Value::from("matroska"))]);
+
+        // Act / Assert
+        assert!(!is_still_image(&stream, &format));
+    }
+
+    #[test]
+    fn is_attached_picture_should_only_match_a_stream_flagged_attached_pic() {
+        // Arrange: cover art carries `attached_pic: 1`; everything else must not match,
+        // including a stream with no disposition object at all.
+        let cover = BTreeMap::from([(
+            "disposition".to_string(),
+            serde_json::json!({"attached_pic": 1}),
+        )]);
+        let ordinary = BTreeMap::from([(
+            "disposition".to_string(),
+            serde_json::json!({"attached_pic": 0}),
+        )]);
+        let missing = BTreeMap::from([("codec_type".to_string(), Value::from("video"))]);
+
+        // Act / Assert
+        assert!(is_attached_picture(&cover));
+        assert!(!is_attached_picture(&ordinary));
+        assert!(!is_attached_picture(&missing));
+    }
+
+    #[test]
+    fn format_tag_should_ignore_a_tag_whose_value_is_blank() {
+        // Arrange: containers routinely carry empty or whitespace-only tags. Surfacing
+        // one as a title paints a blank value over the filename the user was reading.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {"tags": {"title": "   ", "comment": "", "date": "  2010  "}}
+            }"#,
+        )
+        .unwrap();
+        let info = MediaInfo::from_json(value).unwrap();
+
+        // Act / Assert: blanks are dropped, and a real value is trimmed rather than
+        // returned with the container's padding.
+        assert_that!(info.container_title()).is_none();
+        assert_that!(info.container_comment()).is_none();
+        assert_that!(info.container_date().as_deref()).contains("2010");
+    }
+
+    #[test]
+    fn format_tag_should_return_nothing_when_the_container_has_no_tags_at_all() {
+        // Arrange: a container with a format section but no `tags` object.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {"format_name": "matroska"}
+            }"#,
+        )
+        .unwrap();
+        let info = MediaInfo::from_json(value).unwrap();
+
+        // Act / Assert
+        assert_that!(info.container_title()).is_none();
+        assert_that!(info.container_artist()).is_none();
+        assert_that!(info.container_genre()).is_none();
+    }
+
+    #[test]
+    fn container_artist_and_comment_should_fall_back_through_their_alternate_tags() {
+        // Arrange: different muxers spell the same idea differently, so each getter walks
+        // a chain of alternates. Only the fallback links are exercised here — the primary
+        // spellings are covered above.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {"tags": {
+                    "description": "From the description tag",
+                    "creation_time": "2019-04-01T00:00:00.000000Z",
+                    "composer": "From the composer tag"
+                }}
+            }"#,
+        )
+        .unwrap();
+        let info = MediaInfo::from_json(value).unwrap();
+
+        // Act / Assert
+        assert_that!(info.container_comment().as_deref()).contains("From the description tag");
+        assert_that!(info.container_date().as_deref()).contains("2019-04-01T00:00:00.000000Z");
+        assert_that!(info.container_artist().as_deref()).contains("From the composer tag");
+    }
+
+    #[test]
+    fn probe_file_should_report_a_non_media_file_as_not_video_carrying_ffprobes_reason() {
+        require_tools(
+            "probe_file_should_report_a_non_media_file_as_not_video_carrying_ffprobes_reason",
+            &["ffprobe"],
+        );
+
+        // Arrange: a text file with a media extension — what a stray `.srt` rename or a
+        // partially downloaded file looks like when the user selects it.
+        let directory = scratch("not-media");
+        let path = directory.join("notes.mkv");
+        std::fs::write(&path, b"this is not a media file").unwrap();
+
+        // Act
+        let outcome = probe_file(&path, false);
+
+        // Assert: `NotVideo` (a normal answer about a normal file), not `Error`, and it
+        // carries ffprobe's own words rather than a generic placeholder.
+        let ProbeOutcome::NotVideo(reason) = outcome else {
+            panic!("a non-media file must probe as NotVideo, got {outcome:?}");
+        };
+        assert!(
+            !reason.is_empty(),
+            "the reason must carry ffprobe's stderr, not an empty string",
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn probe_file_should_report_a_missing_file_as_not_video() {
+        require_tools(
+            "probe_file_should_report_a_missing_file_as_not_video",
+            &["ffprobe"],
+        );
+
+        // Arrange / Act: a path that has been deleted between the directory scan and the
+        // probe — the race a watched directory hits routinely.
+        let outcome = probe_file(
+            std::path::Path::new("/nonexistent/reel-tui/movie.mkv"),
+            false,
+        );
+
+        // Assert
+        assert!(
+            matches!(outcome, ProbeOutcome::NotVideo(_)),
+            "a missing file must probe as NotVideo, got {outcome:?}",
+        );
+    }
+
+    #[test]
+    fn probe_file_should_read_a_real_file_when_told_it_lives_on_a_network_mount() {
+        require_tools(
+            "probe_file_should_read_a_real_file_when_told_it_lives_on_a_network_mount",
+            &["ffmpeg", "ffprobe"],
+        );
+
+        // Arrange: the network path adds `-probesize`/`-analyzeduration` to keep ffprobe
+        // from seeking deep over the wire. Those bounds must still be wide enough to
+        // recognise an ordinary file — too tight and every file on a share reads as
+        // unplayable.
+        let directory = scratch("network-flags");
+        let path = directory.join("clip.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture must build");
+
+        // Act: the same file probed both ways.
+        let network = probe_file(&path, true);
+        let local = probe_file(&path, false);
+
+        // Assert: the fast flags change how much ffprobe reads, never what it concludes.
+        let (ProbeOutcome::Video(network_info), ProbeOutcome::Video(local_info)) =
+            (&network, &local)
+        else {
+            panic!("a real file must probe as Video both ways, got {network:?} / {local:?}");
+        };
+        assert_eq!(network_info.streams.len(), 2);
+        assert_eq!(network_info.streams.len(), local_info.streams.len());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn probe_any_file_should_accept_a_file_with_no_video_stream() {
+        require_tools(
+            "probe_any_file_should_accept_a_file_with_no_video_stream",
+            &["ffmpeg", "ffprobe"],
+        );
+
+        // Arrange: `probe_any_file` exists precisely to inspect things `probe_file` would
+        // reject — subtitle sidecars and audio-only output — so a missing video stream
+        // must not be an error here.
+        let directory = scratch("any-file");
+        let path = directory.join("audio.mka");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono:d=1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture must build");
+
+        // Act
+        let info = probe_any_file(&path).unwrap();
+
+        // Assert: accepted, with the audio stream intact — where `from_json` would have
+        // refused it for having no video.
+        assert_that!(info.streams).has_length(1);
+        assert!(MediaInfo::from_json(serde_json::json!({"streams": []})).is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn probe_any_file_should_surface_ffprobes_reason_for_a_file_it_cannot_read() {
+        require_tools(
+            "probe_any_file_should_surface_ffprobes_reason_for_a_file_it_cannot_read",
+            &["ffprobe"],
+        );
+
+        // Arrange: the converted-subtitle check runs this against ffmpeg's own output, so
+        // when it fails the message is the only clue the user gets about what went wrong.
+        let directory = scratch("any-file-error");
+        let path = directory.join("broken.srt");
+        std::fs::write(&path, b"\0\0\0not a subtitle\0\0").unwrap();
+
+        // Act
+        let result = probe_any_file(&path);
+
+        // Assert: an error carrying a non-empty reason, never a silent empty MediaInfo.
+        let Err(reason) = result else {
+            panic!("an unreadable file must be an error, got {result:?}");
+        };
+        assert!(!reason.is_empty(), "the error must explain itself");
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

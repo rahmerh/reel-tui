@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode};
+use crate::app::{
+    App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -167,6 +169,135 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                         _ if input.is_double_g(key) => {
                             app.move_container_settings_to_endpoint(false)
                         }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(Dialog::AudioSettings) => {
+            let mode = app
+                .audio_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode)
+                .unwrap_or_default();
+            match mode {
+                AudioSettingsMode::TitleEdit => {
+                    input.reset_sequence();
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            app.save_from_audio_settings()
+                        }
+                        (KeyCode::Esc | KeyCode::Enter, _) => app.escape_audio_settings(),
+                        _ => {
+                            handle_text_input_key(app, key);
+                        }
+                    }
+                }
+                AudioSettingsMode::LanguageDropdown => {
+                    let searching = app
+                        .audio_settings_popup
+                        .as_ref()
+                        .is_some_and(|popup| popup.language_search.is_active);
+                    if searching {
+                        input.reset_sequence();
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                app.save_from_audio_settings()
+                            }
+                            (KeyCode::Esc, _) => app.cancel_audio_language_search(),
+                            (KeyCode::Down, KeyModifiers::NONE)
+                            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                app.move_audio_settings_cursor(1)
+                            }
+                            (KeyCode::Up, KeyModifiers::NONE)
+                            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                app.move_audio_settings_cursor(-1)
+                            }
+                            (KeyCode::Enter, _) => app.activate_audio_settings(),
+                            _ => {
+                                handle_text_input_key(app, key);
+                            }
+                        }
+                    } else {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                input.reset_sequence();
+                                app.toggle_audio_field_help();
+                            }
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                input.reset_sequence();
+                                app.save_from_audio_settings();
+                            }
+                            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.start_audio_language_search();
+                            }
+                            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_cursor(1)
+                            }
+                            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_cursor(-1)
+                            }
+                            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_audio_settings_to_endpoint(true);
+                            }
+                            (KeyCode::Enter, _) => {
+                                input.reset_sequence();
+                                app.activate_audio_settings();
+                            }
+                            _ if is_back_key(key) => {
+                                input.reset_sequence();
+                                app.escape_audio_settings();
+                            }
+                            _ if input.is_double_g(key) => {
+                                app.move_audio_settings_to_endpoint(false)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AudioSettingsMode::Summary | AudioSettingsMode::Dropdown => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            input.reset_sequence();
+                            app.toggle_audio_field_help();
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            input.reset_sequence();
+                            app.save_from_audio_settings();
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.start_audio_title_input();
+                        }
+                        (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.reset_focused_field();
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_cursor(-1)
+                        }
+                        (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_audio_settings_to_endpoint(true);
+                        }
+                        (KeyCode::Enter, _) => {
+                            input.reset_sequence();
+                            app.activate_audio_settings();
+                        }
+                        _ if is_back_key(key) => {
+                            input.reset_sequence();
+                            app.escape_audio_settings();
+                        }
+                        _ if input.is_double_g(key) => app.move_audio_settings_to_endpoint(false),
                         _ => {}
                     }
                 }
@@ -741,6 +872,7 @@ mod tests {
     use crate::subtitle::SubtitleSource;
     use kernal::prelude::*;
     use std::{
+        collections::BTreeSet,
         fs,
         path::PathBuf,
         sync::mpsc,
@@ -750,8 +882,8 @@ mod tests {
     use super::*;
     use crate::{
         app::{
-            CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
-            ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField,
+            AudioSettingsField, CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
+            ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField, ResetScope,
             SubtitleSettingsField, TextInputState, VideoSettingsField, VideoSettingsMode,
             VideoSettingsPopup,
         },
@@ -813,6 +945,44 @@ mod tests {
         (app, directory)
     }
 
+    fn audio_settings_app() -> (App, PathBuf) {
+        let (mut app, directory) = test_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                     "channels": 2, "sample_rate": "48000",
+                     "tags": {"language": "eng"}, "disposition": {"default": 1}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.subtitle_capabilities.ffmpeg = true;
+        app.subtitle_capabilities.ffmpeg_encoders = BTreeSet::from([
+            "aac".to_string(),
+            "ac3".to_string(),
+            "eac3".to_string(),
+            "libopus".to_string(),
+            "flac".to_string(),
+            "alac".to_string(),
+            "libmp3lame".to_string(),
+            "libvorbis".to_string(),
+        ]);
+        app.subtitle_capabilities.ffmpeg_muxers = BTreeSet::from(["matroska".to_string()]);
+        app.stream_order = vec![0, 1];
+        app.default_streams.insert(1);
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|track| *track == crate::app::TrackRef::Embedded(1))
+            .unwrap();
+        app.open_track_settings();
+        (app, directory)
+    }
+
     fn container_settings_app() -> (App, PathBuf) {
         let (mut app, directory) = test_app();
         app.outcome = Some(ProbeOutcome::Video(
@@ -853,6 +1023,274 @@ mod tests {
         drop(app);
         fs::remove_dir_all(directory).unwrap();
         result
+    }
+
+    /// A probed file with editable tracks, left on the file list rather than in the track
+    /// editor — the state the user is in while browsing, where track-editing keys must
+    /// stay inert. Unlike `test_app`, the directory actually holds files, so a file is
+    /// genuinely selected and file-list keys have something to act on.
+    fn browsing_app() -> (App, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-input-browsing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for name in ["a.mkv", "b.mkv"] {
+            fs::write(directory.join(name), b"media").unwrap();
+        }
+        let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = mpsc::channel::<EditRequest>();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
+        app.select_first();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                    {
+                        "index": 2,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.layer = Layer::Files;
+        (app, directory)
+    }
+
+    #[test]
+    fn track_editing_keys_should_do_nothing_while_the_user_is_browsing_files() {
+        // Arrange: every one of these keys is guarded on `Layer::Streams` here, and the
+        // `App` method behind it re-checks the layer for itself. This pins the outer half
+        // of that pair and the end-to-end contract through `handle_key`: a keystroke aimed
+        // at the file list must never reorder or delete a track in the file the cursor
+        // happens to be sitting on. Because the guard is doubled, dropping either one
+        // alone leaves the behaviour intact — so this test does not fail on that edit by
+        // itself, and is a contract lock rather than a single-guard regression test.
+        let keys = [
+            ("d (delete track)", key(KeyCode::Char('d'))),
+            ("i (stream details)", key(KeyCode::Char('i'))),
+            ("h (subtitle column left)", key(KeyCode::Char('h'))),
+            ("ctrl+k (move track up)", ctrl('k')),
+            ("ctrl+j (move track down)", ctrl('j')),
+            ("ctrl+h (transfer subtitle out)", ctrl('h')),
+            ("ctrl+l (transfer subtitle in)", ctrl('l')),
+        ];
+
+        for (label, event) in keys {
+            let (mut app, directory) = browsing_app();
+            let order_before = app.stream_order.clone();
+
+            // Act
+            let outcome = handle_key(&mut app, &mut InputState::default(), event);
+
+            // Assert: the app stays where it was and the track list is untouched.
+            assert_that!(outcome).is_equal_to(InputOutcome::Continue);
+            assert_eq!(app.layer, Layer::Files, "{label} must not change layer");
+            assert_eq!(
+                app.stream_order, order_before,
+                "{label} must not reorder tracks from the file list",
+            );
+            assert!(
+                app.deleted_streams.is_empty(),
+                "{label} must not delete a track from the file list",
+            );
+            assert!(
+                app.dialog.is_none(),
+                "{label} must not open a dialog from the file list",
+            );
+
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn file_search_should_only_open_from_the_file_list() {
+        // Arrange: `/` starts a filename search, which only means anything against the
+        // file list. Firing it from the track editor would swallow the keystroke and
+        // leave the user typing into a search they cannot see results for. As with the
+        // track-editing keys above, `App::start_file_search` re-checks the layer, so this
+        // covers both halves of the contract rather than one guard in isolation.
+        let (mut app, directory) = browsing_app();
+        app.layer = Layer::Streams;
+
+        // Act
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('/')),
+        );
+
+        // Assert
+        assert!(
+            !app.file_search.is_active,
+            "search must not open from Streams"
+        );
+        assert_eq!(app.layer, Layer::Streams);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+
+        // And the guarded-for case still works.
+        let (mut app, directory) = browsing_app();
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('/')),
+        );
+        assert!(app.file_search.is_active, "search must open from Files");
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lowercase_r_should_reset_a_field_in_the_editor_but_a_whole_file_from_the_list() {
+        // Arrange: `r` is bound twice with opposite scopes — in the editor it clears the
+        // focused field, from the file list it discards a staged file's edits entirely.
+        // The table's guard (`layer == Layer::Streams`) is the only thing separating a
+        // one-field undo from throwing away every edit staged against that file, so the
+        // two must be proven distinct rather than assumed.
+
+        // Act / Assert: from the file list, it asks before discarding, and the scope it
+        // stages is the one selected file — not the whole directory.
+        let (mut app, directory) = browsing_app();
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('r')),
+        );
+        assert!(
+            app.dialog.is_some(),
+            "r from the file list must confirm before discarding a file's edits",
+        );
+        assert!(
+            matches!(app.pending_reset(), Some(ResetScope::File(_))),
+            "r from the file list must scope the reset to one file, got {:?}",
+            app.pending_reset(),
+        );
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+
+        // Act / Assert: from the editor it resets the focused field and raises no such
+        // confirmation, because nothing beyond that field is being thrown away.
+        let (mut app, directory) = browsing_app();
+        app.layer = Layer::Streams;
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            key(KeyCode::Char('r')),
+        );
+        assert!(
+            app.dialog.is_none(),
+            "r in the editor resets one field and must not raise a file-wide prompt",
+        );
+        assert_eq!(app.layer, Layer::Streams);
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capital_r_should_reset_every_staged_file_from_the_list_and_only_the_open_one_elsewhere() {
+        // Arrange: `R` is guarded by the table's one inverted condition
+        // (`layer != Layer::Files`), with the file-list case handled further down. Both
+        // sides raise the same `ConfirmReset` dialog, so the dialog alone proves nothing —
+        // what separates them is the scope staged behind it. A regression that let the
+        // file-list arm win everywhere would discard every staged file in the directory
+        // when the user meant only the file they had open.
+
+        // Act / Assert: from the file list, every staged file is in scope.
+        let (mut app, directory) = browsing_app();
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(app.dialog, Some(Dialog::ConfirmReset)));
+        assert!(
+            matches!(app.pending_reset(), Some(ResetScope::AllFiles)),
+            "R from the file list must scope the reset to every staged file, got {:?}",
+            app.pending_reset(),
+        );
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+
+        // Act / Assert: from the editor, only the open file is.
+        let (mut app, directory) = browsing_app();
+        app.layer = Layer::Streams;
+        handle_key(
+            &mut app,
+            &mut InputState::default(),
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(app.dialog, Some(Dialog::ConfirmReset)));
+        assert!(
+            matches!(app.pending_reset(), Some(ResetScope::CurrentFile)),
+            "R in the editor must scope the reset to the open file, got {:?}",
+            app.pending_reset(),
+        );
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn enter_should_do_nothing_in_a_layer_that_defines_no_action_for_it() {
+        // Arrange: Enter is claimed by both `Streams` (open track settings) and `Files`
+        // (descend). `StreamDetails` is neither — it is a read-only view, and Enter there
+        // must not fall through to whichever arm happens to be listed first.
+        let (mut app, directory) = browsing_app();
+        app.layer = Layer::StreamDetails;
+
+        // Act
+        let outcome = handle_key(&mut app, &mut InputState::default(), key(KeyCode::Enter));
+
+        // Assert
+        assert_that!(outcome).is_equal_to(InputOutcome::Continue);
+        assert_eq!(app.layer, Layer::StreamDetails);
+        assert!(app.dialog.is_none());
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn process_all_should_be_reachable_from_both_the_file_list_and_the_track_editor() {
+        // Arrange: ctrl+s is listed twice, once per layer, so a regression that dropped
+        // either arm would still look correct from the other. Both are checked here.
+        for layer in [Layer::Files, Layer::Streams] {
+            let (mut app, directory) = browsing_app();
+            app.layer = layer;
+
+            // Act
+            handle_key(&mut app, &mut InputState::default(), ctrl('s'));
+
+            // Assert: something was raised — a dialog to confirm, or a notice explaining
+            // why there is nothing to process. Silence would mean the key did nothing.
+            assert!(
+                app.dialog.is_some() || app.notice.is_some(),
+                "ctrl+s must be answered in {layer:?}",
+            );
+
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -1635,6 +2073,251 @@ mod tests {
     }
 
     #[test]
+    fn audio_popup_keys_should_drive_dropdown_search_title_and_role_fields() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+        assert_eq!(app.dialog, Some(Dialog::AudioSettings));
+
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Dropdown,
+        );
+        let initial_codec = app.audio_settings_popup.as_ref().unwrap().codec_cursor;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert!(app.audio_settings_popup.as_ref().unwrap().codec_cursor > initial_codec);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in "dut".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        assert!(app.filtered_audio_languages().len() < 10);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(app.audio_settings[&1].metadata.language, "nld");
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for character in "Commentary".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings[&1].metadata.title.as_deref(),
+            Some("Commentary")
+        );
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Commentary;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert!(app.audio_settings[&1].metadata.commentary);
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().field,
+            AudioSettingsField::Dubbed
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().field,
+            AudioSettingsField::Codec
+        );
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_audio_editor_key_path_should_stay_scoped_to_its_mode() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('K')));
+        assert!(app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().language_cursor,
+            0
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Summary,
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, ctrl('n'));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, ctrl('p'));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert!(
+            !app.audio_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .is_active
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        assert_eq!(
+            app.audio_settings_popup.as_ref().unwrap().mode,
+            AudioSettingsMode::Summary,
+        );
+
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+
+        let (mut save_from_title, title_directory) = audio_settings_app();
+        save_from_title.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(
+            &mut save_from_title,
+            &mut InputState::default(),
+            key(KeyCode::Char('i')),
+        );
+        handle_key(
+            &mut save_from_title,
+            &mut InputState::default(),
+            key(KeyCode::Char('T')),
+        );
+        handle_key(&mut save_from_title, &mut InputState::default(), ctrl('s'));
+        assert!(save_from_title.audio_settings_popup.is_none());
+        assert_eq!(
+            save_from_title.audio_settings[&1].metadata.title.as_deref(),
+            Some("T")
+        );
+
+        let (mut save_from_search, search_directory) = audio_settings_app();
+        save_from_search
+            .audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .field = AudioSettingsField::Language;
+        handle_key(
+            &mut save_from_search,
+            &mut InputState::default(),
+            key(KeyCode::Enter),
+        );
+        handle_key(
+            &mut save_from_search,
+            &mut InputState::default(),
+            key(KeyCode::Char('/')),
+        );
+        handle_key(&mut save_from_search, &mut InputState::default(), ctrl('s'));
+        assert!(save_from_search.audio_settings_popup.is_none());
+
+        let (mut save_from_language, language_directory) = audio_settings_app();
+        save_from_language
+            .audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .field = AudioSettingsField::Language;
+        handle_key(
+            &mut save_from_language,
+            &mut InputState::default(),
+            key(KeyCode::Enter),
+        );
+        handle_key(
+            &mut save_from_language,
+            &mut InputState::default(),
+            ctrl('s'),
+        );
+        assert!(save_from_language.audio_settings_popup.is_none());
+
+        let (mut save_from_summary, summary_directory) = audio_settings_app();
+        handle_key(
+            &mut save_from_summary,
+            &mut InputState::default(),
+            ctrl('s'),
+        );
+        assert!(save_from_summary.audio_settings_popup.is_none());
+
+        drop((
+            app,
+            save_from_title,
+            save_from_search,
+            save_from_language,
+            save_from_summary,
+        ));
+        for directory in [
+            directory,
+            title_directory,
+            search_directory,
+            language_directory,
+            summary_directory,
+        ] {
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn audio_field_help_should_toggle_follow_navigation_and_leave_text_input_alone() {
+        let (mut app, directory) = audio_settings_app();
+        let mut input = InputState::default();
+        let shifted_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+
+        // Help opens from the summary and follows the highlighted field into a
+        // dropdown without taking focus away from the audio editor.
+        handle_key(&mut app, &mut input, shifted_k);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.field, AudioSettingsField::ChannelLayout);
+        assert_eq!(popup.mode, AudioSettingsMode::Dropdown);
+
+        // K can close and reopen help while navigating a dropdown.
+        handle_key(&mut app, &mut input, shifted_k);
+        assert!(!app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, shifted_k);
+        assert!(app.audio_settings_popup.as_ref().unwrap().help_visible);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Once an actual input is active, K remains ordinary text.
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        handle_key(&mut app, &mut input, shifted_k);
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.language_search.value, "K");
+
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, shifted_k);
+        let popup = app.audio_settings_popup.as_ref().unwrap();
+        assert!(popup.help_visible);
+        assert_eq!(popup.mode, AudioSettingsMode::TitleEdit);
+        assert_eq!(popup.title_input.value, "K");
+
+        // A newly opened popup starts with its help closed.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        app.open_track_settings();
+        assert!(!app.audio_settings_popup.as_ref().unwrap().help_visible);
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn language_dropdown_keys_should_search_move_and_commit() {
         // Arrange: the language list is long enough that typing is the only practical way
         // through it, so search, movement and the endpoint jumps all have to work inside
@@ -1902,6 +2585,7 @@ mod tests {
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
                 default_sidecars: Default::default(),
+                audio_settings: Default::default(),
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
@@ -1940,6 +2624,7 @@ mod tests {
                 deleted_streams: Default::default(),
                 default_streams: Default::default(),
                 default_sidecars: Default::default(),
+                audio_settings: Default::default(),
                 video_settings: Default::default(),
                 subtitle_changes: Default::default(),
                 left_subtitle_order: Vec::new(),
@@ -2016,6 +2701,7 @@ mod tests {
                     deleted_streams: Default::default(),
                     default_streams: Default::default(),
                     default_sidecars: Default::default(),
+                    audio_settings: Default::default(),
                     video_settings: Default::default(),
                     subtitle_changes: Default::default(),
                     left_subtitle_order: Vec::new(),
@@ -2265,6 +2951,149 @@ mod tests {
         assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("beta.mkv");
         let quit = handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(quit).is_equal_to(InputOutcome::Quit);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg`/`G` and the back keys have to work in every scrollable dialog, not just the
+    /// ones that happen to have a test. Each of these is a separate `match` arm, so a
+    /// dialog added without them silently loses the bindings the keybindings popup
+    /// promises.
+    #[test]
+    fn every_scrollable_dialog_should_answer_gg_g_and_the_back_keys() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: the keybindings popup.
+        app.dialog = Some(Dialog::Keybindings);
+        app.set_keybindings_max_scroll(20);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_that!(app.keybindings_scroll).is_equal_to(20);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(app.keybindings_scroll).is_equal_to(0);
+
+        // Act / Assert: the confirm-process-all list.
+        app.dialog = Some(Dialog::ConfirmProcessAll);
+        app.set_confirm_process_all_max_scroll(20);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(20);
+        handle_key(&mut app, &mut input, ctrl('u'));
+        let after_page_up = app.confirm_process_all_scroll;
+        assert_that!(after_page_up < 20).is_true();
+        handle_key(&mut app, &mut input, ctrl('d'));
+        assert_that!(app.confirm_process_all_scroll > after_page_up).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(0);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The error notice has exactly one job: go away. Both the confirm key and the back
+    /// keys have to do it, or a failure message strands the user in a modal.
+    #[test]
+    fn the_error_dialog_should_close_on_enter_and_on_either_back_key() {
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+            // Arrange
+            let (mut app, directory) = browsing_app();
+            app.dialog = Some(Dialog::Error);
+
+            // Act
+            let outcome = handle_key(&mut app, &mut InputState::default(), key(code));
+
+            // Assert: dismissed without quitting reel.
+            assert_that!(app.dialog).is_none();
+            assert_that!(outcome).is_equal_to(InputOutcome::Continue);
+
+            // Cleanup
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// `gg` is the only two-key chord outside the `z` family, and it shares its first
+    /// key with nothing — but in the Files panel it has to survive being handled after
+    /// the `z`-chord and reset keys, which see every keystroke first.
+    #[test]
+    fn double_g_should_jump_to_the_top_of_the_file_list() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        app.select_last();
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("b.mkv");
+
+        // Act: a lone `g` is not enough.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("b.mkv");
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+
+        // Assert
+        assert_that!(app.selected_file().unwrap().display_name.as_str()).is_equal_to("a.mkv");
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The reset prompt discards staged work, so backing out of it has to be possible
+    /// with either back key and must leave the staged edits alone.
+    #[test]
+    fn the_reset_prompt_should_be_dismissable_with_either_back_key() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            // Arrange
+            let (mut app, directory) = browsing_app();
+            let path = app.selected_file().unwrap().path.clone();
+            app.request_reset_file(path);
+            assert_that!(app.dialog).contains(Dialog::ConfirmReset);
+
+            // Act
+            let outcome = handle_key(&mut app, &mut InputState::default(), key(code));
+
+            // Assert: the prompt is gone and nothing was reset.
+            assert_that!(outcome).is_equal_to(InputOutcome::Continue);
+            assert_that!(app.dialog).is_none();
+            assert_that!(app.pending_reset().is_none()).is_true();
+
+            // Cleanup
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// `r` on a file row asks before discarding that file's staged edits; `R` asks
+    /// about every staged file. Both share their key with a `z` chord, so both have to
+    /// come out the other side of `z_command` still meaning what they said.
+    #[test]
+    fn the_reset_keys_should_survive_sharing_their_letters_with_the_fold_chords() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: lowercase `r` scopes to the selected file.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        assert_that!(app.dialog).contains(Dialog::ConfirmReset);
+        let selected = app.selected_file().unwrap().path.clone();
+        assert_that!(app.pending_reset()).contains(&ResetScope::File(selected));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Act / Assert: uppercase `R` scopes to every staged file.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
+        assert_that!(app.dialog).contains(Dialog::ConfirmReset);
+        assert_that!(app.pending_reset()).contains(&ResetScope::AllFiles);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Act / Assert: `zR` is still the unfold-all chord, not a reset.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
+        assert_that!(app.dialog).is_none();
 
         // Cleanup
         drop(app);
