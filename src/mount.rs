@@ -30,7 +30,13 @@ fn network_mode_override(value: &str) -> Option<MountType> {
 }
 
 pub fn detect_mount_type(path: &Path) -> MountType {
+    // The override answers without touching the filesystem. This runs per probe and per
+    // temporary-path computation, so someone who set `REEL_NETWORK_MODE` precisely to stop
+    // Reel from guessing should not pay a `/proc/mounts` read on every one of them.
     let override_value = env::var("REEL_NETWORK_MODE").ok();
+    if let Some(override_type) = override_value.as_deref().and_then(network_mode_override) {
+        return override_type;
+    }
     #[cfg(target_os = "linux")]
     let mounts_content = fs::read_to_string("/proc/mounts").ok();
     #[cfg(not(target_os = "linux"))]
@@ -195,6 +201,30 @@ mod tests {
                 "{value:?} must fall through to real detection",
             );
         }
+    }
+
+    #[test]
+    fn a_recognised_override_should_answer_without_consulting_proc_mounts() {
+        // The override exists so someone on an exotic mount can stop Reel guessing. It
+        // runs per probe and per temporary-path computation, so it has to answer from the
+        // variable alone — passing no mount table at all must not change the verdict.
+        for (value, expected) in [
+            ("1", MountType::Network),
+            ("true", MountType::Network),
+            ("off", MountType::Local),
+            ("no", MountType::Local),
+        ] {
+            assert_eq!(
+                detect_mount_type_from(Path::new("/mnt/media/movie.mkv"), Some(value), None),
+                expected,
+            );
+        }
+        // An unrecognised value still falls through to real detection rather than
+        // becoming an error, so a typo cannot stop a directory opening.
+        assert_eq!(
+            detect_mount_type_from(Path::new("/mnt/media/movie.mkv"), Some("maybe"), None),
+            MountType::Local,
+        );
     }
 
     #[test]
