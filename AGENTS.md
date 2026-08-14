@@ -37,6 +37,8 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 `src/requirements.rs` holds the minimum versions, each measured rather than guessed. Do not lower one without re-measuring; each is load-bearing.
 
 - **FFmpeg 8.1** (`ffmpeg` *and* `ffprobe`) — enforced at startup, refusing to launch below it. `n8.1` is the first release containing FFmpeg commit `e59d964a3c`, which taught the `mov` demuxer to read the ISO-BMFF `name` atom. Below it `ffprobe` reports MP4/MOV track titles as absent, so a remux erases every title, `apply_edits` writes the erasure out as `title=`, and `validate_result` compares absent against absent and passes it. No flag works around it — the muxer never receives a title the demuxer did not parse. The e2e suite otherwise passes on 5.0.1 through 8.0.1, so the floor is entirely about this.
+- **seconv 5.1.0** — gates subtitle conversion and OCR, not startup. 5.0.0 cannot read a VobSub `.idx` ("Unable to determine subtitle format"). **Cannot be version-gated**: the 5.1.0 build reports `5.0.0` from `--version`, so `subtitle::seconv_is_supported` probes the `--help` listing for `--no-vobsub-isolate-colors` instead. Also needs `libicu` present, or it aborts in `Bootstrap.Initialize`.
+- **Tesseract 4.0** — gates OCR only. Verified working on 4.0.0, 4.1.1, and 5.3.x. 3.x is unreachable regardless: `seconv` needs a newer glibc than any distribution shipping it.
 
 ## Adaptive Filesystem & Performance Architecture
 

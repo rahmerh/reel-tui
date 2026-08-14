@@ -26,6 +26,20 @@ use std::process::{Command, Stdio};
 /// The oldest FFmpeg suite `reel` will run against. See the module docs for why.
 pub const MINIMUM_FFMPEG: Version = Version { major: 8, minor: 1 };
 
+/// The oldest Tesseract `reel` will OCR with. 4.0 is where the LSTM engine and the
+/// `--psm`-style flags `seconv` drives it with arrived; 3.x is unreachable anyway,
+/// because `seconv` needs a newer glibc than any distribution shipping Tesseract 3.
+pub const MINIMUM_TESSERACT: Version = Version { major: 4, minor: 0 };
+
+/// The oldest `seconv` `reel` will convert subtitles with. 5.0.0 cannot read a VobSub
+/// `.idx` at all ("Unable to determine subtitle format"), which is the input every
+/// image-subtitle path starts from.
+///
+/// This one cannot be enforced by version, only by capability: the 5.1.0 build reports
+/// `5.0.0` from `--version`, so a version gate would reject a working install. See
+/// `subtitle::seconv_is_supported`.
+pub const MINIMUM_SECONV: &str = "5.1.0";
+
 /// A `major.minor` version. The patch level never distinguishes a capability `reel`
 /// cares about, so it is parsed away rather than stored.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -131,7 +145,17 @@ fn banner(program: &str) -> Option<String> {
 /// spell it `N-119779-g6c291232cf`, which carries no release at all and so yields
 /// `None` rather than a guess.
 pub fn parse_version(banner: &str) -> Option<Version> {
-    let word = banner.lines().next()?.split_whitespace().nth(2)?;
+    parse_version_word(banner, 2)
+}
+
+/// Extracts `major.minor` from a Tesseract banner's first line (`tesseract 5.5.3`),
+/// where the version is the second word rather than the third.
+pub fn parse_tesseract_version(banner: &str) -> Option<Version> {
+    parse_version_word(banner, 1)
+}
+
+fn parse_version_word(banner: &str, index: usize) -> Option<Version> {
+    let word = banner.lines().next()?.split_whitespace().nth(index)?;
     let digits = word.strip_prefix('n').unwrap_or(word);
     let mut parts = digits
         .split(|character: char| !character.is_ascii_digit())

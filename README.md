@@ -25,8 +25,11 @@ build](https://johnvansickle.com/ffmpeg/) or
 
 Optional subtitle tools:
 
-- `seconv` for PGS/VobSub conversion, image subtitle rendering, and OCR
-- `tesseract` plus installed language data for image-to-text OCR
+- [`seconv` 5.1.0+](https://github.com/SubtitleEdit/subtitleedit/releases) for PGS/VobSub
+  conversion, image subtitle rendering, and OCR. 5.0.0 cannot read a VobSub `.idx` at
+  all. Note that the 5.1.0 build still reports `5.0.0` from `--version`, so Reel detects
+  it by capability instead. It also needs `libicu` installed.
+- `tesseract` 4.0+ plus installed language data for image-to-text OCR
 
 Reel detects optional tools from `PATH`, if not found you can still use the rest of the app.
 

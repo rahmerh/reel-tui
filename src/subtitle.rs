@@ -8,6 +8,7 @@ use std::{
 use isolang::{Language, languages};
 
 use crate::files::{FileEntry, FileFingerprint};
+use crate::requirements::{MINIMUM_SECONV, MINIMUM_TESSERACT, parse_tesseract_version};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SubtitleFormat {
@@ -408,11 +409,13 @@ impl ToolCapabilities {
         let encoders = command_stdout("ffmpeg", &["-hide_banner", "-encoders"]);
         let muxers = command_stdout("ffmpeg", &["-hide_banner", "-muxers"]);
         let ffmpeg = encoders.is_some() && muxers.is_some();
-        let seconv = command_succeeds("seconv", &["--version"]);
-        let tesseract_languages = command_stdout("tesseract", &["--list-langs"])
+        let seconv = command_stdout("seconv", &["--help"])
             .as_deref()
-            .map(parse_tesseract_languages)
-            .unwrap_or_default();
+            .is_some_and(seconv_is_supported);
+        let tesseract_languages = detect_tesseract_languages(
+            || command_stdout("tesseract", &["--version"]),
+            || command_stdout("tesseract", &["--list-langs"]),
+        );
 
         Self {
             ffmpeg,
@@ -479,21 +482,25 @@ impl ToolCapabilities {
             && extracting_embedded
             && !self.seconv
         {
-            return Some("VobSub export requires seconv in PATH".to_string());
+            return Some(format!(
+                "VobSub export requires seconv {MINIMUM_SECONV}+ in PATH"
+            ));
         }
         if source.is_image() && target.is_image() && source != target {
             return Some("cross-image conversion is not safely supported".to_string());
         }
         if source.is_image() && target.is_text() {
             if !self.seconv {
-                return Some("requires seconv in PATH".to_string());
+                return Some(format!("requires seconv {MINIMUM_SECONV}+ in PATH"));
             }
             if self.tesseract_languages.is_empty() {
-                return Some("requires Tesseract language data in PATH".to_string());
+                return Some(format!(
+                    "requires Tesseract {MINIMUM_TESSERACT}+ language data in PATH"
+                ));
             }
         } else if source.is_text() && target.is_image() {
             if !self.seconv {
-                return Some("requires seconv in PATH".to_string());
+                return Some(format!("requires seconv {MINIMUM_SECONV}+ in PATH"));
             }
         } else if source.is_text() && target.is_text() {
             if !self.ffmpeg {
@@ -530,16 +537,6 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn command_succeeds(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn parse_capability_names(output: &str) -> BTreeSet<String> {
     output
         .lines()
@@ -560,6 +557,42 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
             .then(|| name.to_string())
         })
         .collect()
+}
+
+/// The OCR languages `reel` will offer, or none when Tesseract is missing or too old.
+///
+/// The version is consulted before the language list so an ancient Tesseract reports as
+/// having no languages rather than as having languages that OCR badly: `reel` shows the
+/// resulting choice as unavailable, which is recoverable, instead of running the
+/// conversion and writing a subtitle full of garbage, which is not.
+fn detect_tesseract_languages(
+    version: impl FnOnce() -> Option<String>,
+    languages: impl FnOnce() -> Option<String>,
+) -> Vec<String> {
+    if !version().as_deref().is_some_and(tesseract_is_supported) {
+        return Vec::new();
+    }
+    languages()
+        .as_deref()
+        .map(parse_tesseract_languages)
+        .unwrap_or_default()
+}
+
+fn tesseract_is_supported(banner: &str) -> bool {
+    parse_tesseract_version(banner).is_some_and(|version| version >= MINIMUM_TESSERACT)
+}
+
+/// Whether a `seconv --help` listing belongs to a build new enough to use.
+///
+/// `--version` cannot answer this: the 5.1.0 release reports `5.0.0`, so gating on it
+/// rejects the very build `reel` needs. The help listing is the only thing that
+/// distinguishes them, and `--no-vobsub-isolate-colors` is the flag to look for —
+/// 5.1.0 added it as part of the VobSub OCR rework that also taught `seconv` to read a
+/// `.idx` at all, which is what 5.0.0 refuses with "Unable to determine subtitle
+/// format". A newer release that drops the flag would read as unsupported, which fails
+/// closed rather than silently producing empty subtitles.
+fn seconv_is_supported(help: &str) -> bool {
+    help.contains("--no-vobsub-isolate-colors")
 }
 
 fn parse_tesseract_languages(output: &str) -> Vec<String> {
@@ -1449,6 +1482,75 @@ mod tests {
         // Assert
         assert_that!(vobsub.enabled).is_false();
         assert_that!(vobsub.reason.as_deref().unwrap()).contains("cross-image");
+    }
+
+    #[test]
+    fn seconv_should_be_judged_by_its_help_listing_because_its_version_lies() {
+        // Arrange: the v5.1.0 release reports "5.0.0" from `--version`, so a version
+        // gate would reject the exact build reel needs. These are the two listings that
+        // have to be told apart, trimmed to the line that distinguishes them: 5.0.0
+        // cannot read a VobSub `.idx` at all, and 5.1.0's VobSub OCR rework is what
+        // added the colour-isolation flag.
+        let five_zero = "  --ocr-engine:[engine]    OCR engine: tesseract | nocr | \n  \
+                         --time-codes-only        Image sources (.sup/VobSub/PGS/DVB)\n";
+        let five_one = "  --ocr-engine:[engine]    OCR engine: tesseract | nocr | \n  \
+                        --time-codes-only        Image sources (.sup/VobSub/PGS/DVB)\n  \
+                        --no-vobsub-isolate-colors  Disable VobSub OCR colour isolation\n";
+
+        // Act / Assert: mentioning VobSub is not enough — both listings do. Only the
+        // flag itself may count, or 5.0.0 reads as supported and every image-subtitle
+        // conversion fails after the user commits to it.
+        assert_that!(seconv_is_supported(five_zero)).is_false();
+        assert_that!(seconv_is_supported(five_one)).is_true();
+        assert_that!(seconv_is_supported("")).is_false();
+    }
+
+    #[test]
+    fn tesseract_should_be_offered_only_when_it_is_new_enough_to_ocr_well() {
+        // Arrange: the banners of the Tesseract builds reel was measured against, plus
+        // the 3.x that predates the LSTM engine and the flags seconv drives it with.
+        let list = || Some("List of available languages (2):\neng\nosd\nnld\n".to_string());
+
+        // Act
+        let modern = detect_tesseract_languages(|| Some("tesseract 5.5.3\n".to_string()), list);
+        let oldest_supported =
+            detect_tesseract_languages(|| Some("tesseract 4.0.0\n".to_string()), list);
+        let too_old = detect_tesseract_languages(|| Some("tesseract 3.04.01\n".to_string()), list);
+        let missing = detect_tesseract_languages(|| None, list);
+        let unreadable = detect_tesseract_languages(|| Some("tesseract\n".to_string()), list);
+        // A supported Tesseract with no language data installed is still no languages.
+        let no_data = detect_tesseract_languages(|| Some("tesseract 5.5.3\n".to_string()), || None);
+
+        // Assert
+        assert_that!(modern)
+            .contains_exactly_in_given_order(["eng".to_string(), "nld".to_string()]);
+        assert_that!(oldest_supported)
+            .contains_exactly_in_given_order(["eng".to_string(), "nld".to_string()]);
+        assert_that!(too_old).is_empty();
+        assert_that!(missing).is_empty();
+        assert_that!(unreadable).is_empty();
+        assert_that!(no_data).is_empty();
+    }
+
+    #[test]
+    fn a_too_old_tesseract_should_not_be_consulted_for_languages_at_all() {
+        // Arrange: the version has to be checked *before* the language list is read, or
+        // a 3.x install reports usable languages and reel offers an OCR conversion that
+        // silently produces garbage text instead of an unavailable choice.
+        let mut listed = false;
+
+        // Act
+        let languages = detect_tesseract_languages(
+            || Some("tesseract 3.04.01\n".to_string()),
+            || {
+                listed = true;
+                Some("List of available languages (1):\neng\n".to_string())
+            },
+        );
+
+        // Assert
+        assert_that!(languages).is_empty();
+        assert_that!(listed).is_false();
     }
 
     #[test]
