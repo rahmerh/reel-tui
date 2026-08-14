@@ -547,6 +547,12 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
             let mut fields = line.split_whitespace();
             let flags = fields.next()?;
             let name = fields.next()?;
+            // `ffmpeg -encoders` prints its flag legend in the same shape as its entries
+            // (" V..... = Video"), so without this the legend contributes a capability
+            // literally named "=".
+            if name == "=" {
+                return None;
+            }
             (flags.contains('E')
                 || flags.starts_with('V')
                 || flags.starts_with('A')
@@ -1725,6 +1731,9 @@ mod tests {
         assert_that!(capabilities.contains("webvtt")).is_true();
         assert_that!(capabilities.contains("libx264")).is_true();
         assert_that!(capabilities.contains("aac")).is_true();
+        // The flag legend is printed in the same shape as a real entry, so it must not
+        // contribute a capability of its own.
+        assert_that!(capabilities.contains("=")).is_false();
 
         let muxer_output = " File formats:
   D. = Demuxing supported
