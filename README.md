@@ -17,6 +17,8 @@ Optional subtitle tools:
 
 Reel detects optional tools from `PATH`, if not found you can still use the rest of the app.
 
+Desktop completion notifications use `notify-send` when it is available.
+
 ## Installation
 
 ```sh
@@ -35,6 +37,14 @@ Or pass a target directory path:
 
 ```sh
 reel /path/to/media
+```
+
+Desktop notifications are enabled by default. Disable them in
+`~/.config/reel/config.toml`:
+
+```toml
+[notifications]
+enabled = false
 ```
 
 Use `reel --help` (or `reel -h`) to show command-line help, and `reel --version`

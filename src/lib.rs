@@ -10,6 +10,7 @@ pub mod edit;
 pub mod files;
 pub mod input;
 pub mod mount;
+pub mod notification;
 pub mod probe;
 pub mod staging;
 pub mod subtitle;

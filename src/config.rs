@@ -12,6 +12,7 @@ use serde::Deserialize;
 /// (adaptive polling interval, local-scratch remuxing).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
+    pub notifications: bool,
     pub transcode_workers: usize,
     pub remux_workers: usize,
     pub network_transcode_workers: usize,
@@ -21,6 +22,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            notifications: true,
             transcode_workers: 1,
             remux_workers: 5,
             network_transcode_workers: 1,
@@ -35,7 +37,13 @@ const MAX_WORKERS: usize = 16;
 
 #[derive(Deserialize, Default)]
 struct RawConfig {
+    notifications: Option<RawNotifications>,
     workers: Option<RawWorkers>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawNotifications {
+    enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -100,9 +108,11 @@ impl Config {
             return defaults;
         };
         let raw: RawConfig = toml::from_str(&contents).unwrap_or_default();
+        let notifications = raw.notifications.unwrap_or_default();
         let workers = raw.workers.unwrap_or_default();
         let network = workers.network.unwrap_or_default();
         Self {
+            notifications: notifications.enabled.unwrap_or(defaults.notifications),
             transcode_workers: clamp(workers.transcode.unwrap_or(defaults.transcode_workers)),
             remux_workers: clamp(workers.remux.unwrap_or(defaults.remux_workers)),
             network_transcode_workers: clamp(
@@ -172,13 +182,14 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            b"[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n",
+            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n",
         )
         .unwrap();
         let config = Config::load_from(&path);
         assert_eq!(
             config,
             Config {
+                notifications: false,
                 transcode_workers: 2,
                 remux_workers: 8,
                 network_transcode_workers: 3,
@@ -331,6 +342,7 @@ mod tests {
     #[test]
     fn effective_workers_should_use_the_network_limits_only_on_a_network_mount() {
         let config = Config {
+            notifications: false,
             transcode_workers: 1,
             remux_workers: 5,
             network_transcode_workers: 1,
@@ -338,5 +350,25 @@ mod tests {
         };
         assert_eq!(config.effective_workers(false), (1, 5));
         assert_eq!(config.effective_workers(true), (1, 1));
+    }
+
+    #[test]
+    fn notifications_should_be_enabled_by_default_and_individually_configurable() {
+        let directory = scratch("notifications");
+        let path = directory.join("config.toml");
+
+        assert!(Config::default().notifications);
+        fs::write(&path, b"[notifications]\nenabled = false\n").unwrap();
+        let config = Config::load_from(&path);
+
+        assert!(!config.notifications);
+        assert_eq!(
+            config,
+            Config {
+                notifications: false,
+                ..Config::default()
+            }
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

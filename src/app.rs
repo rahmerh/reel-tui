@@ -1034,6 +1034,10 @@ pub struct App {
     /// (in `confirm_process_all`) and sent to whichever of these matches.
     transcode_tx: Sender<EditRequest>,
     remux_tx: Sender<EditRequest>,
+    /// Optional best-effort desktop notification channel. `main` only supplies it
+    /// when notifications are enabled in the user's config; tests and other library
+    /// consumers remain notification-free unless they explicitly opt in.
+    completion_notification_tx: Option<Sender<PathBuf>>,
     /// State for an in-flight "process all staged files" batch
     /// (`Dialog::BatchProcessing`/`ConfirmCancel`) — the sole edit-processing path;
     /// even a single staged file goes through a one-item batch, so `App` no longer
@@ -1159,6 +1163,7 @@ impl App {
             request_tx,
             transcode_tx,
             remux_tx,
+            completion_notification_tx: None,
             active_batch: None,
             pending_reset: None,
             reset_choice: ResetChoice::default(),
@@ -1190,6 +1195,10 @@ impl App {
         };
         app.apply_directory_snapshot(snapshot);
         Ok(app)
+    }
+
+    pub fn set_completion_notification_sender(&mut self, sender: Option<Sender<PathBuf>>) {
+        self.completion_notification_tx = sender;
     }
 
     /// Returns whether any snapshot was applied, so the main loop can skip redrawing
@@ -1918,6 +1927,9 @@ impl App {
                         ..
                     } => {
                         self.unstage_consumed_file(&path);
+                        if let Some(sender) = &self.completion_notification_tx {
+                            let _ = sender.send(output.clone());
+                        }
                         output_path = Some(output);
                         BatchItemStatus::Completed
                     }
@@ -11366,6 +11378,8 @@ mod tests {
         let directory = app.directory.clone();
         let files = app.files.clone();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+        app.set_completion_notification_sender(Some(notification_tx));
         app.dialog = Some(Dialog::BatchProcessing);
         app.active_batch = Some(crate::staging::BatchState {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -11444,7 +11458,7 @@ mod tests {
             .send(EditEvent::Finished {
                 path: files[0].path.clone(),
                 outcome: EditOutcome::Completed {
-                    output_path: files[0].path.clone(),
+                    output_path: directory.join("a.mp4"),
                     media_changed: true,
                 },
             })
@@ -11452,6 +11466,7 @@ mod tests {
         app.receive_edit_results(&result_rx);
         assert_that!(app.dialog).is_equal_to(Some(Dialog::BatchProcessing));
         assert!(!app.staged_edits.contains_key(&files[0].path));
+        assert_eq!(notification_rx.try_recv(), Ok(directory.join("a.mp4")));
 
         // b.mkv fails; the batch is now fully terminal and must auto-close with a
         // summary notice, since every item has reached a terminal state.
@@ -11466,6 +11481,11 @@ mod tests {
         assert!(app.active_batch.is_none());
         assert_that!(app.notice.as_deref().unwrap()).contains("1 of 2");
         assert_that!(app.notice.as_deref().unwrap()).contains("1 failed");
+        assert_eq!(
+            notification_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "failed files must not produce completion notifications"
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }

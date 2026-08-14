@@ -476,6 +476,9 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
     let untouched_before = fs::read(scratch.join("untouched.mkv")).unwrap();
 
     let mut app = Harness::start(scratch);
+    let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+    app.app
+        .set_completion_notification_sender(Some(notification_tx));
     for name in ["alpha.mkv", "bravo.mkv"] {
         app.open(name);
         let second_audio = app
@@ -535,6 +538,16 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
         fs::read(app.path("untouched.mkv")).unwrap(),
         untouched_before,
         "processing staged files must not rewrite an unstaged neighbor"
+    );
+    let mut notified = notification_rx
+        .try_iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    notified.sort();
+    assert_eq!(
+        notified,
+        ["alpha.mkv", "bravo.mkv"],
+        "each successfully processed file should emit one completion notification"
     );
 }
 
