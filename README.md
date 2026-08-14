@@ -2,7 +2,8 @@
 
 > ❗ This project is 100% vibe coded using AI. I just wanted a tool quickly, I'll probably rewrite this myself in the future. ❗
 
-A TUI to inspect and edit video file metadata. Uses ffprobe and ffmpeg to inspect and edit media files.
+A TUI for inspecting, editing, and converting media files. Uses ffprobe and ffmpeg to inspect
+and edit media files.
 
 ## Requirements
 
@@ -35,6 +36,9 @@ Or pass a target directory path:
 ```sh
 reel /path/to/media
 ```
+
+Use `reel --help` (or `reel -h`) to show command-line help, and `reel --version`
+(or `reel -V`) to print the installed version.
 
 ## How It Works
 

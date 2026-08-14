@@ -21,6 +21,7 @@ mod harness;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::process::Command;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
@@ -34,6 +35,39 @@ use harness::{
 use reel_tui::app::{
     AudioSettingsField, ContainerSettingsField, Layer, SubtitleSettingsField, TrackRef,
 };
+use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
+
+/// Command-line informational and usage-error paths must exit before terminal setup
+/// or media workers start, with output suitable for scripts and shell users.
+#[test]
+fn cli_flags_should_report_help_version_and_usage_errors_without_starting_the_tui() {
+    let binary = env!("CARGO_BIN_EXE_reel");
+
+    for flag in ["--help", "-h"] {
+        let output = Command::new(binary).arg(flag).output().unwrap();
+        assert!(output.status.success(), "{flag} should succeed");
+        assert_eq!(output.stdout, HELP_TEXT.as_bytes());
+        assert!(output.stderr.is_empty());
+    }
+
+    for flag in ["--version", "-V"] {
+        let output = Command::new(binary).arg(flag).output().unwrap();
+        assert!(output.status.success(), "{flag} should succeed");
+        assert_eq!(output.stdout, VERSION_TEXT.as_bytes());
+        assert!(output.stderr.is_empty());
+    }
+
+    let output = Command::new(binary).arg("--wat").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "error: unknown option '--wat'\n\n{USAGE}\n\n\
+             For more information, try '--help'.\n"
+        )
+    );
+}
 
 /// Browsing is the front door to every edit. This scenario covers the real directory
 /// monitor, probe worker, file search (including a sidecar-only match), fold commands,
