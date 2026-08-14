@@ -24,6 +24,10 @@ fn main() -> ExitCode {
 }
 
 fn run(target_dir: PathBuf) -> Result<()> {
+    // Before the terminal is touched, so an unsupported FFmpeg reports as a plain
+    // stderr line instead of a message painted onto an alternate screen that is torn
+    // down a moment later.
+    reel_tui::requirements::check_ffmpeg_suite()?;
     let target_dir = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
     let directory_rx = spawn_directory_monitor(target_dir.clone());
     let (request_tx, result_rx) = spawn_probe_worker();

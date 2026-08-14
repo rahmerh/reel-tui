@@ -37,6 +37,111 @@ use reel_tui::app::{
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 
+/// An FFmpeg older than the supported floor has to stop `reel` at the door.
+///
+/// Below FFmpeg 8.1 the `mov` demuxer does not read the ISO-BMFF `name` atom, so
+/// ffprobe reports every MP4/MOV track title as absent. Remuxing then erases all of
+/// them, `apply_edits` writes the erasure out as `title=`, and `validate_result`
+/// compares absent against absent and calls it correct — the loss is silent end to end.
+/// Starting up and letting the user reach Save is not an option, so this asserts the
+/// refusal happens before the TUI does anything, with a message that names the version
+/// found and what it costs.
+///
+/// The old and unversioned builds are stub `ffprobe`/`ffmpeg` scripts on `PATH` rather
+/// than real downloads: the behaviour under test is `reel`'s reaction to a banner, and
+/// vendoring a 7.1 toolchain into the test tree to produce one banner would trade
+/// minutes of fixture wrangling for nothing. Every other scenario in this file runs the
+/// genuine binaries.
+#[test]
+fn an_unsupported_ffmpeg_should_refuse_to_start_instead_of_silently_losing_titles() {
+    let binary = env!("CARGO_BIN_EXE_reel");
+    let scratch = Scratch::new("ffmpeg-floor");
+
+    let stub = |name: &str, banner: &str| {
+        let path = scratch.join(name);
+        fs::write(&path, format!("#!/bin/sh\necho '{banner}'\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    };
+
+    // A real n7.1.1 banner: the newest release that still cannot read the atom.
+    stub(
+        "ffprobe",
+        "ffprobe version n7.1.1-20-g9373b442a6 Copyright (c) 2007-2025",
+    );
+    stub(
+        "ffmpeg",
+        "ffmpeg version n7.1.1-20-g9373b442a6 Copyright (c) 2000-2025",
+    );
+
+    let run = |path: &str| {
+        Command::new(binary)
+            .arg(scratch.path())
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    };
+
+    let outdated = run(&scratch.path().to_string_lossy());
+    assert!(!outdated.status.success(), "an old FFmpeg must not launch");
+    assert!(outdated.stdout.is_empty(), "the TUI must not have drawn");
+    let message = String::from_utf8(outdated.stderr).unwrap();
+    assert!(
+        message.contains("8.1") && message.contains("`ffprobe` is 7.1"),
+        "the refusal must name the floor and the version found, got: {message}"
+    );
+    assert!(
+        message.contains("silently erases every title"),
+        "the refusal must say what running anyway would cost, got: {message}"
+    );
+
+    // A git snapshot carries no release in its banner. Guessing would defeat the floor,
+    // so it is refused too — with a message that quotes what could not be parsed.
+    stub("ffprobe", "ffprobe version N-119779-g6c291232cf Copyright");
+    let unversioned = run(&scratch.path().to_string_lossy());
+    assert!(!unversioned.status.success());
+    let message = String::from_utf8(unversioned.stderr).unwrap();
+    assert!(
+        message.contains("could not determine the version") && message.contains("N-119779"),
+        "an unversioned build must be refused by name, got: {message}"
+    );
+
+    // No FFmpeg at all is the same refusal, pointed at installing it.
+    let absent = run("");
+    assert!(!absent.status.success());
+    let message = String::from_utf8(absent.stderr).unwrap();
+    assert!(
+        message.contains("could not run `ffprobe`") && message.contains("PATH"),
+        "a missing FFmpeg must be refused actionably, got: {message}"
+    );
+
+    // The gate must not be a blanket refusal. A supported banner gets past it — the run
+    // still fails, because a piped stdin is not a terminal, but it fails on something
+    // other than the floor.
+    stub("ffprobe", "ffprobe version n8.1.2 Copyright (c) 2007-2026");
+    stub("ffmpeg", "ffmpeg version n8.1.2 Copyright (c) 2000-2026");
+    let supported = run(&scratch.path().to_string_lossy());
+    let message = String::from_utf8(supported.stderr).unwrap();
+    assert!(
+        !message.contains("reel requires FFmpeg"),
+        "a supported FFmpeg must clear the floor, got: {message}"
+    );
+
+    // The check runs after argument parsing, so `--help` still works on a machine with
+    // no FFmpeg at all — otherwise the one command that could explain the requirement
+    // would be the one the requirement blocks.
+    let help = Command::new(binary)
+        .arg("--help")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "--help must not need FFmpeg");
+    assert_eq!(help.stdout, HELP_TEXT.as_bytes());
+}
+
 /// Command-line informational and usage-error paths must exit before terminal setup
 /// or media workers start, with output suitable for scripts and shell users.
 #[test]

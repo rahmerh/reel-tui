@@ -12,6 +12,7 @@ pub mod input;
 pub mod mount;
 pub mod notification;
 pub mod probe;
+pub mod requirements;
 pub mod staging;
 pub mod subtitle;
 pub mod ui;

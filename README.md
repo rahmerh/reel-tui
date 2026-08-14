@@ -8,7 +8,20 @@ and edit media files.
 ## Requirements
 
 - A recent Rust toolchain
-- `ffprobe` and `ffmpeg` available in `PATH`
+- **FFmpeg 8.1 or newer** — both `ffprobe` and `ffmpeg` in `PATH`
+
+Reel refuses to start on older FFmpeg builds, and the floor is deliberately strict.
+FFmpeg 8.1 is the first release whose `mov` demuxer reads a track title back out of the
+ISO-BMFF `name` atom. On anything older, `ffprobe` reports every MP4/MOV track title as
+absent even though it is there, so remuxing an MP4 or MOV **erases all of its track
+titles** — including on a plain stream copy, and including titles Reel itself just
+wrote. Nothing in Reel can work around a demuxer that does not parse the atom, so it
+declines to touch your files rather than quietly damage them.
+
+FFmpeg 8.1 landed in November 2025 and has not reached most distribution repositories
+yet. On Debian, Ubuntu, or Fedora you will likely need a [static
+build](https://johnvansickle.com/ffmpeg/) or
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) on your `PATH`.
 
 Optional subtitle tools:
 

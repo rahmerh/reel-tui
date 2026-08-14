@@ -32,6 +32,12 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - The harness redirects `XDG_CACHE_HOME` to throwaway storage, so runs never touch the user's real probe cache or failure log. The unit-test binary is covered separately: `DiskCache::cache_dir()` returns throwaway storage under `cfg(test)` (`src/cache.rs`). **Both halves are load-bearing** — without them a test run rewrites `~/.cache/reel-tui/probe_cache.json` with `/tmp` fixture paths and fills `edit_errors.log` with deliberately-failing test edits, which is exactly the log this file tells you to read first. Never add a test that resolves the real cache directory.
 - **Prove every new test fails against the code it is meant to catch.** Break the behavior deliberately — revert the fix, or invert the condition the scenario exercises — confirm the test fails, then restore it. This applies to e2e scenarios and unit tests alike. A test that passes against broken code is worse than no test, because it converts an unchecked path into a checked-looking one. State in the change summary which tests were proven this way and how they were broken. A feature-level e2e scenario still need not reproduce every defect in that feature; focused regression coverage belongs in the unit suite.
 
+## External Tool Floors
+
+`src/requirements.rs` holds the minimum versions, each measured rather than guessed. Do not lower one without re-measuring; each is load-bearing.
+
+- **FFmpeg 8.1** (`ffmpeg` *and* `ffprobe`) — enforced at startup, refusing to launch below it. `n8.1` is the first release containing FFmpeg commit `e59d964a3c`, which taught the `mov` demuxer to read the ISO-BMFF `name` atom. Below it `ffprobe` reports MP4/MOV track titles as absent, so a remux erases every title, `apply_edits` writes the erasure out as `title=`, and `validate_result` compares absent against absent and passes it. No flag works around it — the muxer never receives a title the demuxer did not parse. The e2e suite otherwise passes on 5.0.1 through 8.0.1, so the floor is entirely about this.
+
 ## Adaptive Filesystem & Performance Architecture
 
 `reel-tui` automatically detects whether the target directory resides on a local disk or a remote network mount (NFS, SMB, etc.):
