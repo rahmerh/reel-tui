@@ -20,10 +20,7 @@ use crate::{
         SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
         TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
-    edit::{
-        AudioQuality, AudioSampleRate, AudioSettings, ContainerFormat, audio_bitrate_kbps,
-        effective_audio_codec, stream_channels, stream_index,
-    },
+    edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
     subtitle::{
@@ -1192,12 +1189,28 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_resolve_conflicts_dialog(frame, app);
         return;
     }
-    let title = " Error ";
-    let body = app
-        .edit_error
-        .clone()
-        .unwrap_or_else(|| "An unknown editing error occurred.".to_string());
-    let color = Color::Red;
+    // Matched exhaustively rather than falling through to the error popup: every dialog
+    // above returns, so a new `Dialog` variant that forgets to must fail to compile here
+    // instead of silently rendering itself as an editing error.
+    let (title, body, color) = match dialog {
+        Dialog::Keybindings
+        | Dialog::ContainerSettings
+        | Dialog::AudioSettings
+        | Dialog::VideoSettings
+        | Dialog::SubtitleSettings
+        | Dialog::ConfirmCancel
+        | Dialog::ConfirmProcessAll
+        | Dialog::BatchProcessing
+        | Dialog::ConfirmReset
+        | Dialog::ResolveConflicts => unreachable!("handled and returned above"),
+        Dialog::Error => (
+            " Error ",
+            app.edit_error
+                .clone()
+                .unwrap_or_else(|| "An unknown editing error occurred.".to_string()),
+            Color::Red,
+        ),
+    };
     let area = centered_fixed(frame.area(), 64, 9);
     let text = padded_popup_text(Text::from(body));
     frame.render_widget(Clear, area);
@@ -3861,25 +3874,6 @@ fn audio_stream_for_display(
             "channel_layout".to_string(),
             Value::String(layout.to_string()),
         );
-    }
-    if let AudioSampleRate::Hz(rate) = settings.sample_rate {
-        staged.insert("sample_rate".to_string(), Value::String(rate.to_string()));
-    }
-    if settings.quality != AudioQuality::Source {
-        let channels = settings
-            .channel_layout
-            .channels()
-            .or_else(|| stream_channels(stream));
-        let codec = effective_audio_codec(stream, settings);
-        if let Some(rate) = codec
-            .zip(channels)
-            .and_then(|(codec, channels)| audio_bitrate_kbps(codec, channels, settings.quality))
-        {
-            staged.insert(
-                "bit_rate".to_string(),
-                Value::String((rate * 1_000).to_string()),
-            );
-        }
     }
     let tags = staged
         .entry("tags".to_string())
@@ -8634,8 +8628,6 @@ mod tests {
             crate::edit::AudioSettings {
                 codec: crate::edit::AudioCodec::Ac3,
                 channel_layout: crate::edit::AudioChannelLayout::Mono,
-                quality: crate::edit::AudioQuality::Balanced,
-                sample_rate: crate::edit::AudioSampleRate::Hz(32_000),
                 metadata: crate::edit::AudioMetadata {
                     language: "nld".to_string(),
                     title: Some("Director commentary".to_string()),
@@ -8673,9 +8665,7 @@ mod tests {
             .contains("Language: Dutch")
             .contains("Role: Commentary")
             .contains("Format: Dolby Digital (AC-3)")
-            .contains("Channels: Mono")
-            .contains("Bitrate: 128 kb/s")
-            .contains("Sample rate: 32 kHz");
+            .contains("Channels: Mono");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -8688,8 +8678,6 @@ mod tests {
             crate::edit::AudioSettings {
                 codec: crate::edit::AudioCodec::Ac3,
                 channel_layout: crate::edit::AudioChannelLayout::Original,
-                quality: crate::edit::AudioQuality::Source,
-                sample_rate: crate::edit::AudioSampleRate::Original,
                 metadata: crate::edit::AudioMetadata {
                     language: "eng".to_string(),
                     title: None,
@@ -8776,8 +8764,6 @@ mod tests {
             crate::edit::AudioSettings {
                 codec: crate::edit::AudioCodec::Ac3,
                 channel_layout: crate::edit::AudioChannelLayout::Mono,
-                quality: crate::edit::AudioQuality::Source,
-                sample_rate: crate::edit::AudioSampleRate::Original,
                 metadata: crate::edit::AudioMetadata {
                     language: "nld".to_string(),
                     title: Some("Commentary".to_string()),
@@ -8886,8 +8872,6 @@ mod tests {
                 &AudioSettings {
                     codec: AudioCodec::Ac3,
                     channel_layout: layout,
-                    quality: AudioQuality::Balanced,
-                    sample_rate: AudioSampleRate::Hz(32_000),
                     metadata: AudioMetadata {
                         language: "eng".to_string(),
                         title: None,
@@ -8900,7 +8884,6 @@ mod tests {
                 },
             );
             assert_eq!(string(&staged, "channel_layout"), Some(expected));
-            assert_eq!(string(&staged, "sample_rate"), Some("32000"));
         }
 
         let titled_stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
@@ -8913,8 +8896,6 @@ mod tests {
         let mut titled = AudioSettings {
             codec: AudioCodec::Original,
             channel_layout: AudioChannelLayout::Original,
-            quality: AudioQuality::Source,
-            sample_rate: AudioSampleRate::Original,
             metadata: AudioMetadata {
                 language: "eng".to_string(),
                 title: None,

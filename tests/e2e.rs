@@ -1210,10 +1210,11 @@ fn a_custom_downscale_should_reach_the_encoder_with_the_requested_dimensions() {
 /// that produced the recorded default-disposition failure. This drives every
 /// meaningful visible Matroska audio field through the popup, including moving the
 /// default flag between neighboring audio tracks, and then verifies the real encoded
-/// file. The hidden quality and sample-rate controls must resolve to a balanced AC-3
-/// bitrate and automatically downsample the incompatible 96 kHz source. The edited
-/// track starts as Original, reproducing the save-time conflict that appeared only
-/// after another supported Matroska role was selected.
+/// file. Bitrate and sample rate are chosen for the user rather than offered, so this
+/// also pins that choice: an AC-3 bitrate for the layout, and an automatic downsample of
+/// the 96 kHz source AC-3 cannot carry. The edited track starts as Original, reproducing
+/// the save-time conflict that appeared only after another supported Matroska role was
+/// selected.
 #[test]
 fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor() {
     let test = "editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neighbor";
@@ -1383,11 +1384,15 @@ fn converting_audio_metadata_to_mp4_should_drop_unsupported_roles_and_preserve_i
             .contains(&AudioSettingsField::Original),
         "MP4's unsupported Original role should not be editable"
     );
+    // The staged edit keeps the source's Original role even though MP4 cannot store it:
+    // the container target is not a decision the user made about this flag, and it has to
+    // come back intact if they pick MKV again. The drop happens when the file is written,
+    // which the probe below checks.
     let effective = app
         .app
         .effective_audio_settings(1)
         .expect("the selected audio track should have effective settings");
-    assert!(!effective.metadata.original);
+    assert!(effective.metadata.original);
     assert!(effective.metadata.commentary);
     app.choose_audio_setting(AudioSettingsField::Codec, "ALAC");
     app.close_audio_settings();
@@ -1413,6 +1418,69 @@ fn converting_audio_metadata_to_mp4_should_drop_unsupported_roles_and_preserve_i
     );
     assert!(stream_disposition(neighbor, "comment"));
     assert!(!stream_disposition(neighbor, "original"));
+}
+
+/// A `tmcd` timecode track is what a camera writes into an MP4, and ffmpeg genuinely
+/// refuses to write one back out ("codec not currently supported in container"). Reel
+/// shows no row for it, so it can be neither dropped nor converted — which makes the
+/// up-front refusal the only useful outcome. Without it the batch starts, runs, and dies
+/// on a raw muxer error with the work already half done.
+#[test]
+fn a_stream_reel_cannot_edit_should_be_refused_before_the_batch_starts() {
+    let test = "a_stream_reel_cannot_edit_should_be_refused_before_the_batch_starts";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("unwritable-stream");
+    write_media(
+        &scratch.join("clip.mp4"),
+        &MediaSpec::mp4()
+            .audio(&["eng", "nld"])
+            .timecode("00:00:00:00"),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mp4");
+    let before = fs::read(app.path("clip.mp4")).unwrap();
+    let probed = probe(&app.path("clip.mp4"));
+    assert!(
+        probed
+            .streams
+            .iter()
+            .any(|stream| stream.get("codec_type").and_then(|kind| kind.as_str()) == Some("data")),
+        "the fixture should carry the timecode track this scenario is about"
+    );
+
+    // An edit that says nothing about the data track: move the default audio flag.
+    let second_audio = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(2))
+        .expect("the second audio track should have a row");
+    app.open_audio_settings(second_audio);
+    app.toggle_audio_field(AudioSettingsField::Default);
+    app.close_audio_settings();
+    app.press(harness::ctrl('s'));
+
+    let error = app.app.edit_error.clone().unwrap_or_default();
+    assert!(
+        error.contains("data track") && error.contains("MP4 can't contain"),
+        "the refusal should name the unwritable track, got: {error:?}"
+    );
+    assert!(
+        !error.contains("codec not currently supported"),
+        "the raw muxer error leaked to the user: {error}"
+    );
+    assert!(
+        app.app.active_batch.is_none(),
+        "nothing should have been dispatched"
+    );
+    assert_eq!(
+        fs::read(app.path("clip.mp4")).unwrap(),
+        before,
+        "a refused edit must not touch the source"
+    );
+    app.assert_no_temp_leftovers();
 }
 
 /// > Failed: test.mp4 (container: MKV) — Could not extract subtitle for conversion:

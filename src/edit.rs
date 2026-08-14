@@ -207,53 +207,14 @@ impl AudioChannelLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioQuality {
-    Source,
-    Compact,
-    Balanced,
-    High,
-}
-
-impl AudioQuality {
-    pub const PRESETS: [Self; 3] = [Self::Compact, Self::Balanced, Self::High];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Source => "Source",
-            Self::Compact => "Compact",
-            Self::Balanced => "Balanced",
-            Self::High => "High",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioSampleRate {
-    Original,
-    Hz(u32),
-}
-
-impl AudioSampleRate {
-    pub const TARGETS: [u32; 15] = [
-        192_000, 176_400, 96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000,
-        12_000, 11_025, 8_000, 7_350,
-    ];
-
-    pub fn label(self) -> String {
-        match self {
-            Self::Original => "Original".to_string(),
-            Self::Hz(rate) if rate % 1_000 == 0 => format!("{} kHz", rate / 1_000),
-            Self::Hz(rate) => {
-                let value = format!("{:.3}", rate as f64 / 1_000.0)
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string();
-                format!("{value} kHz")
-            }
-        }
-    }
-}
+/// Sample rates an encoder may be asked for, highest first. Reel never offers these to
+/// the user: `resolved_audio_sample_rate` keeps the source rate whenever the chosen codec
+/// accepts it, and otherwise steps down to the highest rate the codec does accept, which
+/// is the safe automatic behaviour the readme promises.
+const AUDIO_SAMPLE_RATE_CANDIDATES: [u32; 15] = [
+    192_000, 176_400, 96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000,
+    12_000, 11_025, 8_000, 7_350,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioMetadata {
@@ -331,14 +292,10 @@ impl AudioMetadata {
 pub struct AudioSettings {
     pub codec: AudioCodec,
     pub channel_layout: AudioChannelLayout,
-    pub quality: AudioQuality,
-    pub sample_rate: AudioSampleRate,
     pub metadata: AudioMetadata,
 }
 
 pub(crate) const CHANNEL_UPMIX_NOT_IMPLEMENTED: &str = "Channel upmixing is not implemented.";
-pub(crate) const SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED: &str =
-    "Sample-rate upsampling is not implemented.";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ContainerFormat {
@@ -838,16 +795,7 @@ pub enum EditOutcome {
 /// low worker count to avoid several encodes contending for cores) or the remux pool
 /// (I/O-bound, safe to run with much higher concurrency) — see
 /// `spawn_edit_worker_pools`.
-#[cfg(test)]
 pub(crate) fn plan_requires_transcode(
-    info: &MediaInfo,
-    stream_order: &[u64],
-    video_settings: &BTreeMap<u64, VideoSettings>,
-) -> bool {
-    plan_requires_transcode_with_audio(info, stream_order, &BTreeMap::new(), video_settings)
-}
-
-pub(crate) fn plan_requires_transcode_with_audio(
     info: &MediaInfo,
     stream_order: &[u64],
     audio_settings: &BTreeMap<u64, AudioSettings>,
@@ -942,6 +890,17 @@ fn append_edit_failure_log(log_path: &Path, request: &EditRequest, kind: &str, m
     }
 }
 
+/// The text of a caught panic, for the failure the user sees and the entry
+/// `log_edit_failure` writes. `Box<dyn Any>` carries the payload `panic!` was given,
+/// which is a `&str` for a literal and a `String` once it has been formatted.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "an unknown internal error".to_string())
+}
+
 fn run_edit_worker_pool(
     request_rx: Arc<Mutex<Receiver<EditRequest>>>,
     result_tx: Sender<EditEvent>,
@@ -963,32 +922,47 @@ fn run_edit_worker_pool(
                 };
                 let progress_tx = result_tx.clone();
                 let progress_path = request.path.clone();
-                let result = apply_edits_with_audio(
-                    EditTarget {
-                        source: &request.path,
-                        destination: request.destination,
-                        container: request.container,
-                        container_metadata: request.container_metadata.as_ref(),
-                    },
-                    TrackEdits {
-                        stream_order: &request.stream_order,
-                        deleted_streams: &request.deleted_streams,
-                        default_streams: &request.default_streams,
-                        default_sidecars: &request.default_sidecars,
-                        video_settings: &request.video_settings,
-                        subtitle_changes: &request.subtitle_changes,
-                        left_subtitle_order: &request.left_subtitle_order,
-                        sidecars: &request.sidecars,
-                    },
-                    &request.audio_settings,
-                    &request.cancelled,
-                    |progress| {
-                        let _ = progress_tx.send(EditEvent::Progress {
-                            path: progress_path.clone(),
-                            progress,
-                        });
-                    },
-                );
+                // A panic here — a broken invariant in the plan, a `.expect` in the
+                // ffmpeg command builder — would otherwise unwind the whole worker,
+                // poisoning `request_rx` so every *other* worker in this pool breaks out
+                // of its loop too, and leaving the batch waiting on an `EditEvent` that
+                // can never arrive. One request failing is recoverable; the pool silently
+                // dying while the UI reports "processing" is not.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    apply_edits(
+                        EditTarget {
+                            source: &request.path,
+                            destination: request.destination,
+                            container: request.container,
+                            container_metadata: request.container_metadata.as_ref(),
+                        },
+                        TrackEdits {
+                            stream_order: &request.stream_order,
+                            deleted_streams: &request.deleted_streams,
+                            default_streams: &request.default_streams,
+                            default_sidecars: &request.default_sidecars,
+                            audio_settings: &request.audio_settings,
+                            video_settings: &request.video_settings,
+                            subtitle_changes: &request.subtitle_changes,
+                            left_subtitle_order: &request.left_subtitle_order,
+                            sidecars: &request.sidecars,
+                        },
+                        &request.cancelled,
+                        |progress| {
+                            let _ = progress_tx.send(EditEvent::Progress {
+                                path: progress_path.clone(),
+                                progress,
+                            });
+                        },
+                    )
+                }))
+                .unwrap_or_else(|payload| {
+                    Err(EditError::Failed(format!(
+                        "The media edit failed unexpectedly: {}. The original file was not \
+                         replaced.",
+                        panic_message(&payload)
+                    )))
+                });
                 let outcome = match result {
                     Ok(result) => EditOutcome::Completed {
                         output_path: result.output_path,
@@ -1095,25 +1069,7 @@ fn describe_index_diff(indices: &[&u64]) -> String {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn validate_edit(
-    info: &MediaInfo,
-    stream_order: &[u64],
-    deleted_streams: &BTreeSet<u64>,
-    default_streams: &BTreeSet<u64>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-) -> Result<(), String> {
-    validate_edit_with_audio(
-        info,
-        stream_order,
-        deleted_streams,
-        default_streams,
-        &BTreeMap::new(),
-        video_settings,
-    )
-}
-
-pub(crate) fn validate_edit_with_audio(
     info: &MediaInfo,
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
@@ -1196,28 +1152,12 @@ pub(crate) fn validate_edit_with_audio(
         }
         let source_rate = stream_sample_rate(stream)
             .ok_or_else(|| format!("The sample rate for audio track #{index} is unavailable."))?;
-        if let AudioSampleRate::Hz(sample_rate) = settings.sample_rate
-            && sample_rate > source_rate
-        {
-            return Err(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED.to_string());
-        }
-        let sample_rate = resolved_audio_sample_rate(codec, source_rate, settings.sample_rate)
-            .ok_or_else(|| {
-                format!(
-                    "{} cannot use the source sample rate; choose another codec.",
-                    codec.label()
-                )
-            })?;
-        if !codec.supports_sample_rate(sample_rate) {
-            return Err(format!(
-                "{} does not support a {} sample rate; choose another rate or codec.",
-                codec.label(),
-                AudioSampleRate::Hz(sample_rate).label()
-            ));
-        }
-        if codec.is_lossless() && settings.quality != AudioQuality::Source {
-            return Err("Lossless audio codecs do not use a bitrate quality preset.".to_string());
-        }
+        resolved_audio_sample_rate(codec, source_rate).ok_or_else(|| {
+            format!(
+                "{} cannot use the source sample rate; choose another codec.",
+                codec.label()
+            )
+        })?;
     }
     if !video_settings.keys().all(|index| ordered.contains(index)) {
         return Err("Video settings refer to a missing or deleted track.".to_string());
@@ -1303,25 +1243,7 @@ pub(crate) fn validate_edit_with_audio(
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn container_conflicts(
-    info: &MediaInfo,
-    stream_order: &[u64],
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    subtitle_changes: &[SubtitleChange],
-    target: ContainerFormat,
-) -> Vec<String> {
-    container_conflicts_with_audio(
-        info,
-        stream_order,
-        &BTreeMap::new(),
-        video_settings,
-        subtitle_changes,
-        target,
-    )
-}
-
-pub(crate) fn container_conflicts_with_audio(
     info: &MediaInfo,
     stream_order: &[u64],
     audio_settings: &BTreeMap<u64, AudioSettings>,
@@ -1336,14 +1258,13 @@ pub(crate) fn container_conflicts_with_audio(
         video_settings,
         subtitle_changes,
         target,
-        true,
     )
     .into_iter()
     .map(|(_, message)| message)
     .collect()
 }
 
-pub(crate) fn container_conflict_streams_with_audio(
+pub(crate) fn container_conflict_streams(
     info: &MediaInfo,
     stream_order: &[u64],
     audio_settings: &BTreeMap<u64, AudioSettings>,
@@ -1358,7 +1279,6 @@ pub(crate) fn container_conflict_streams_with_audio(
         video_settings,
         subtitle_changes,
         target,
-        true,
     )
     .into_iter()
     .map(|(index, _)| index)
@@ -1493,7 +1413,6 @@ fn container_conflict_entries(
     video_settings: &BTreeMap<u64, VideoSettings>,
     subtitle_changes: &[SubtitleChange],
     target: ContainerFormat,
-    include_source_audio_metadata: bool,
 ) -> Vec<(u64, String)> {
     let mut conflicts = Vec::new();
     for index in stream_order {
@@ -1537,51 +1456,19 @@ fn container_conflict_entries(
         } else {
             source_codec
         };
-        let codec_supported = target.supports_codec(kind, codec, is_attached_picture(stream));
-        if !codec_supported {
+        // Audio metadata deliberately raises no conflict. Whatever the target container
+        // cannot store is dropped silently by `retain_supported_audio_metadata` on the
+        // way out, exactly as subtitle flags are, and `App::audio_field_visible` hides
+        // those fields from the dialog in the first place — so there is nothing for the
+        // user to act on and no conflict to report.
+        if !target.supports_codec(kind, codec, is_attached_picture(stream)) {
             conflicts.push((
                 *index,
                 container_conflict_message(target, *index, kind, codec),
             ));
         }
-        if kind == "audio" {
-            let mut metadata = audio_settings
-                .get(index)
-                .map(|settings| settings.metadata.clone())
-                .or_else(|| include_source_audio_metadata.then(|| audio_metadata(stream)));
-            if let Some(metadata) = metadata.as_mut() {
-                target.retain_supported_audio_metadata(metadata);
-            }
-            conflicts.extend(metadata.into_iter().flat_map(|metadata| {
-                audio_metadata_conflicts(&metadata, target)
-                    .into_iter()
-                    .map(|message| (*index, format!("Audio track #{index}: {message}")))
-            }));
-        }
     }
     conflicts
-}
-
-pub(crate) fn current_container_conflicts_with_audio(
-    info: &MediaInfo,
-    stream_order: &[u64],
-    audio_settings: &BTreeMap<u64, AudioSettings>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    subtitle_changes: &[SubtitleChange],
-    target: ContainerFormat,
-) -> Vec<String> {
-    container_conflict_entries(
-        info,
-        stream_order,
-        audio_settings,
-        video_settings,
-        subtitle_changes,
-        target,
-        false,
-    )
-    .into_iter()
-    .map(|(_, message)| message)
-    .collect()
 }
 
 fn container_conflict_message(
@@ -1643,30 +1530,6 @@ fn container_conflict_message(
         "{} can't contain {codec} {kind} track #{index}. {resolution}",
         target.label()
     )
-}
-
-fn audio_metadata_conflicts(metadata: &AudioMetadata, target: ContainerFormat) -> Vec<String> {
-    let mut conflicts = Vec::new();
-    if metadata.language != "und" && !target.supports_audio_language() {
-        conflicts.push(format!(
-            "{} cannot store audio language metadata; choose Undetermined or another container.",
-            target.label()
-        ));
-    }
-    for role in AudioRole::ALL {
-        if metadata.get_role(role) && !target.supports_audio_role(role) {
-            conflicts.push(format!(
-                "{} cannot store the {} audio role; clear it or choose another container.",
-                target.label(),
-                role.label()
-            ));
-        }
-    }
-    if metadata.original && metadata.dubbed {
-        conflicts
-            .push("Original and Dubbed audio roles are mutually exclusive; clear one.".to_string());
-    }
-    conflicts
 }
 
 fn validate_subtitle_sources(
@@ -1810,20 +1673,9 @@ fn classify_edit_error(message: String) -> EditError {
     }
 }
 
-#[cfg(test)]
 fn apply_edits(
     target: EditTarget<'_>,
     edits: TrackEdits<'_>,
-    cancelled: &AtomicBool,
-    report_progress: impl FnMut(EditProgress),
-) -> Result<EditResult, EditError> {
-    apply_edits_with_audio(target, edits, &BTreeMap::new(), cancelled, report_progress)
-}
-
-fn apply_edits_with_audio(
-    target: EditTarget<'_>,
-    edits: TrackEdits<'_>,
-    audio_settings: &BTreeMap<u64, AudioSettings>,
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(EditProgress),
 ) -> Result<EditResult, EditError> {
@@ -1833,6 +1685,7 @@ fn apply_edits_with_audio(
         deleted_streams,
         default_streams,
         default_sidecars,
+        audio_settings,
         video_settings,
         subtitle_changes,
         sidecars,
@@ -1868,7 +1721,7 @@ fn apply_edits_with_audio(
             }
         })?;
         report_progress(EditProgress::new(EditPhase::ValidateChanges));
-        validate_edit_with_audio(
+        validate_edit(
             &source_info,
             stream_order,
             deleted_streams,
@@ -1906,7 +1759,7 @@ fn apply_edits_with_audio(
         let effective_container = target_container.or(detected_container);
         if let Some(container) = effective_container {
             let mut conflicts = if target_container.is_some() {
-                container_conflicts_with_audio(
+                container_conflicts(
                     &source_info,
                     &output_stream_order,
                     audio_settings,
@@ -1947,7 +1800,7 @@ fn apply_edits_with_audio(
         let container_changed =
             target_container.is_some_and(|container| detected_container != Some(container));
         let container_metadata_changed = target.container_metadata.is_some();
-        let media_changed = media_changes_required_with_audio(
+        let media_changed = media_changes_required(
             &source_info,
             &output_stream_order,
             deleted_streams,
@@ -2036,7 +1889,7 @@ fn apply_edits_with_audio(
                 .zip(video_settings.get(index))
                 .is_some_and(|(stream, settings)| requires_transcode(stream, *settings))
         });
-        let media_operation = media_write_label_for_work(
+        let media_operation = media_write_label(
             target_container,
             audio_encode,
             video_encode,
@@ -2096,7 +1949,7 @@ fn apply_edits_with_audio(
                 output_info.streams.len()
             )));
         }
-        validate_result_with_audio(
+        validate_result(
             &source_info,
             &output_info,
             &output_stream_order,
@@ -2202,37 +2055,7 @@ struct EditResult {
     media_changed: bool,
 }
 
-#[cfg(test)]
 fn media_write_label(
-    target_container: Option<ContainerFormat>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    container_metadata_changed: bool,
-) -> String {
-    media_write_label_with_audio(
-        target_container,
-        &BTreeMap::new(),
-        video_settings,
-        container_metadata_changed,
-    )
-}
-
-#[cfg(test)]
-fn media_write_label_with_audio(
-    target_container: Option<ContainerFormat>,
-    audio_settings: &BTreeMap<u64, AudioSettings>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    container_metadata_changed: bool,
-) -> String {
-    let audio_encode = audio_settings.values().any(audio_settings_require_encode);
-    media_write_label_for_work(
-        target_container,
-        audio_encode,
-        !video_settings.is_empty(),
-        container_metadata_changed,
-    )
-}
-
-fn media_write_label_for_work(
     target_container: Option<ContainerFormat>,
     audio_encode: bool,
     video_encode: bool,
@@ -2255,30 +2078,8 @@ fn media_write_label_for_work(
     }
 }
 
-#[cfg(test)]
-fn media_changes_required(
-    source_info: &MediaInfo,
-    stream_order: &[u64],
-    deleted_streams: &BTreeSet<u64>,
-    default_streams: &BTreeSet<u64>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    subtitle_changes: &[SubtitleChange],
-    container_changed: bool,
-) -> bool {
-    media_changes_required_with_audio(
-        source_info,
-        stream_order,
-        deleted_streams,
-        default_streams,
-        &BTreeMap::new(),
-        video_settings,
-        subtitle_changes,
-        container_changed,
-    )
-}
-
 #[expect(clippy::too_many_arguments)]
-fn media_changes_required_with_audio(
+fn media_changes_required(
     source_info: &MediaInfo,
     stream_order: &[u64],
     deleted_streams: &BTreeSet<u64>,
@@ -3010,6 +2811,7 @@ struct TrackEdits<'a> {
     deleted_streams: &'a BTreeSet<u64>,
     default_streams: &'a BTreeSet<u64>,
     default_sidecars: &'a BTreeSet<usize>,
+    audio_settings: &'a BTreeMap<u64, AudioSettings>,
     video_settings: &'a BTreeMap<u64, VideoSettings>,
     subtitle_changes: &'a [SubtitleChange],
     left_subtitle_order: &'a [TrackRef],
@@ -3584,38 +3386,7 @@ fn output_track_plan(
 }
 
 #[expect(clippy::too_many_arguments)]
-#[cfg(test)]
 fn validate_result(
-    source: &MediaInfo,
-    output: &MediaInfo,
-    stream_order: &[u64],
-    left_subtitle_order: &[TrackRef],
-    default_streams: &BTreeSet<u64>,
-    video_settings: &BTreeMap<u64, VideoSettings>,
-    subtitle_replacements: &[SubtitleReplacement],
-    subtitle_imports: &[SubtitleImport],
-    subtitle_changes: &[SubtitleChange],
-    sidecars: &[SidecarEntry],
-    container: Option<ContainerFormat>,
-) -> Result<(), String> {
-    validate_result_with_audio(
-        source,
-        output,
-        stream_order,
-        left_subtitle_order,
-        default_streams,
-        &BTreeMap::new(),
-        video_settings,
-        subtitle_replacements,
-        subtitle_imports,
-        subtitle_changes,
-        sidecars,
-        container,
-    )
-}
-
-#[expect(clippy::too_many_arguments)]
-fn validate_result_with_audio(
     source: &MediaInfo,
     output: &MediaInfo,
     stream_order: &[u64],
@@ -3734,9 +3505,7 @@ fn validate_result_with_audio(
             }
             let expected_sample_rate = effective_audio_codec(source_stream, settings)
                 .zip(stream_sample_rate(source_stream))
-                .and_then(|(codec, source_rate)| {
-                    resolved_audio_sample_rate(codec, source_rate, settings.sample_rate)
-                });
+                .and_then(|(codec, source_rate)| resolved_audio_sample_rate(codec, source_rate));
             if audio_requires_transcode(source_stream, settings)
                 && expected_sample_rate.is_some_and(|rate| stream_sample_rate(stream) != Some(rate))
             {
@@ -4111,22 +3880,23 @@ fn run_ffmpeg(
             }
             let source_rate = stream_sample_rate(stream)
                 .expect("audio settings with a transcode have a validated source sample rate");
-            let rate = resolved_audio_sample_rate(codec, source_rate, settings.sample_rate)
+            let rate = resolved_audio_sample_rate(codec, source_rate)
                 .expect("audio settings have a validated target sample rate");
             if rate != source_rate {
                 command
                     .arg(format!("-ar:a:{audio_output_index}"))
                     .arg(rate.to_string());
             }
-            if !codec.is_lossless() {
-                let channels = settings
-                    .channel_layout
-                    .channels()
-                    .or_else(|| stream_channels(stream))
-                    .unwrap_or(2);
-                let bitrate =
-                    audio_bitrate_kbps(codec, channels, resolved_audio_quality(settings.quality))
-                        .expect("validated lossy codec/channel pairs have a bitrate preset");
+            // No bitrate for a channel count Reel has no preset for: the encoder's own
+            // default is a far better outcome than killing the worker thread, which would
+            // strand the whole pool and leave the batch reporting "processing" forever.
+            if let Some(bitrate) = settings
+                .channel_layout
+                .channels()
+                .or_else(|| stream_channels(stream))
+                .filter(|_| !codec.is_lossless())
+                .and_then(|channels| audio_bitrate_kbps(codec, channels))
+            {
                 command
                     .arg(format!("-b:a:{audio_output_index}"))
                     .arg(format!("{bitrate}k"));
@@ -4590,25 +4360,16 @@ pub(crate) fn stream_sample_rate(stream: &BTreeMap<String, Value>) -> Option<u32
     })
 }
 
-fn resolved_audio_sample_rate(
-    codec: AudioCodec,
-    source_rate: u32,
-    setting: AudioSampleRate,
-) -> Option<u32> {
-    match setting {
-        AudioSampleRate::Hz(rate) => Some(rate),
-        AudioSampleRate::Original if codec.supports_sample_rate(source_rate) => Some(source_rate),
-        AudioSampleRate::Original => AudioSampleRate::TARGETS
-            .into_iter()
-            .find(|rate| *rate <= source_rate && codec.supports_sample_rate(*rate)),
+/// The rate the encoder is actually asked for: the source rate when the codec accepts it,
+/// otherwise the highest candidate below it that the codec does accept. `None` means no
+/// candidate fits, which validation turns into an actionable "choose another codec".
+fn resolved_audio_sample_rate(codec: AudioCodec, source_rate: u32) -> Option<u32> {
+    if codec.supports_sample_rate(source_rate) {
+        return Some(source_rate);
     }
-}
-
-fn resolved_audio_quality(quality: AudioQuality) -> AudioQuality {
-    match quality {
-        AudioQuality::Source => AudioQuality::Balanced,
-        quality => quality,
-    }
+    AUDIO_SAMPLE_RATE_CANDIDATES
+        .into_iter()
+        .find(|rate| *rate <= source_rate && codec.supports_sample_rate(*rate))
 }
 
 pub(crate) fn audio_requires_transcode(
@@ -4620,16 +4381,12 @@ pub(crate) fn audio_requires_transcode(
         .codec_name()
         .is_some_and(|target| stream.get("codec_name").and_then(Value::as_str) != Some(target))
         || settings.channel_layout != AudioChannelLayout::Original
-        || settings.sample_rate != AudioSampleRate::Original
-        || settings.quality != AudioQuality::Source
 }
 
 #[cfg(test)]
 fn audio_settings_require_encode(settings: &AudioSettings) -> bool {
     settings.codec != AudioCodec::Original
         || settings.channel_layout != AudioChannelLayout::Original
-        || settings.sample_rate != AudioSampleRate::Original
-        || settings.quality != AudioQuality::Source
 }
 
 fn audio_metadata(stream: &BTreeMap<String, Value>) -> AudioMetadata {
@@ -4666,40 +4423,33 @@ fn should_write_audio_metadata(
     stream_kind == Some("audio") && (has_settings || changing_container)
 }
 
-pub(crate) fn audio_bitrate_kbps(
-    codec: AudioCodec,
-    channels: u8,
-    quality: AudioQuality,
-) -> Option<u32> {
-    let tier = match quality {
-        AudioQuality::Compact => 0,
-        AudioQuality::Balanced => 1,
-        AudioQuality::High => 2,
-        AudioQuality::Source => return None,
-    };
-    let rates = match (codec, channels) {
-        (AudioCodec::Aac, 1) => [64, 96, 128],
-        (AudioCodec::Aac, 2) => [128, 192, 256],
-        (AudioCodec::Aac, 3..=6) => [384, 512, 640],
-        (AudioCodec::Aac, 7..=8) => [512, 640, 768],
-        (AudioCodec::Ac3, 1) | (AudioCodec::Eac3, 1) => [96, 128, 192],
-        (AudioCodec::Ac3, 2) => [192, 256, 384],
-        (AudioCodec::Ac3, 3..=6) => [384, 448, 640],
-        (AudioCodec::Eac3, 2) => [128, 192, 256],
-        (AudioCodec::Eac3, 3..=6) => [384, 640, 1_024],
-        (AudioCodec::Opus, 1) => [48, 64, 96],
-        (AudioCodec::Opus, 2) => [96, 128, 192],
-        (AudioCodec::Opus, 3..=6) => [256, 384, 512],
-        (AudioCodec::Opus, 7..=8) => [320, 512, 768],
-        (AudioCodec::Mp3, 1) => [64, 96, 128],
-        (AudioCodec::Mp3, 2) => [128, 192, 320],
-        (AudioCodec::Vorbis, 1) => [48, 80, 128],
-        (AudioCodec::Vorbis, 2) => [96, 160, 256],
-        (AudioCodec::Vorbis, 3..=6) => [256, 384, 512],
-        (AudioCodec::Vorbis, 7..=8) => [320, 512, 768],
+/// The bitrate Reel picks for a lossy encode. Deliberately not user-selectable: the readme
+/// promises safe automatic values, so there is one well-tempered rate per codec and channel
+/// count rather than a quality dial. `None` means the pair is not a lossy encode Reel offers,
+/// which validation rejects before the command is ever built.
+pub(crate) fn audio_bitrate_kbps(codec: AudioCodec, channels: u8) -> Option<u32> {
+    Some(match (codec, channels) {
+        (AudioCodec::Aac, 1) => 96,
+        (AudioCodec::Aac, 2) => 192,
+        (AudioCodec::Aac, 3..=6) => 512,
+        (AudioCodec::Aac, 7..=8) => 640,
+        (AudioCodec::Ac3, 1) | (AudioCodec::Eac3, 1) => 128,
+        (AudioCodec::Ac3, 2) => 256,
+        (AudioCodec::Ac3, 3..=6) => 448,
+        (AudioCodec::Eac3, 2) => 192,
+        (AudioCodec::Eac3, 3..=6) => 640,
+        (AudioCodec::Opus, 1) => 64,
+        (AudioCodec::Opus, 2) => 128,
+        (AudioCodec::Opus, 3..=6) => 384,
+        (AudioCodec::Opus, 7..=8) => 512,
+        (AudioCodec::Mp3, 1) => 96,
+        (AudioCodec::Mp3, 2) => 192,
+        (AudioCodec::Vorbis, 1) => 80,
+        (AudioCodec::Vorbis, 2) => 160,
+        (AudioCodec::Vorbis, 3..=6) => 384,
+        (AudioCodec::Vorbis, 7..=8) => 512,
         _ => return None,
-    };
-    Some(rates[tier])
+    })
 }
 
 fn resolution_filter(resolution: VideoResolution) -> Option<String> {
@@ -5061,25 +4811,31 @@ mod tests {
             },
         )]);
 
-        assert_that!(media_write_label(None, &BTreeMap::new(), false))
+        let video_encode = !settings.is_empty();
+
+        assert_that!(media_write_label(None, false, false, false))
             .is_equal_to("Remuxing media".to_string());
-        assert_that!(media_write_label(None, &BTreeMap::new(), true))
+        assert_that!(media_write_label(None, false, false, true))
             .is_equal_to("Updating container metadata".to_string());
         assert_that!(media_write_label(
             Some(ContainerFormat::Mp4),
-            &BTreeMap::new(),
+            false,
+            false,
             false
         ))
         .is_equal_to("Remuxing to MP4".to_string());
-        assert_that!(media_write_label(None, &settings, false))
+        assert_that!(media_write_label(None, false, video_encode, false))
             .is_equal_to("Encoding video".to_string());
         assert_that!(media_write_label(
             Some(ContainerFormat::Mp4),
-            &settings,
+            false,
+            video_encode,
             false
         ))
         .is_equal_to("Encoding video and remuxing to MP4".to_string());
-        assert_that!(media_write_label_for_work(None, true, true, false))
+        assert_that!(media_write_label(None, true, false, false))
+            .is_equal_to("Encoding audio".to_string());
+        assert_that!(media_write_label(None, true, true, false))
             .is_equal_to("Encoding video and audio".to_string());
     }
 
@@ -5368,6 +5124,7 @@ mod tests {
         let conflicts = container_conflicts(
             &info,
             &[0, 1, 2],
+            &BTreeMap::new(),
             &video_settings,
             &subtitle_changes,
             ContainerFormat::Mp4,
@@ -5407,6 +5164,7 @@ mod tests {
         let conflicts = container_conflicts(
             &info,
             &[0, 1, 2],
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &subtitle_changes,
             ContainerFormat::Mp4,
@@ -5719,6 +5477,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
 
         // Assert
@@ -5740,6 +5499,7 @@ mod tests {
             &[0, 1],
             &BTreeSet::from([2]),
             &BTreeSet::from([2]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
 
@@ -5763,6 +5523,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::from([1]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
 
         // Assert
@@ -5784,7 +5545,14 @@ mod tests {
         )]);
 
         // Act
-        let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+        let result = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &settings,
+        );
 
         // Assert
         assert_that!(result).contains_error(
@@ -5807,7 +5575,14 @@ mod tests {
         )]);
 
         // Act
-        let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+        let result = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &settings,
+        );
 
         // Assert
         assert_that!(result)
@@ -5834,7 +5609,14 @@ mod tests {
             )]);
 
             // Act
-            let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+            let result = validate_edit(
+                &info,
+                &[0],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &settings,
+            );
 
             // Assert
             assert_that!(result).contains_error("Upscaling isn't possible yet.".to_string());
@@ -5869,6 +5651,7 @@ mod tests {
             &[0],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings(1920, 10),
         );
         let narrow = validate_edit(
@@ -5876,6 +5659,7 @@ mod tests {
             &[0],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings(10, 1080),
         );
         let smallest_allowed = validate_edit(
@@ -5883,6 +5667,7 @@ mod tests {
             &[0],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings(16, 16),
         );
 
@@ -5947,6 +5732,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
 
         // Assert
@@ -5970,6 +5756,7 @@ mod tests {
             &[0, 1, 1],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
 
@@ -5999,6 +5786,7 @@ mod tests {
             &[0, 1],
             &BTreeSet::from([1]),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
 
@@ -6039,6 +5827,7 @@ mod tests {
             &[0],
             &BTreeSet::from([1]),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings,
         );
 
@@ -6081,6 +5870,7 @@ mod tests {
             &[0, 1],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings,
         );
         let on_cover = validate_edit(
@@ -6088,6 +5878,7 @@ mod tests {
             &[0, 1],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &settings,
         );
 
@@ -6132,6 +5923,7 @@ mod tests {
                 &[0],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
+                &BTreeMap::new(),
                 &settings(width, height),
             );
             assert_that!(result).contains_error(
@@ -6143,7 +5935,8 @@ mod tests {
                     &[0],
                     &BTreeSet::new(),
                     &BTreeSet::new(),
-                    &settings(1280, 720),
+                    &BTreeMap::new(),
+                    &settings(1280, 720)
                 )
                 .is_ok(),
                 "the valid control case must still pass while checking {case}",
@@ -6172,7 +5965,14 @@ mod tests {
         )]);
 
         // Act
-        let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+        let result = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &settings,
+        );
 
         // Assert
         assert_that!(result).contains_error(
@@ -6199,7 +5999,14 @@ mod tests {
         )]);
 
         // Act
-        let result = validate_edit(&info, &[0], &BTreeSet::new(), &BTreeSet::new(), &settings);
+        let result = validate_edit(
+            &info,
+            &[0],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &settings,
+        );
 
         // Assert
         assert_that!(result)
@@ -6995,8 +6802,6 @@ mod tests {
         AudioSettings {
             codec: AudioCodec::Original,
             channel_layout: AudioChannelLayout::Original,
-            quality: AudioQuality::Source,
-            sample_rate: AudioSampleRate::Original,
             metadata: AudioMetadata {
                 language: "eng".to_string(),
                 title: None,
@@ -7121,7 +6926,7 @@ mod tests {
         };
         let validate =
             |settings: AudioSettings, output: MediaInfo, container: Option<ContainerFormat>| {
-                validate_result_with_audio(
+                validate_result(
                     &source,
                     &output,
                     &[0, 1],
@@ -7187,6 +6992,7 @@ mod tests {
             stream_order,
             &[],
             default_streams,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &[],
             &[],
@@ -7316,6 +7122,7 @@ mod tests {
                 &[0, 1, 2],
                 deleted,
                 defaults,
+                &BTreeMap::new(),
                 settings,
                 changes,
                 container,
@@ -7379,8 +7186,9 @@ mod tests {
             &BTreeSet::new(),
             &defaults,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &[],
-            false,
+            false
         ))
         .is_true();
     }
@@ -7800,6 +7608,7 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             replacements,
             imports,
             changes,
@@ -7964,6 +7773,7 @@ mod tests {
                 &[0],
                 &[],
                 &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeMap::from([(0_u64, settings)]),
                 &[],
                 &[],
@@ -8025,6 +7835,7 @@ mod tests {
             &[0],
             &[],
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &BTreeMap::from([(
                 0_u64,
                 VideoSettings {
@@ -8152,6 +7963,7 @@ mod tests {
                 deleted_streams: &BTreeSet::from([2]),
                 default_streams: &BTreeSet::from([1, 3]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8279,7 +8091,7 @@ mod tests {
         let audio_settings = BTreeMap::from([(1, settings)]);
 
         // Act
-        let output = apply_edits_with_audio(
+        let output = apply_edits(
             EditTarget {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
@@ -8291,12 +8103,12 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &audio_settings,
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
                 sidecars: &[],
             },
-            &audio_settings,
             &AtomicBool::new(false),
             |_| {},
         )
@@ -8371,6 +8183,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8443,6 +8256,7 @@ mod tests {
                 deleted_streams: &BTreeSet::from([0]),
                 default_streams: &BTreeSet::from([0]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8540,6 +8354,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8623,6 +8438,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8724,6 +8540,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[change],
                 left_subtitle_order: &[],
@@ -8755,6 +8572,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[SubtitleChange {
                     source: SubtitleSource::Embedded(1),
@@ -8847,6 +8665,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &settings,
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -8934,6 +8753,7 @@ mod tests {
                     deleted_streams: &BTreeSet::new(),
                     default_streams: &BTreeSet::new(),
                     default_sidecars: &BTreeSet::new(),
+                    audio_settings: &BTreeMap::new(),
                     video_settings: &settings,
                     subtitle_changes: &[],
                     left_subtitle_order: &[],
@@ -9030,6 +8850,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -9136,6 +8957,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -9225,6 +9047,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -9347,6 +9170,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -9465,6 +9289,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -9600,6 +9425,7 @@ mod tests {
                 deleted_streams: &BTreeSet::from([3, 4]),
                 default_streams: &BTreeSet::from([0, 1, 5]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[change],
                 left_subtitle_order: &[],
@@ -9734,6 +9560,7 @@ mod tests {
                 deleted_streams: &BTreeSet::from([3]),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[change],
                 left_subtitle_order: &[],
@@ -9878,6 +9705,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0, 1]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -9994,6 +9822,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -10014,6 +9843,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::from([0]),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -10116,6 +9946,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -10234,6 +10065,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &changes,
                 left_subtitle_order: &[],
@@ -10406,6 +10238,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
@@ -10501,8 +10334,6 @@ mod tests {
         let mut settings = audio_settings();
         settings.codec = AudioCodec::Ac3;
         settings.channel_layout = AudioChannelLayout::Mono;
-        settings.quality = AudioQuality::Balanced;
-        settings.sample_rate = AudioSampleRate::Hz(32_000);
         settings.metadata = AudioMetadata {
             language: "nld".to_string(),
             title: Some("Director commentary".to_string()),
@@ -10516,7 +10347,7 @@ mod tests {
         let defaults = BTreeSet::from([2]);
         let mut phases = Vec::new();
 
-        apply_edits_with_audio(
+        apply_edits(
             EditTarget {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
@@ -10528,12 +10359,12 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &defaults,
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &audio_settings,
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
                 sidecars: &[],
             },
-            &audio_settings,
             &AtomicBool::new(false),
             |progress| phases.push(progress.label()),
         )
@@ -10550,7 +10381,7 @@ mod tests {
         assert_that!(is_default(&output.streams[1])).is_false();
         assert_that!(output.streams[2].get("codec_name").and_then(Value::as_str)).contains("ac3");
         assert_that!(stream_channels(&output.streams[2])).contains(1);
-        assert_that!(stream_sample_rate(&output.streams[2])).contains(32_000);
+        assert_that!(stream_sample_rate(&output.streams[2])).contains(48_000);
         assert_that!(stream_language(&output.streams[2])).is_equal_to("nld".to_string());
         assert_that!(audio_stream_title(&output.streams[2]).as_deref())
             .contains("Director commentary");
@@ -10594,7 +10425,7 @@ mod tests {
         let mut settings = audio_settings();
         settings.codec = AudioCodec::Alac;
         settings.metadata.language = "und".to_string();
-        apply_edits_with_audio(
+        apply_edits(
             EditTarget {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
@@ -10606,12 +10437,12 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::from([(1, settings)]),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
                 sidecars: &[],
             },
-            &BTreeMap::from([(1, settings)]),
             &AtomicBool::new(false),
             |_| {},
         )
@@ -10625,7 +10456,7 @@ mod tests {
         assert_eq!(stream_channels(&output.streams[1]), Some(2));
         assert_eq!(stream_sample_rate(&output.streams[1]), Some(48_000));
 
-        let converted = apply_edits_with_audio(
+        let converted = apply_edits(
             EditTarget {
                 source: &source,
                 destination: SaveDestination::ReplaceOriginal,
@@ -10637,12 +10468,12 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &BTreeSet::new(),
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[],
                 left_subtitle_order: &[],
                 sidecars: &[],
             },
-            &BTreeMap::new(),
             &AtomicBool::new(false),
             |_| {},
         )
@@ -10663,7 +10494,13 @@ mod tests {
         ]));
 
         // No video_settings entry at all: nothing to transcode.
-        assert_that!(plan_requires_transcode(&info, &[0, 1], &BTreeMap::new())).is_false();
+        assert_that!(plan_requires_transcode(
+            &info,
+            &[0, 1],
+            &BTreeMap::new(),
+            &BTreeMap::new()
+        ))
+        .is_false();
 
         // Settings present but requesting the source's own codec at original
         // resolution: still just a copy, not a transcode.
@@ -10674,7 +10511,13 @@ mod tests {
                 resolution: VideoResolution::Original,
             },
         )]);
-        assert_that!(plan_requires_transcode(&info, &[0, 1], &no_op_settings)).is_false();
+        assert_that!(plan_requires_transcode(
+            &info,
+            &[0, 1],
+            &BTreeMap::new(),
+            &no_op_settings
+        ))
+        .is_false();
 
         // A genuine codec change on the video stream: this is a real transcode.
         let transcode_settings = BTreeMap::from([(
@@ -10684,7 +10527,13 @@ mod tests {
                 resolution: VideoResolution::Original,
             },
         )]);
-        assert_that!(plan_requires_transcode(&info, &[0, 1], &transcode_settings)).is_true();
+        assert_that!(plan_requires_transcode(
+            &info,
+            &[0, 1],
+            &BTreeMap::new(),
+            &transcode_settings
+        ))
+        .is_true();
 
         // Settings keyed to the AUDIO stream's index must never count, even with a
         // "transcode-shaped" value — only video streams can trigger a transcode.
@@ -10698,33 +10547,35 @@ mod tests {
         assert_that!(plan_requires_transcode(
             &info,
             &[0, 1],
+            &BTreeMap::new(),
             &audio_keyed_settings
         ))
         .is_false();
     }
 
     #[test]
-    fn audio_quality_presets_should_use_the_documented_codec_and_layout_bitrates() {
-        let qualities = [
-            AudioQuality::Compact,
-            AudioQuality::Balanced,
-            AudioQuality::High,
-        ];
-        let rates =
-            |codec, channels| qualities.map(|quality| audio_bitrate_kbps(codec, channels, quality));
+    fn automatic_audio_bitrates_should_scale_with_the_codec_and_channel_count() {
+        // Reel picks the bitrate itself — there is no quality dial — so every lossy
+        // codec/layout pair it will encode needs a value, and every pair it refuses
+        // must have none rather than a silently wrong default.
+        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 1)).is_equal_to(Some(96));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 2)).is_equal_to(Some(192));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 6)).is_equal_to(Some(512));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 8)).is_equal_to(Some(640));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Ac3, 6)).is_equal_to(Some(448));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Eac3, 6)).is_equal_to(Some(640));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Opus, 2)).is_equal_to(Some(128));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Mp3, 2)).is_equal_to(Some(192));
+        assert_that!(audio_bitrate_kbps(AudioCodec::Vorbis, 8)).is_equal_to(Some(512));
 
-        assert_that!(rates(AudioCodec::Aac, 1)).is_equal_to([Some(64), Some(96), Some(128)]);
-        assert_that!(rates(AudioCodec::Aac, 2)).is_equal_to([Some(128), Some(192), Some(256)]);
-        assert_that!(rates(AudioCodec::Aac, 6)).is_equal_to([Some(384), Some(512), Some(640)]);
-        assert_that!(rates(AudioCodec::Aac, 8)).is_equal_to([Some(512), Some(640), Some(768)]);
-        assert_that!(rates(AudioCodec::Ac3, 6)).is_equal_to([Some(384), Some(448), Some(640)]);
-        assert_that!(rates(AudioCodec::Eac3, 6)).is_equal_to([Some(384), Some(640), Some(1_024)]);
-        assert_that!(rates(AudioCodec::Opus, 2)).is_equal_to([Some(96), Some(128), Some(192)]);
-        assert_that!(rates(AudioCodec::Mp3, 2)).is_equal_to([Some(128), Some(192), Some(320)]);
-        assert_that!(rates(AudioCodec::Vorbis, 8)).is_equal_to([Some(320), Some(512), Some(768)]);
-        assert_that!(rates(AudioCodec::Ac3, 8)).is_equal_to([None, None, None]);
-        assert_that!(rates(AudioCodec::Mp3, 6)).is_equal_to([None, None, None]);
-        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 2, AudioQuality::Source)).is_none();
+        // Layouts the codec cannot carry, which `supports_channels` rejects first.
+        assert_that!(audio_bitrate_kbps(AudioCodec::Ac3, 8)).is_none();
+        assert_that!(audio_bitrate_kbps(AudioCodec::Mp3, 6)).is_none();
+        // A stream reporting no channels at all must not panic the worker.
+        assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 0)).is_none();
+        // Lossless codecs are never given a bitrate.
+        assert_that!(audio_bitrate_kbps(AudioCodec::Flac, 2)).is_none();
+        assert_that!(audio_bitrate_kbps(AudioCodec::Alac, 2)).is_none();
     }
 
     #[test]
@@ -10813,18 +10664,6 @@ mod tests {
             assert_eq!(layout.label(), label);
             assert_eq!(layout.channels(), channels);
         }
-        for (quality, label) in [
-            (AudioQuality::Source, "Source"),
-            (AudioQuality::Compact, "Compact"),
-            (AudioQuality::Balanced, "Balanced"),
-            (AudioQuality::High, "High"),
-        ] {
-            assert_eq!(quality.label(), label);
-        }
-        assert_eq!(AudioSampleRate::Original.label(), "Original");
-        assert_eq!(AudioSampleRate::Hz(48_000).label(), "48 kHz");
-        assert_eq!(AudioSampleRate::Hz(44_100).label(), "44.1 kHz");
-
         let mut metadata = audio_settings().metadata;
         for role in AudioRole::ALL {
             assert!(!metadata.get_role(role));
@@ -10853,6 +10692,8 @@ mod tests {
         let automatic = audio_settings();
         assert!(!audio_requires_transcode(&stream, &automatic));
         assert!(!audio_settings_require_encode(&automatic));
+        // The only two staged values that can force an encode: everything else about an
+        // audio track is metadata, which a `-c copy` remux carries just as well.
         for changed in [
             AudioSettings {
                 codec: AudioCodec::Ac3,
@@ -10860,14 +10701,6 @@ mod tests {
             },
             AudioSettings {
                 channel_layout: AudioChannelLayout::Mono,
-                ..automatic.clone()
-            },
-            AudioSettings {
-                sample_rate: AudioSampleRate::Hz(32_000),
-                ..automatic.clone()
-            },
-            AudioSettings {
-                quality: AudioQuality::High,
                 ..automatic.clone()
             },
         ] {
@@ -10882,52 +10715,13 @@ mod tests {
     }
 
     #[test]
-    fn audio_bitrate_table_should_cover_every_supported_layout_family() {
-        let qualities = AudioQuality::PRESETS;
-        let rates =
-            |codec, channels| qualities.map(|quality| audio_bitrate_kbps(codec, channels, quality));
-
-        assert_eq!(rates(AudioCodec::Ac3, 1), [Some(96), Some(128), Some(192)]);
-        assert_eq!(rates(AudioCodec::Ac3, 2), [Some(192), Some(256), Some(384)]);
-        assert_eq!(rates(AudioCodec::Eac3, 1), [Some(96), Some(128), Some(192)]);
-        assert_eq!(
-            rates(AudioCodec::Eac3, 2),
-            [Some(128), Some(192), Some(256)]
-        );
-        assert_eq!(rates(AudioCodec::Opus, 1), [Some(48), Some(64), Some(96)]);
-        assert_eq!(
-            rates(AudioCodec::Opus, 6),
-            [Some(256), Some(384), Some(512)]
-        );
-        assert_eq!(
-            rates(AudioCodec::Opus, 8),
-            [Some(320), Some(512), Some(768)]
-        );
-        assert_eq!(rates(AudioCodec::Mp3, 1), [Some(64), Some(96), Some(128)]);
-        assert_eq!(
-            rates(AudioCodec::Vorbis, 1),
-            [Some(48), Some(80), Some(128)]
-        );
-        assert_eq!(
-            rates(AudioCodec::Vorbis, 2),
-            [Some(96), Some(160), Some(256)]
-        );
-        assert_eq!(
-            rates(AudioCodec::Vorbis, 6),
-            [Some(256), Some(384), Some(512)]
-        );
-        assert_eq!(rates(AudioCodec::Flac, 2), [None, None, None]);
-        assert_eq!(rates(AudioCodec::Aac, 0), [None, None, None]);
-    }
-
-    #[test]
     fn audio_validation_should_report_every_invalid_technical_shape() {
         let validate = |stream: Value, index: u64, settings: AudioSettings| {
             let info = media(serde_json::json!([
                 {"index": 0, "codec_type": "video", "codec_name": "h264"},
                 stream
             ]));
-            validate_edit_with_audio(
+            validate_edit(
                 &info,
                 &[0, 1],
                 &BTreeSet::new(),
@@ -10987,21 +10781,23 @@ mod tests {
         assert_that!(validate(low_rate, 1, technical.clone()).as_str())
             .contains("cannot use the source sample rate");
 
-        let mut unsupported_rate = audio_settings();
-        unsupported_rate.codec = AudioCodec::Aac;
-        unsupported_rate.sample_rate = AudioSampleRate::Hz(192_000);
-        let high_rate = serde_json::json!({
-            "index": 1, "codec_type": "audio", "codec_name": "aac",
-            "channels": 2, "sample_rate": "192000"
-        });
-        assert_that!(validate(high_rate, 1, unsupported_rate).as_str())
-            .contains("does not support a 192 kHz sample rate");
-
-        let mut lossless_quality = audio_settings();
-        lossless_quality.codec = AudioCodec::Flac;
-        lossless_quality.quality = AudioQuality::High;
-        assert_that!(validate(base(), 1, lossless_quality).as_str())
-            .contains("Lossless audio codecs");
+        // A source rate above everything the codec accepts is resolved downward rather
+        // than refused: AC-3 tops out at 48 kHz, so a 192 kHz source is simply encoded
+        // at 48 and the edit is allowed through.
+        let high_rate = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "192000"}
+        ]));
+        assert_that!(validate_edit(
+            &high_rate,
+            &[0, 1],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::from([(1, technical.clone())]),
+            &BTreeMap::new(),
+        ))
+        .is_ok();
 
         let info = media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264"},
@@ -11009,7 +10805,7 @@ mod tests {
         ]));
         let mut lossless = audio_settings();
         lossless.codec = AudioCodec::Flac;
-        assert_that!(validate_edit_with_audio(
+        assert_that!(validate_edit(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11021,63 +10817,21 @@ mod tests {
     }
 
     #[test]
-    fn audio_metadata_validation_should_name_every_unsupported_field() {
-        let metadata = AudioMetadata {
-            language: "eng".to_string(),
-            title: Some("Accessible dub".to_string()),
-            commentary: true,
-            hearing_impaired: true,
-            audio_description: true,
-            original: true,
-            dubbed: true,
-        };
-        let conflicts = audio_metadata_conflicts(&metadata, ContainerFormat::Mov).join("\n");
-
-        assert_that!(conflicts.as_str()).contains("audio language metadata");
-        for role in AudioRole::ALL {
-            assert_that!(conflicts.as_str()).contains(role.label());
-        }
-        assert_that!(conflicts.as_str()).contains("mutually exclusive");
+    fn an_unsupported_audio_codec_should_name_the_codecs_the_container_can_hold() {
         assert_that!(container_conflict_message(ContainerFormat::Mp4, 1, "audio", "opus").as_str())
             .contains("Encode it as AAC");
     }
 
     #[test]
-    fn hidden_audio_encode_options_should_resolve_to_safe_automatic_values() {
-        assert_that!(resolved_audio_quality(AudioQuality::Source))
-            .is_equal_to(AudioQuality::Balanced);
-        assert_that!(resolved_audio_quality(AudioQuality::High)).is_equal_to(AudioQuality::High);
-
-        assert_that!(resolved_audio_sample_rate(
-            AudioCodec::Ac3,
-            48_000,
-            AudioSampleRate::Original,
-        ))
-        .is_equal_to(Some(48_000));
-        assert_that!(resolved_audio_sample_rate(
-            AudioCodec::Ac3,
-            96_000,
-            AudioSampleRate::Original,
-        ))
-        .is_equal_to(Some(48_000));
-        assert_that!(resolved_audio_sample_rate(
-            AudioCodec::Opus,
-            44_100,
-            AudioSampleRate::Original,
-        ))
-        .is_equal_to(Some(24_000));
-        assert_that!(resolved_audio_sample_rate(
-            AudioCodec::Ac3,
-            16_000,
-            AudioSampleRate::Original,
-        ))
-        .is_none();
-        assert_that!(resolved_audio_sample_rate(
-            AudioCodec::Ac3,
-            48_000,
-            AudioSampleRate::Hz(32_000),
-        ))
-        .is_equal_to(Some(32_000));
+    fn the_sample_rate_should_resolve_to_the_best_rate_the_codec_accepts() {
+        // Kept as-is when the codec can take it.
+        assert_that!(resolved_audio_sample_rate(AudioCodec::Ac3, 48_000)).is_equal_to(Some(48_000));
+        // Stepped down to the highest candidate the codec does accept.
+        assert_that!(resolved_audio_sample_rate(AudioCodec::Ac3, 96_000)).is_equal_to(Some(48_000));
+        assert_that!(resolved_audio_sample_rate(AudioCodec::Opus, 44_100))
+            .is_equal_to(Some(24_000));
+        // Nothing fits below the source rate, which validation reports as actionable.
+        assert_that!(resolved_audio_sample_rate(AudioCodec::Ac3, 16_000)).is_none();
     }
 
     #[test]
@@ -11090,7 +10844,7 @@ mod tests {
         let mut settings = audio_settings();
         settings.codec = AudioCodec::Ac3;
 
-        assert_that!(validate_edit_with_audio(
+        assert_that!(validate_edit(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11113,7 +10867,7 @@ mod tests {
         settings.channel_layout = AudioChannelLayout::Surround51;
         let staged = BTreeMap::from([(1, settings.clone())]);
 
-        let result = validate_edit_with_audio(
+        let result = validate_edit(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11128,10 +10882,11 @@ mod tests {
         assert_that!(staged[&1].codec).is_equal_to(AudioCodec::Mp3);
         assert_that!(staged[&1].channel_layout).is_equal_to(AudioChannelLayout::Surround51);
 
+        // A layout the codec does support passes, so the refusal above is about the
+        // channel count and not about MP3 being rejected outright.
         settings.codec = AudioCodec::Aac;
         settings.channel_layout = AudioChannelLayout::Stereo;
-        settings.sample_rate = AudioSampleRate::Hz(96_000);
-        assert_that!(validate_edit_with_audio(
+        assert_that!(validate_edit(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11139,7 +10894,7 @@ mod tests {
             &BTreeMap::from([(1, settings)]),
             &BTreeMap::new(),
         ))
-        .contains_error(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED.to_string());
+        .is_ok();
     }
 
     #[test]
@@ -11154,7 +10909,7 @@ mod tests {
         settings.metadata.commentary = true;
         let staged = BTreeMap::from([(1, settings)]);
 
-        assert_that!(validate_edit_with_audio(
+        assert_that!(validate_edit(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11163,20 +10918,15 @@ mod tests {
             &BTreeMap::new(),
         ))
         .is_ok();
-        assert_that!(plan_requires_transcode_with_audio(
+        assert_that!(plan_requires_transcode(
             &info,
             &[0, 1],
             &staged,
             &BTreeMap::new(),
         ))
         .is_false();
-        assert_that!(media_write_label_with_audio(
-            None,
-            &staged,
-            &BTreeMap::new(),
-            false,
-        ))
-        .is_equal_to("Remuxing media".to_string());
+        assert_that!(media_write_label(None, false, false, false))
+            .is_equal_to("Remuxing media".to_string());
     }
 
     #[test]
@@ -11189,25 +10939,23 @@ mod tests {
         let mut settings = audio_settings();
         settings.codec = AudioCodec::Ac3;
         settings.channel_layout = AudioChannelLayout::Mono;
-        settings.quality = AudioQuality::Balanced;
-        settings.sample_rate = AudioSampleRate::Hz(32_000);
         let staged = BTreeMap::from([(1, settings)]);
 
-        assert_that!(plan_requires_transcode_with_audio(
+        assert_that!(plan_requires_transcode(
             &info,
             &[0, 1],
             &staged,
             &BTreeMap::new(),
         ))
         .is_true();
-        assert_that!(media_write_label_with_audio(
+        assert_that!(media_write_label(
             Some(ContainerFormat::Matroska),
-            &staged,
-            &BTreeMap::new(),
+            true,
             false,
+            false
         ))
         .is_equal_to("Encoding audio and remuxing to MKV".to_string());
-        assert_that!(media_changes_required_with_audio(
+        assert_that!(media_changes_required(
             &info,
             &[0, 1],
             &BTreeSet::new(),
@@ -11228,15 +10976,7 @@ mod tests {
              "tags": {"language": "eng"}, "disposition": {"comment": 1}}
         ]));
 
-        let converting = container_conflicts_with_audio(
-            &info,
-            &[0, 1],
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
-            ContainerFormat::WebM,
-        );
-        let unchanged = current_container_conflicts_with_audio(
+        let converting = container_conflicts(
             &info,
             &[0, 1],
             &BTreeMap::new(),
@@ -11245,8 +10985,10 @@ mod tests {
             ContainerFormat::WebM,
         );
 
+        // WebM stores no audio role at all, and the commentary flag on track #1 is simply
+        // dropped on the way out rather than reported: the dialog never offers a field the
+        // container can't store, so a conflict here would name something the user cannot act on.
         assert_that!(converting).is_empty();
-        assert_that!(unchanged).is_empty();
     }
 
     #[test]
@@ -11311,21 +11053,6 @@ mod tests {
 
     #[test]
     fn matroska_should_accept_original_with_other_audio_roles() {
-        let metadata = AudioMetadata {
-            language: "eng".to_string(),
-            title: Some("Accessible original mix".to_string()),
-            commentary: true,
-            hearing_impaired: true,
-            audio_description: true,
-            original: true,
-            dubbed: false,
-        };
-
-        assert_that!(audio_metadata_conflicts(
-            &metadata,
-            ContainerFormat::Matroska
-        ))
-        .is_empty();
         for role in AudioRole::ALL {
             assert!(
                 ContainerFormat::Matroska.supports_audio_role(role),
@@ -11350,9 +11077,13 @@ mod tests {
         metadata.set_role(AudioRole::Dubbed, true);
         assert!(metadata.dubbed && !metadata.original);
 
-        metadata.original = true;
-        assert_that!(audio_metadata_conflicts(&metadata, ContainerFormat::Matroska).join("\n"))
-            .contains("Original and Dubbed audio roles are mutually exclusive");
+        // Clearing one is not enough to set the other: each direction has to hold on its
+        // own, because `set_role` is the only way the dialog ever changes a role and it is
+        // what keeps the pair from ever both being staged.
+        metadata.set_role(AudioRole::Original, true);
+        assert!(metadata.original && !metadata.dubbed);
+        metadata.set_role(AudioRole::Original, false);
+        assert!(!metadata.original && !metadata.dubbed);
     }
 
     #[test]
@@ -11500,6 +11231,23 @@ mod tests {
         assert_that!(fs::read(&blocker).unwrap()).is_equal_to(b"not a directory".to_vec());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_panicking_edit_should_become_a_failure_message_rather_than_killing_the_pool() {
+        // The worker catches panics so one broken request cannot poison the shared
+        // receiver and silently stop every other worker in its pool. What the user ends
+        // up reading is whatever the panic carried, so both payload shapes have to
+        // survive: `panic!("literal")` hands over a `&str`, `panic!("{x}")` a `String`.
+        let literal = std::panic::catch_unwind(|| panic!("a broken invariant")).unwrap_err();
+        assert_that!(panic_message(&*literal).as_str()).is_equal_to("a broken invariant");
+
+        let formatted = std::panic::catch_unwind(|| panic!("track {} is missing", 7)).unwrap_err();
+        assert_that!(panic_message(&*formatted).as_str()).is_equal_to("track 7 is missing");
+
+        // A payload that is neither still has to produce something printable.
+        let exotic = std::panic::catch_unwind(|| std::panic::panic_any(42_u8)).unwrap_err();
+        assert_that!(panic_message(&*exotic).as_str()).is_equal_to("an unknown internal error");
     }
 
     #[test]
@@ -12428,6 +12176,7 @@ mod tests {
                 deleted_streams: &BTreeSet::new(),
                 default_streams: &defaults,
                 default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[change],
                 left_subtitle_order: &[],

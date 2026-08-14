@@ -16,15 +16,14 @@ use ratatui::widgets::ListState;
 
 use crate::{
     edit::{
-        AudioChannelLayout, AudioCodec, AudioMetadata, AudioQuality, AudioRole, AudioSampleRate,
-        AudioSettings, CHANNEL_UPMIX_NOT_IMPLEMENTED, ContainerFormat, ContainerMetadata,
-        CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
-        MINIMUM_CUSTOM_DIMENSION, SaveDestination, VideoCodec, VideoResolution, VideoSettings,
-        audio_bitrate_kbps, audio_requires_transcode, audio_stream_title,
-        container_conflict_streams_with_audio, container_conflicts_with_audio,
-        current_container_conflicts_with_audio, effective_audio_codec, imported_subtitle_conflicts,
-        plan_requires_transcode_with_audio, stream_channels, stream_disposition, stream_index,
-        subtitle_metadata_conflicts, validate_edit_with_audio,
+        AudioChannelLayout, AudioCodec, AudioMetadata, AudioRole, AudioSettings,
+        CHANNEL_UPMIX_NOT_IMPLEMENTED, ContainerFormat, ContainerMetadata, CustomResolution,
+        CustomScaling, EditEvent, EditOutcome, EditRequest, MINIMUM_CUSTOM_DIMENSION,
+        SaveDestination, VideoCodec, VideoResolution, VideoSettings, audio_bitrate_kbps,
+        audio_requires_transcode, audio_stream_title, container_conflict_streams,
+        container_conflicts, effective_audio_codec, imported_subtitle_conflicts,
+        plan_requires_transcode, stream_channels, stream_disposition, stream_index,
+        subtitle_metadata_conflicts, validate_edit,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -2769,7 +2768,7 @@ impl App {
         };
         let stream_order = final_stream_order(info, &self.stream_order, &self.deleted_streams);
         let subtitle_changes = self.subtitle_changes.values().cloned().collect::<Vec<_>>();
-        container_conflict_streams_with_audio(
+        container_conflict_streams(
             info,
             &stream_order,
             &self.audio_settings,
@@ -3429,8 +3428,6 @@ impl App {
         (stream_kind(stream) == Some("audio")).then(|| AudioSettings {
             codec: AudioCodec::Original,
             channel_layout: AudioChannelLayout::Original,
-            quality: AudioQuality::Source,
-            sample_rate: AudioSampleRate::Original,
             metadata: AudioMetadata {
                 language: stream_language(stream),
                 title: audio_stream_title(stream),
@@ -3443,16 +3440,23 @@ impl App {
         })
     }
 
+    /// The staged audio settings for `index`, or the track's own settings when nothing is
+    /// staged. Deliberately *not* filtered against the target container: this is the
+    /// user's intent, and it has to survive them changing the container target again.
+    ///
+    /// Filtering here instead used to leak the filtered value straight back into the
+    /// staged edit — `store_audio_settings` compared it against the unfiltered source, so
+    /// they could never match, and merely opening and leaving a field staged an edit
+    /// nobody made with (say) MP4's unsupported Original role cleared. Switching back to
+    /// MKV then wrote that cleared flag out for real. The container filter belongs where
+    /// the file is actually written (`retain_supported_audio_metadata` in edit.rs) and
+    /// where fields are offered (`audio_field_visible` hides what the container can't
+    /// store), not in the staged model.
     pub fn effective_audio_settings(&self, index: u64) -> Option<AudioSettings> {
-        let mut settings = self
-            .audio_settings
+        self.audio_settings
             .get(&index)
             .cloned()
-            .or_else(|| self.original_audio_settings(index))?;
-        if let Some(container) = self.effective_container() {
-            container.retain_supported_audio_metadata(&mut settings.metadata);
-        }
-        Some(settings)
+            .or_else(|| self.original_audio_settings(index))
     }
 
     fn store_audio_settings(&mut self, index: u64, mut settings: AudioSettings) {
@@ -5526,7 +5530,7 @@ impl App {
                 .difference(&staged.deleted_streams)
                 .copied()
                 .collect::<BTreeSet<_>>();
-            let transcode = plan_requires_transcode_with_audio(
+            let transcode = plan_requires_transcode(
                 info,
                 &stream_order,
                 &staged.audio_settings,
@@ -7017,7 +7021,7 @@ fn container_conflicts_for_plan(
     };
     let order = final_stream_order(info, stream_order, deleted_streams);
     let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
-    conflicts.extend(container_conflicts_with_audio(
+    conflicts.extend(container_conflicts(
         info,
         &order,
         audio_settings,
@@ -7074,19 +7078,39 @@ fn staged_container_conflicts(
         };
     };
     let changes = subtitle_changes.values().cloned().collect::<Vec<_>>();
-    let order = info
+    // No container change is staged, so only the tracks this edit re-encodes can newly
+    // fail to fit the container the file is already in — picking Opus for an audio track
+    // No container change is staged, so most streams are about to be copied through
+    // byte-for-byte and need no opinion from us. Two kinds still do:
+    //
+    //   * tracks this edit re-encodes, whose new codec is the user's choice and may not
+    //     fit the container the file is already in — Vorbis for an audio track in an MP4;
+    //   * streams Reel offers no control over at all (`data`, `attachment`), which it
+    //     cannot drop or convert on the user's behalf, so an unwritable one has to be
+    //     reported here rather than surfacing as a raw ffmpeg "codec not currently
+    //     supported in container" once the batch is already running.
+    //
+    // Everything else is deliberately left alone. `supports_codec` is a conservative
+    // shortlist, not a full account of what these containers accept, so blocking an
+    // untouched audio or subtitle track on it refuses edits that would have worked: an
+    // MKV holding `dvb_subtitle` could not be reordered or have a default flag flipped.
+    let checked = info
         .map(|info| final_stream_order(info, stream_order, deleted_streams))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|index| {
+            audio_settings.contains_key(index)
+                || video_settings.contains_key(index)
+                || info
+                    .and_then(|info| stream_by_index(info, *index))
+                    .is_some_and(|stream| {
+                        !matches!(stream_kind(stream), Some("video" | "audio" | "subtitle"))
+                    })
+        })
+        .collect::<Vec<_>>();
     let mut conflicts = info
         .map(|info| {
-            current_container_conflicts_with_audio(
-                info,
-                &order,
-                audio_settings,
-                video_settings,
-                &[],
-                target,
-            )
+            container_conflicts(info, &checked, audio_settings, video_settings, &[], target)
         })
         .unwrap_or_default();
     conflicts.extend(imported_subtitle_conflicts(&changes, sidecars, target));
@@ -7154,7 +7178,7 @@ fn validate_staged_edit(
         .difference(&reconciled.deleted_streams)
         .copied()
         .collect();
-    validate_edit_with_audio(
+    validate_edit(
         info,
         &order,
         &reconciled.deleted_streams,
@@ -7169,7 +7193,7 @@ fn validate_staged_edit(
             continue;
         }
         let codec = effective_audio_codec(stream, settings)
-            .expect("validate_edit_with_audio accepts only encodable audio codecs");
+            .expect("validate_edit accepts only encodable audio codecs");
         let encoder = codec
             .encoder()
             .expect("audio target codecs always provide an encoder");
@@ -7660,33 +7684,29 @@ fn staged_edit_summary_entries(
     }
     for (index, settings) in &staged.audio_settings {
         let source = stream_by_index(info, *index);
-        let codec = source
-            .and_then(|stream| effective_audio_codec(stream, settings))
-            .map(AudioCodec::label)
-            .unwrap_or("original codec");
+        let target_codec = source.and_then(|stream| effective_audio_codec(stream, settings));
         let channels = settings
             .channel_layout
             .channels()
             .or_else(|| source.and_then(stream_channels));
-        let mut details = vec![codec.to_string()];
+        let mut details = vec![
+            target_codec
+                .map(AudioCodec::label)
+                .unwrap_or("original codec")
+                .to_string(),
+        ];
         if settings.channel_layout != AudioChannelLayout::Original {
             details.push(settings.channel_layout.label().to_string());
         }
-        if settings.quality != AudioQuality::Source
-            && let Some(channels) = channels
-            && let Some(rate) = source
-                .and_then(|stream| effective_audio_codec(stream, settings))
-                .and_then(|codec| audio_bitrate_kbps(codec, channels, settings.quality))
+        if let Some(rate) = target_codec
+            .filter(|codec| !codec.is_lossless())
+            .zip(channels)
+            .and_then(|(codec, channels)| audio_bitrate_kbps(codec, channels))
         {
-            details.push(format!("{} ({rate} kbps)", settings.quality.label()));
-        }
-        if let AudioSampleRate::Hz(rate) = settings.sample_rate {
-            details.push(AudioSampleRate::Hz(rate).label());
+            details.push(format!("{rate} kbps"));
         }
         let technical_change = settings.codec != AudioCodec::Original
-            || settings.channel_layout != AudioChannelLayout::Original
-            || settings.quality != AudioQuality::Source
-            || settings.sample_rate != AudioSampleRate::Original;
+            || settings.channel_layout != AudioChannelLayout::Original;
         if technical_change {
             lines.push((
                 "audio",
@@ -11076,8 +11096,6 @@ mod tests {
         let settings = AudioSettings {
             codec: AudioCodec::Ac3,
             channel_layout: AudioChannelLayout::Mono,
-            quality: AudioQuality::Balanced,
-            sample_rate: AudioSampleRate::Hz(32_000),
             metadata: AudioMetadata {
                 language: "nld".to_string(),
                 title: Some("Director commentary".to_string()),
@@ -12343,8 +12361,6 @@ mod tests {
         AudioSettings {
             codec: AudioCodec::Original,
             channel_layout: AudioChannelLayout::Original,
-            quality: AudioQuality::Source,
-            sample_rate: AudioSampleRate::Original,
             metadata: empty_audio_metadata(),
         }
     }
@@ -12464,6 +12480,74 @@ mod tests {
     }
 
     #[test]
+    fn an_untouched_track_should_not_be_judged_against_a_container_it_already_lives_in() {
+        // Regression: `supports_codec` is a conservative shortlist, not a full account of
+        // what a container accepts, and plenty of real files carry a codec it omits — an
+        // MKV with `dvb_subtitle`, an MP4 with DTS. Judging every surviving stream against
+        // the container the file is *already in* turned those into a hard refusal from
+        // `validate_staged_edit`, so the file could not be reordered, renamed, or have a
+        // default flag flipped at all, over content the edit never touches and ffmpeg
+        // would have copied through untouched.
+        let mut app = test_file_app(&["movie.mp4"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "dts",
+                 "channels": 6, "sample_rate": "48000"},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000"}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.container_target = None;
+
+        // Act: an ordinary edit that says nothing about the DTS track.
+        app.default_streams.insert(2);
+
+        // Assert: nothing to report, and specifically not about the untouched track.
+        assert_that!(app.selected_container_conflicts()).is_empty();
+
+        // A codec the edit itself chooses is still checked, which is what this gate is
+        // for — MP4 cannot carry Vorbis.
+        let mut vorbis = app.effective_audio_settings(1).unwrap();
+        vorbis.codec = AudioCodec::Vorbis;
+        app.audio_settings.insert(1, vorbis);
+        assert_that!(app.selected_container_conflicts().join("\n").as_str())
+            .contains("audio track #1");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_stream_reel_cannot_edit_should_still_be_reported_before_the_batch_starts() {
+        // The mirror of the case above. A `tmcd` timecode track is not something Reel can
+        // drop, convert, or even show a row for, and ffmpeg genuinely refuses to write one
+        // into the output — so this is the one shape that has to be refused up front
+        // rather than failing mid-batch with a raw muxer error.
+        let mut app = test_file_app(&["movie.mp4"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000"},
+                {"index": 2, "codec_type": "data", "codec_name": "unknown"}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.container_target = None;
+        app.default_streams.insert(1);
+
+        assert_that!(app.selected_container_conflicts().join("\n").as_str())
+            .contains("data track #2");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn mp4_conversion_should_hide_and_clear_unsupported_source_audio_roles() {
         // Arrange: reproduce the reported workflow. The FLAC track starts with both a
         // supported Commentary role and MP4's unsupported Original role, while a
@@ -12492,13 +12576,23 @@ mod tests {
         focus_track(&mut app, TrackRef::Embedded(1));
         app.open_audio_settings();
 
-        // Assert the unsupported role is already absent; no manual untick is possible
-        // or necessary, while MP4-supported fields and metadata remain available.
+        // Assert: MP4 cannot store Original, so the dialog does not offer it — there is
+        // nothing for the user to untick. The staged model still carries the source's
+        // value, because the container target is not a decision the user made about this
+        // flag and they may yet change it back.
         assert_that!(app.visible_audio_fields()).contains(AudioSettingsField::Commentary);
         assert_that!(app.visible_audio_fields()).does_not_contain(AudioSettingsField::Original);
         let effective = app.effective_audio_settings(1).unwrap();
-        assert_that!(effective.metadata.original).is_false();
+        assert_that!(effective.metadata.original).is_true();
         assert_that!(effective.metadata.commentary).is_true();
+
+        // Merely opening a field and leaving it must not stage anything: the value the
+        // dialog showed has to compare equal to the source it came from.
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.start_audio_title_input();
+        app.escape_audio_settings();
+        assert_that!(app.audio_settings.contains_key(&1)).is_false();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
 
         // Act: choose the expected lossless MP4 replacement through the popup path.
         app.activate_audio_settings();
@@ -12514,9 +12608,15 @@ mod tests {
         // supported metadata on both the edited track and its neighbor is preserved.
         let staged = &app.audio_settings[&1];
         assert_that!(staged.codec).is_equal_to(AudioCodec::Alac);
-        assert_that!(staged.metadata.original).is_false();
         assert_that!(staged.metadata.commentary).is_true();
         assert_that!(staged.metadata.title.as_deref()).contains("Main mix");
+        // The role MP4 cannot store is dropped when the file is written, not baked into
+        // the staged edit: dropping the MP4 target has to bring it back rather than leave
+        // it silently cleared in an MKV that could have carried it.
+        assert_that!(staged.metadata.original).is_true();
+        let mut mp4_metadata = staged.metadata.clone();
+        ContainerFormat::Mp4.retain_supported_audio_metadata(&mut mp4_metadata);
+        assert_that!(mp4_metadata.original).is_false();
         assert_that!(app.audio_settings.contains_key(&2)).is_false();
         let neighbor = app.effective_audio_settings(2).unwrap();
         assert_that!(neighbor.metadata.language.as_str()).is_equal_to("nld");
@@ -12705,8 +12805,6 @@ mod tests {
             AudioSettings {
                 codec: AudioCodec::Aac,
                 channel_layout: AudioChannelLayout::Original,
-                quality: AudioQuality::Source,
-                sample_rate: AudioSampleRate::Original,
                 metadata: AudioMetadata {
                     language: "zza".to_string(),
                     ..empty_audio_metadata()
@@ -12886,8 +12984,6 @@ mod tests {
         let changed = AudioSettings {
             codec: AudioCodec::Ac3,
             channel_layout: AudioChannelLayout::Mono,
-            quality: AudioQuality::High,
-            sample_rate: AudioSampleRate::Hz(32_000),
             metadata: AudioMetadata {
                 language: "nld".to_string(),
                 title: Some("Changed".to_string()),
@@ -13035,8 +13131,6 @@ mod tests {
             AudioSettings {
                 codec: AudioCodec::Ac3,
                 channel_layout: AudioChannelLayout::Mono,
-                quality: AudioQuality::High,
-                sample_rate: AudioSampleRate::Hz(32_000),
                 metadata: AudioMetadata {
                     language: "nld".to_string(),
                     title: Some("Commentary".to_string()),
@@ -13050,8 +13144,6 @@ mod tests {
             AudioSettings {
                 codec: AudioCodec::Original,
                 channel_layout: AudioChannelLayout::Original,
-                quality: AudioQuality::Source,
-                sample_rate: AudioSampleRate::Original,
                 metadata: empty_audio_metadata(),
             },
         );
@@ -13062,7 +13154,6 @@ mod tests {
         staged.audio_settings.insert(
             98,
             AudioSettings {
-                quality: AudioQuality::High,
                 metadata: empty_audio_metadata(),
                 ..automatic_audio_settings()
             },
@@ -13070,7 +13161,7 @@ mod tests {
         staged.audio_settings.insert(
             2,
             AudioSettings {
-                quality: AudioQuality::High,
+                codec: AudioCodec::Aac,
                 metadata: source_metadata.clone(),
                 ..automatic_audio_settings()
             },
@@ -13079,14 +13170,6 @@ mod tests {
             3,
             AudioSettings {
                 channel_layout: AudioChannelLayout::Mono,
-                metadata: source_metadata.clone(),
-                ..automatic_audio_settings()
-            },
-        );
-        staged.audio_settings.insert(
-            4,
-            AudioSettings {
-                sample_rate: AudioSampleRate::Hz(32_000),
                 metadata: source_metadata.clone(),
                 ..automatic_audio_settings()
             },
@@ -13104,14 +13187,14 @@ mod tests {
             .iter()
             .map(|(_, line)| line.as_str())
             .collect::<Vec<_>>();
-        assert!(rendered.contains(
-            &"Encoding audio track #1 as Dolby Digital (AC-3) · Mono · High (192 kbps) · 32 kHz"
-        ));
+        assert!(
+            rendered.contains(&"Encoding audio track #1 as Dolby Digital (AC-3) · Mono · 128 kbps")
+        );
         assert!(rendered.contains(&"Updating audio track #1 metadata"));
         assert!(rendered.contains(&"Updating audio track #99 metadata"));
         assert!(rendered.iter().any(|line| line.contains("audio track #2")));
         assert!(rendered.iter().any(|line| line.contains("audio track #3")));
-        assert!(rendered.iter().any(|line| line.contains("audio track #4")));
+        // #5's staged settings match the source exactly, so it contributes no line.
         assert!(!rendered.iter().any(|line| line.contains("audio track #5")));
     }
 

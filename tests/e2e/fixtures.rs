@@ -46,6 +46,11 @@ pub struct MediaSpec {
     pub audio_codecs: Vec<&'static str>,
     pub audio_titles: Vec<Option<&'static str>>,
     pub audio_sample_rate: u32,
+    /// Writes a `tmcd` timecode track, which ffprobe reports as a `data` stream whose
+    /// codec Reel's container table does not list. Cameras produce these constantly, so
+    /// it is the realistic shape of "content the file has always held and no edit
+    /// touches".
+    pub timecode: Option<&'static str>,
     pub subtitles: Vec<SubtitleSpec>,
 }
 
@@ -64,6 +69,7 @@ impl Default for MediaSpec {
             audio_codecs: Vec::new(),
             audio_titles: Vec::new(),
             audio_sample_rate: 48_000,
+            timecode: None,
             subtitles: Vec::new(),
         }
     }
@@ -79,6 +85,11 @@ impl MediaSpec {
             muxer: "mp4",
             ..Self::default()
         }
+    }
+
+    pub fn timecode(mut self, timecode: &'static str) -> Self {
+        self.timecode = Some(timecode);
+        self
     }
 
     pub fn size(mut self, width: u32, height: u32) -> Self {
@@ -221,6 +232,10 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
         command
             .arg(format!("-disposition:s:{index}"))
             .arg(if subtitle.default { "default" } else { "0" });
+    }
+
+    if let Some(timecode) = spec.timecode {
+        command.args(["-timecode", timecode]);
     }
 
     command.args(["-f", spec.muxer]);
