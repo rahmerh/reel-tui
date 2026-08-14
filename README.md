@@ -8,32 +8,14 @@ and edit media files.
 ## Requirements
 
 - A recent Rust toolchain
-- **FFmpeg 8.1 or newer** — both `ffprobe` and `ffmpeg` in `PATH`
-
-Reel refuses to start on older FFmpeg builds, and the floor is deliberately strict.
-FFmpeg 8.1 is the first release whose `mov` demuxer reads a track title back out of the
-ISO-BMFF `name` atom. On anything older, `ffprobe` reports every MP4/MOV track title as
-absent even though it is there, so remuxing an MP4 or MOV **erases all of its track
-titles** — including on a plain stream copy, and including titles Reel itself just
-wrote. Nothing in Reel can work around a demuxer that does not parse the atom, so it
-declines to touch your files rather than quietly damage them.
-
-FFmpeg 8.1 landed in November 2025 and has not reached most distribution repositories
-yet. On Debian, Ubuntu, or Fedora you will likely need a [static
-build](https://johnvansickle.com/ffmpeg/) or
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) on your `PATH`.
+- FFmpeg 8.1+
 
 Optional subtitle tools:
 
-- [`seconv` 5.1.0+](https://github.com/SubtitleEdit/subtitleedit/releases) for PGS/VobSub
-  conversion, image subtitle rendering, and OCR. 5.0.0 cannot read a VobSub `.idx` at
-  all. Note that the 5.1.0 build still reports `5.0.0` from `--version`, so Reel detects
-  it by capability instead. It also needs `libicu` installed.
+- [`seconv` 5.1.0+](https://github.com/SubtitleEdit/subtitleedit/releases)
 - `tesseract` 4.0+ plus installed language data for image-to-text OCR
 
-Reel detects optional tools from `PATH`, if not found you can still use the rest of the app.
-
-Desktop completion notifications use `notify-send` when it is available.
+Reel detects all tools from `PATH`, if optional tools are not found you can still use the rest of the app.
 
 ## Installation
 
@@ -55,17 +37,6 @@ Or pass a target directory path:
 reel /path/to/media
 ```
 
-Desktop notifications are enabled by default. Disable them in
-`~/.config/reel/config.toml`:
-
-```toml
-[notifications]
-enabled = false
-```
-
-Use `reel --help` (or `reel -h`) to show command-line help, and `reel --version`
-(or `reel -V`) to print the installed version.
-
 ## How It Works
 
 `reel` uses a non-destructive, queued editing model:
@@ -79,7 +50,7 @@ Use `reel --help` (or `reel -h`) to show command-line help, and `reel --version`
 - **Media Inspection**: Inspect container formats, track layouts, duration, bitrates, and metadata across your video collection.
 - **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and modify stream metadata without re-encoding.
 - **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting.
-- **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata. Reel automatically selects safe bitrate and sample-rate values for the chosen codec.
+- **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata.
 - **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
 
