@@ -19,12 +19,12 @@ use crate::{
         AudioChannelLayout, AudioCodec, AudioMetadata, AudioQuality, AudioRole, AudioSampleRate,
         AudioSettings, CHANNEL_UPMIX_NOT_IMPLEMENTED, ContainerFormat, ContainerMetadata,
         CustomResolution, CustomScaling, EditEvent, EditOutcome, EditRequest,
-        MINIMUM_CUSTOM_DIMENSION, SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED, SaveDestination,
-        VideoCodec, VideoResolution, VideoSettings, audio_bitrate_kbps, audio_requires_transcode,
-        audio_stream_title, container_conflict_streams_with_audio, container_conflicts_with_audio,
+        MINIMUM_CUSTOM_DIMENSION, SaveDestination, VideoCodec, VideoResolution, VideoSettings,
+        audio_bitrate_kbps, audio_requires_transcode, audio_stream_title,
+        container_conflict_streams_with_audio, container_conflicts_with_audio,
         current_container_conflicts_with_audio, effective_audio_codec, imported_subtitle_conflicts,
         plan_requires_transcode_with_audio, stream_channels, stream_disposition, stream_index,
-        stream_sample_rate, subtitle_metadata_conflicts, validate_edit_with_audio,
+        subtitle_metadata_conflicts, validate_edit_with_audio,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -691,8 +691,6 @@ pub enum AudioSettingsField {
     #[default]
     Codec,
     ChannelLayout,
-    Quality,
-    SampleRate,
     Language,
     Title,
     Default,
@@ -704,11 +702,9 @@ pub enum AudioSettingsField {
 }
 
 impl AudioSettingsField {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 10] = [
         Self::Codec,
         Self::ChannelLayout,
-        Self::Quality,
-        Self::SampleRate,
         Self::Language,
         Self::Title,
         Self::Default,
@@ -723,8 +719,6 @@ impl AudioSettingsField {
         match self {
             Self::Codec => "Codec",
             Self::ChannelLayout => "Channel layout",
-            Self::Quality => "Quality",
-            Self::SampleRate => "Sample rate",
             Self::Language => "Language",
             Self::Title => "Title",
             Self::Default => "Default",
@@ -765,8 +759,6 @@ pub struct AudioSettingsPopup {
     pub help_visible: bool,
     pub codec_cursor: usize,
     pub channel_cursor: usize,
-    pub quality_cursor: usize,
-    pub sample_rate_cursor: usize,
     pub language_cursor: usize,
     pub language_search: SearchState,
     pub title_input: TextInputState,
@@ -3440,10 +3432,15 @@ impl App {
     }
 
     pub fn effective_audio_settings(&self, index: u64) -> Option<AudioSettings> {
-        self.audio_settings
+        let mut settings = self
+            .audio_settings
             .get(&index)
             .cloned()
-            .or_else(|| self.original_audio_settings(index))
+            .or_else(|| self.original_audio_settings(index))?;
+        if let Some(container) = self.effective_container() {
+            container.retain_supported_audio_metadata(&mut settings.metadata);
+        }
+        Some(settings)
     }
 
     fn store_audio_settings(&mut self, index: u64, mut settings: AudioSettings) {
@@ -3475,13 +3472,11 @@ impl App {
             self.notice = Some("Audio settings are only available for audio tracks.".into());
             return;
         }
-        let Some(settings) = self.effective_audio_settings(index) else {
-            return;
-        };
+        let settings = self
+            .effective_audio_settings(index)
+            .expect("the selected stream was just verified as audio");
         let codecs = self.audio_codec_choices(index);
         let channels = self.audio_channel_choices(index);
-        let qualities = self.audio_quality_choices(index);
-        let sample_rates = self.audio_sample_rate_choices(index);
         let languages = self.audio_language_choices_for(index, "");
         let language_cursor = languages
             .iter()
@@ -3499,14 +3494,6 @@ impl App {
             channel_cursor: channels
                 .iter()
                 .position(|choice| choice.value == settings.channel_layout)
-                .unwrap_or(0),
-            quality_cursor: qualities
-                .iter()
-                .position(|choice| choice.value == settings.quality)
-                .unwrap_or(0),
-            sample_rate_cursor: sample_rates
-                .iter()
-                .position(|choice| choice.value == settings.sample_rate)
                 .unwrap_or(0),
             language_cursor,
             language_search: SearchState::default(),
@@ -3634,105 +3621,6 @@ impl App {
         choices
     }
 
-    pub fn audio_quality_choices(&self, index: u64) -> Vec<AudioChoice<AudioQuality>> {
-        let Some(codec) = self.effective_audio_codec_for(index) else {
-            return Vec::new();
-        };
-        if codec.is_lossless() {
-            return Vec::new();
-        }
-        let Some(settings) = self.effective_audio_settings(index) else {
-            return Vec::new();
-        };
-        let source = self
-            .media_info()
-            .and_then(|info| stream_by_index(info, index));
-        let channels = settings
-            .channel_layout
-            .channels()
-            .or_else(|| source.and_then(stream_channels))
-            .unwrap_or(2);
-        let mut choices = Vec::new();
-        let bitrate = source
-            .and_then(|stream| stream.get("bit_rate"))
-            .and_then(|value| match value {
-                serde_json::Value::String(value) => value.parse::<u64>().ok(),
-                serde_json::Value::Number(value) => value.as_u64(),
-                _ => None,
-            })
-            .map(|rate| format!(" ({} kbps)", rate / 1_000))
-            .unwrap_or_default();
-        choices.push(AudioChoice {
-            value: AudioQuality::Source,
-            label: format!("Source{bitrate}"),
-            current: settings.quality == AudioQuality::Source,
-            enabled: true,
-            reason: None,
-        });
-        choices.extend(AudioQuality::PRESETS.into_iter().map(|quality| {
-            let bitrate = audio_bitrate_kbps(codec, channels, quality);
-            AudioChoice {
-                value: quality,
-                label: bitrate
-                    .map(|rate| format!("{} ({rate} kbps)", quality.label()))
-                    .unwrap_or_else(|| quality.label().to_string()),
-                current: false,
-                enabled: bitrate.is_some(),
-                reason: bitrate
-                    .is_none()
-                    .then(|| format!("{} does not support this layout", codec.label())),
-            }
-        }));
-        choices
-    }
-
-    pub fn audio_sample_rate_choices(&self, index: u64) -> Vec<AudioChoice<AudioSampleRate>> {
-        let source_rate = self
-            .media_info()
-            .and_then(|info| stream_by_index(info, index))
-            .and_then(stream_sample_rate);
-        let codec = self.effective_audio_codec_for(index);
-        let mut choices = Vec::new();
-        if !source_rate.is_some_and(|rate| AudioSampleRate::TARGETS.contains(&rate)) {
-            choices.push(AudioChoice {
-                value: AudioSampleRate::Original,
-                label: source_rate
-                    .map(|rate| AudioSampleRate::Hz(rate).label())
-                    .unwrap_or_else(|| "Original".to_string()),
-                current: true,
-                enabled: source_rate
-                    .is_some_and(|rate| codec.is_none_or(|codec| codec.supports_sample_rate(rate))),
-                reason: source_rate
-                    .is_none()
-                    .then(|| "Source sample rate is unavailable".to_string()),
-            });
-        }
-        choices.extend(AudioSampleRate::TARGETS.into_iter().map(|rate| {
-            let current = source_rate == Some(rate);
-            let reason = if source_rate.is_none() {
-                Some("Source sample rate is unavailable".to_string())
-            } else if source_rate.is_some_and(|source| rate > source) {
-                Some(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED.to_string())
-            } else {
-                codec
-                    .filter(|codec| !codec.supports_sample_rate(rate))
-                    .map(|codec| format!("{} does not support this rate", codec.label()))
-            };
-            AudioChoice {
-                value: if current {
-                    AudioSampleRate::Original
-                } else {
-                    AudioSampleRate::Hz(rate)
-                },
-                label: AudioSampleRate::Hz(rate).label(),
-                current,
-                enabled: reason.is_none(),
-                reason,
-            }
-        }));
-        choices
-    }
-
     fn audio_language_choices_for(&self, index: u64, query: &str) -> Vec<LanguageChoice> {
         let mut choices = common_language_choices();
         choices.insert(
@@ -3762,10 +3650,16 @@ impl App {
     }
 
     pub fn audio_field_visible(&self, field: AudioSettingsField) -> bool {
-        !matches!(
-            field,
-            AudioSettingsField::Quality | AudioSettingsField::SampleRate
-        )
+        let Some(container) = self.effective_container() else {
+            return true;
+        };
+        match field {
+            AudioSettingsField::Language => container.supports_audio_language(),
+            field if field.role().is_some() => field
+                .role()
+                .is_some_and(|role| container.supports_audio_role(role)),
+            _ => true,
+        }
     }
 
     pub fn visible_audio_fields(&self) -> Vec<AudioSettingsField> {
@@ -3773,37 +3667,6 @@ impl App {
             .into_iter()
             .filter(|field| self.audio_field_visible(*field))
             .collect()
-    }
-
-    pub fn audio_field_reason(&self, field: AudioSettingsField) -> Option<String> {
-        let popup = self.audio_settings_popup.as_ref()?;
-        let settings = self.effective_audio_settings(popup.stream_index)?;
-        let original = self.original_audio_settings(popup.stream_index)?;
-        let container = self.effective_container()?;
-        match field {
-            AudioSettingsField::Language
-                if !container.supports_audio_language() && settings.metadata.language == "und" =>
-            {
-                Some(format!(
-                    "{} cannot store audio language metadata",
-                    container.label()
-                ))
-            }
-            field
-                if field.role().is_some_and(|role| {
-                    !container.supports_audio_role(role)
-                        && !settings.metadata.get_role(role)
-                        && !original.metadata.get_role(role)
-                }) =>
-            {
-                Some(format!(
-                    "{} cannot store the {} audio role",
-                    container.label(),
-                    field.label()
-                ))
-            }
-            _ => None,
-        }
     }
 
     pub fn open_video_settings(&mut self) {
@@ -4663,26 +4526,6 @@ impl App {
                             |position| choices[position].enabled,
                         );
                     }
-                    AudioSettingsField::Quality => {
-                        let choices = self.audio_quality_choices(index);
-                        let popup = self.audio_settings_popup.as_mut().unwrap();
-                        popup.quality_cursor = move_cursor(
-                            popup.quality_cursor,
-                            choices.len(),
-                            direction,
-                            |position| choices[position].enabled,
-                        );
-                    }
-                    AudioSettingsField::SampleRate => {
-                        let choices = self.audio_sample_rate_choices(index);
-                        let popup = self.audio_settings_popup.as_mut().unwrap();
-                        popup.sample_rate_cursor = move_cursor(
-                            popup.sample_rate_cursor,
-                            choices.len(),
-                            direction,
-                            |position| choices[position].enabled,
-                        );
-                    }
                     _ => {}
                 }
             }
@@ -4703,9 +4546,12 @@ impl App {
         match popup.mode {
             AudioSettingsMode::Summary => {
                 let fields = self.visible_audio_fields();
-                if let Some(field) = if end { fields.last() } else { fields.first() } {
-                    self.audio_settings_popup.as_mut().unwrap().field = *field;
-                }
+                let field = if end {
+                    *fields.last().expect("codec is always an audio field")
+                } else {
+                    *fields.first().expect("codec is always an audio field")
+                };
+                self.audio_settings_popup.as_mut().unwrap().field = field;
             }
             AudioSettingsMode::Dropdown => {
                 let index = popup.stream_index;
@@ -4719,24 +4565,14 @@ impl App {
                         let choices = self.audio_channel_choices(index);
                         cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
                     }
-                    AudioSettingsField::Quality => {
-                        let choices = self.audio_quality_choices(index);
-                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
-                    }
-                    AudioSettingsField::SampleRate => {
-                        let choices = self.audio_sample_rate_choices(index);
-                        cursor_endpoint(choices.len(), end, |position| choices[position].enabled)
-                    }
                     _ => None,
                 };
                 if let Some(endpoint) = endpoint {
                     let popup = self.audio_settings_popup.as_mut().unwrap();
-                    match field {
-                        AudioSettingsField::Codec => popup.codec_cursor = endpoint,
-                        AudioSettingsField::ChannelLayout => popup.channel_cursor = endpoint,
-                        AudioSettingsField::Quality => popup.quality_cursor = endpoint,
-                        AudioSettingsField::SampleRate => popup.sample_rate_cursor = endpoint,
-                        _ => {}
+                    if field == AudioSettingsField::Codec {
+                        popup.codec_cursor = endpoint;
+                    } else {
+                        popup.channel_cursor = endpoint;
                     }
                 }
             }
@@ -4759,15 +4595,8 @@ impl App {
         let field = popup.field;
         let mode = popup.mode;
         if mode == AudioSettingsMode::Summary {
-            if let Some(reason) = self.audio_field_reason(field) {
-                self.notice = Some(reason);
-                return;
-            }
             match field {
-                AudioSettingsField::Codec
-                | AudioSettingsField::ChannelLayout
-                | AudioSettingsField::Quality
-                | AudioSettingsField::SampleRate => {
+                AudioSettingsField::Codec | AudioSettingsField::ChannelLayout => {
                     self.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
                 }
                 AudioSettingsField::Language => {
@@ -4787,9 +4616,8 @@ impl App {
                 AudioSettingsField::Title => self.start_audio_title_input(),
                 AudioSettingsField::Default => self.toggle_audio_default(index),
                 field => {
-                    if let Some(role) = field.role()
-                        && let Some(mut settings) = self.effective_audio_settings(index)
-                    {
+                    let role = field.role().expect("remaining audio fields are roles");
+                    if let Some(mut settings) = self.effective_audio_settings(index) {
                         let enabled = settings.metadata.get_role(role);
                         settings.metadata.set_role(role, !enabled);
                         self.store_audio_settings(index, settings);
@@ -4834,22 +4662,6 @@ impl App {
                     return;
                 };
                 settings.channel_layout = choice.value;
-            }
-            AudioSettingsField::Quality => {
-                let cursor = popup.quality_cursor;
-                let choices = self.audio_quality_choices(index);
-                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
-                    return;
-                };
-                settings.quality = choice.value;
-            }
-            AudioSettingsField::SampleRate => {
-                let cursor = popup.sample_rate_cursor;
-                let choices = self.audio_sample_rate_choices(index);
-                let Some(choice) = choices.get(cursor).filter(|choice| choice.enabled) else {
-                    return;
-                };
-                settings.sample_rate = choice.value;
             }
             _ => return,
         }
@@ -4967,8 +4779,6 @@ impl App {
         match field {
             AudioSettingsField::Codec => current.codec != original.codec,
             AudioSettingsField::ChannelLayout => current.channel_layout != original.channel_layout,
-            AudioSettingsField::Quality => current.quality != original.quality,
-            AudioSettingsField::SampleRate => current.sample_rate != original.sample_rate,
             AudioSettingsField::Language => current.metadata.language != original.metadata.language,
             AudioSettingsField::Title => current.metadata.title != original.metadata.title,
             AudioSettingsField::Default => {
@@ -6686,17 +6496,14 @@ impl App {
         let Some(original) = self.original_audio_settings(index) else {
             return;
         };
-        let Some(mut settings) = self.effective_audio_settings(index) else {
-            return;
-        };
+        let mut settings = self
+            .effective_audio_settings(index)
+            .expect("original audio settings imply effective audio settings");
         match field {
             AudioSettingsField::Codec => settings.codec = original.codec,
             AudioSettingsField::ChannelLayout => settings.channel_layout = original.channel_layout,
-            AudioSettingsField::Quality => settings.quality = original.quality,
-            AudioSettingsField::SampleRate => settings.sample_rate = original.sample_rate,
             AudioSettingsField::Language => settings.metadata.language = original.metadata.language,
             AudioSettingsField::Title => settings.metadata.title = original.metadata.title,
-            AudioSettingsField::Default => unreachable!(),
             field => {
                 let role = field.role().expect("audio role field");
                 settings
@@ -7344,9 +7151,8 @@ fn validate_staged_edit(
         video_settings,
     )?;
     for (index, settings) in audio_settings {
-        let Some(stream) = stream_by_index(info, *index) else {
-            continue;
-        };
+        let stream = stream_by_index(info, *index)
+            .expect("validated audio settings refer to an existing stream");
         if !audio_requires_transcode(stream, settings) {
             continue;
         }
@@ -12493,8 +12299,38 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    fn audio_test_app(streams: serde_json::Value, index: u64) -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(&mut app, streams);
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Embedded(index));
+        app
+    }
+
+    fn empty_audio_metadata() -> AudioMetadata {
+        AudioMetadata {
+            language: "und".to_string(),
+            title: None,
+            commentary: false,
+            hearing_impaired: false,
+            audio_description: false,
+            original: false,
+            dubbed: false,
+        }
+    }
+
+    fn automatic_audio_settings() -> AudioSettings {
+        AudioSettings {
+            codec: AudioCodec::Original,
+            channel_layout: AudioChannelLayout::Original,
+            quality: AudioQuality::Source,
+            sample_rate: AudioSampleRate::Original,
+            metadata: empty_audio_metadata(),
+        }
+    }
+
     #[test]
-    fn audio_choices_should_keep_upmixing_and_upsampling_visible_but_disabled() {
+    fn audio_choices_should_keep_upmixing_visible_but_disabled() {
         let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
         set_media(
@@ -12514,68 +12350,10 @@ mod tests {
             .iter()
             .find(|choice| choice.value == AudioChannelLayout::Surround71)
             .unwrap();
-        let rates = app.audio_sample_rate_choices(1);
-        let high_rate = rates
-            .iter()
-            .find(|choice| choice.value == AudioSampleRate::Hz(96_000))
-            .unwrap();
-
         assert_that!(surround.enabled).is_false();
         assert_that!(surround.reason.as_deref()).contains(CHANNEL_UPMIX_NOT_IMPLEMENTED);
-        assert_that!(high_rate.enabled).is_false();
-        assert_that!(high_rate.reason.as_deref()).contains(SAMPLE_RATE_UPSAMPLING_NOT_IMPLEMENTED);
         assert_that!(layouts.iter().filter(|choice| choice.current).count()).is_equal_to(1);
-        assert_that!(rates.iter().filter(|choice| choice.current).count()).is_equal_to(1);
-        assert_that!(app.audio_field_visible(AudioSettingsField::Quality)).is_false();
-        assert_that!(app.audio_field_visible(AudioSettingsField::SampleRate)).is_false();
-
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn changing_audio_codec_should_not_silently_rewrite_an_incompatible_quality() {
-        let mut app = test_file_app(&["movie.mkv"]);
-        let directory = app.directory.clone();
-        set_media(
-            &mut app,
-            serde_json::json!([
-                {"index": 0, "codec_type": "video", "codec_name": "h264"},
-                {"index": 1, "codec_type": "audio", "codec_name": "aac",
-                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
-            ]),
-        );
-        app.subtitle_capabilities = full_subtitle_capabilities();
-        focus_track(&mut app, TrackRef::Embedded(1));
-        app.open_audio_settings();
-
-        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Quality;
-        app.activate_audio_settings();
-        let balanced = app
-            .audio_quality_choices(1)
-            .iter()
-            .position(|choice| choice.value == AudioQuality::Balanced)
-            .unwrap();
-        app.audio_settings_popup.as_mut().unwrap().quality_cursor = balanced;
-        app.activate_audio_settings();
-        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
-        app.activate_audio_settings();
-        let flac = app
-            .audio_codec_choices(1)
-            .iter()
-            .position(|choice| choice.value == AudioCodec::Flac)
-            .unwrap();
-        app.audio_settings_popup.as_mut().unwrap().codec_cursor = flac;
-        app.activate_audio_settings();
-
-        let settings = &app.audio_settings[&1];
-        assert_that!(settings.codec).is_equal_to(AudioCodec::Flac);
-        assert_that!(settings.quality).is_equal_to(AudioQuality::Balanced);
-        assert_that!(app.audio_field_visible(AudioSettingsField::Quality)).is_false();
-        assert_that!(app.staged_file_status(&app.files[0].path)).is_equal_to(
-            StagedFileStatus::Invalid(
-                "Lossless audio codecs do not use a bitrate quality preset.".to_string(),
-            ),
-        );
+        assert_eq!(app.visible_audio_fields(), AudioSettingsField::ALL);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -12666,6 +12444,70 @@ mod tests {
     }
 
     #[test]
+    fn mp4_conversion_should_hide_and_clear_unsupported_source_audio_roles() {
+        // Arrange: reproduce the reported workflow. The FLAC track starts with both a
+        // supported Commentary role and MP4's unsupported Original role, while a
+        // neighboring AAC track must remain unstaged and retain its metadata.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "flac",
+                 "channels": 2, "sample_rate": "48000",
+                 "tags": {"language": "eng", "title": "Main mix"},
+                 "disposition": {"comment": 1, "original": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000",
+                 "tags": {"language": "nld", "title": "Commentary"},
+                 "disposition": {"comment": 1}}
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.subtitle_capabilities
+            .ffmpeg_muxers
+            .insert("mp4".to_string());
+        app.container_target = Some(ContainerFormat::Mp4);
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+
+        // Assert the unsupported role is already absent; no manual untick is possible
+        // or necessary, while MP4-supported fields and metadata remain available.
+        assert_that!(app.visible_audio_fields()).contains(AudioSettingsField::Commentary);
+        assert_that!(app.visible_audio_fields()).does_not_contain(AudioSettingsField::Original);
+        let effective = app.effective_audio_settings(1).unwrap();
+        assert_that!(effective.metadata.original).is_false();
+        assert_that!(effective.metadata.commentary).is_true();
+
+        // Act: choose the expected lossless MP4 replacement through the popup path.
+        app.activate_audio_settings();
+        let alac = app
+            .audio_codec_choices(1)
+            .iter()
+            .position(|choice| choice.value == AudioCodec::Alac)
+            .unwrap();
+        app.audio_settings_popup.as_mut().unwrap().codec_cursor = alac;
+        app.activate_audio_settings();
+
+        // Assert: the resulting plan is valid without touching Original manually, and
+        // supported metadata on both the edited track and its neighbor is preserved.
+        let staged = &app.audio_settings[&1];
+        assert_that!(staged.codec).is_equal_to(AudioCodec::Alac);
+        assert_that!(staged.metadata.original).is_false();
+        assert_that!(staged.metadata.commentary).is_true();
+        assert_that!(staged.metadata.title.as_deref()).contains("Main mix");
+        assert_that!(app.audio_settings.contains_key(&2)).is_false();
+        let neighbor = app.effective_audio_settings(2).unwrap();
+        assert_that!(neighbor.metadata.language.as_str()).is_equal_to("nld");
+        assert_that!(neighbor.metadata.title.as_deref()).contains("Commentary");
+        assert_that!(neighbor.metadata.commentary).is_true();
+        assert_that!(app.selected_container_conflicts()).is_empty();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn original_and_dubbed_audio_roles_should_replace_each_other() {
         let mut app = test_file_app(&["movie.mkv"]);
         let directory = app.directory.clone();
@@ -12697,6 +12539,615 @@ mod tests {
         assert_that!(app.selected_container_conflicts()).is_empty();
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_settings_entry_points_should_cover_every_guard_and_editor_mode() {
+        let mut app = audio_test_app(
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
+            ]),
+            1,
+        );
+        let directory = app.directory.clone();
+
+        app.layer = Layer::Files;
+        app.open_audio_settings();
+        assert_that!(app.audio_settings_popup.is_none()).is_true();
+        app.layer = Layer::Streams;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_audio_settings();
+        assert_that!(app.audio_settings_popup.is_none()).is_true();
+        app.dialog = None;
+        focus_track(&mut app, TrackRef::Container);
+        app.open_audio_settings();
+        assert_that!(app.audio_settings_popup.is_none()).is_true();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.deleted_streams.insert(1);
+        app.open_audio_settings();
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Unmark this track"))
+        );
+        app.deleted_streams.clear();
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_audio_settings();
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("only available for audio"))
+        );
+
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+        assert_that!(app.dialog).contains(Dialog::AudioSettings);
+        app.toggle_audio_field_help();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().help_visible).is_true();
+        app.toggle_audio_field_help();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().help_visible).is_false();
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
+        app.start_audio_title_input();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::Summary);
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.start_audio_title_input();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::TitleEdit);
+        app.start_audio_title_input();
+        app.escape_audio_settings();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::Summary);
+
+        app.start_audio_language_search();
+        assert_that!(
+            app.audio_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .is_active
+        )
+        .is_false();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::LanguageDropdown;
+        app.start_audio_language_search();
+        assert_that!(
+            app.audio_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .is_active
+        )
+        .is_true();
+        app.cancel_audio_language_search();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(0);
+
+        app.audio_settings_popup = None;
+        app.toggle_audio_field_help();
+        app.start_audio_title_input();
+        app.start_audio_language_search();
+        app.cancel_audio_language_search();
+        app.escape_audio_settings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.filtered_audio_languages()).is_empty();
+        assert_that!(app.effective_audio_settings(99)).is_none();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_choice_builders_should_cover_missing_unknown_and_container_specific_inputs() {
+        let mut app = audio_test_app(
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "mystery",
+                 "channels": 3, "bit_rate": true, "tags": {"language": "qaa"}}
+            ]),
+            1,
+        );
+        let directory = app.directory.clone();
+        app.subtitle_capabilities.ffmpeg_encoders.clear();
+        app.container_target = Some(ContainerFormat::WebM);
+
+        let codecs = app.audio_codec_choices(1);
+        assert_that!(codecs[0].label.as_str()).is_equal_to("MYSTERY");
+        assert_that!(codecs[0].enabled).is_false();
+        assert_that!(
+            codecs.iter().any(|choice| {
+                choice.reason.as_deref() == Some("FFmpeg encoder is unavailable")
+            })
+        )
+        .is_true();
+        let layouts = app.audio_channel_choices(1);
+        assert_that!(layouts[0].label.as_str()).is_equal_to("3 channels");
+        assert_that!(layouts[0].enabled).is_true();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let rejected = app.audio_codec_choices(1);
+        assert_that!(rejected.iter().any(|choice| {
+            choice.value == AudioCodec::Aac
+                && choice.reason.as_deref() == Some("WebM cannot contain AAC audio")
+        }))
+        .is_true();
+        assert_that!(app.audio_codec_choices(99)[0].label.as_str()).is_equal_to("UNKNOWN");
+        assert_that!(app.effective_audio_codec_for(99)).is_none();
+        assert!(
+            app.audio_channel_choices(99)[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unavailable"))
+        );
+
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.audio_settings.insert(
+            1,
+            AudioSettings {
+                codec: AudioCodec::Aac,
+                channel_layout: AudioChannelLayout::Original,
+                quality: AudioQuality::Source,
+                sample_rate: AudioSampleRate::Original,
+                metadata: AudioMetadata {
+                    language: "zza".to_string(),
+                    ..empty_audio_metadata()
+                },
+            },
+        );
+        assert_that!(app.audio_language_choices_for(1, "zza").len()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_navigation_and_activation_should_cover_every_popup_branch() {
+        let mut app = audio_test_app(
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"},
+                 "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "nld"}}
+            ]),
+            1,
+        );
+        let directory = app.directory.clone();
+
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_to_endpoint(true);
+        app.activate_audio_settings();
+        app.open_audio_settings();
+        assert_that!(app.active_text_input()).is_none();
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_cursor(-1);
+        app.move_audio_settings_to_endpoint(true);
+        app.move_audio_settings_to_endpoint(false);
+
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = AudioSettingsMode::Dropdown;
+            app.move_audio_settings_cursor(1);
+            app.move_audio_settings_cursor(-1);
+            app.move_audio_settings_to_endpoint(true);
+            app.move_audio_settings_to_endpoint(false);
+        }
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_to_endpoint(true);
+
+        {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = AudioSettingsField::Language;
+            popup.mode = AudioSettingsMode::LanguageDropdown;
+        }
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_to_endpoint(true);
+        app.move_audio_settings_to_endpoint(false);
+        app.audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .language_search
+            .input
+            .value = "no language matches this".to_string();
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_to_endpoint(true);
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::TitleEdit;
+        app.move_audio_settings_cursor(1);
+        app.move_audio_settings_to_endpoint(true);
+
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.mode = AudioSettingsMode::Summary;
+            popup.field = field;
+            app.activate_audio_settings();
+            assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+                .is_equal_to(AudioSettingsMode::Dropdown);
+            app.escape_audio_settings();
+        }
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        app.activate_audio_settings();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::LanguageDropdown);
+        app.audio_settings_popup.as_mut().unwrap().language_cursor = 1;
+        app.activate_audio_settings();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::Summary);
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().language_cursor = usize::MAX;
+        app.activate_audio_settings();
+
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Summary;
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().title_input.value = "  New title  ".to_string();
+        app.activate_audio_settings();
+        app.escape_audio_settings();
+        assert_that!(app.audio_settings[&1].metadata.title.as_deref()).contains("New title");
+
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Default;
+        app.activate_audio_settings();
+        assert_that!(app.default_streams.contains(&1)).is_false();
+        app.activate_audio_settings();
+        assert!(app.default_streams.contains(&1));
+        for field in [
+            AudioSettingsField::Commentary,
+            AudioSettingsField::HearingImpaired,
+            AudioSettingsField::AudioDescription,
+            AudioSettingsField::Original,
+            AudioSettingsField::Dubbed,
+        ] {
+            app.audio_settings_popup.as_mut().unwrap().field = field;
+            app.activate_audio_settings();
+        }
+
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::ChannelLayout;
+        app.audio_settings_popup.as_mut().unwrap().channel_cursor = usize::MAX;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
+        app.audio_settings_popup.as_mut().unwrap().codec_cursor = usize::MAX;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::ChannelLayout;
+        let disabled = app
+            .audio_channel_choices(1)
+            .iter()
+            .position(|choice| !choice.enabled)
+            .unwrap();
+        app.audio_settings_popup.as_mut().unwrap().channel_cursor = disabled;
+        app.activate_audio_settings();
+        let mono = app
+            .audio_channel_choices(1)
+            .iter()
+            .position(|choice| choice.value == AudioChannelLayout::Mono)
+            .unwrap();
+        app.audio_settings_popup.as_mut().unwrap().channel_cursor = mono;
+        app.activate_audio_settings();
+        assert_that!(app.audio_settings[&1].channel_layout).is_equal_to(AudioChannelLayout::Mono);
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::TitleEdit;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 99;
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Codec;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Summary;
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Commentary;
+        app.activate_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Language;
+        app.activate_audio_settings();
+        assert_that!(app.active_text_input()).is_none();
+        app.audio_settings_popup.as_mut().unwrap().language_cursor = 0;
+        app.activate_audio_settings();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_reset_change_detection_escape_and_save_should_cover_all_fields() {
+        let mut app = audio_test_app(
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000",
+                 "tags": {"language": "eng", "title": "Original"},
+                 "disposition": {"default": 1, "original": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000", "tags": {"language": "nld"}}
+            ]),
+            1,
+        );
+        let directory = app.directory.clone();
+        app.open_audio_settings();
+        let changed = AudioSettings {
+            codec: AudioCodec::Ac3,
+            channel_layout: AudioChannelLayout::Mono,
+            quality: AudioQuality::High,
+            sample_rate: AudioSampleRate::Hz(32_000),
+            metadata: AudioMetadata {
+                language: "nld".to_string(),
+                title: Some("Changed".to_string()),
+                commentary: true,
+                hearing_impaired: true,
+                audio_description: true,
+                original: false,
+                dubbed: true,
+            },
+        };
+        app.audio_settings.insert(1, changed.clone());
+        app.default_streams.clear();
+        for field in AudioSettingsField::ALL {
+            assert_that!(app.audio_field_changed(field)).is_true();
+        }
+        for field in AudioSettingsField::ALL {
+            app.audio_settings.insert(1, changed.clone());
+            app.default_streams.clear();
+            app.audio_settings_popup.as_mut().unwrap().field = field;
+            app.reset_focused_field();
+        }
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Default;
+        app.reset_focused_field();
+        assert!(app.default_streams.contains(&1));
+
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 2;
+        app.default_streams.insert(2);
+        app.reset_audio_field(AudioSettingsField::Default);
+        assert_that!(app.default_streams.contains(&2)).is_false();
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 99;
+        app.reset_audio_field(AudioSettingsField::Codec);
+        app.audio_settings_popup = None;
+        app.reset_audio_field(AudioSettingsField::Codec);
+        app.commit_audio_title();
+        app.after_text_edit(TextInputSite::AudioLanguageSearch, InputEdit::Changed, None);
+        assert_that!(app.audio_field_changed(AudioSettingsField::Codec)).is_false();
+
+        app.audio_settings_popup = Some(AudioSettingsPopup {
+            stream_index: 99,
+            field: AudioSettingsField::Title,
+            mode: AudioSettingsMode::TitleEdit,
+            help_visible: false,
+            codec_cursor: 0,
+            channel_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new("Missing".to_string()),
+        });
+        app.commit_audio_title();
+        assert_that!(app.audio_field_changed(AudioSettingsField::Title)).is_false();
+
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_audio_settings();
+        app.audio_settings_popup = Some(AudioSettingsPopup {
+            stream_index: 0,
+            field: AudioSettingsField::Codec,
+            mode: AudioSettingsMode::Summary,
+            help_visible: false,
+            codec_cursor: 0,
+            channel_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new(String::new()),
+        });
+        app.audio_settings.insert(0, changed.clone());
+        assert_that!(app.audio_field_changed(AudioSettingsField::Codec)).is_false();
+        app.audio_settings.remove(&0);
+
+        app.dialog = Some(Dialog::AudioSettings);
+        app.audio_settings_popup = None;
+        app.reset_focused_field();
+        app.dialog = None;
+
+        app.video_settings_popup = None;
+        app.move_video_settings_cursor(1);
+        app.video_settings_popup = Some(VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Codec,
+            mode: VideoSettingsMode::Summary,
+            codec_cursor: 0,
+            resolution_cursor: 0,
+            custom_resolution: None,
+        });
+        app.move_video_settings_cursor(1);
+        app.move_video_settings_cursor(1);
+        app.move_video_settings_cursor(-1);
+        app.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::CustomResolution;
+        app.video_settings_popup.as_mut().unwrap().custom_resolution = None;
+        app.move_video_settings_cursor(1);
+
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Dropdown;
+        app.audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .language_search
+            .input
+            .value = "eng".to_string();
+        app.escape_audio_settings();
+        assert_that!(app.audio_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(AudioSettingsMode::Summary);
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::LanguageDropdown;
+        app.escape_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().mode = AudioSettingsMode::Summary;
+        app.escape_audio_settings();
+        assert_that!(app.audio_settings_popup.is_none()).is_true();
+
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_audio_settings();
+        app.audio_settings_popup.as_mut().unwrap().field = AudioSettingsField::Title;
+        app.start_audio_title_input();
+        app.audio_settings_popup.as_mut().unwrap().title_input.value = "Saved".to_string();
+        app.save_from_audio_settings();
+        assert_that!(app.audio_settings_popup.is_none()).is_true();
+        assert_that!(app.audio_settings[&1].metadata.title.as_deref()).contains("Saved");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audio_staged_summary_should_describe_every_technical_and_metadata_shape() {
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}},
+            {"index": 2, "codec_type": "audio", "codec_name": "dts",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}},
+            {"index": 3, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}},
+            {"index": 4, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}},
+            {"index": 5, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
+        ]));
+        let fingerprint = crate::files::FileFingerprint {
+            length: 1,
+            modified: None,
+        };
+        let order = vec![0, 1, 2, 3, 4, 5];
+        let mut staged = staged_edit(fingerprint, order.clone());
+        staged.original_stream_order = order;
+        staged.audio_settings.insert(
+            1,
+            AudioSettings {
+                codec: AudioCodec::Ac3,
+                channel_layout: AudioChannelLayout::Mono,
+                quality: AudioQuality::High,
+                sample_rate: AudioSampleRate::Hz(32_000),
+                metadata: AudioMetadata {
+                    language: "nld".to_string(),
+                    title: Some("Commentary".to_string()),
+                    commentary: true,
+                    ..empty_audio_metadata()
+                },
+            },
+        );
+        staged.audio_settings.insert(
+            99,
+            AudioSettings {
+                codec: AudioCodec::Original,
+                channel_layout: AudioChannelLayout::Original,
+                quality: AudioQuality::Source,
+                sample_rate: AudioSampleRate::Original,
+                metadata: empty_audio_metadata(),
+            },
+        );
+        let source_metadata = AudioMetadata {
+            language: "eng".to_string(),
+            ..empty_audio_metadata()
+        };
+        staged.audio_settings.insert(
+            98,
+            AudioSettings {
+                quality: AudioQuality::High,
+                metadata: empty_audio_metadata(),
+                ..automatic_audio_settings()
+            },
+        );
+        staged.audio_settings.insert(
+            2,
+            AudioSettings {
+                quality: AudioQuality::High,
+                metadata: source_metadata.clone(),
+                ..automatic_audio_settings()
+            },
+        );
+        staged.audio_settings.insert(
+            3,
+            AudioSettings {
+                channel_layout: AudioChannelLayout::Mono,
+                metadata: source_metadata.clone(),
+                ..automatic_audio_settings()
+            },
+        );
+        staged.audio_settings.insert(
+            4,
+            AudioSettings {
+                sample_rate: AudioSampleRate::Hz(32_000),
+                metadata: source_metadata.clone(),
+                ..automatic_audio_settings()
+            },
+        );
+        staged.audio_settings.insert(
+            5,
+            AudioSettings {
+                metadata: source_metadata,
+                ..automatic_audio_settings()
+            },
+        );
+
+        let lines = staged_edit_summary_entries(Path::new("movie.mkv"), &info, &staged);
+        let rendered = lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(
+            &"Encoding audio track #1 as Dolby Digital (AC-3) · Mono · High (192 kbps) · 32 kHz"
+        ));
+        assert!(rendered.contains(&"Updating audio track #1 metadata"));
+        assert!(rendered.contains(&"Updating audio track #99 metadata"));
+        assert!(rendered.iter().any(|line| line.contains("audio track #2")));
+        assert!(rendered.iter().any(|line| line.contains("audio track #3")));
+        assert!(rendered.iter().any(|line| line.contains("audio track #4")));
+        assert!(!rendered.iter().any(|line| line.contains("audio track #5")));
+    }
+
+    #[test]
+    fn staged_audio_validation_should_skip_metadata_only_work_and_require_target_encoders() {
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "48000", "tags": {"language": "eng"}}
+        ]));
+        let groups = track_groups_for(&info);
+        let validate = |settings: AudioSettings| {
+            validate_staged_edit(
+                &ToolCapabilities::default(),
+                Path::new("movie.mkv"),
+                &info,
+                &[],
+                &[0, 1],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &[0, 1],
+                &BTreeSet::new(),
+                &groups,
+                &BTreeSet::new(),
+                &BTreeMap::from([(1, settings)]),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+            )
+        };
+
+        let mut metadata_only = automatic_audio_settings();
+        metadata_only.metadata.language = "eng".to_string();
+        metadata_only.metadata.title = Some("Commentary".to_string());
+        assert!(validate(metadata_only).is_ok());
+
+        let mut technical = automatic_audio_settings();
+        technical.codec = AudioCodec::Ac3;
+        technical.metadata.language = "eng".to_string();
+        let error = match validate(technical) {
+            Ok(_) => panic!("missing AC-3 encoder should reject the staged edit"),
+            Err(error) => error,
+        };
+        assert_that!(error.as_str()).contains("Dolby Digital (AC-3) encoder");
+
+        let mut staged = staged_edit(
+            crate::files::FileFingerprint {
+                length: 1,
+                modified: None,
+            },
+            vec![0, 1],
+        );
+        staged.original_stream_order = vec![0, 1];
+        assert_that!(staged_edit_stages_anything(&staged)).is_false();
+        staged.audio_settings.insert(1, automatic_audio_settings());
+        assert_that!(staged_edit_stages_anything(&staged)).is_true();
     }
 
     #[test]
@@ -15405,8 +15856,6 @@ mod tests {
                     help_visible: false,
                     codec_cursor: 0,
                     channel_cursor: 0,
-                    quality_cursor: 0,
-                    sample_rate_cursor: 0,
                     language_cursor: 0,
                     language_search,
                     title_input: active,

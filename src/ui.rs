@@ -21,8 +21,8 @@ use crate::{
         TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
     edit::{
-        AudioChannelLayout, AudioQuality, AudioSampleRate, AudioSettings, ContainerFormat,
-        audio_bitrate_kbps, effective_audio_codec, stream_channels, stream_index,
+        AudioQuality, AudioSampleRate, AudioSettings, ContainerFormat, audio_bitrate_kbps,
+        effective_audio_codec, stream_channels, stream_index,
     },
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
@@ -1192,22 +1192,12 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_resolve_conflicts_dialog(frame, app);
         return;
     }
-    let (title, body, color) = match dialog {
-        Dialog::Keybindings
-        | Dialog::ContainerSettings
-        | Dialog::AudioSettings
-        | Dialog::VideoSettings => unreachable!(),
-        Dialog::SubtitleSettings | Dialog::ConfirmCancel => unreachable!(),
-        Dialog::ConfirmProcessAll | Dialog::BatchProcessing => unreachable!(),
-        Dialog::ConfirmReset | Dialog::ResolveConflicts => unreachable!(),
-        Dialog::Error => (
-            " Error ",
-            app.edit_error
-                .clone()
-                .unwrap_or_else(|| "An unknown editing error occurred.".to_string()),
-            Color::Red,
-        ),
-    };
+    let title = " Error ";
+    let body = app
+        .edit_error
+        .clone()
+        .unwrap_or_else(|| "An unknown editing error occurred.".to_string());
+    let color = Color::Red;
     let area = centered_fixed(frame.area(), 64, 9);
     let text = padded_popup_text(Text::from(body));
     frame.render_widget(Clear, area);
@@ -2200,19 +2190,13 @@ fn audio_field_help_title(field: AudioSettingsField) -> String {
     format!(" Information about {} ", field.label())
 }
 
-fn audio_field_help_text(app: &App, popup: &crate::app::AudioSettingsPopup) -> Text<'static> {
+fn audio_field_help_text(popup: &crate::app::AudioSettingsPopup) -> Text<'static> {
     let description = match popup.field {
         AudioSettingsField::Codec => {
             "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality."
         }
         AudioSettingsField::ChannelLayout => {
             "Sets the number and arrangement of output channels, such as Mono, Stereo, or 5.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not implemented."
-        }
-        AudioSettingsField::Quality => {
-            "Controls the target bitrate when Reel encodes with a lossy audio codec. Higher quality uses more data; lossless codecs do not use a bitrate quality profile."
-        }
-        AudioSettingsField::SampleRate => {
-            "Sets how many audio samples are stored per second. Reel keeps the source rate when the selected codec supports it and automatically chooses a lower compatible rate when necessary; upsampling is not implemented."
         }
         AudioSettingsField::Language => {
             "Identifies the language spoken on this audio track to players and media libraries. It changes metadata only; it does not translate or dub the audio."
@@ -2239,14 +2223,10 @@ fn audio_field_help_text(app: &App, popup: &crate::app::AudioSettingsPopup) -> T
             "Marks the track as a dubbed version whose dialogue was re-recorded, usually in another language. This flag is metadata only and is mutually exclusive with Original."
         }
     };
-    let mut paragraphs = vec![(description.to_string(), Style::default().fg(Color::White))];
-    if let Some(reason) = app.audio_field_reason(popup.field) {
-        paragraphs.push((
-            format!("Unavailable: {reason}"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    help_paragraphs(paragraphs)
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
 }
 
 fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
@@ -2349,72 +2329,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     }
                 }
             }
-            AudioSettingsField::Quality => {
-                let choices = app.audio_quality_choices(popup.stream_index);
-                let label = choices
-                    .iter()
-                    .find(|choice| choice.value == settings.quality)
-                    .map(|choice| choice.label.as_str())
-                    .unwrap_or_else(|| settings.quality.label());
-                lines.push(setting_line(
-                    field.label(),
-                    label,
-                    selected(field),
-                    changed(field),
-                    expanded(field),
-                ));
-                if expanded(field) {
-                    dropdown_start = Some(lines.len());
-                    let last = choices.len().saturating_sub(1);
-                    for (position, choice) in choices.iter().enumerate() {
-                        let label = choice.reason.as_ref().map_or_else(
-                            || choice.label.clone(),
-                            |reason| format!("{} — {reason}", choice.label),
-                        );
-                        lines.push(dropdown_line(
-                            &label,
-                            position == popup.quality_cursor,
-                            choice.value == settings.quality,
-                            choice.enabled,
-                            changed(field) && choice.value == settings.quality,
-                            position == last,
-                        ));
-                    }
-                }
-            }
-            AudioSettingsField::SampleRate => {
-                let choices = app.audio_sample_rate_choices(popup.stream_index);
-                let label = choices
-                    .iter()
-                    .find(|choice| choice.value == settings.sample_rate)
-                    .map(|choice| choice.label.clone())
-                    .unwrap_or_else(|| settings.sample_rate.label());
-                lines.push(setting_line(
-                    field.label(),
-                    &label,
-                    selected(field),
-                    changed(field),
-                    expanded(field),
-                ));
-                if expanded(field) {
-                    dropdown_start = Some(lines.len());
-                    let last = choices.len().saturating_sub(1);
-                    for (position, choice) in choices.iter().enumerate() {
-                        let label = choice.reason.as_ref().map_or_else(
-                            || choice.label.clone(),
-                            |reason| format!("{} — {reason}", choice.label),
-                        );
-                        lines.push(dropdown_line(
-                            &label,
-                            position == popup.sample_rate_cursor,
-                            choice.value == settings.sample_rate,
-                            choice.enabled,
-                            changed(field) && choice.value == settings.sample_rate,
-                            position == last,
-                        ));
-                    }
-                }
-            }
             AudioSettingsField::Language => {
                 let language = language_choice(&settings.metadata.language)
                     .map(|choice| choice.label())
@@ -2473,7 +2387,7 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                 app.default_streams.contains(&popup.stream_index),
                 selected(field),
                 changed(field),
-                app.audio_field_reason(field).as_deref(),
+                None,
             )),
             field => {
                 let checked = field
@@ -2484,7 +2398,7 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     checked,
                     selected(field),
                     changed(field),
-                    app.audio_field_reason(field).as_deref(),
+                    None,
                 ));
             }
         }
@@ -2492,14 +2406,12 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
 
     let focus_line = match popup.mode {
         AudioSettingsMode::Dropdown => {
-            dropdown_start.unwrap_or(0)
-                + match popup.field {
-                    AudioSettingsField::Codec => popup.codec_cursor,
-                    AudioSettingsField::ChannelLayout => popup.channel_cursor,
-                    AudioSettingsField::Quality => popup.quality_cursor,
-                    AudioSettingsField::SampleRate => popup.sample_rate_cursor,
-                    _ => 0,
-                }
+            let cursor = if popup.field == AudioSettingsField::Codec {
+                popup.codec_cursor
+            } else {
+                popup.channel_cursor
+            };
+            dropdown_start.unwrap_or(0) + cursor
         }
         AudioSettingsMode::LanguageDropdown => {
             let choices = app.filtered_audio_languages();
@@ -2519,7 +2431,7 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
             focus_line,
             help: popup.help_visible.then(|| {
                 (
-                    audio_field_help_text(app, popup),
+                    audio_field_help_text(popup),
                     audio_field_help_title(popup.field),
                 )
             }),
@@ -3936,12 +3848,14 @@ fn audio_stream_for_display(
     }
     if let Some(channels) = settings.channel_layout.channels() {
         staged.insert("channels".to_string(), Value::from(channels));
-        let layout = match settings.channel_layout {
-            AudioChannelLayout::Surround71 => "7.1",
-            AudioChannelLayout::Surround51 => "5.1",
-            AudioChannelLayout::Stereo => "stereo",
-            AudioChannelLayout::Mono => "mono",
-            AudioChannelLayout::Original => unreachable!(),
+        let layout = if channels == 8 {
+            "7.1"
+        } else if channels == 6 {
+            "5.1"
+        } else if channels == 2 {
+            "stereo"
+        } else {
+            "mono"
         };
         staged.insert(
             "channel_layout".to_string(),
@@ -4735,6 +4649,8 @@ fn truncate_end(value: &str, width: usize) -> String {
 mod tests {
     use kernal::prelude::*;
 
+    use crate::edit::{AudioChannelLayout, AudioCodec, AudioMetadata};
+
     use super::*;
 
     /// A scratch directory holding `files`, and an `App` pointed at it. Every render test
@@ -5157,8 +5073,6 @@ mod tests {
                     help_visible: true,
                     codec_cursor: 0,
                     channel_cursor: 0,
-                    quality_cursor: 0,
-                    sample_rate_cursor: 0,
                     language_cursor: 0,
                     language_search: SearchState::default(),
                     title_input: TextInputState::new(String::new()),
@@ -8813,6 +8727,214 @@ mod tests {
     }
 
     #[test]
+    fn audio_settings_dialog_should_render_every_editor_mode_and_guard() {
+        let (mut app, directory) = probed_app("audio-popup-modes");
+        assert!(
+            drawn(100, 30, |frame| render_audio_settings_dialog(frame, &app))
+                .trim()
+                .is_empty()
+        );
+
+        open_dialog(&mut app, Dialog::AudioSettings);
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 99;
+        assert!(
+            drawn(100, 30, |frame| render_audio_settings_dialog(frame, &app))
+                .trim()
+                .is_empty()
+        );
+        app.audio_settings_popup.as_mut().unwrap().stream_index = 1;
+        if let Some(ProbeOutcome::Video(info)) = app.outcome.as_mut() {
+            info.streams[1].insert("channels".to_string(), Value::from(2));
+            info.streams[1].insert(
+                "sample_rate".to_string(),
+                Value::String("48000".to_string()),
+            );
+        }
+        app.subtitle_capabilities.ffmpeg_encoders.clear();
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = AudioSettingsMode::Dropdown;
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+        {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = AudioSettingsField::Language;
+            popup.mode = AudioSettingsMode::LanguageDropdown;
+        }
+        let original_language = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(original_language.as_str()).contains("English (eng)");
+
+        app.subtitle_capabilities.ffmpeg_encoders = crate::edit::AudioCodec::TARGETS
+            .into_iter()
+            .filter_map(crate::edit::AudioCodec::encoder)
+            .map(str::to_string)
+            .collect();
+        app.audio_settings.insert(
+            1,
+            crate::edit::AudioSettings {
+                codec: crate::edit::AudioCodec::Ac3,
+                channel_layout: crate::edit::AudioChannelLayout::Mono,
+                quality: crate::edit::AudioQuality::Source,
+                sample_rate: crate::edit::AudioSampleRate::Original,
+                metadata: crate::edit::AudioMetadata {
+                    language: "nld".to_string(),
+                    title: Some("Commentary".to_string()),
+                    commentary: true,
+                    hearing_impaired: true,
+                    audio_description: true,
+                    original: true,
+                    dubbed: false,
+                },
+            },
+        );
+
+        for field in [AudioSettingsField::Codec, AudioSettingsField::ChannelLayout] {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = AudioSettingsMode::Dropdown;
+            popup.codec_cursor = 1;
+            popup.channel_cursor = 1;
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+
+        {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = AudioSettingsField::Language;
+            popup.mode = AudioSettingsMode::LanguageDropdown;
+            popup.language_cursor = 12;
+            popup.language_search.input.activate();
+        }
+        let languages = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(languages.as_str())
+            .contains("Search")
+            .contains("matches");
+        app.audio_settings_popup
+            .as_mut()
+            .unwrap()
+            .language_search
+            .input
+            .value = "no language matches".to_string();
+        let empty = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(empty.as_str()).contains("no matches");
+
+        for field in AudioSettingsField::ALL {
+            let popup = app.audio_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            popup.mode = if field == AudioSettingsField::Title {
+                AudioSettingsMode::TitleEdit
+            } else {
+                AudioSettingsMode::Summary
+            };
+            let screen = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+            assert_that!(screen.as_str()).contains(field.label());
+        }
+
+        app.audio_settings_popup.as_mut().unwrap().help_visible = false;
+        app.container_target = Some(ContainerFormat::Mp4);
+        let mp4 = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(mp4.as_str()).does_not_contain("Original");
+        app.container_target = Some(ContainerFormat::WebM);
+        let webm = drawn(110, 34, |frame| render_audio_settings_dialog(frame, &app));
+        assert_that!(webm.as_str()).does_not_contain("Commentary");
+
+        app.audio_settings_popup = None;
+        app.video_settings.insert(
+            0,
+            crate::edit::VideoSettings {
+                codec: crate::edit::VideoCodec::Hevc,
+                resolution: crate::edit::VideoResolution::Original,
+            },
+        );
+        let choices = app.video_codec_choices(0);
+        app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+            stream_index: 0,
+            field: VideoSettingsField::Codec,
+            mode: VideoSettingsMode::Dropdown,
+            codec_cursor: choices
+                .iter()
+                .position(|choice| choice.value == crate::edit::VideoCodec::Hevc)
+                .unwrap(),
+            resolution_cursor: 0,
+            custom_resolution: None,
+        });
+        let video = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(video.as_str()).contains("HEVC");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_audio_display_should_cover_every_technical_and_metadata_shape() {
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "aac",
+            "channels": 8,
+            "tags": "not an object",
+            "disposition": "not an object"
+        }))
+        .unwrap();
+        for (layout, expected) in [
+            (AudioChannelLayout::Surround71, "7.1"),
+            (AudioChannelLayout::Surround51, "5.1"),
+            (AudioChannelLayout::Stereo, "stereo"),
+            (AudioChannelLayout::Mono, "mono"),
+        ] {
+            let staged = audio_stream_for_display(
+                &stream,
+                &AudioSettings {
+                    codec: AudioCodec::Ac3,
+                    channel_layout: layout,
+                    quality: AudioQuality::Balanced,
+                    sample_rate: AudioSampleRate::Hz(32_000),
+                    metadata: AudioMetadata {
+                        language: "eng".to_string(),
+                        title: None,
+                        commentary: true,
+                        hearing_impaired: true,
+                        audio_description: true,
+                        original: true,
+                        dubbed: true,
+                    },
+                },
+            );
+            assert_eq!(string(&staged, "channel_layout"), Some(expected));
+            assert_eq!(string(&staged, "sample_rate"), Some("32000"));
+        }
+
+        let titled_stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "aac",
+            "channels": 2,
+            "tags": {"title": "Old title"},
+            "disposition": {}
+        }))
+        .unwrap();
+        let mut titled = AudioSettings {
+            codec: AudioCodec::Original,
+            channel_layout: AudioChannelLayout::Original,
+            quality: AudioQuality::Source,
+            sample_rate: AudioSampleRate::Original,
+            metadata: AudioMetadata {
+                language: "eng".to_string(),
+                title: None,
+                commentary: false,
+                hearing_impaired: false,
+                audio_description: false,
+                original: false,
+                dubbed: false,
+            },
+        };
+        titled.metadata.title = Some("New title".to_string());
+        let staged = audio_stream_for_display(&titled_stream, &titled);
+        assert_eq!(stream_title(&staged).as_deref(), Some("New title"));
+
+        titled.metadata.title = None;
+        let original = audio_stream_for_display(&titled_stream, &titled);
+        assert_eq!(string(&original, "codec_name"), Some("aac"));
+    }
+
+    #[test]
     fn audio_field_help_should_explain_every_field() {
         let (mut app, directory) = probed_app("audio-field-help");
         open_dialog(&mut app, Dialog::AudioSettings);
@@ -8821,11 +8943,6 @@ mod tests {
             (
                 AudioSettingsField::ChannelLayout,
                 "upmixing is not implemented",
-            ),
-            (AudioSettingsField::Quality, "target bitrate"),
-            (
-                AudioSettingsField::SampleRate,
-                "samples are stored per second",
             ),
             (AudioSettingsField::Language, "does not translate or dub"),
             (AudioSettingsField::Title, "distinguish audio tracks"),
@@ -8853,7 +8970,7 @@ mod tests {
             let popup = app.audio_settings_popup.as_mut().unwrap();
             popup.field = field;
             let popup = app.audio_settings_popup.as_ref().unwrap();
-            assert_that!(audio_field_help_text(&app, popup).to_string().as_str()).contains(phrase);
+            assert_that!(audio_field_help_text(popup).to_string().as_str()).contains(phrase);
             assert_eq!(
                 audio_field_help_title(field),
                 format!(" Information about {} ", field.label())
@@ -10172,8 +10289,7 @@ mod tests {
         }
         app.container_settings_popup = None;
 
-        // Act / Assert: audio fields, including the currently hidden technical fields
-        // so making one visible later cannot expose an untested or clipped explanation.
+        // Act / Assert: every audio field.
         for field in AudioSettingsField::ALL {
             app.audio_settings_popup = Some(crate::app::AudioSettingsPopup {
                 stream_index: 2,
@@ -10182,14 +10298,12 @@ mod tests {
                 help_visible: true,
                 codec_cursor: 0,
                 channel_cursor: 0,
-                quality_cursor: 0,
-                sample_rate_cursor: 0,
                 language_cursor: 0,
                 language_search: SearchState::default(),
                 title_input: TextInputState::new(String::new()),
             });
             let popup = app.audio_settings_popup.as_ref().unwrap();
-            let help = audio_field_help_text(&app, popup);
+            let help = audio_field_help_text(popup);
             fits(format!("{field:?}"), &help, &|frame| {
                 render_audio_settings_dialog(frame, &app)
             });

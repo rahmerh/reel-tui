@@ -507,6 +507,17 @@ impl ContainerFormat {
             Self::Mov | Self::WebM => false,
         }
     }
+
+    pub fn retain_supported_audio_metadata(self, metadata: &mut AudioMetadata) {
+        if !self.supports_audio_language() {
+            metadata.language = "und".to_string();
+        }
+        for role in AudioRole::ALL {
+            if !self.supports_audio_role(role) {
+                metadata.set_role(role, false);
+            }
+        }
+    }
 }
 
 impl VideoCodec {
@@ -1147,13 +1158,11 @@ pub(crate) fn validate_edit_with_audio(
         return Err("Audio settings refer to a missing or deleted track.".to_string());
     }
     for (index, settings) in audio_settings {
-        let Some(stream) = info
+        let stream = info
             .streams
             .iter()
             .find(|stream| stream_index(stream) == Some(*index))
-        else {
-            return Err("The file's tracks changed. Reopen it and try again.".to_string());
-        };
+            .expect("validated stream order contains every audio-settings index");
         if stream_kind(stream) != Some("audio") {
             return Err("Audio settings can only be applied to audio tracks.".to_string());
         }
@@ -1208,15 +1217,6 @@ pub(crate) fn validate_edit_with_audio(
         }
         if codec.is_lossless() && settings.quality != AudioQuality::Source {
             return Err("Lossless audio codecs do not use a bitrate quality preset.".to_string());
-        }
-        if !codec.is_lossless()
-            && audio_bitrate_kbps(codec, channels, resolved_audio_quality(settings.quality))
-                .is_none()
-        {
-            return Err(format!(
-                "{} does not support the selected quality for this channel layout.",
-                codec.label()
-            ));
         }
     }
     if !video_settings.keys().all(|index| ordered.contains(index)) {
@@ -1545,10 +1545,13 @@ fn container_conflict_entries(
             ));
         }
         if kind == "audio" {
-            let metadata = audio_settings
+            let mut metadata = audio_settings
                 .get(index)
                 .map(|settings| settings.metadata.clone())
                 .or_else(|| include_source_audio_metadata.then(|| audio_metadata(stream)));
+            if let Some(metadata) = metadata.as_mut() {
+                target.retain_supported_audio_metadata(metadata);
+            }
             conflicts.extend(metadata.into_iter().flat_map(|metadata| {
                 audio_metadata_conflicts(&metadata, target)
                     .into_iter()
@@ -1632,11 +1635,7 @@ fn container_conflict_message(
                         .then_some(candidate.label())
                 })
                 .collect::<Vec<_>>();
-            if targets.is_empty() {
-                "Choose another container or remove the track.".to_string()
-            } else {
-                format!("Encode it as {} or remove the track.", targets.join(" or "))
-            }
+            format!("Encode it as {} or remove the track.", targets.join(" or "))
         }
         _ => "Choose MKV or remove the track.".to_string(),
     };
@@ -3715,9 +3714,8 @@ fn validate_result_with_audio(
             .iter()
             .find(|candidate| stream_index(candidate) == Some(source_index));
         if let Some(settings) = audio_settings.get(&source_index) {
-            let source_stream = source_stream.ok_or_else(|| {
-                format!("The source audio track #{source_index} is no longer available.")
-            })?;
+            let source_stream = source_stream
+                .expect("the validated output plan contains every configured audio source");
             let expected_codec =
                 effective_audio_codec(source_stream, settings).and_then(AudioCodec::codec_name);
             if audio_requires_transcode(source_stream, settings)
@@ -3746,7 +3744,11 @@ fn validate_result_with_audio(
                     "The encoded audio track at position {position} has the wrong sample rate."
                 ));
             }
-            if !audio_metadata_matches(stream, &settings.metadata) {
+            let mut expected_metadata = settings.metadata.clone();
+            if let Some(container) = container {
+                container.retain_supported_audio_metadata(&mut expected_metadata);
+            }
+            if !audio_metadata_matches(stream, &expected_metadata) {
                 return Err(format!(
                     "The audio track at position {position} has the wrong metadata."
                 ));
@@ -3875,12 +3877,19 @@ fn audio_metadata_matches(stream: &BTreeMap<String, Value>, expected: &AudioMeta
 
 pub(crate) fn audio_stream_title(stream: &BTreeMap<String, Value>) -> Option<String> {
     let tags = stream.get("tags").and_then(Value::as_object)?;
-    ["title", "name", "handler_name"]
+    ["title", "name"]
         .into_iter()
         .filter_map(|key| tags.get(key).and_then(Value::as_str))
         .map(str::trim)
         .find(|title| !title.is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            tags.get("handler_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty() && !title.eq_ignore_ascii_case("SoundHandler"))
+                .map(str::to_string)
+        })
 }
 
 pub(crate) fn stream_disposition(stream: &BTreeMap<String, Value>, name: &str) -> bool {
@@ -4035,14 +4044,12 @@ fn run_ffmpeg(
     }
     let mut video_output_index = 0;
     for source_index in plan.stream_order {
-        let Some(stream) = plan
+        let stream = plan
             .source_info
             .streams
             .iter()
             .find(|stream| stream_index(stream) == Some(*source_index))
-        else {
-            continue;
-        };
+            .expect("validated stream order contains every video source");
         if stream_kind(stream) != Some("video") {
             continue;
         }
@@ -4075,14 +4082,12 @@ fn run_ffmpeg(
     }
     let mut audio_output_index = 0;
     for source_index in plan.stream_order {
-        let Some(stream) = plan
+        let stream = plan
             .source_info
             .streams
             .iter()
             .find(|stream| stream_index(stream) == Some(*source_index))
-        else {
-            continue;
-        };
+            .expect("validated stream order contains every audio source");
         if stream_kind(stream) != Some("audio") {
             continue;
         }
@@ -4120,12 +4125,11 @@ fn run_ffmpeg(
                     .or_else(|| stream_channels(stream))
                     .unwrap_or(2);
                 let bitrate =
-                    audio_bitrate_kbps(codec, channels, resolved_audio_quality(settings.quality));
-                if let Some(bitrate) = bitrate {
-                    command
-                        .arg(format!("-b:a:{audio_output_index}"))
-                        .arg(format!("{bitrate}k"));
-                }
+                    audio_bitrate_kbps(codec, channels, resolved_audio_quality(settings.quality))
+                        .expect("validated lossy codec/channel pairs have a bitrate preset");
+                command
+                    .arg(format!("-b:a:{audio_output_index}"))
+                    .arg(format!("{bitrate}k"));
             }
         }
         audio_output_index += 1;
@@ -4140,29 +4144,34 @@ fn run_ffmpeg(
                     .replacements
                     .iter()
                     .any(|replacement| replacement.source_index == *source_index);
-                let source_stream = plan
+                let stream = plan
                     .source_info
                     .streams
                     .iter()
-                    .find(|stream| stream_index(stream) == Some(*source_index));
+                    .find(|stream| stream_index(stream) == Some(*source_index))
+                    .expect("validated output tracks refer to existing source streams");
                 let metadata_change = plan.subtitle_changes.iter().find(|change| {
                     change.source == SubtitleSource::Embedded(*source_index)
                         && change.metadata.is_some()
                 });
-                if let Some(stream) = source_stream
-                    && stream_kind(stream) == Some("subtitle")
-                {
+                if stream_kind(stream) == Some("subtitle") {
                     command
                         .arg(format!("-metadata:s:{output_index}"))
                         .arg(format!("language={}", stream_language(stream)));
                 }
-                if let Some(stream) = source_stream
-                    && stream_kind(stream) == Some("audio")
-                    && let Some(settings) = plan.audio_settings.get(source_index)
-                {
+                if should_write_audio_metadata(
+                    stream_kind(stream),
+                    plan.audio_settings.contains_key(source_index),
+                    plan.container.is_some(),
+                ) {
+                    let metadata = audio_metadata_for_output(
+                        stream,
+                        plan.audio_settings.get(source_index),
+                        metadata_container,
+                    );
                     command
                         .arg(format!("-metadata:s:{output_index}"))
-                        .arg(format!("language={}", settings.metadata.language));
+                        .arg(format!("language={}", metadata.language));
                     let title_key = if matches!(
                         metadata_container,
                         Some(ContainerFormat::Mp4 | ContainerFormat::Mov)
@@ -4175,20 +4184,17 @@ fn run_ffmpeg(
                         .arg(format!("-metadata:s:{output_index}"))
                         .arg(format!(
                             "{title_key}={}",
-                            settings.metadata.title.as_deref().unwrap_or("")
+                            metadata.title.as_deref().unwrap_or("")
                         ))
                         .arg(format!("-disposition:{output_index}"))
                         .arg(audio_disposition(
                             stream,
                             plan.default_streams.contains(source_index),
-                            &settings.metadata,
+                            &metadata,
                         ));
                     continue;
                 }
                 if replacement || metadata_change.is_some() {
-                    let Some(stream) = source_stream else {
-                        continue;
-                    };
                     let mut metadata = metadata_change
                         .map(|change| effective_subtitle_metadata(change, stream_metadata(stream)))
                         .unwrap_or_else(|| stream_metadata(stream));
@@ -4638,6 +4644,28 @@ fn audio_metadata(stream: &BTreeMap<String, Value>) -> AudioMetadata {
     }
 }
 
+fn audio_metadata_for_output(
+    stream: &BTreeMap<String, Value>,
+    settings: Option<&AudioSettings>,
+    container: Option<ContainerFormat>,
+) -> AudioMetadata {
+    let mut metadata = settings
+        .map(|settings| settings.metadata.clone())
+        .unwrap_or_else(|| audio_metadata(stream));
+    if let Some(container) = container {
+        container.retain_supported_audio_metadata(&mut metadata);
+    }
+    metadata
+}
+
+fn should_write_audio_metadata(
+    stream_kind: Option<&str>,
+    has_settings: bool,
+    changing_container: bool,
+) -> bool {
+    stream_kind == Some("audio") && (has_settings || changing_container)
+}
+
 pub(crate) fn audio_bitrate_kbps(
     codec: AudioCodec,
     channels: u8,
@@ -4804,14 +4832,13 @@ mod tests {
         }
     }
 
-    fn require_tools(test: &str, tools: &[&str]) -> bool {
+    fn require_tools(test: &str, tools: &[&str]) {
         for tool in tools {
             assert!(
                 tool_available(tool),
                 "{test} requires {tool}; install the missing test prerequisite"
             );
         }
-        true
     }
 
     /// Regression test for a check that never checked: the old helper narrowed to an
@@ -4819,18 +4846,19 @@ mod tests {
     /// has never heard of.
     #[test]
     fn tool_availability_should_reject_an_encoder_ffmpeg_does_not_have() {
-        // Arrange / Act: a name no build ships, checked without assuming which real
-        // encoders this machine happens to have.
+        // Arrange / Act: a name no build ships, checked alongside the suite's real
+        // ffmpeg prerequisite.
+        require_tools(
+            "tool_availability_should_reject_an_encoder_ffmpeg_does_not_have",
+            &["ffmpeg"],
+        );
         let bogus = tool_available("ffmpeg:definitely_not_a_real_encoder");
         let missing_program = tool_available("definitely-not-a-real-program");
 
         // Assert
         assert_that!(bogus).is_false();
         assert_that!(missing_program).is_false();
-        // A real program is still detected when this machine provides it.
-        if Command::new("ffmpeg").arg("-version").output().is_ok() {
-            assert_that!(tool_available("ffmpeg")).is_true();
-        }
+        assert_that!(tool_available("ffmpeg")).is_true();
     }
 
     fn english_subtitle_metadata() -> SubtitleMetadata {
@@ -5051,6 +5079,8 @@ mod tests {
             false
         ))
         .is_equal_to("Encoding video and remuxing to MP4".to_string());
+        assert_that!(media_write_label_for_work(None, true, true, false))
+            .is_equal_to("Encoding video and audio".to_string());
     }
 
     #[test]
@@ -6979,6 +7009,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audio_title_should_ignore_only_the_generated_mp4_handler_name() {
+        let stream =
+            |tags: Value| serde_json::from_value(serde_json::json!({"tags": tags})).unwrap();
+        let generated = audio_stream_title(&stream(serde_json::json!({
+            "handler_name": "SoundHandler"
+        })));
+        let generated_lowercase = audio_stream_title(&stream(serde_json::json!({
+            "handler_name": "soundhandler"
+        })));
+        let custom = audio_stream_title(&stream(serde_json::json!({
+            "handler_name": "Director commentary"
+        })));
+        let explicit = audio_stream_title(&stream(serde_json::json!({
+            "title": "SoundHandler",
+            "handler_name": "SoundHandler"
+        })));
+        let named = audio_stream_title(&stream(serde_json::json!({
+            "title": "  ",
+            "name": " Alternate name ",
+            "handler_name": "Ignored fallback"
+        })));
+        let blank = audio_stream_title(&stream(serde_json::json!({
+            "handler_name": "  "
+        })));
+        let no_tags = audio_stream_title(&BTreeMap::new());
+
+        assert_that!(generated).is_none();
+        assert_that!(generated_lowercase).is_none();
+        assert_that!(custom.as_deref()).contains("Director commentary");
+        assert_that!(explicit).contains("SoundHandler".to_string());
+        assert_that!(named).contains("Alternate name".to_string());
+        assert_that!(blank).is_none();
+        assert_that!(no_tags).is_none();
+    }
+
+    #[test]
+    fn audio_metadata_matching_should_compare_every_field() {
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "tags": {"language": "eng", "title": "Accessible original dub"},
+            "disposition": {
+                "comment": 1,
+                "hearing_impaired": 1,
+                "visual_impaired": 1,
+                "original": 1,
+                "dub": 1
+            }
+        }))
+        .unwrap();
+        let expected = AudioMetadata {
+            language: "eng".to_string(),
+            title: Some("Accessible original dub".to_string()),
+            commentary: true,
+            hearing_impaired: true,
+            audio_description: true,
+            original: true,
+            dubbed: true,
+        };
+        assert!(audio_metadata_matches(&stream, &expected));
+
+        for changed in [
+            AudioMetadata {
+                language: "nld".to_string(),
+                ..expected.clone()
+            },
+            AudioMetadata {
+                title: Some("Other".to_string()),
+                ..expected.clone()
+            },
+            AudioMetadata {
+                commentary: false,
+                ..expected.clone()
+            },
+            AudioMetadata {
+                hearing_impaired: false,
+                ..expected.clone()
+            },
+            AudioMetadata {
+                audio_description: false,
+                ..expected.clone()
+            },
+            AudioMetadata {
+                original: false,
+                ..expected.clone()
+            },
+            AudioMetadata {
+                dubbed: false,
+                ..expected.clone()
+            },
+        ] {
+            assert!(!audio_metadata_matches(&stream, &changed));
+        }
+    }
+
+    #[test]
+    fn audio_output_validation_should_reject_each_mismatch_and_normalize_for_container() {
+        let source = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac",
+             "channels": 2, "sample_rate": "96000", "tags": {"language": "eng"}}
+        ]));
+        let output = |codec: &str, channels: u8, rate: u32, original: bool| {
+            media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": codec,
+                 "channels": channels, "sample_rate": rate.to_string(),
+                 "tags": {"language": "eng", "handler_name": "SoundHandler"},
+                 "disposition": {"original": u8::from(original)}}
+            ]))
+        };
+        let validate =
+            |settings: AudioSettings, output: MediaInfo, container: Option<ContainerFormat>| {
+                validate_result_with_audio(
+                    &source,
+                    &output,
+                    &[0, 1],
+                    &[],
+                    &BTreeSet::new(),
+                    &BTreeMap::from([(1, settings)]),
+                    &BTreeMap::new(),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    container,
+                )
+            };
+
+        let mut encoded = audio_settings();
+        encoded.codec = AudioCodec::Ac3;
+        assert_that!(validate(encoded.clone(), output("aac", 2, 48_000, false), None).unwrap_err())
+            .contains("wrong codec");
+
+        encoded.channel_layout = AudioChannelLayout::Mono;
+        assert_that!(validate(encoded.clone(), output("ac3", 2, 48_000, false), None).unwrap_err())
+            .contains("wrong channel layout");
+
+        encoded.channel_layout = AudioChannelLayout::Original;
+        assert_that!(validate(encoded.clone(), output("ac3", 2, 96_000, false), None).unwrap_err())
+            .contains("wrong sample rate");
+
+        encoded.metadata.commentary = true;
+        assert_that!(validate(encoded.clone(), output("ac3", 2, 48_000, false), None).unwrap_err())
+            .contains("wrong metadata");
+
+        encoded.metadata.commentary = false;
+        encoded.metadata.original = true;
+        assert_that!(validate(
+            encoded,
+            output("ac3", 2, 48_000, false),
+            Some(ContainerFormat::Mp4),
+        ))
+        .is_ok();
+    }
+
     fn defaulted(mut stream: Value) -> Value {
         stream["disposition"] = serde_json::json!({"default": 1});
         stream
@@ -7566,12 +7751,10 @@ mod tests {
     #[test]
     fn a_converted_subtitle_should_be_rejected_when_it_is_not_the_format_that_was_asked_for() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "a_converted_subtitle_should_be_rejected_when_it_is_not_the_format_that_was_asked_for",
             &["ffprobe"],
-        ) {
-            return;
-        }
+        );
         let directory = scratch_directory("validate-subtitle-output");
         let _cleanup = DirectoryCleanup(Some(directory.clone()));
         let subtitle = directory.join("movie.eng.srt");
@@ -7883,12 +8066,10 @@ mod tests {
     fn apply_edits_should_remux_order_defaults_and_deletions_when_source_contains_multiple_tracks()
     {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_remux_order_defaults_and_deletions_when_source_contains_multiple_tracks",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-edit-{}-{}",
@@ -8049,14 +8230,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_edits_should_create_a_valid_mp4_copy_when_only_the_container_changes() {
+    fn apply_edits_should_accept_mp4s_generated_handler_for_untitled_audio() {
         // Arrange
-        if !require_tools(
-            "apply_edits_should_create_a_valid_mp4_copy_when_only_the_container_changes",
+        require_tools(
+            "apply_edits_should_accept_mp4s_generated_handler_for_untitled_audio",
             &["ffmpeg:aac"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-container-copy-{}-{}",
             std::process::id(),
@@ -8087,14 +8266,20 @@ mod tests {
                 "mpeg4",
                 "-c:a",
                 "aac",
+                "-disposition:a:0",
+                "default+original+comment",
             ])
             .arg(&source)
             .status()
             .unwrap();
         assert_that!(status.success()).is_true();
+        let mut settings = audio_settings();
+        settings.metadata.language = "eng".to_string();
+        settings.metadata.commentary = true;
+        let audio_settings = BTreeMap::from([(1, settings)]);
 
         // Act
-        let output = apply_edits(
+        let output = apply_edits_with_audio(
             EditTarget {
                 source: &source,
                 destination: SaveDestination::CreateCopy,
@@ -8111,6 +8296,7 @@ mod tests {
                 left_subtitle_order: &[],
                 sidecars: &[],
             },
+            &audio_settings,
             &AtomicBool::new(false),
             |_| {},
         )
@@ -8124,6 +8310,9 @@ mod tests {
         assert_that!(output_info.format["format_name"].as_str().unwrap()).contains("mp4");
         assert_that!(output_info.streams[0]["codec_name"].as_str()).contains("mpeg4");
         assert_that!(output_info.streams[1]["codec_name"].as_str()).contains("aac");
+        assert_that!(audio_stream_title(&output_info.streams[1])).is_none();
+        assert_that!(stream_original(&output_info.streams[1])).is_false();
+        assert_that!(stream_commentary(&output_info.streams[1])).is_true();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -8137,12 +8326,10 @@ mod tests {
         // `EditError::Failed` — otherwise the caller has no way to tell "discard this
         // stale staged edit" apart from "the edit itself is invalid," and a retry
         // just fails identically forever instead of prompting a fresh re-stage.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_treat_a_stream_order_mismatch_as_stale_rather_than_a_hard_failure",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-stale-edit-{}-{}",
             std::process::id(),
@@ -8212,12 +8399,10 @@ mod tests {
         // (here: marking a track default while also deleting it) is something the
         // user needs to actively fix, not something reopening the file resolves, so
         // it must stay `EditError::Failed` and the staged edit must survive.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_keep_a_genuinely_invalid_edit_as_a_hard_failure",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-invalid-edit-{}-{}",
             std::process::id(),
@@ -8287,12 +8472,10 @@ mod tests {
         // must still write real Matroska (matching what's genuinely there), not let
         // `run_ffmpeg` infer "mp4" purely from the (lying) output extension and then
         // have ffmpeg itself reject the SubRip subtitle MP4 can't hold.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_write_genuine_matroska_when_a_mkv_file_is_misnamed_with_an_mp4_extension",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-misnamed-mkv-{}-{}",
             std::process::id(),
@@ -8387,12 +8570,10 @@ mod tests {
         // same ISO-BMFF/QuickTime muxer family and benefits identically. Without it,
         // the `moov` atom lands after `mdat`, requiring a full trailing scan to open
         // or seek the file instead of reading a few bytes from the front.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_place_moov_before_mdat_when_converting_to_mov",
             &["ffmpeg:aac"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-mov-faststart-{}-{}",
             std::process::id(),
@@ -8465,12 +8646,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_keep_captions_and_hearing_impaired_independent_in_mp4() {
-        if !require_tools(
+        require_tools(
             "apply_edits_should_keep_captions_and_hearing_impaired_independent_in_mp4",
             &["ffmpeg:mov_text"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-independent-accessibility-flags-{}-{}",
             std::process::id(),
@@ -8608,12 +8787,10 @@ mod tests {
     #[test]
     fn apply_edits_should_create_an_edited_copy_without_changing_the_source() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_create_an_edited_copy_without_changing_the_source",
             &["ffmpeg:libx264"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-transcode-{}-{}",
             std::process::id(),
@@ -8698,12 +8875,10 @@ mod tests {
     #[test]
     fn apply_edits_should_honor_each_custom_scaling_mode() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_honor_each_custom_scaling_mode",
             &["ffmpeg:libx264"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-custom-scale-{}-{}",
             std::process::id(),
@@ -8782,12 +8957,10 @@ mod tests {
     #[test]
     fn apply_edits_should_export_converted_subtitle_without_retaining_an_embedded_copy() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_export_converted_subtitle_without_retaining_an_embedded_copy",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-subtitle-convert-{}-{}",
@@ -8884,12 +9057,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_export_vobsub_with_flags_and_remove_the_embedded_subtitle() {
-        if !require_tools(
+        require_tools(
             "apply_edits_should_export_vobsub_with_flags_and_remove_the_embedded_subtitle",
             &["ffmpeg", "seconv"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-vobsub-export-{}-{}",
@@ -9006,12 +9177,10 @@ mod tests {
     #[test]
     fn cancelling_after_the_remux_finishes_should_still_leave_the_original_untouched() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "cancelling_after_the_remux_finishes_should_still_leave_the_original_untouched",
             &["ffmpeg", "ffmpeg:libx264", "ffmpeg:aac"],
-        ) {
-            return;
-        }
+        );
         let directory = scratch_directory("cancel-after-remux");
         let _cleanup = DirectoryCleanup(Some(directory.clone()));
         let source = directory.join("movie.mkv");
@@ -9099,12 +9268,10 @@ mod tests {
     #[test]
     fn apply_edits_should_ocr_an_embedded_image_subtitle_into_a_text_sidecar() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_ocr_an_embedded_image_subtitle_into_a_text_sidecar",
             &["ffmpeg", "seconv", "tesseract"],
-        ) {
-            return;
-        }
+        );
         let directory = scratch_directory("vobsub-ocr");
         let _cleanup = DirectoryCleanup(Some(directory.clone()));
 
@@ -9225,12 +9392,10 @@ mod tests {
     #[test]
     fn apply_edits_should_export_and_remove_incompatible_subtitle_during_mp4_conversion() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_export_and_remove_incompatible_subtitle_during_mp4_conversion",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-subtitle-export-{}-{}",
@@ -9332,12 +9497,10 @@ mod tests {
         // subtitle tracks, converting the one survivor for an MP4 target, and marking
         // it default failed with "the wrong default flag" even though the request
         // was entirely valid.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_default_the_one_surviving_converted_subtitle_after_bulk_deletion",
             &["ffmpeg:mov_text"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-bulk-delete-default-{}-{}",
             std::process::id(),
@@ -9470,12 +9633,10 @@ mod tests {
         // only file it can write and validation rejected it. The track's title also has
         // to survive, since ffprobe reports an MP4 track name under `name`, not
         // `title`.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_accept_the_default_flag_mp4_forces_onto_a_lone_subtitle",
             &["ffmpeg:mov_text"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-mp4-forced-default-{}-{}",
             std::process::id(),
@@ -9600,12 +9761,10 @@ mod tests {
     #[test]
     fn apply_edits_should_import_sidecars_after_embedded_subtitles_and_remove_the_sources() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_import_sidecars_after_embedded_subtitles_and_remove_the_sources",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-sidecar-import-{}-{}",
             std::process::id(),
@@ -9761,12 +9920,10 @@ mod tests {
     #[test]
     fn failed_or_cancelled_sidecar_import_should_leave_media_and_sidecar_untouched() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "failed_or_cancelled_sidecar_import_should_leave_media_and_sidecar_untouched",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-cancelled-sidecar-import-{}-{}",
             std::process::id(),
@@ -9885,12 +10042,10 @@ mod tests {
     #[test]
     fn apply_edits_should_drop_source_number_when_converted_target_has_no_duplicate() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_drop_source_number_when_converted_target_has_no_duplicate",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-sidecar-convert-{}-{}",
@@ -9986,12 +10141,10 @@ mod tests {
     #[test]
     fn apply_edits_should_number_converted_sidecar_when_matching_target_already_exists() {
         // Arrange
-        if !require_tools(
+        require_tools(
             "apply_edits_should_number_converted_sidecar_when_matching_target_already_exists",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-sidecar-collision-{}-{}",
@@ -10195,12 +10348,10 @@ mod tests {
         // Arrange: a title, comment, date, genre and artist staged on the container. Each
         // is written by its own ffmpeg argument, and a metadata-only save must not disturb
         // the streams it is not about.
-        if !require_tools(
+        require_tools(
             "apply_edits_should_write_container_metadata_and_leave_the_tracks_alone",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-container-metadata-{}-{}",
             std::process::id(),
@@ -10306,12 +10457,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_encode_one_audio_track_and_preserve_its_neighbor() {
-        if !require_tools(
+        require_tools(
             "apply_edits_should_encode_one_audio_track_and_preserve_its_neighbor",
             &["ffmpeg", "ffmpeg:aac", "ffmpeg:ac3"],
-        ) {
-            return;
-        }
+        );
         let directory = scratch_directory("encode-audio-track");
         let _cleanup = DirectoryCleanup(Some(directory.clone()));
         let source = directory.join("movie.mkv");
@@ -10424,6 +10573,89 @@ mod tests {
     }
 
     #[test]
+    fn apply_edits_should_encode_lossless_audio_with_automatic_channels_and_rate() {
+        require_tools(
+            "apply_edits_should_encode_lossless_audio_with_automatic_channels_and_rate",
+            &["ffmpeg", "ffmpeg:aac", "ffmpeg:alac"],
+        );
+        let directory = scratch_directory("encode-lossless-audio");
+        let _cleanup = DirectoryCleanup(Some(directory.clone()));
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x64:r=1:d=1")
+            .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1"])
+            .args(["-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "aac"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        let mut settings = audio_settings();
+        settings.codec = AudioCodec::Alac;
+        settings.metadata.language = "und".to_string();
+        apply_edits_with_audio(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &BTreeMap::from([(1, settings)]),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        let output = media_info(&source).unwrap();
+        assert_eq!(
+            output.streams[1].get("codec_name").and_then(Value::as_str),
+            Some("alac")
+        );
+        assert_eq!(stream_channels(&output.streams[1]), Some(2));
+        assert_eq!(stream_sample_rate(&output.streams[1]), Some(48_000));
+
+        let converted = apply_edits_with_audio(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: Some(ContainerFormat::Mp4),
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            media_info(&converted.output_path).unwrap().streams[1]
+                .get("codec_name")
+                .and_then(Value::as_str),
+            Some("alac")
+        );
+    }
+
+    #[test]
     fn plan_requires_transcode_should_detect_only_a_genuine_codec_or_resolution_change() {
         let info = media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "h264"},
@@ -10493,6 +10725,321 @@ mod tests {
         assert_that!(rates(AudioCodec::Ac3, 8)).is_equal_to([None, None, None]);
         assert_that!(rates(AudioCodec::Mp3, 6)).is_equal_to([None, None, None]);
         assert_that!(audio_bitrate_kbps(AudioCodec::Aac, 2, AudioQuality::Source)).is_none();
+    }
+
+    #[test]
+    fn audio_value_contracts_should_cover_every_variant_and_boundary() {
+        let codecs = [
+            (AudioCodec::Original, "Original", None, None),
+            (AudioCodec::Aac, "AAC", Some("aac"), Some("aac")),
+            (
+                AudioCodec::Ac3,
+                "Dolby Digital (AC-3)",
+                Some("ac3"),
+                Some("ac3"),
+            ),
+            (
+                AudioCodec::Eac3,
+                "Dolby Digital Plus (E-AC-3)",
+                Some("eac3"),
+                Some("eac3"),
+            ),
+            (AudioCodec::Opus, "Opus", Some("opus"), Some("libopus")),
+            (AudioCodec::Flac, "FLAC", Some("flac"), Some("flac")),
+            (AudioCodec::Alac, "ALAC", Some("alac"), Some("alac")),
+            (AudioCodec::Mp3, "MP3", Some("mp3"), Some("libmp3lame")),
+            (
+                AudioCodec::Vorbis,
+                "Vorbis",
+                Some("vorbis"),
+                Some("libvorbis"),
+            ),
+        ];
+        for (codec, label, name, encoder) in codecs {
+            assert_eq!(codec.label(), label);
+            assert_eq!(codec.codec_name(), name);
+            assert_eq!(codec.encoder(), encoder);
+            if let Some(name) = name {
+                assert_eq!(AudioCodec::from_codec_name(name), Some(codec));
+            }
+        }
+        assert_eq!(AudioCodec::from_codec_name("dts"), None);
+        assert!(AudioCodec::Flac.is_lossless() && AudioCodec::Alac.is_lossless());
+        assert!(!AudioCodec::Aac.is_lossless());
+
+        assert!(AudioCodec::Original.supports_channels(u8::MAX));
+        for codec in [AudioCodec::Ac3, AudioCodec::Eac3] {
+            assert!(codec.supports_channels(6));
+            assert!(!codec.supports_channels(7));
+        }
+        assert!(AudioCodec::Mp3.supports_channels(2));
+        assert!(!AudioCodec::Mp3.supports_channels(3));
+        for codec in [
+            AudioCodec::Aac,
+            AudioCodec::Opus,
+            AudioCodec::Flac,
+            AudioCodec::Alac,
+            AudioCodec::Vorbis,
+        ] {
+            assert!(codec.supports_channels(8));
+            assert!(!codec.supports_channels(9));
+        }
+
+        for codec in [
+            AudioCodec::Original,
+            AudioCodec::Flac,
+            AudioCodec::Alac,
+            AudioCodec::Vorbis,
+        ] {
+            assert!(codec.supports_sample_rate(192_000));
+            assert!(!codec.supports_sample_rate(10_000));
+        }
+        assert!(AudioCodec::Aac.supports_sample_rate(96_000));
+        assert!(!AudioCodec::Aac.supports_sample_rate(192_000));
+        assert!(AudioCodec::Ac3.supports_sample_rate(32_000));
+        assert!(!AudioCodec::Eac3.supports_sample_rate(24_000));
+        assert!(AudioCodec::Opus.supports_sample_rate(48_000));
+        assert!(!AudioCodec::Opus.supports_sample_rate(44_100));
+        assert!(AudioCodec::Mp3.supports_sample_rate(44_100));
+        assert!(!AudioCodec::Mp3.supports_sample_rate(96_000));
+
+        for (layout, label, channels) in [
+            (AudioChannelLayout::Original, "Original", None),
+            (AudioChannelLayout::Surround71, "7.1 surround", Some(8)),
+            (AudioChannelLayout::Surround51, "5.1 surround", Some(6)),
+            (AudioChannelLayout::Stereo, "Stereo", Some(2)),
+            (AudioChannelLayout::Mono, "Mono", Some(1)),
+        ] {
+            assert_eq!(layout.label(), label);
+            assert_eq!(layout.channels(), channels);
+        }
+        for (quality, label) in [
+            (AudioQuality::Source, "Source"),
+            (AudioQuality::Compact, "Compact"),
+            (AudioQuality::Balanced, "Balanced"),
+            (AudioQuality::High, "High"),
+        ] {
+            assert_eq!(quality.label(), label);
+        }
+        assert_eq!(AudioSampleRate::Original.label(), "Original");
+        assert_eq!(AudioSampleRate::Hz(48_000).label(), "48 kHz");
+        assert_eq!(AudioSampleRate::Hz(44_100).label(), "44.1 kHz");
+
+        let mut metadata = audio_settings().metadata;
+        for role in AudioRole::ALL {
+            assert!(!metadata.get_role(role));
+            metadata.set_role(role, true);
+            assert!(metadata.get_role(role));
+            assert!(!role.label().is_empty());
+            metadata.set_role(role, false);
+        }
+
+        let string_rate =
+            serde_json::from_value(serde_json::json!({"sample_rate": "48000"})).unwrap();
+        let number_rate =
+            serde_json::from_value(serde_json::json!({"sample_rate": 44100})).unwrap();
+        let overflow =
+            serde_json::from_value(serde_json::json!({"sample_rate": 4294967296_u64})).unwrap();
+        let invalid = serde_json::from_value(serde_json::json!({"sample_rate": true})).unwrap();
+        assert_eq!(stream_sample_rate(&string_rate), Some(48_000));
+        assert_eq!(stream_sample_rate(&number_rate), Some(44_100));
+        assert_eq!(stream_sample_rate(&overflow), None);
+        assert_eq!(stream_sample_rate(&invalid), None);
+
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "aac", "channels": 2, "sample_rate": "48000"
+        }))
+        .unwrap();
+        let automatic = audio_settings();
+        assert!(!audio_requires_transcode(&stream, &automatic));
+        assert!(!audio_settings_require_encode(&automatic));
+        for changed in [
+            AudioSettings {
+                codec: AudioCodec::Ac3,
+                ..automatic.clone()
+            },
+            AudioSettings {
+                channel_layout: AudioChannelLayout::Mono,
+                ..automatic.clone()
+            },
+            AudioSettings {
+                sample_rate: AudioSampleRate::Hz(32_000),
+                ..automatic.clone()
+            },
+            AudioSettings {
+                quality: AudioQuality::High,
+                ..automatic.clone()
+            },
+        ] {
+            assert!(audio_requires_transcode(&stream, &changed));
+            assert!(audio_settings_require_encode(&changed));
+        }
+        assert!(!should_write_audio_metadata(Some("video"), true, true));
+        assert!(should_write_audio_metadata(Some("audio"), true, false));
+        assert!(should_write_audio_metadata(Some("audio"), false, true));
+        assert!(!should_write_audio_metadata(Some("audio"), false, false));
+        assert!(!should_write_audio_metadata(None, false, false));
+    }
+
+    #[test]
+    fn audio_bitrate_table_should_cover_every_supported_layout_family() {
+        let qualities = AudioQuality::PRESETS;
+        let rates =
+            |codec, channels| qualities.map(|quality| audio_bitrate_kbps(codec, channels, quality));
+
+        assert_eq!(rates(AudioCodec::Ac3, 1), [Some(96), Some(128), Some(192)]);
+        assert_eq!(rates(AudioCodec::Ac3, 2), [Some(192), Some(256), Some(384)]);
+        assert_eq!(rates(AudioCodec::Eac3, 1), [Some(96), Some(128), Some(192)]);
+        assert_eq!(
+            rates(AudioCodec::Eac3, 2),
+            [Some(128), Some(192), Some(256)]
+        );
+        assert_eq!(rates(AudioCodec::Opus, 1), [Some(48), Some(64), Some(96)]);
+        assert_eq!(
+            rates(AudioCodec::Opus, 6),
+            [Some(256), Some(384), Some(512)]
+        );
+        assert_eq!(
+            rates(AudioCodec::Opus, 8),
+            [Some(320), Some(512), Some(768)]
+        );
+        assert_eq!(rates(AudioCodec::Mp3, 1), [Some(64), Some(96), Some(128)]);
+        assert_eq!(
+            rates(AudioCodec::Vorbis, 1),
+            [Some(48), Some(80), Some(128)]
+        );
+        assert_eq!(
+            rates(AudioCodec::Vorbis, 2),
+            [Some(96), Some(160), Some(256)]
+        );
+        assert_eq!(
+            rates(AudioCodec::Vorbis, 6),
+            [Some(256), Some(384), Some(512)]
+        );
+        assert_eq!(rates(AudioCodec::Flac, 2), [None, None, None]);
+        assert_eq!(rates(AudioCodec::Aac, 0), [None, None, None]);
+    }
+
+    #[test]
+    fn audio_validation_should_report_every_invalid_technical_shape() {
+        let validate = |stream: Value, index: u64, settings: AudioSettings| {
+            let info = media(serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                stream
+            ]));
+            validate_edit_with_audio(
+                &info,
+                &[0, 1],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeMap::from([(index, settings)]),
+                &BTreeMap::new(),
+            )
+            .unwrap_err()
+        };
+        let base = || {
+            serde_json::json!({
+                "index": 1, "codec_type": "audio", "codec_name": "aac",
+                "channels": 2, "sample_rate": "48000"
+            })
+        };
+
+        assert_that!(validate(base(), 2, audio_settings()).as_str()).contains("missing or deleted");
+        assert_that!(validate(track(1, "subtitle", "subrip"), 1, audio_settings()).as_str())
+            .contains("only be applied to audio");
+        let mut technical = audio_settings();
+        technical.codec = AudioCodec::Ac3;
+        assert_that!(validate(track(1, "audio", "aac"), 1, technical.clone()).as_str())
+            .contains("channel layout");
+
+        let mut upmix = technical.clone();
+        upmix.channel_layout = AudioChannelLayout::Surround51;
+        assert_that!(validate(base(), 1, upmix).as_str()).contains(CHANNEL_UPMIX_NOT_IMPLEMENTED);
+
+        let mut unknown = audio_settings();
+        unknown.channel_layout = AudioChannelLayout::Mono;
+        let unknown_stream = serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "dts",
+            "channels": 2, "sample_rate": "48000"
+        });
+        assert_that!(validate(unknown_stream, 1, unknown).as_str())
+            .contains("original UNKNOWN codec");
+
+        let mut unsupported_channels = technical.clone();
+        unsupported_channels.codec = AudioCodec::Mp3;
+        unsupported_channels.channel_layout = AudioChannelLayout::Surround51;
+        let eight_channels = serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac",
+            "channels": 8, "sample_rate": "48000"
+        });
+        assert_that!(validate(eight_channels, 1, unsupported_channels).as_str())
+            .contains("does not support 6-channel");
+
+        let missing_rate = serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2
+        });
+        assert_that!(validate(missing_rate, 1, technical.clone()).as_str()).contains("sample rate");
+
+        let low_rate = serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac",
+            "channels": 2, "sample_rate": "16000"
+        });
+        assert_that!(validate(low_rate, 1, technical.clone()).as_str())
+            .contains("cannot use the source sample rate");
+
+        let mut unsupported_rate = audio_settings();
+        unsupported_rate.codec = AudioCodec::Aac;
+        unsupported_rate.sample_rate = AudioSampleRate::Hz(192_000);
+        let high_rate = serde_json::json!({
+            "index": 1, "codec_type": "audio", "codec_name": "aac",
+            "channels": 2, "sample_rate": "192000"
+        });
+        assert_that!(validate(high_rate, 1, unsupported_rate).as_str())
+            .contains("does not support a 192 kHz sample rate");
+
+        let mut lossless_quality = audio_settings();
+        lossless_quality.codec = AudioCodec::Flac;
+        lossless_quality.quality = AudioQuality::High;
+        assert_that!(validate(base(), 1, lossless_quality).as_str())
+            .contains("Lossless audio codecs");
+
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            base()
+        ]));
+        let mut lossless = audio_settings();
+        lossless.codec = AudioCodec::Flac;
+        assert_that!(validate_edit_with_audio(
+            &info,
+            &[0, 1],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::from([(1, lossless)]),
+            &BTreeMap::new(),
+        ))
+        .is_ok();
+    }
+
+    #[test]
+    fn audio_metadata_validation_should_name_every_unsupported_field() {
+        let metadata = AudioMetadata {
+            language: "eng".to_string(),
+            title: Some("Accessible dub".to_string()),
+            commentary: true,
+            hearing_impaired: true,
+            audio_description: true,
+            original: true,
+            dubbed: true,
+        };
+        let conflicts = audio_metadata_conflicts(&metadata, ContainerFormat::Mov).join("\n");
+
+        assert_that!(conflicts.as_str()).contains("audio language metadata");
+        for role in AudioRole::ALL {
+            assert_that!(conflicts.as_str()).contains(role.label());
+        }
+        assert_that!(conflicts.as_str()).contains("mutually exclusive");
+        assert_that!(container_conflict_message(ContainerFormat::Mp4, 1, "audio", "opus").as_str())
+            .contains("Encode it as AAC");
     }
 
     #[test]
@@ -10660,10 +11207,21 @@ mod tests {
             false,
         ))
         .is_equal_to("Encoding audio and remuxing to MKV".to_string());
+        assert_that!(media_changes_required_with_audio(
+            &info,
+            &[0, 1],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &staged,
+            &BTreeMap::new(),
+            &[],
+            false,
+        ))
+        .is_true();
     }
 
     #[test]
-    fn container_conversion_should_validate_existing_audio_metadata_roles() {
+    fn container_conversion_should_discard_unsupported_audio_metadata_roles() {
         let info = media(serde_json::json!([
             {"index": 0, "codec_type": "video", "codec_name": "vp9"},
             {"index": 1, "codec_type": "audio", "codec_name": "opus",
@@ -10687,8 +11245,68 @@ mod tests {
             ContainerFormat::WebM,
         );
 
-        assert_that!(converting.join("\n").as_str()).contains("Commentary audio role");
+        assert_that!(converting).is_empty();
         assert_that!(unchanged).is_empty();
+    }
+
+    #[test]
+    fn audio_metadata_should_retain_only_what_the_target_container_can_store() {
+        let metadata = AudioMetadata {
+            language: "eng".to_string(),
+            title: Some("Original commentary".to_string()),
+            commentary: true,
+            hearing_impaired: true,
+            audio_description: true,
+            original: true,
+            dubbed: false,
+        };
+
+        let mut matroska = metadata.clone();
+        ContainerFormat::Matroska.retain_supported_audio_metadata(&mut matroska);
+        assert_that!(matroska).is_equal_to(metadata.clone());
+
+        let mut mp4 = metadata.clone();
+        ContainerFormat::Mp4.retain_supported_audio_metadata(&mut mp4);
+        assert_that!(mp4.language.as_str()).is_equal_to("eng");
+        assert_that!(mp4.title.as_deref()).contains("Original commentary");
+        assert!(mp4.commentary && mp4.hearing_impaired && mp4.audio_description);
+        assert_that!(mp4.original).is_false();
+
+        for (container, language) in [
+            (ContainerFormat::Mov, "und"),
+            (ContainerFormat::WebM, "eng"),
+        ] {
+            let mut retained = metadata.clone();
+            container.retain_supported_audio_metadata(&mut retained);
+            assert_that!(retained.language.as_str()).is_equal_to(language);
+            assert_that!(retained.title.as_deref()).contains("Original commentary");
+            for role in AudioRole::ALL {
+                assert_that!(retained.get_role(role)).is_false();
+            }
+        }
+
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "tags": {"language": "eng", "title": "Source"},
+            "disposition": {"original": 1}
+        }))
+        .unwrap();
+        let from_source = audio_metadata_for_output(&stream, None, None);
+        assert_eq!(from_source.title.as_deref(), Some("Source"));
+        assert!(from_source.original);
+        let normalized = audio_metadata_for_output(
+            &stream,
+            Some(&AudioSettings {
+                metadata: metadata.clone(),
+                ..audio_settings()
+            }),
+            Some(ContainerFormat::Mov),
+        );
+        assert_eq!(normalized.language, "und");
+        assert!(
+            AudioRole::ALL
+                .into_iter()
+                .all(|role| !normalized.get_role(role))
+        );
     }
 
     #[test]
@@ -11633,12 +12251,10 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_change_should_stage_a_collision_safe_filename_rename() {
-        if !require_tools(
+        require_tools(
             "metadata_only_sidecar_change_should_stage_a_collision_safe_filename_rename",
             &["ffprobe"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-sidecar-metadata-{}-{}",
             std::process::id(),
@@ -11704,12 +12320,10 @@ mod tests {
 
     #[test]
     fn apply_edits_should_write_and_validate_embedded_subtitle_metadata() {
-        if !require_tools(
+        require_tools(
             "apply_edits_should_write_and_validate_embedded_subtitle_metadata",
             &["ffmpeg"],
-        ) {
-            return;
-        }
+        );
         let directory = std::env::temp_dir().join(format!(
             "reel-tui-embedded-metadata-{}-{}",
             std::process::id(),
