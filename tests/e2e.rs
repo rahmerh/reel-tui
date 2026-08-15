@@ -34,6 +34,7 @@ use harness::{
 };
 use reel_tui::app::{
     AudioSettingsField, ContainerSettingsField, Layer, SubtitleSettingsField, TrackRef,
+    VideoSettingsField,
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 
@@ -1440,6 +1441,78 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     }
     assert!(stream_disposition(edited, "original"));
     assert!(!stream_disposition(edited, "dub"));
+}
+
+#[test]
+/// Video tracks get the same language/title/default metadata editing as audio and
+/// subtitle tracks, without forcing a re-encode and without disturbing an unrelated
+/// neighboring track.
+fn editing_a_video_tracks_metadata_should_persist_and_preserve_its_neighbor() {
+    let test = "editing_a_video_tracks_metadata_should_persist_and_preserve_its_neighbor";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("video-metadata");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng"])
+            .audio_dispositions(&["default"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let video_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(0))
+        .expect("the video track should have a row");
+    app.open_video_settings(video_row);
+
+    // K opens contextual help for the highlighted video field, matching every other
+    // metadata editor.
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    assert!(app.app.video_settings_popup.as_ref().unwrap().help_visible);
+    assert!(
+        app.screen().contains("Information about Codec")
+            && app.screen().contains("video format written to the output"),
+        "Codec help should be rendered beside the video editor:\n{}",
+        app.screen()
+    );
+
+    app.choose_video_language("dutch", "nld");
+    app.type_video_title("Director's cut");
+    app.toggle_video_field(VideoSettingsField::Default);
+
+    assert!(
+        app.app.selected_container_conflicts().is_empty(),
+        "a supported Matroska video language should not conflict: {:?}",
+        app.app.selected_container_conflicts()
+    );
+
+    app.close_video_settings();
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        codec_names(&after),
+        ["h264", "aac"],
+        "metadata-only edits must not force a re-encode of either track"
+    );
+    let video = &after.streams[0];
+    let audio = &after.streams[1];
+
+    assert_eq!(stream_tag(video, "language"), Some("nld"));
+    assert_eq!(stream_tag(video, "title"), Some("Director's cut"));
+    assert!(stream_disposition(video, "default"));
+
+    // The neighboring audio track's own metadata and default flag are untouched: video
+    // and audio defaults are tracked independently.
+    assert_eq!(stream_tag(audio, "language"), Some("eng"));
+    assert!(stream_disposition(audio, "default"));
 }
 
 /// > [1786639801] Failed: /home/bas/Downloads/reel/test.mkv (destination:

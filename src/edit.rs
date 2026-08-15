@@ -447,7 +447,11 @@ impl ContainerFormat {
         }
     }
 
-    pub fn supports_audio_language(self) -> bool {
+    /// Whether this container supports a stream-level `language` tag at all. This is a
+    /// container property, not an audio property — `Mov` (plain QuickTime, as opposed to
+    /// `Mp4`) doesn't carry it for any stream kind — so video metadata reuses this
+    /// unchanged rather than duplicating the exclusion rule.
+    pub fn supports_stream_language(self) -> bool {
         !matches!(self, Self::Mov)
     }
 
@@ -466,13 +470,19 @@ impl ContainerFormat {
     }
 
     pub fn retain_supported_audio_metadata(self, metadata: &mut AudioMetadata) {
-        if !self.supports_audio_language() {
+        if !self.supports_stream_language() {
             metadata.language = "und".to_string();
         }
         for role in AudioRole::ALL {
             if !self.supports_audio_role(role) {
                 metadata.set_role(role, false);
             }
+        }
+    }
+
+    pub fn retain_supported_video_metadata(self, metadata: &mut VideoMetadata) {
+        if !self.supports_stream_language() {
+            metadata.language = "und".to_string();
         }
     }
 }
@@ -576,10 +586,17 @@ impl VideoResolution {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoMetadata {
+    pub language: String,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoSettings {
     pub codec: VideoCodec,
     pub resolution: VideoResolution,
+    pub metadata: VideoMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -598,6 +615,10 @@ impl Default for VideoSettings {
         Self {
             codec: VideoCodec::Original,
             resolution: VideoResolution::Original,
+            metadata: VideoMetadata {
+                language: "und".to_string(),
+                title: None,
+            },
         }
     }
 }
@@ -809,7 +830,7 @@ pub(crate) fn plan_requires_transcode(
                 (stream_kind(stream) == Some("video")
                     && video_settings
                         .get(source_index)
-                        .is_some_and(|settings| requires_transcode(stream, *settings)))
+                        .is_some_and(|settings| requires_transcode(stream, settings)))
                     || (stream_kind(stream) == Some("audio")
                         && audio_settings
                             .get(source_index)
@@ -1887,7 +1908,7 @@ fn apply_edits(
                 .iter()
                 .find(|stream| stream_index(stream) == Some(*index))
                 .zip(video_settings.get(index))
-                .is_some_and(|(stream, settings)| requires_transcode(stream, *settings))
+                .is_some_and(|(stream, settings)| requires_transcode(stream, settings))
         });
         let media_operation = media_write_label(
             target_container,
@@ -3561,7 +3582,16 @@ fn validate_result(
         let Some(settings) = video_settings.get(&source_index) else {
             continue;
         };
-        if source_stream.is_some_and(|stream| !requires_transcode(stream, *settings)) {
+        let mut expected_metadata = settings.metadata.clone();
+        if let Some(container) = container {
+            container.retain_supported_video_metadata(&mut expected_metadata);
+        }
+        if !video_metadata_matches(stream, &expected_metadata) {
+            return Err(format!(
+                "The video track at position {position} has the wrong metadata."
+            ));
+        }
+        if source_stream.is_some_and(|stream| !requires_transcode(stream, settings)) {
             continue;
         }
         let expected_codec = settings
@@ -3657,6 +3687,29 @@ pub(crate) fn audio_stream_title(stream: &BTreeMap<String, Value>) -> Option<Str
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|title| !title.is_empty() && !title.eq_ignore_ascii_case("SoundHandler"))
+                .map(str::to_string)
+        })
+}
+
+fn video_metadata_matches(stream: &BTreeMap<String, Value>, expected: &VideoMetadata) -> bool {
+    stream_language(stream) == expected.language && video_stream_title(stream) == expected.title
+}
+
+/// Mirrors `audio_stream_title`, but ignores ffmpeg's default MP4/MOV *video* handler name
+/// (`VideoHandler`) rather than its audio one (`SoundHandler`).
+pub(crate) fn video_stream_title(stream: &BTreeMap<String, Value>) -> Option<String> {
+    let tags = stream.get("tags").and_then(Value::as_object)?;
+    ["title", "name"]
+        .into_iter()
+        .filter_map(|key| tags.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|title| !title.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            tags.get("handler_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty() && !title.eq_ignore_ascii_case("VideoHandler"))
                 .map(str::to_string)
         })
 }
@@ -3825,7 +3878,7 @@ fn run_ffmpeg(
         if let Some(settings) = plan
             .video_settings
             .get(source_index)
-            .filter(|settings| requires_transcode(stream, **settings))
+            .filter(|settings| requires_transcode(stream, settings))
         {
             let codec = settings
                 .codec
@@ -3961,6 +4014,40 @@ fn run_ffmpeg(
                             stream,
                             plan.default_streams.contains(source_index),
                             &metadata,
+                        ));
+                    continue;
+                }
+                if should_write_video_metadata(
+                    stream_kind(stream),
+                    plan.video_settings.contains_key(source_index),
+                    plan.container.is_some(),
+                ) {
+                    let metadata = video_metadata_for_output(
+                        stream,
+                        plan.video_settings.get(source_index),
+                        metadata_container,
+                    );
+                    command
+                        .arg(format!("-metadata:s:{output_index}"))
+                        .arg(format!("language={}", metadata.language));
+                    let title_key = if matches!(
+                        metadata_container,
+                        Some(ContainerFormat::Mp4 | ContainerFormat::Mov)
+                    ) {
+                        "handler_name"
+                    } else {
+                        "title"
+                    };
+                    command
+                        .arg(format!("-metadata:s:{output_index}"))
+                        .arg(format!(
+                            "{title_key}={}",
+                            metadata.title.as_deref().unwrap_or("")
+                        ))
+                        .arg(format!("-disposition:{output_index}"))
+                        .arg(video_disposition(
+                            stream,
+                            plan.default_streams.contains(source_index),
                         ));
                     continue;
                 }
@@ -4160,6 +4247,29 @@ fn audio_disposition(
     }
 }
 
+/// Mirrors `audio_disposition`/`subtitle_disposition`, but video only ever models
+/// `default` — there is no established ffmpeg/Matroska convention for a video-stream
+/// role the way there is for audio (commentary, dub, ...) or subtitle (forced, cc, ...).
+/// Any other flag already on the source stream (e.g. `attached_pic`) is preserved.
+fn video_disposition(stream: &BTreeMap<String, Value>, default: bool) -> String {
+    let mut dispositions = stream
+        .get("disposition")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter(|(name, value)| value.as_i64() == Some(1) && name.as_str() != "default")
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    if default {
+        dispositions.insert("default".to_string());
+    }
+    if dispositions.is_empty() {
+        "0".to_string()
+    } else {
+        dispositions.into_iter().collect::<Vec<_>>().join("+")
+    }
+}
+
 fn media_duration(info: &MediaInfo) -> Option<f64> {
     info.format
         .get("duration")
@@ -4324,7 +4434,7 @@ fn source_codec(stream: &BTreeMap<String, Value>) -> Option<&'static str> {
     }
 }
 
-fn requires_transcode(stream: &BTreeMap<String, Value>, settings: VideoSettings) -> bool {
+fn requires_transcode(stream: &BTreeMap<String, Value>, settings: &VideoSettings) -> bool {
     settings.resolution != VideoResolution::Original
         || settings
             .codec
@@ -4421,6 +4531,35 @@ fn should_write_audio_metadata(
     changing_container: bool,
 ) -> bool {
     stream_kind == Some("audio") && (has_settings || changing_container)
+}
+
+fn video_metadata(stream: &BTreeMap<String, Value>) -> VideoMetadata {
+    VideoMetadata {
+        language: stream_language(stream),
+        title: video_stream_title(stream),
+    }
+}
+
+fn video_metadata_for_output(
+    stream: &BTreeMap<String, Value>,
+    settings: Option<&VideoSettings>,
+    container: Option<ContainerFormat>,
+) -> VideoMetadata {
+    let mut metadata = settings
+        .map(|settings| settings.metadata.clone())
+        .unwrap_or_else(|| video_metadata(stream));
+    if let Some(container) = container {
+        container.retain_supported_video_metadata(&mut metadata);
+    }
+    metadata
+}
+
+fn should_write_video_metadata(
+    stream_kind: Option<&str>,
+    has_settings: bool,
+    changing_container: bool,
+) -> bool {
+    stream_kind == Some("video") && (has_settings || changing_container)
 }
 
 /// The bitrate Reel picks for a lossy encode. Deliberately not user-selectable: the readme
@@ -4808,6 +4947,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::H264,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5107,6 +5250,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
         let subtitle_changes = [SubtitleChange {
@@ -5541,6 +5688,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Original,
                 resolution: VideoResolution::P480,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5571,6 +5722,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Original,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5605,6 +5760,10 @@ mod tests {
                         height,
                         scaling: CustomScaling::FitPad,
                     }),
+                    metadata: VideoMetadata {
+                        language: "und".to_string(),
+                        title: None,
+                    },
                 },
             )]);
 
@@ -5641,6 +5800,10 @@ mod tests {
                         height,
                         scaling: CustomScaling::FitPad,
                     }),
+                    metadata: VideoMetadata {
+                        language: "und".to_string(),
+                        title: None,
+                    },
                 },
             )])
         };
@@ -5818,6 +5981,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Original,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5861,6 +6028,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Original,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5906,6 +6077,10 @@ mod tests {
                         height,
                         scaling: CustomScaling::FitPad,
                     }),
+                    metadata: VideoMetadata {
+                        language: "und".to_string(),
+                        title: None,
+                    },
                 },
             )])
         };
@@ -5961,6 +6136,10 @@ mod tests {
                     height: 720,
                     scaling: CustomScaling::FitPad,
                 }),
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -5995,6 +6174,10 @@ mod tests {
                     height: 720,
                     scaling: CustomScaling::FitPad,
                 }),
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -7137,6 +7320,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
         let exported = [SubtitleChange {
@@ -7785,16 +7972,24 @@ mod tests {
         let to_hevc = VideoSettings {
             codec: VideoCodec::Hevc,
             resolution: VideoResolution::Original,
+            metadata: VideoMetadata {
+                language: "und".to_string(),
+                title: None,
+            },
         };
         let to_720p = VideoSettings {
             codec: VideoCodec::Original,
             resolution: VideoResolution::P720,
+            metadata: VideoMetadata {
+                language: "und".to_string(),
+                title: None,
+            },
         };
 
         // Act
-        let not_encoded = validate(&output("h264", 1920, 1080), to_hevc);
+        let not_encoded = validate(&output("h264", 1920, 1080), to_hevc.clone());
         let encoded = validate(&output("hevc", 1920, 1080), to_hevc);
-        let not_scaled = validate(&output("h264", 1920, 1080), to_720p);
+        let not_scaled = validate(&output("h264", 1920, 1080), to_720p.clone());
         let scaled = validate(&output("h264", 1280, 720), to_720p);
 
         // Assert: a resize with no codec change still has to come back as the source
@@ -7841,6 +8036,10 @@ mod tests {
                 VideoSettings {
                     codec: VideoCodec::H264,
                     resolution: VideoResolution::Original,
+                    metadata: VideoMetadata {
+                        language: "und".to_string(),
+                        title: None,
+                    },
                 },
             )]),
             &[],
@@ -8649,6 +8848,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::H264,
                 resolution: VideoResolution::P480,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
 
@@ -8737,6 +8940,10 @@ mod tests {
                         height: 18,
                         scaling,
                     }),
+                    metadata: VideoMetadata {
+                        language: "und".to_string(),
+                        title: None,
+                    },
                 },
             )]);
 
@@ -10404,6 +10611,98 @@ mod tests {
     }
 
     #[test]
+    fn apply_edits_should_write_video_metadata_and_preserve_its_neighbor() {
+        require_tools(
+            "apply_edits_should_write_video_metadata_and_preserve_its_neighbor",
+            &["ffmpeg"],
+        );
+        let directory = scratch_directory("video-metadata");
+        let _cleanup = DirectoryCleanup(Some(directory.clone()));
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x64:r=1:d=1")
+            .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1"])
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:a:0",
+                "title=Main audio",
+                "-disposition:v:0",
+                "0",
+                "-disposition:a:0",
+                "default",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        let settings = VideoSettings {
+            metadata: VideoMetadata {
+                language: "nld".to_string(),
+                title: Some("Director's cut".to_string()),
+            },
+            ..VideoSettings::default()
+        };
+        let video_settings = BTreeMap::from([(0, settings)]);
+        // Video and audio defaults are tracked independently (each kind gets its own
+        // exclusive default in the UI layer), so both stay flagged here.
+        let defaults = BTreeSet::from([0, 1]);
+        let mut phases = Vec::new();
+
+        apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &defaults,
+                default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
+                video_settings: &video_settings,
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |progress| phases.push(progress.label()),
+        )
+        .unwrap();
+
+        let output = media_info(&source).unwrap();
+        assert_that!(output.streams.len()).is_equal_to(2);
+        assert_that!(output.streams[0].get("codec_name").and_then(Value::as_str)).contains("ffv1");
+        assert_that!(stream_language(&output.streams[0])).is_equal_to("nld".to_string());
+        assert_that!(video_stream_title(&output.streams[0]).as_deref()).contains("Director's cut");
+        assert_that!(is_default(&output.streams[0])).is_true();
+        // The neighboring audio track's metadata and default flag are untouched by the
+        // video-only edit.
+        assert_that!(stream_language(&output.streams[1])).is_equal_to("eng".to_string());
+        assert_that!(audio_stream_title(&output.streams[1]).as_deref()).contains("Main audio");
+        assert_that!(is_default(&output.streams[1])).is_true();
+        let leftovers = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "movie.mkv")
+            .collect::<Vec<_>>();
+        assert_that!(leftovers).is_empty();
+    }
+
+    #[test]
     fn apply_edits_should_encode_lossless_audio_with_automatic_channels_and_rate() {
         require_tools(
             "apply_edits_should_encode_lossless_audio_with_automatic_channels_and_rate",
@@ -10509,6 +10808,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::H264,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -10525,6 +10828,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -10542,6 +10849,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -10712,6 +11023,108 @@ mod tests {
         assert!(should_write_audio_metadata(Some("audio"), false, true));
         assert!(!should_write_audio_metadata(Some("audio"), false, false));
         assert!(!should_write_audio_metadata(None, false, false));
+    }
+
+    #[test]
+    fn should_write_video_metadata_should_gate_on_kind_and_reason() {
+        assert!(!should_write_video_metadata(Some("audio"), true, true));
+        assert!(should_write_video_metadata(Some("video"), true, false));
+        assert!(should_write_video_metadata(Some("video"), false, true));
+        assert!(!should_write_video_metadata(Some("video"), false, false));
+        assert!(!should_write_video_metadata(None, false, false));
+    }
+
+    #[test]
+    fn video_disposition_should_preserve_unrelated_flags_and_toggle_default() {
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "disposition": {"default": 0, "attached_pic": 1, "forced": 1}
+        }))
+        .unwrap();
+        // An unrelated flag ("attached_pic") already on the source survives regardless
+        // of the default flag Reel is asked to write.
+        assert_that!(video_disposition(&stream, false).as_str()).is_equal_to("attached_pic+forced");
+        assert_that!(video_disposition(&stream, true).as_str())
+            .is_equal_to("attached_pic+default+forced");
+    }
+
+    #[test]
+    fn video_disposition_should_report_zero_when_nothing_is_set() {
+        let stream =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({})).unwrap();
+        assert_that!(video_disposition(&stream, false).as_str()).is_equal_to("0");
+    }
+
+    #[test]
+    fn video_stream_title_should_prefer_a_real_title_over_the_generic_mp4_handler_name() {
+        let named = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "tags": {"title": "Director's cut"}
+        }))
+        .unwrap();
+        assert_that!(video_stream_title(&named)).is_equal_to(Some("Director's cut".to_string()));
+
+        // The generic ISO-BMFF handler name ffmpeg writes when no real title was set is
+        // not a title — mirrors "SoundHandler" for audio.
+        let generic_handler =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+                "tags": {"handler_name": "VideoHandler"}
+            }))
+            .unwrap();
+        assert_that!(video_stream_title(&generic_handler)).is_none();
+
+        let real_handler_name =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+                "tags": {"handler_name": "Extended cut"}
+            }))
+            .unwrap();
+        assert_that!(video_stream_title(&real_handler_name))
+            .is_equal_to(Some("Extended cut".to_string()));
+
+        let untagged =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({})).unwrap();
+        assert_that!(video_stream_title(&untagged)).is_none();
+    }
+
+    #[test]
+    fn video_metadata_matches_should_compare_language_and_title() {
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "tags": {"language": "nld", "title": "Director's cut"}
+        }))
+        .unwrap();
+        let matching = VideoMetadata {
+            language: "nld".to_string(),
+            title: Some("Director's cut".to_string()),
+        };
+        assert_that!(video_metadata_matches(&stream, &matching)).is_true();
+
+        let wrong_language = VideoMetadata {
+            language: "eng".to_string(),
+            ..matching.clone()
+        };
+        assert_that!(video_metadata_matches(&stream, &wrong_language)).is_false();
+
+        let wrong_title = VideoMetadata {
+            title: Some("Theatrical cut".to_string()),
+            ..matching
+        };
+        assert_that!(video_metadata_matches(&stream, &wrong_title)).is_false();
+    }
+
+    #[test]
+    fn retain_supported_video_metadata_should_clear_language_only_on_mov() {
+        let mut metadata = VideoMetadata {
+            language: "nld".to_string(),
+            title: Some("Director's cut".to_string()),
+        };
+        ContainerFormat::Mov.retain_supported_video_metadata(&mut metadata);
+        assert_that!(metadata.language.as_str()).is_equal_to("und");
+        assert_that!(metadata.title.as_deref()).contains("Director's cut");
+
+        let mut unaffected = VideoMetadata {
+            language: "nld".to_string(),
+            title: None,
+        };
+        ContainerFormat::Matroska.retain_supported_video_metadata(&mut unaffected);
+        assert_that!(unaffected.language.as_str()).is_equal_to("nld");
     }
 
     #[test]
@@ -11109,6 +11522,10 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::H264,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         );
         request.subtitle_changes.push(SubtitleChange {

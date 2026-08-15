@@ -49,7 +49,7 @@ reel /path/to/media
 
 - **Media Inspection**: Inspect container formats, track layouts, duration, bitrates, and metadata across your video collection.
 - **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and modify stream metadata without re-encoding.
-- **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting.
+- **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting; edit language, title, and default metadata on individual video tracks without re-encoding.
 - **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata.
 - **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
@@ -57,4 +57,3 @@ reel /path/to/media
 ## Future planned
 
 - **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
-- **Video track metadata editing**: Edit metadata attached to individual video tracks.

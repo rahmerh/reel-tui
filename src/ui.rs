@@ -1603,7 +1603,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "K",
-        "Explain the highlighted container, audio, or subtitle field",
+        "Explain the highlighted container, video, audio, or subtitle field",
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
@@ -2453,6 +2453,34 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+fn video_field_help_title(field: VideoSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static> {
+    let description = match popup.field {
+        VideoSettingsField::Codec => {
+            "Sets the video format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec re-encodes the video and may affect quality and processing time."
+        }
+        VideoSettingsField::Resolution => {
+            "Sets the output frame size. Keeping Original avoids re-encoding unless another technical setting requires it; choosing a smaller size scales the picture down."
+        }
+        VideoSettingsField::Language => {
+            "Identifies the language associated with this video track to players and media libraries. It changes metadata only."
+        }
+        VideoSettingsField::Title => {
+            "An optional name shown by players, such as “Director's cut” or “Extended version.” Use it to distinguish video tracks that otherwise look alike."
+        }
+        VideoSettingsField::Default => {
+            "Marks this as the video track a player should prefer automatically.\n\nReel allows only 1 default video track and automatically clears the flag from any other video track when this one is selected."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
 fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.video_settings_popup.as_ref() else {
         return;
@@ -2461,90 +2489,193 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
         render_custom_resolution_dialog(frame, app);
         return;
     }
-    let settings = app
-        .video_settings
-        .get(&popup.stream_index)
-        .copied()
-        .unwrap_or_default();
-    let codec_choices = app.video_codec_choices(popup.stream_index);
-    let codec_label = codec_choices
-        .iter()
-        .find(|choice| choice.value == settings.codec)
-        .map(|choice| choice.label.as_str())
-        .unwrap_or("Unknown");
-    let resolution_choices = app.resolution_choices(popup.stream_index);
-    let resolution_label = resolution_choices
-        .iter()
-        .find(|choice| choice.selected(settings.resolution))
-        .map(|choice| choice.label.clone())
-        .unwrap_or_else(|| settings.resolution.label());
+    let Some(settings) = app.effective_video_settings(popup.stream_index) else {
+        return;
+    };
+    let selected = |field| popup.field == field;
+    let changed = |field| app.video_field_changed(field);
+    let expanded = |field| popup.mode == VideoSettingsMode::Dropdown && selected(field);
+    let mut lines = Vec::new();
+    let mut field_lines = Vec::new();
+    let mut dropdown_start = None;
 
-    let codec_expanded =
-        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Codec;
-    let resolution_expanded =
-        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Resolution;
-    // Each field's options are pushed straight after that field's own row. Collecting
-    // both rows first and appending the options at the end would hang an expanded
-    // Codec list underneath Resolution.
-    let mut lines = vec![setting_line(
-        "Codec",
-        codec_label,
-        popup.field == VideoSettingsField::Codec,
-        settings.codec != crate::edit::VideoCodec::Original,
-        codec_expanded,
-    )];
-    if codec_expanded {
-        let last_index = codec_choices.len().saturating_sub(1);
-        for (position, choice) in codec_choices.iter().enumerate() {
-            let label = match &choice.reason {
-                Some(reason) => format!("{} — {reason}", choice.label),
-                None => choice.label.clone(),
+    for field in app.visible_video_fields() {
+        let previous_field = field_lines.last().map(|(field, _)| *field);
+        let follows_expanded_field = previous_field == Some(popup.field)
+            && matches!(
+                popup.mode,
+                VideoSettingsMode::Dropdown | VideoSettingsMode::LanguageDropdown
+            );
+        let starts_group = matches!(
+            field,
+            VideoSettingsField::Language | VideoSettingsField::Default
+        );
+        if previous_field.is_some() && (follows_expanded_field || starts_group) {
+            lines.push(Line::from(""));
+        }
+        let line_index = lines.len();
+        field_lines.push((field, line_index));
+        match field {
+            VideoSettingsField::Codec => {
+                let choices = app.video_codec_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.value == settings.codec)
+                    .map(|choice| choice.label.as_str())
+                    .unwrap_or("Unknown");
+                lines.push(setting_line(
+                    field.label(),
+                    label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let label = choice.reason.as_ref().map_or_else(
+                            || choice.label.clone(),
+                            |reason| format!("{} — {reason}", choice.label),
+                        );
+                        lines.push(dropdown_line(
+                            &label,
+                            position == popup.codec_cursor,
+                            choice.value == settings.codec,
+                            choice.enabled,
+                            changed(field) && choice.value == settings.codec,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Resolution => {
+                let choices = app.resolution_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.selected(settings.resolution))
+                    .map(|choice| choice.label.clone())
+                    .unwrap_or_else(|| settings.resolution.label());
+                lines.push(setting_line(
+                    field.label(),
+                    &label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let choice_selected = choice.selected(settings.resolution);
+                        lines.push(dropdown_line(
+                            &choice.label,
+                            position == popup.resolution_cursor,
+                            choice_selected,
+                            choice.enabled,
+                            changed(field) && choice_selected,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Language => {
+                let language = language_choice(&settings.metadata.language)
+                    .map(|choice| choice.label())
+                    .unwrap_or_else(|| "Undetermined (und)".to_string());
+                lines.push(setting_line(
+                    field.label(),
+                    &language,
+                    selected(field),
+                    changed(field),
+                    popup.mode == VideoSettingsMode::LanguageDropdown,
+                ));
+                if popup.mode == VideoSettingsMode::LanguageDropdown {
+                    lines.push(text_field_line(
+                        TextField::new(
+                            "Search",
+                            FieldValue::Editing(&popup.language_search.input),
+                            TextInputConfig::LANGUAGE_SEARCH.width,
+                        )
+                        .selected(popup.language_search.is_active)
+                        .placeholder("type to filter")
+                        .suffix(match_suffix(app.filtered_video_languages().len()))
+                        .reject(app.text_input_reject(TextInputSite::VideoLanguageSearch)),
+                    ));
+                    dropdown_start = Some(lines.len());
+                    let choices = app.filtered_video_languages();
+                    let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+                    let end = (start + 10).min(choices.len());
+                    let last = end.saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate().take(end).skip(start) {
+                        lines.push(dropdown_line(
+                            &choice.label(),
+                            position == popup.language_cursor,
+                            choice.code == settings.metadata.language,
+                            true,
+                            changed(field) && choice.code == settings.metadata.language,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Title => {
+                lines.push(text_field_line(
+                    TextField::new(
+                        field.label(),
+                        FieldValue::Editing(&popup.title_input),
+                        TextInputConfig::SUBTITLE_TITLE.width,
+                    )
+                    .selected(selected(field))
+                    .changed(changed(field))
+                    .placeholder("name shown in player menus")
+                    .reject(app.text_input_reject(TextInputSite::VideoTitle)),
+                ));
+            }
+            VideoSettingsField::Default => lines.push(subtitle_checkbox_line(
+                field.label(),
+                app.default_streams.contains(&popup.stream_index),
+                selected(field),
+                changed(field),
+                None,
+            )),
+        }
+    }
+
+    let focus_line = match popup.mode {
+        VideoSettingsMode::Dropdown => {
+            let cursor = if popup.field == VideoSettingsField::Codec {
+                popup.codec_cursor
+            } else {
+                popup.resolution_cursor
             };
-            let selected = choice.value == settings.codec;
-            lines.push(dropdown_line(
-                &label,
-                position == popup.codec_cursor,
-                selected,
-                choice.enabled,
-                settings.codec != crate::edit::VideoCodec::Original && selected,
-                position == last_index,
-            ));
+            dropdown_start.unwrap_or(0) + cursor
         }
-    }
-    lines.push(setting_line(
-        "Resolution",
-        &resolution_label,
-        popup.field == VideoSettingsField::Resolution,
-        settings.resolution != crate::edit::VideoResolution::Original,
-        resolution_expanded,
-    ));
-    if resolution_expanded {
-        let last_index = resolution_choices.len().saturating_sub(1);
-        for (position, choice) in resolution_choices.iter().enumerate() {
-            let selected = choice.selected(settings.resolution);
-            lines.push(dropdown_line(
-                &choice.label,
-                position == popup.resolution_cursor,
-                selected,
-                choice.enabled,
-                settings.resolution != crate::edit::VideoResolution::Original && selected,
-                position == last_index,
-            ));
+        VideoSettingsMode::LanguageDropdown => {
+            let choices = app.filtered_video_languages();
+            let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+            dropdown_start.unwrap_or(0) + popup.language_cursor.saturating_sub(start)
         }
-    }
-
-    let text = padded_popup_text(Text::from(lines));
-    let height = (text.lines.len() as u16 + 2).max(7);
-    let area = centered_fixed(frame.area(), 58, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" Video track #{} settings ", popup.stream_index)),
-        ),
-        area,
+        VideoSettingsMode::Summary | VideoSettingsMode::TitleEdit => field_lines
+            .iter()
+            .find_map(|(field, line)| (*field == popup.field).then_some(*line))
+            .unwrap_or(0),
+        VideoSettingsMode::CustomResolution => 0,
+    };
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: format!(" Video track #{} settings ", popup.stream_index),
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    video_field_help_text(popup),
+                    video_field_help_title(popup.field),
+                )
+            }),
+            min_height: 14,
+        },
     );
 }
 
@@ -5057,6 +5188,10 @@ mod tests {
                     codec_cursor: 0,
                     resolution_cursor: 0,
                     custom_resolution: None,
+                    help_visible: false,
+                    language_cursor: 0,
+                    language_search: SearchState::default(),
+                    title_input: TextInputState::default(),
                 });
             }
             Dialog::AudioSettings => {
@@ -5382,6 +5517,10 @@ mod tests {
             crate::edit::VideoSettings {
                 codec: crate::edit::VideoCodec::Hevc,
                 resolution: crate::edit::VideoResolution::P1080,
+                metadata: crate::edit::VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         );
         app.staged_edits.insert(path, edit);
@@ -5536,6 +5675,10 @@ mod tests {
                     crate::edit::VideoSettings {
                         codec: crate::edit::VideoCodec::Hevc,
                         resolution: crate::edit::VideoResolution::Original,
+                        metadata: crate::edit::VideoMetadata {
+                            language: "und".to_string(),
+                            title: None,
+                        },
                     },
                 );
             } else {
@@ -8832,6 +8975,10 @@ mod tests {
             crate::edit::VideoSettings {
                 codec: crate::edit::VideoCodec::Hevc,
                 resolution: crate::edit::VideoResolution::Original,
+                metadata: crate::edit::VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                },
             },
         );
         let choices = app.video_codec_choices(0);
@@ -8845,6 +8992,10 @@ mod tests {
                 .unwrap(),
             resolution_cursor: 0,
             custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         let video = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
         assert_that!(video.as_str()).contains("HEVC");
@@ -9694,7 +9845,7 @@ mod tests {
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted container, audio, or subtitle field",
+            "Explain the highlighted container, video, audio, or subtitle field",
             "i",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
@@ -10345,6 +10496,10 @@ mod tests {
             codec_cursor: 0,
             resolution_cursor: 0,
             custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
