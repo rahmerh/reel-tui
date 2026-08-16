@@ -1310,44 +1310,38 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
         }
     }
 
-    // 2. Metadata Text Fields. The third column is the hint shown while the field is
-    // empty: an example of the value wanted, not a restatement of the label.
+    // 2. Metadata Text Fields.
     let text_fields = [
         (
             "Title",
             ContainerSettingsField::Title,
             effective.title.as_deref(),
-            "e.g. Big Buck Bunny",
         ),
         (
             "Comment",
             ContainerSettingsField::Comment,
             effective.comment.as_deref(),
-            "a note about this file",
         ),
         (
             "Date",
             ContainerSettingsField::Date,
             effective.date.as_deref(),
-            "e.g. 2008-04-10",
         ),
         (
             "Genre",
             ContainerSettingsField::Genre,
             effective.genre.as_deref(),
-            "e.g. Animation",
         ),
         (
             "Artist",
             ContainerSettingsField::Artist,
             effective.artist.as_deref(),
-            "e.g. Blender Foundation",
         ),
     ];
 
     lines.push(Line::from(""));
 
-    for (label, field, val, hint) in text_fields {
+    for (label, field, val) in text_fields {
         field_lines.push((field, lines.len()));
         let editing = selected(field) && popup.mode == ContainerSettingsMode::TextEdit;
         let value = if editing {
@@ -1359,7 +1353,6 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
             TextField::new(label, value, TextInputConfig::CONTAINER_METADATA.width)
                 .selected(selected(field))
                 .changed(changed(field))
-                .placeholder(hint)
                 .reject(app.text_input_reject(TextInputSite::ContainerMetadata)),
         ));
     }
@@ -1530,7 +1523,6 @@ fn search_line(search: &mut SearchState, area: Rect, reject: Option<InputReject>
         )
         .bar()
         .selected(search.is_active)
-        .placeholder("type to filter")
         .suffix(match_suffix(search.match_count))
         .reject(reject),
     )
@@ -2375,7 +2367,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                             TextInputConfig::LANGUAGE_SEARCH.width,
                         )
                         .selected(popup.language_search.is_active)
-                        .placeholder("type to filter")
                         .suffix(match_suffix(app.filtered_audio_languages().len()))
                         .reject(app.text_input_reject(TextInputSite::AudioLanguageSearch)),
                     ));
@@ -2405,7 +2396,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     )
                     .selected(selected(field))
                     .changed(changed(field))
-                    .placeholder("name shown in player menus")
                     .reject(app.text_input_reject(TextInputSite::AudioTitle)),
                 ));
             }
@@ -2642,7 +2632,6 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                             TextInputConfig::LANGUAGE_SEARCH.width,
                         )
                         .selected(popup.language_search.is_active)
-                        .placeholder("type to filter")
                         .suffix(match_suffix(app.filtered_video_languages().len()))
                         .reject(app.text_input_reject(TextInputSite::VideoLanguageSearch)),
                     ));
@@ -2672,7 +2661,6 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                     )
                     .selected(selected(field))
                     .changed(changed(field))
-                    .placeholder("name shown in player menus")
                     .reject(app.text_input_reject(TextInputSite::VideoTitle)),
                 ));
             }
@@ -2756,7 +2744,6 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         &draft.width,
         draft.field == CustomResolutionField::Width,
         width_changed,
-        "e.g. 1920",
         reject,
     ));
     lines.push(Line::from(""));
@@ -2765,7 +2752,6 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         &draft.height,
         draft.field == CustomResolutionField::Height,
         height_changed,
-        "e.g. 1080",
         reject,
     ));
     lines.push(Line::from(""));
@@ -2800,7 +2786,6 @@ fn custom_input_line(
     input: &TextInputState,
     focused: bool,
     changed: bool,
-    placeholder: &str,
     reject: Option<InputReject>,
 ) -> Line<'static> {
     text_field_line(
@@ -2811,7 +2796,6 @@ fn custom_input_line(
         )
         .selected(focused)
         .changed(changed)
-        .placeholder(placeholder)
         .reject(reject),
     )
 }
@@ -2914,7 +2898,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                 TextInputConfig::LANGUAGE_SEARCH.width,
             )
             .selected(popup.language_search.is_active)
-            .placeholder("type to filter")
             .suffix(match_suffix(choices.len()))
             .reject(app.text_input_reject(TextInputSite::LanguageSearch)),
         ));
@@ -2958,7 +2941,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             )
             .selected(selected(SubtitleSettingsField::Title))
             .changed(changed(SubtitleSettingsField::Title))
-            .placeholder("name shown in player menus")
             .reason(
                 app.subtitle_field_reason(SubtitleSettingsField::Title)
                     .as_deref(),
@@ -3340,8 +3322,6 @@ struct TextField<'a> {
     selected: bool,
     changed: bool,
     chrome: FieldChrome,
-    /// Shown in place of an empty value while the field is idle.
-    placeholder: Option<&'a str>,
     /// Trailing dim text, such as a match count.
     suffix: Option<String>,
     /// Why the field is unavailable; also renders it disabled.
@@ -3359,7 +3339,6 @@ impl<'a> TextField<'a> {
             selected: false,
             changed: false,
             chrome: FieldChrome::Row,
-            placeholder: None,
             suffix: None,
             reason: None,
             reject: None,
@@ -3378,11 +3357,6 @@ impl<'a> TextField<'a> {
 
     fn bar(mut self) -> Self {
         self.chrome = FieldChrome::Bar;
-        self
-    }
-
-    fn placeholder(mut self, placeholder: &'a str) -> Self {
-        self.placeholder = Some(placeholder);
         self
     }
 
@@ -3463,7 +3437,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         selected,
         changed,
         chrome,
-        placeholder,
         suffix,
         reason,
         reject,
@@ -3519,8 +3492,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         }
     };
 
-    let placeholder = placeholder.filter(|_| before.is_empty() && after.is_empty());
-
     let mut spans = Vec::new();
     let label_style = Style::default().fg(if selected { Color::Cyan } else { Color::Gray });
     let mut frame_style = if reject.is_some() {
@@ -3568,19 +3539,7 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         ));
     }
     spans.push(Span::styled(after, value_style));
-    let mut filled = used + caret_columns;
-    if let Some(placeholder) = placeholder {
-        let (text, columns) = take_columns(
-            &placeholder.chars().collect::<Vec<_>>(),
-            0,
-            width.saturating_sub(filled),
-        );
-        filled += columns;
-        spans.push(Span::styled(
-            text,
-            value_style.fg(Color::DarkGray).italic().not_bold(),
-        ));
-    }
+    let filled = used + caret_columns;
     spans.push(Span::styled(
         " ".repeat(width.saturating_sub(filled)),
         value_style,
@@ -4987,9 +4946,10 @@ mod tests {
         app.paste_text("zzq");
         let searching = drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert
-        assert_that!(&unfiltered).does_not_contain("type to filter");
-        assert_that!(&empty).contains("type to filter");
+        // Assert: the search bar (and its match-count suffix) only renders once the
+        // search has started.
+        assert_that!(&unfiltered).does_not_contain("matches");
+        assert_that!(&empty).contains("matches");
         assert_that!(&searching).contains("zzq");
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -11105,36 +11065,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_field_should_hint_at_its_value_and_drop_the_hint_when_typed_into() {
-        // Arrange
-        let config = TextInputConfig::CONTAINER_METADATA;
-        let empty = TextInputState::new(String::new());
-        let typed = TextInputState::new("B".to_string());
-
-        // Act
-        let hinted = text_field_line(
-            TextField::new("Title", FieldValue::Editing(&empty), config.width)
-                .placeholder("e.g. Big Buck Bunny"),
-        );
-        let filled = text_field_line(
-            TextField::new("Title", FieldValue::Editing(&typed), config.width)
-                .placeholder("e.g. Big Buck Bunny"),
-        );
-
-        // Assert: the hint reads as an example rather than as a stored value, and it
-        // does not change the row's width.
-        assert_that!(hinted.to_string().as_str()).contains("e.g. Big Buck Bunny");
-        assert_that!(filled.to_string().as_str()).does_not_contain("e.g.");
-        assert_that!(hinted.width()).is_equal_to(filled.width());
-        let hint = hinted
-            .spans
-            .iter()
-            .find(|span| span.content.contains("e.g."))
-            .expect("the hint should be rendered");
-        assert_that!(hint.style.fg).is_equal_to(Some(Color::DarkGray));
-    }
-
-    #[test]
     fn a_search_bar_should_be_framed_like_a_settings_row() {
         // Arrange
         let mut search = SearchState::default();
@@ -11182,31 +11112,11 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_empty_search_bar_should_show_its_placeholder() {
-        // Arrange
-        let mut search = SearchState::default();
-        let area = Rect::new(0, 0, 60, 1);
-
-        // Act
-        let idle = search_line(&mut search, area, None).to_string();
-        search.activate();
-        let active = search_line(&mut search, area, None).to_string();
-
-        // Assert
-        assert_that!(idle.as_str())
-            .contains("type to filter")
-            .does_not_contain(FIELD_CARET);
-        assert_that!(active.as_str())
-            .contains("type to filter")
-            .contains(FIELD_CARET);
-    }
-
-    #[test]
     fn custom_input_should_use_a_flat_dark_surface_and_cursor() {
         // Act
         let mut input = TextInputState::new("1280".to_string());
         input.activate();
-        let line = custom_input_line("Width", &input, true, false, "e.g. 1920", None);
+        let line = custom_input_line("Width", &input, true, false, None);
 
         // Assert
         assert_that!(line.to_string())
@@ -11226,7 +11136,7 @@ mod tests {
     fn custom_input_should_mark_a_changed_value_yellow_and_italic() {
         // Act
         let input = TextInputState::new("1280".to_string());
-        let line = custom_input_line("Width", &input, false, true, "e.g. 1920", None);
+        let line = custom_input_line("Width", &input, false, true, None);
 
         // Assert
         let value = value_span(&line, "1280");
