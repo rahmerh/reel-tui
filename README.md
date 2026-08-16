@@ -53,6 +53,7 @@ reel /path/to/media
 - **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata.
 - **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
+- **Desktop Notifications**: Get notified when a file finishes processing, sent only while `reel` isn't the focused window.
 
 ## Future planned
 
