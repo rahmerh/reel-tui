@@ -2212,19 +2212,19 @@ fn audio_field_help_title(field: AudioSettingsField) -> String {
 fn audio_field_help_text(popup: &crate::app::AudioSettingsPopup) -> Text<'static> {
     let description = match popup.field {
         AudioSettingsField::Codec => {
-            "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality."
+            "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality.\n\nAAC and Opus are efficient lossy codecs that stay small at strong quality, with Opus usually edging out AAC at low bitrates and AAC having the widest hardware support. AC3 and E-AC3 are the lossy surround formats TVs and receivers decode natively, with E-AC3 fitting more channels (up to 7.1) into less space than AC3's 5.1. MP3 and Vorbis are older lossy formats kept mainly for compatibility. FLAC and ALAC are lossless, reproducing the source exactly at roughly double a lossy track's size."
         }
         AudioSettingsField::ChannelLayout => {
-            "Sets the number and arrangement of output channels, such as Mono, Stereo, or 5.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not implemented."
+            "Sets the number and arrangement of output channels, such as Mono, Stereo, 5.1 surround, or 7.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not possible yet.\n\n7.1 and 5.1 surround keep multiple speaker channels for a full home-theatre mix; 7.1 adds a rear-centre pair over 5.1's front-left/right/centre, LFE, and rear-left/right. Stereo is a plain 2-channel mix, the safest choice for headphones or a TV's built-in speakers. Mono collapses everything to a single channel, useful mainly for old recordings or spoken-word tracks with no stereo content to lose."
         }
         AudioSettingsField::Language => {
             "Identifies the language spoken on this audio track to players and media libraries. It changes metadata only; it does not translate or dub the audio."
         }
         AudioSettingsField::Title => {
-            "An optional name shown by players, such as “English 5.1” or “Director commentary.” Use it to distinguish audio tracks that otherwise look alike."
+            "An optional name shown by players. Use it to distinguish audio tracks that otherwise look alike."
         }
         AudioSettingsField::Default => {
-            "Marks this as the audio track a player should prefer automatically.\n\nReel allows only 1 default audio track and automatically clears the flag from any other audio track when this one is selected."
+            "Marks this as the audio track a player should prefer automatically.\n\nOnly 1 default audio track is possible, and marking one clears the flag from any other audio track."
         }
         AudioSettingsField::Commentary => {
             "Marks the track as commentary rather than the main programme audio, for example a director or cast commentary. This flag is metadata only; it does not change the audio content."
@@ -2464,22 +2464,22 @@ fn video_field_help_title(field: VideoSettingsField) -> String {
 fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static> {
     let description = match popup.field {
         VideoSettingsField::Codec => {
-            "Sets the video format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec re-encodes the video and may affect quality and processing time."
+            "Sets the video format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec re-encodes the video and may affect quality and processing time.\n\nH.264 is the most widely compatible codec, playable on virtually any device, at the cost of a larger file for the same quality. HEVC (H.265) roughly halves the file size at equal quality but needs newer hardware to play smoothly and encodes more slowly. AV1 compresses tighter still and is royalty-free, at the price of the slowest encode times and the newest, least universal hardware support."
         }
         VideoSettingsField::Resolution => {
-            "Sets the output frame size. Keeping Original avoids re-encoding unless another technical setting requires it; choosing a smaller size scales the picture down."
+            "Sets the output frame size. Choosing a preset fits the picture into that frame without stretching it, padding with black bars if the source's aspect ratio differs. Only the Custom option lets you stretch the picture to fill the frame exactly instead."
         }
         VideoSettingsField::Rotation => {
-            "Turns the picture for playback by tagging the track, without touching the encoded video, so it saves in seconds and loses no quality.\n\nRe-encoding the same track instead applies the rotation to the picture itself, and the tag is no longer needed."
+            "Turns the picture for playback by tagging the track, without touching the encoded video.\n\nChoosing to re-encode instead permanently rotates the picture's pixels into the new orientation, so it plays right-side up even on a player that ignores rotation tags — and the tag itself becomes unnecessary, since the picture no longer needs one."
         }
         VideoSettingsField::Language => {
-            "Identifies the language associated with this video track to players and media libraries. It changes metadata only."
+            "Identifies the language associated with this video track to players and media libraries. It changes metadata only.\n\nEvery track in a container can carry a language tag, not just audio — video only needs one when the picture itself is tied to a language, such as hardcoded subtitles burned into the frame, or one of several alternate-language video angles on a disc rip. If neither applies, it's fine to leave this at its default."
         }
         VideoSettingsField::Title => {
             "An optional name shown by players, such as “Director's cut” or “Extended version.” Use it to distinguish video tracks that otherwise look alike."
         }
         VideoSettingsField::Default => {
-            "Marks this as the video track a player should prefer automatically.\n\nReel allows only 1 default video track and automatically clears the flag from any other video track when this one is selected."
+            "Marks this as the video track a player should prefer automatically.\n\nOnly 1 default video track is possible, and marking one clears the flag from any other video track."
         }
         VideoSettingsField::Commentary => {
             "Marks this as a commentary angle rather than the feature itself, such as a picture-in-picture director's track. This flag is metadata only."
@@ -9406,14 +9406,14 @@ mod tests {
         open_dialog(&mut app, Dialog::VideoSettings);
         let expected = [
             (VideoSettingsField::Codec, "avoids re-encoding"),
-            (VideoSettingsField::Resolution, "scales the picture down"),
+            (VideoSettingsField::Resolution, "without stretching"),
             (
                 VideoSettingsField::Rotation,
                 "without touching the encoded video",
             ),
             (VideoSettingsField::Language, "changes metadata only"),
             (VideoSettingsField::Title, "distinguish video tracks"),
-            (VideoSettingsField::Default, "only 1 default video track"),
+            (VideoSettingsField::Default, "Only 1 default video track"),
             (VideoSettingsField::Commentary, "picture-in-picture"),
         ];
 
@@ -9439,11 +9439,11 @@ mod tests {
             (AudioSettingsField::Codec, "avoids re-encoding"),
             (
                 AudioSettingsField::ChannelLayout,
-                "upmixing is not implemented",
+                "upmixing is not possible",
             ),
             (AudioSettingsField::Language, "does not translate or dub"),
             (AudioSettingsField::Title, "distinguish audio tracks"),
-            (AudioSettingsField::Default, "only 1 default audio track"),
+            (AudioSettingsField::Default, "Only 1 default audio track"),
             (
                 AudioSettingsField::Commentary,
                 "director or cast commentary",

@@ -1380,7 +1380,9 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     app.pump();
     assert!(
         app.screen().contains("Information about Channel layout")
-            && app.screen().contains("upmixing is not implemented"),
+            // The phrase wraps across rows at this popup width, so the check uses a
+            // substring short enough to land on one wrapped line.
+            && app.screen().contains("possible yet"),
         "help should follow the highlighted audio field:\n{}",
         app.screen()
     );
