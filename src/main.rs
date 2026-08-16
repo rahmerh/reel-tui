@@ -2,7 +2,10 @@ use std::time::Duration;
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyEventKind,
+};
 use crossterm::execute;
 use reel_tui::app::App;
 use reel_tui::cli;
@@ -45,6 +48,10 @@ fn run(target_dir: PathBuf) -> Result<()> {
 
     ratatui::run(|terminal| -> Result<()> {
         let _paste = BracketedPaste::enable()?;
+        // A terminal that does not understand this escape sequence just ignores it —
+        // `app.terminal_focused` then stays `None` forever and completion notifications
+        // send unconditionally, same as before this existed.
+        let _focus = FocusReporting::enable()?;
         // Redraw only when something render-relevant actually happened, instead of
         // unconditionally repainting the whole UI ~20 times a second forever. The
         // `Dialog::Processing` progress spinner is animated purely by elapsed wall
@@ -78,6 +85,8 @@ fn run(target_dir: PathBuf) -> Result<()> {
                         dirty = true;
                     }
                     Event::Resize(_, _) => dirty = true,
+                    Event::FocusGained => app.set_terminal_focused(true),
+                    Event::FocusLost => app.set_terminal_focused(false),
                     _ => {}
                 }
             }
@@ -102,5 +111,25 @@ impl BracketedPaste {
 impl Drop for BracketedPaste {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
+}
+
+/// Turns on the xterm focus-reporting escape sequence for the lifetime of the TUI, so
+/// `Event::FocusGained`/`FocusLost` start arriving and a completion notification can
+/// skip firing while the terminal is the focused window. Undone in `Drop` for the same
+/// reason `BracketedPaste` is: it must not outlive the alternate screen it was turned on
+/// for, including while unwinding.
+struct FocusReporting;
+
+impl FocusReporting {
+    fn enable() -> Result<Self> {
+        execute!(std::io::stdout(), EnableFocusChange)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for FocusReporting {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableFocusChange);
     }
 }

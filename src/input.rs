@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{
     App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
+    VideoSettingsMode,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,8 +318,142 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                         handle_text_input_key(app, key);
                     }
                 }
-            } else {
-                match (key.code, key.modifiers) {
+                return InputOutcome::Continue;
+            }
+            let mode = app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode)
+                .unwrap_or_default();
+            match mode {
+                VideoSettingsMode::TitleEdit => {
+                    input.reset_sequence();
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            app.save_from_video_settings()
+                        }
+                        (KeyCode::Esc | KeyCode::Enter, _) => app.escape_video_settings(),
+                        _ => {
+                            handle_text_input_key(app, key);
+                        }
+                    }
+                }
+                VideoSettingsMode::LanguageDropdown => {
+                    let searching = app
+                        .video_settings_popup
+                        .as_ref()
+                        .is_some_and(|popup| popup.language_search.is_active);
+                    if searching {
+                        input.reset_sequence();
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                app.save_from_video_settings()
+                            }
+                            (KeyCode::Esc, _) => app.cancel_video_language_search(),
+                            (KeyCode::Down, KeyModifiers::NONE)
+                            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                app.move_video_settings_cursor(1)
+                            }
+                            (KeyCode::Up, KeyModifiers::NONE)
+                            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                app.move_video_settings_cursor(-1)
+                            }
+                            (KeyCode::Enter, _) => app.activate_video_settings(),
+                            _ => {
+                                handle_text_input_key(app, key);
+                            }
+                        }
+                    } else {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                input.reset_sequence();
+                                app.toggle_video_field_help();
+                            }
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                input.reset_sequence();
+                                app.save_from_video_settings();
+                            }
+                            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.start_video_language_search();
+                            }
+                            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_video_settings_cursor(1)
+                            }
+                            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_video_settings_cursor(-1)
+                            }
+                            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                                input.reset_sequence();
+                                app.move_video_settings_to_endpoint(true);
+                            }
+                            (KeyCode::Enter, _) => {
+                                input.reset_sequence();
+                                app.activate_video_settings();
+                            }
+                            _ if is_back_key(key) => {
+                                input.reset_sequence();
+                                app.escape_video_settings();
+                            }
+                            _ if input.is_double_g(key) => {
+                                app.move_video_settings_to_endpoint(false)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                VideoSettingsMode::Summary | VideoSettingsMode::Dropdown => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            input.reset_sequence();
+                            app.toggle_video_field_help();
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            input.reset_sequence();
+                            app.save_from_video_settings();
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            // Both are internally gated (Title vs. a Custom resolution
+                            // choice already open), so only one ever actually fires.
+                            app.start_video_title_input();
+                            app.start_custom_resolution_input();
+                        }
+                        (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.reset_focused_field();
+                        }
+                        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_video_settings_cursor(1)
+                        }
+                        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_video_settings_cursor(-1)
+                        }
+                        (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            input.reset_sequence();
+                            app.move_video_settings_to_endpoint(true);
+                        }
+                        (KeyCode::Enter, _) => {
+                            input.reset_sequence();
+                            app.activate_video_settings();
+                        }
+                        _ if is_back_key(key) => {
+                            input.reset_sequence();
+                            app.escape_video_settings();
+                        }
+                        _ if input.is_double_g(key) => app.move_video_settings_to_endpoint(false),
+                        _ => {}
+                    }
+                }
+                // `CustomResolution` field-text-entry is handled above via
+                // `custom_resolution_input_active()`; reaching this mode here means the
+                // draft is open but no text field is focused (e.g. the scaling choice),
+                // which the Dropdown-shaped keys already cover well enough.
+                VideoSettingsMode::CustomResolution => match (key.code, key.modifiers) {
                     (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
                         app.save_from_video_settings();
@@ -326,10 +461,6 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                     (KeyCode::Char('i'), KeyModifiers::NONE) => {
                         input.reset_sequence();
                         app.start_custom_resolution_input();
-                    }
-                    (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                        input.reset_sequence();
-                        app.reset_focused_field();
                     }
                     (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
                         input.reset_sequence();
@@ -353,7 +484,7 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                     }
                     _ if input.is_double_g(key) => app.move_video_settings_to_endpoint(false),
                     _ => {}
-                }
+                },
             }
         }
         Some(Dialog::SubtitleSettings) => {
@@ -884,8 +1015,8 @@ mod tests {
         app::{
             AudioSettingsField, CancelEditChoice, ContainerSettingsField, ContainerSettingsMode,
             ContainerSettingsPopup, CustomResolutionDraft, CustomResolutionField, ResetScope,
-            SubtitleSettingsField, TextInputState, VideoSettingsField, VideoSettingsMode,
-            VideoSettingsPopup,
+            SearchState, SubtitleSettingsField, TextInputState, VideoSettingsField,
+            VideoSettingsMode, VideoSettingsPopup,
         },
         edit::{CustomResolution, CustomScaling, EditRequest, VideoResolution},
         files::{FileEntry, FileFingerprint},
@@ -1581,7 +1712,12 @@ mod tests {
                 mode: VideoSettingsMode::Dropdown,
                 codec_cursor: 0,
                 resolution_cursor: 0,
+                rotation_cursor: 0,
                 custom_resolution: None,
+                help_visible: false,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::default(),
             });
 
             handle_key(&mut app, &mut InputState::default(), key(code));
@@ -1607,6 +1743,7 @@ mod tests {
             mode: VideoSettingsMode::CustomResolution,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: Some(CustomResolutionDraft {
                 width: TextInputState::default(),
                 height: TextInputState::default(),
@@ -1615,6 +1752,10 @@ mod tests {
                 scaling_cursor: 0,
                 scaling_dropdown_open: false,
             }),
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         let mut input = InputState::default();
 
@@ -1984,12 +2125,17 @@ mod tests {
             mode: VideoSettingsMode::Summary,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(
             app.video_settings_popup.as_ref().unwrap().field,
-            VideoSettingsField::Resolution
+            VideoSettingsField::Commentary
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
@@ -2038,6 +2184,7 @@ mod tests {
                 mode: VideoSettingsMode::CustomResolution,
                 codec_cursor: 0,
                 resolution_cursor: 0,
+                rotation_cursor: 0,
                 custom_resolution: Some(CustomResolutionDraft {
                     width: TextInputState::new("1280".to_string()),
                     height: TextInputState::new("720".to_string()),
@@ -2046,6 +2193,10 @@ mod tests {
                     scaling_cursor: 0,
                     scaling_dropdown_open: false,
                 }),
+                help_visible: false,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::default(),
             });
 
             // Act

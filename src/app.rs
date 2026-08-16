@@ -19,11 +19,12 @@ use crate::{
         AudioChannelLayout, AudioCodec, AudioMetadata, AudioRole, AudioSettings,
         CHANNEL_UPMIX_NOT_IMPLEMENTED, ContainerFormat, ContainerMetadata, CustomResolution,
         CustomScaling, EditEvent, EditOutcome, EditRequest, MINIMUM_CUSTOM_DIMENSION,
-        SaveDestination, VideoCodec, VideoResolution, VideoSettings, audio_bitrate_kbps,
-        audio_requires_transcode, audio_stream_title, container_conflict_streams,
-        container_conflicts, effective_audio_codec, imported_subtitle_conflicts,
-        plan_requires_transcode, stream_channels, stream_disposition, stream_index,
-        subtitle_metadata_conflicts, validate_edit,
+        SaveDestination, VideoCodec, VideoMetadata, VideoResolution, VideoRotation, VideoSettings,
+        audio_bitrate_kbps, audio_requires_transcode, audio_stream_title,
+        container_conflict_streams, container_conflicts, effective_audio_codec,
+        imported_subtitle_conflicts, plan_requires_transcode, stream_channels, stream_disposition,
+        stream_index, stream_rotation, subtitle_metadata_conflicts, validate_edit,
+        video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
@@ -158,6 +159,8 @@ pub enum TextInputSite {
     ContainerMetadata,
     AudioTitle,
     AudioLanguageSearch,
+    VideoTitle,
+    VideoLanguageSearch,
     SubtitleTitle,
     LanguageSearch,
     CustomResolution,
@@ -665,6 +668,35 @@ pub enum VideoSettingsField {
     #[default]
     Codec,
     Resolution,
+    Rotation,
+    Language,
+    Title,
+    Default,
+    Commentary,
+}
+
+impl VideoSettingsField {
+    pub const ALL: [Self; 7] = [
+        Self::Codec,
+        Self::Resolution,
+        Self::Rotation,
+        Self::Language,
+        Self::Title,
+        Self::Default,
+        Self::Commentary,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codec => "Codec",
+            Self::Resolution => "Resolution",
+            Self::Rotation => "Rotation",
+            Self::Language => "Language",
+            Self::Title => "Title",
+            Self::Default => "Default",
+            Self::Commentary => "Commentary",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -672,8 +704,13 @@ pub struct VideoSettingsPopup {
     pub stream_index: u64,
     pub field: VideoSettingsField,
     pub mode: VideoSettingsMode,
+    pub help_visible: bool,
     pub codec_cursor: usize,
     pub resolution_cursor: usize,
+    pub rotation_cursor: usize,
+    pub language_cursor: usize,
+    pub language_search: SearchState,
+    pub title_input: TextInputState,
     pub custom_resolution: Option<CustomResolutionDraft>,
 }
 
@@ -682,6 +719,8 @@ pub enum VideoSettingsMode {
     #[default]
     Summary,
     Dropdown,
+    LanguageDropdown,
+    TitleEdit,
     CustomResolution,
 }
 
@@ -1037,6 +1076,12 @@ pub struct App {
     /// when notifications are enabled in the user's config; tests and other library
     /// consumers remain notification-free unless they explicitly opt in.
     completion_notification_tx: Option<Sender<PathBuf>>,
+    /// Whether the terminal last reported having focus, assumed `true` at launch —
+    /// focus reporting only ever announces a *change*, so a session that never once
+    /// loses focus (the ordinary case: you start an edit and watch it run) would
+    /// otherwise never receive a single event and stay stuck on whatever this started
+    /// as. `main`'s `FocusGained`/`FocusLost` events keep it current from there.
+    terminal_focused: bool,
     /// State for an in-flight "process all staged files" batch
     /// (`Dialog::BatchProcessing`/`ConfirmCancel`) — the sole edit-processing path;
     /// even a single staged file goes through a one-item batch, so `App` no longer
@@ -1163,6 +1208,7 @@ impl App {
             transcode_tx,
             remux_tx,
             completion_notification_tx: None,
+            terminal_focused: true,
             active_batch: None,
             pending_reset: None,
             reset_choice: ResetChoice::default(),
@@ -1198,6 +1244,12 @@ impl App {
 
     pub fn set_completion_notification_sender(&mut self, sender: Option<Sender<PathBuf>>) {
         self.completion_notification_tx = sender;
+    }
+
+    /// Records the terminal's last reported focus state, driven by `main`'s
+    /// `FocusGained`/`FocusLost` events.
+    pub fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_focused = focused;
     }
 
     /// Returns whether any snapshot was applied, so the main loop can skip redrawing
@@ -1926,7 +1978,9 @@ impl App {
                         ..
                     } => {
                         self.unstage_consumed_file(&path);
-                        if let Some(sender) = &self.completion_notification_tx {
+                        if !self.terminal_focused
+                            && let Some(sender) = &self.completion_notification_tx
+                        {
                             let _ = sender.send(output.clone());
                         }
                         output_path = Some(output);
@@ -3238,6 +3292,18 @@ impl App {
             return Some(TextInputSite::AudioLanguageSearch);
         }
         if self
+            .video_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == VideoSettingsMode::TitleEdit)
+        {
+            return Some(TextInputSite::VideoTitle);
+        }
+        if self.video_settings_popup.as_ref().is_some_and(|popup| {
+            popup.mode == VideoSettingsMode::LanguageDropdown && popup.language_search.is_active
+        }) {
+            return Some(TextInputSite::VideoLanguageSearch);
+        }
+        if self
             .subtitle_settings_popup
             .as_ref()
             .is_some_and(|popup| popup.mode == SubtitleSettingsMode::TitleEdit)
@@ -3278,6 +3344,14 @@ impl App {
             )),
             TextInputSite::AudioLanguageSearch => Some((
                 &mut self.audio_settings_popup.as_mut()?.language_search.input,
+                TextInputConfig::LANGUAGE_SEARCH,
+            )),
+            TextInputSite::VideoTitle => Some((
+                &mut self.video_settings_popup.as_mut()?.title_input,
+                TextInputConfig::SUBTITLE_TITLE,
+            )),
+            TextInputSite::VideoLanguageSearch => Some((
+                &mut self.video_settings_popup.as_mut()?.language_search.input,
                 TextInputConfig::LANGUAGE_SEARCH,
             )),
             TextInputSite::SubtitleTitle => Some((
@@ -3355,6 +3429,11 @@ impl App {
                     popup.language_cursor = 0;
                 }
             }
+            TextInputSite::VideoLanguageSearch => {
+                if let Some(popup) = self.video_settings_popup.as_mut() {
+                    popup.language_cursor = 0;
+                }
+            }
             TextInputSite::LanguageSearch => {
                 if let Some(popup) = self.subtitle_settings_popup.as_mut() {
                     popup.language_cursor = 0;
@@ -3369,6 +3448,7 @@ impl App {
             }
             TextInputSite::ContainerMetadata
             | TextInputSite::AudioTitle
+            | TextInputSite::VideoTitle
             | TextInputSite::SubtitleTitle
             | TextInputSite::CustomResolution => {}
         }
@@ -3466,6 +3546,42 @@ impl App {
             self.audio_settings.remove(&index);
         } else {
             self.audio_settings.insert(index, settings);
+        }
+    }
+
+    fn original_video_settings(&self, index: u64) -> Option<VideoSettings> {
+        let stream = self
+            .media_info()
+            .and_then(|info| stream_by_index(info, index))?;
+        (stream_kind(stream) == Some("video")).then(|| VideoSettings {
+            codec: VideoCodec::Original,
+            resolution: VideoResolution::Original,
+            rotation: stream_rotation(stream),
+            metadata: VideoMetadata {
+                language: stream_language(stream),
+                title: video_stream_title(stream),
+                commentary: stream_commentary(stream),
+            },
+        })
+    }
+
+    /// The staged video settings for `index`, or the track's own settings when nothing is
+    /// staged. See `effective_audio_settings` for why this is deliberately not filtered
+    /// against the target container.
+    pub fn effective_video_settings(&self, index: u64) -> Option<VideoSettings> {
+        self.video_settings
+            .get(&index)
+            .cloned()
+            .or_else(|| self.original_video_settings(index))
+    }
+
+    fn store_video_settings(&mut self, index: u64, mut settings: VideoSettings) {
+        settings.metadata.language = canonical_language_code(&settings.metadata.language)
+            .unwrap_or_else(|| "und".to_string());
+        if self.original_video_settings(index).as_ref() == Some(&settings) {
+            self.video_settings.remove(&index);
+        } else {
+            self.video_settings.insert(index, settings);
         }
     }
 
@@ -3670,7 +3786,7 @@ impl App {
             return true;
         };
         match field {
-            AudioSettingsField::Language => container.supports_audio_language(),
+            AudioSettingsField::Language => container.supports_stream_language(),
             field if field.role().is_some() => field
                 .role()
                 .is_some_and(|role| container.supports_audio_role(role)),
@@ -3682,6 +3798,56 @@ impl App {
         AudioSettingsField::ALL
             .into_iter()
             .filter(|field| self.audio_field_visible(*field))
+            .collect()
+    }
+
+    pub fn filtered_video_languages(&self) -> Vec<LanguageChoice> {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            return Vec::new();
+        };
+        self.video_language_choices_for(popup.stream_index, &popup.language_search.value)
+    }
+
+    fn video_language_choices_for(&self, index: u64, query: &str) -> Vec<LanguageChoice> {
+        let mut choices = common_language_choices();
+        choices.insert(
+            0,
+            LanguageChoice {
+                code: "und".to_string(),
+                two_letter: String::new(),
+                name: "Undetermined".to_string(),
+            },
+        );
+        if let Some(current) = self
+            .effective_video_settings(index)
+            .and_then(|settings| language_choice(&settings.metadata.language))
+            && !choices.iter().any(|choice| choice.code == current.code)
+        {
+            choices.push(current);
+        }
+        choices.retain(|choice| choice.matches(query));
+        choices
+    }
+
+    /// The same stream-language container restriction audio has, plus the one role video
+    /// offers — MOV and WebM store no commentary flag, so the field is hidden rather than
+    /// promising a flag the remux would drop.
+    pub fn video_field_visible(&self, field: VideoSettingsField) -> bool {
+        let Some(container) = self.effective_container() else {
+            return true;
+        };
+        match field {
+            VideoSettingsField::Language => container.supports_stream_language(),
+            VideoSettingsField::Commentary => container.supports_commentary_flag(),
+            VideoSettingsField::Rotation => container.supports_display_rotation(),
+            _ => true,
+        }
+    }
+
+    pub fn visible_video_fields(&self) -> Vec<VideoSettingsField> {
+        VideoSettingsField::ALL
+            .into_iter()
+            .filter(|field| self.video_field_visible(*field))
             .collect()
     }
 
@@ -3705,13 +3871,21 @@ impl App {
             return;
         }
 
-        let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        let settings = self
+            .effective_video_settings(index)
+            .expect("the selected stream was just verified as video");
         let codecs = self.video_codec_choices(index);
         let resolutions = self.resolution_choices(index);
+        let languages = self.video_language_choices_for(index, "");
+        let language_cursor = languages
+            .iter()
+            .position(|choice| choice.code == settings.metadata.language)
+            .unwrap_or(0);
         self.video_settings_popup = Some(VideoSettingsPopup {
             stream_index: index,
             field: VideoSettingsField::Codec,
             mode: VideoSettingsMode::Summary,
+            help_visible: false,
             codec_cursor: codecs
                 .iter()
                 .position(|choice| choice.value == settings.codec)
@@ -3720,10 +3894,23 @@ impl App {
                 .iter()
                 .position(|choice| choice.selected(settings.resolution))
                 .unwrap_or(0),
+            rotation_cursor: VideoRotation::ALL
+                .iter()
+                .position(|rotation| *rotation == settings.rotation)
+                .unwrap_or(0),
+            language_cursor,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new(settings.metadata.title.unwrap_or_default()),
             custom_resolution: None,
         });
         self.notice = None;
         self.dialog = Some(Dialog::VideoSettings);
+    }
+
+    pub fn toggle_video_field_help(&mut self) {
+        if let Some(popup) = self.video_settings_popup.as_mut() {
+            popup.help_visible = !popup.help_visible;
+        }
     }
 
     pub fn open_track_settings(&mut self) {
@@ -4813,12 +5000,13 @@ impl App {
         };
         match popup.mode {
             VideoSettingsMode::Summary => {
-                let popup = self.video_settings_popup.as_mut().unwrap();
-                popup.field = match (popup.field, direction.is_positive()) {
-                    (VideoSettingsField::Codec, true) => VideoSettingsField::Resolution,
-                    (VideoSettingsField::Resolution, false) => VideoSettingsField::Codec,
-                    (field, _) => field,
-                };
+                let fields = self.visible_video_fields();
+                let position = fields
+                    .iter()
+                    .position(|field| *field == popup.field)
+                    .unwrap_or(0);
+                let next = move_cursor(position, fields.len(), direction, |_| true);
+                self.video_settings_popup.as_mut().unwrap().field = fields[next];
             }
             VideoSettingsMode::Dropdown => match popup.field {
                 VideoSettingsField::Codec => {
@@ -4839,7 +5027,24 @@ impl App {
                         |position| choices[position].enabled,
                     );
                 }
+                VideoSettingsField::Rotation => {
+                    let popup = self.video_settings_popup.as_mut().unwrap();
+                    popup.rotation_cursor = move_cursor(
+                        popup.rotation_cursor,
+                        VideoRotation::ALL.len(),
+                        direction,
+                        |_| true,
+                    );
+                }
+                _ => {}
             },
+            VideoSettingsMode::LanguageDropdown => {
+                let choices = self.filtered_video_languages();
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.language_cursor =
+                    move_cursor(popup.language_cursor, choices.len(), direction, |_| true);
+            }
+            VideoSettingsMode::TitleEdit => {}
             VideoSettingsMode::CustomResolution => {
                 let Some(draft) = self
                     .video_settings_popup
@@ -4874,11 +5079,13 @@ impl App {
         };
         match popup.mode {
             VideoSettingsMode::Summary => {
-                self.video_settings_popup.as_mut().unwrap().field = if end {
-                    VideoSettingsField::Resolution
+                let fields = self.visible_video_fields();
+                let field = if end {
+                    *fields.last().expect("codec is always a video field")
                 } else {
-                    VideoSettingsField::Codec
+                    *fields.first().expect("codec is always a video field")
                 };
+                self.video_settings_popup.as_mut().unwrap().field = field;
             }
             VideoSettingsMode::Dropdown => match popup.field {
                 VideoSettingsField::Codec => {
@@ -4900,7 +5107,20 @@ impl App {
                             .resolution_cursor = position;
                     }
                 }
+                VideoSettingsField::Rotation => {
+                    self.video_settings_popup.as_mut().unwrap().rotation_cursor =
+                        if end { VideoRotation::ALL.len() - 1 } else { 0 };
+                }
+                _ => {}
             },
+            VideoSettingsMode::LanguageDropdown => {
+                let len = self.filtered_video_languages().len();
+                if len > 0 {
+                    self.video_settings_popup.as_mut().unwrap().language_cursor =
+                        if end { len - 1 } else { 0 };
+                }
+            }
+            VideoSettingsMode::TitleEdit => {}
             VideoSettingsMode::CustomResolution => {
                 let Some(draft) = self
                     .video_settings_popup
@@ -4930,24 +5150,76 @@ impl App {
         let Some(popup) = self.video_settings_popup.as_ref() else {
             return;
         };
-        match popup.mode {
-            VideoSettingsMode::Summary => {
-                self.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::Dropdown;
-                return;
-            }
-            VideoSettingsMode::CustomResolution => {
-                self.activate_custom_resolution();
-                return;
-            }
-            VideoSettingsMode::Dropdown => {}
-        }
-
         let index = popup.stream_index;
         let field = popup.field;
+        let mode = popup.mode;
+        if mode == VideoSettingsMode::Summary {
+            match field {
+                VideoSettingsField::Codec
+                | VideoSettingsField::Resolution
+                | VideoSettingsField::Rotation => {
+                    self.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::Dropdown;
+                }
+                VideoSettingsField::Language => {
+                    let current = self
+                        .effective_video_settings(index)
+                        .map(|settings| settings.metadata.language)
+                        .unwrap_or_else(|| "und".to_string());
+                    let choices = self.video_language_choices_for(index, "");
+                    let popup = self.video_settings_popup.as_mut().unwrap();
+                    popup.language_search.clear();
+                    popup.language_cursor = choices
+                        .iter()
+                        .position(|choice| choice.code == current)
+                        .unwrap_or(0);
+                    popup.mode = VideoSettingsMode::LanguageDropdown;
+                }
+                VideoSettingsField::Title => self.start_video_title_input(),
+                VideoSettingsField::Default => self.toggle_video_default(index),
+                VideoSettingsField::Commentary => {
+                    if let Some(mut settings) = self.effective_video_settings(index) {
+                        settings.metadata.commentary = !settings.metadata.commentary;
+                        self.store_video_settings(index, settings);
+                    }
+                }
+            }
+            return;
+        }
+        if mode == VideoSettingsMode::LanguageDropdown {
+            let choices = self.filtered_video_languages();
+            let cursor = popup.language_cursor;
+            if let Some(choice) = choices.get(cursor)
+                && let Some(mut settings) = self.effective_video_settings(index)
+            {
+                settings.metadata.language.clone_from(&choice.code);
+                self.store_video_settings(index, settings);
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.language_search.clear();
+                popup.mode = VideoSettingsMode::Summary;
+            }
+            return;
+        }
+        if mode == VideoSettingsMode::CustomResolution {
+            self.activate_custom_resolution();
+            return;
+        }
+        if mode != VideoSettingsMode::Dropdown {
+            return;
+        }
+
         let codec_cursor = popup.codec_cursor;
         let resolution_cursor = popup.resolution_cursor;
-        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        let rotation_cursor = popup.rotation_cursor;
+        let Some(mut settings) = self.effective_video_settings(index) else {
+            return;
+        };
         match field {
+            VideoSettingsField::Rotation => {
+                let Some(rotation) = VideoRotation::ALL.get(rotation_cursor) else {
+                    return;
+                };
+                settings.rotation = *rotation;
+            }
             VideoSettingsField::Codec => {
                 let choices = self.video_codec_choices(index);
                 let Some(choice) = choices.get(codec_cursor).filter(|choice| choice.enabled) else {
@@ -5007,13 +5279,96 @@ impl App {
                     }
                 }
             }
+            _ => return,
         }
-        if self.settings_change_stream(index, settings) {
-            self.video_settings.insert(index, settings);
-        } else {
-            self.video_settings.remove(&index);
-        }
+        self.store_video_settings(index, settings);
         self.video_settings_popup.as_mut().unwrap().mode = VideoSettingsMode::Summary;
+    }
+
+    fn toggle_video_default(&mut self, index: u64) {
+        if !self.default_streams.remove(&index) {
+            let video_indices = self
+                .media_info()
+                .into_iter()
+                .flat_map(|info| info.streams.iter())
+                .filter(|stream| stream_kind(stream) == Some("video"))
+                .filter_map(stream_index)
+                .collect::<Vec<_>>();
+            for video_index in video_indices {
+                self.default_streams.remove(&video_index);
+            }
+            self.default_streams.insert(index);
+        }
+    }
+
+    pub fn start_video_title_input(&mut self) {
+        self.clear_text_input_reject();
+        let Some(popup) = self.video_settings_popup.as_mut() else {
+            return;
+        };
+        if popup.mode != VideoSettingsMode::Summary || popup.field != VideoSettingsField::Title {
+            return;
+        }
+        popup.title_input.activate();
+        popup.mode = VideoSettingsMode::TitleEdit;
+    }
+
+    fn commit_video_title(&mut self) {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            return;
+        };
+        let index = popup.stream_index;
+        let title = popup.title_input.value.trim().to_string();
+        if let Some(mut settings) = self.effective_video_settings(index) {
+            settings.metadata.title = (!title.is_empty()).then_some(title);
+            self.store_video_settings(index, settings);
+        }
+    }
+
+    pub fn start_video_language_search(&mut self) {
+        self.clear_text_input_reject();
+        let Some(popup) = self
+            .video_settings_popup
+            .as_mut()
+            .filter(|popup| popup.mode == VideoSettingsMode::LanguageDropdown)
+        else {
+            return;
+        };
+        popup.language_search.activate();
+    }
+
+    pub fn cancel_video_language_search(&mut self) {
+        let Some(popup) = self.video_settings_popup.as_mut() else {
+            return;
+        };
+        popup.language_search.clear();
+        popup.language_cursor = 0;
+    }
+
+    pub fn video_field_changed(&self, field: VideoSettingsField) -> bool {
+        let Some(popup) = self.video_settings_popup.as_ref() else {
+            return false;
+        };
+        let Some(current) = self.effective_video_settings(popup.stream_index) else {
+            return false;
+        };
+        let Some(original) = self.original_video_settings(popup.stream_index) else {
+            return false;
+        };
+        match field {
+            VideoSettingsField::Codec => current.codec != original.codec,
+            VideoSettingsField::Resolution => current.resolution != original.resolution,
+            VideoSettingsField::Rotation => current.rotation != original.rotation,
+            VideoSettingsField::Language => current.metadata.language != original.metadata.language,
+            VideoSettingsField::Title => current.metadata.title != original.metadata.title,
+            VideoSettingsField::Default => {
+                self.default_streams.contains(&popup.stream_index)
+                    != self.original_default_streams.contains(&popup.stream_index)
+            }
+            VideoSettingsField::Commentary => {
+                current.metadata.commentary != original.metadata.commentary
+            }
+        }
     }
 
     pub fn escape_video_settings(&mut self) {
@@ -5046,7 +5401,7 @@ impl App {
             VideoSettingsMode::Dropdown => {
                 let index = popup.stream_index;
                 let field = popup.field;
-                let settings = self.video_settings.get(&index).copied().unwrap_or_default();
+                let settings = self.effective_video_settings(index).unwrap_or_default();
                 let resolution_cursor = (field == VideoSettingsField::Resolution).then(|| {
                     self.resolution_choices(index)
                         .iter()
@@ -5068,7 +5423,21 @@ impl App {
                     VideoSettingsField::Resolution => {
                         popup.resolution_cursor = resolution_cursor.unwrap_or(0);
                     }
+                    _ => {}
                 }
+                return;
+            }
+            VideoSettingsMode::LanguageDropdown => {
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.language_search.clear();
+                popup.mode = VideoSettingsMode::Summary;
+                return;
+            }
+            VideoSettingsMode::TitleEdit => {
+                self.commit_video_title();
+                let popup = self.video_settings_popup.as_mut().unwrap();
+                popup.title_input.deactivate();
+                popup.mode = VideoSettingsMode::Summary;
                 return;
             }
             VideoSettingsMode::Summary => {}
@@ -5092,6 +5461,13 @@ impl App {
             if !self.apply_custom_resolution() {
                 return;
             }
+        }
+        if self
+            .video_settings_popup
+            .as_ref()
+            .is_some_and(|popup| popup.mode == VideoSettingsMode::TitleEdit)
+        {
+            self.commit_video_title();
         }
         self.close_video_settings();
         self.request_process_all();
@@ -5211,13 +5587,11 @@ impl App {
         else {
             return false;
         };
-        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        let Some(mut settings) = self.effective_video_settings(index) else {
+            return false;
+        };
         settings.resolution = resolution;
-        if self.settings_change_stream(index, settings) {
-            self.video_settings.insert(index, settings);
-        } else {
-            self.video_settings.remove(&index);
-        }
+        self.store_video_settings(index, settings);
         true
     }
 
@@ -5402,23 +5776,6 @@ impl App {
             })
         }));
         choices
-    }
-
-    fn settings_change_stream(&self, index: u64, settings: VideoSettings) -> bool {
-        if settings.resolution != VideoResolution::Original {
-            return true;
-        }
-        let source_codec = self
-            .media_info()
-            .and_then(|info| stream_by_index(info, index))
-            .and_then(|stream| stream.get("codec_name"))
-            .and_then(serde_json::Value::as_str);
-        match settings.codec {
-            VideoCodec::Original => false,
-            VideoCodec::H264 => source_codec != Some("h264"),
-            VideoCodec::Hevc => source_codec != Some("hevc"),
-            VideoCodec::Av1 => source_codec != Some("av1"),
-        }
     }
 
     /// The Ctrl+S entry point everywhere (Files panel, Streams layer, and the
@@ -6530,10 +6887,8 @@ impl App {
         self.store_audio_settings(index, settings);
     }
 
-    /// Resets one `VideoSettings` field (`Codec` or `Resolution`) to `Original`,
-    /// leaving the other field's staged value (if any) alone — mirrors the
-    /// store-or-remove logic in `choose_video_codec`/`choose_video_resolution` (via
-    /// `settings_change_stream`).
+    /// Resets one `VideoSettings` field to its original value, leaving any other
+    /// staged field alone — mirrors `reset_audio_field`.
     fn reset_video_field(&mut self, field: VideoSettingsField) {
         let Some(index) = self
             .video_settings_popup
@@ -6542,16 +6897,32 @@ impl App {
         else {
             return;
         };
-        let mut settings = self.video_settings.get(&index).copied().unwrap_or_default();
+        if field == VideoSettingsField::Default {
+            if self.original_default_streams.contains(&index) {
+                self.default_streams.insert(index);
+            } else {
+                self.default_streams.remove(&index);
+            }
+            return;
+        }
+        let Some(original) = self.original_video_settings(index) else {
+            return;
+        };
+        let mut settings = self
+            .effective_video_settings(index)
+            .expect("original video settings imply effective video settings");
         match field {
-            VideoSettingsField::Codec => settings.codec = VideoCodec::Original,
-            VideoSettingsField::Resolution => settings.resolution = VideoResolution::Original,
+            VideoSettingsField::Codec => settings.codec = original.codec,
+            VideoSettingsField::Resolution => settings.resolution = original.resolution,
+            VideoSettingsField::Rotation => settings.rotation = original.rotation,
+            VideoSettingsField::Language => settings.metadata.language = original.metadata.language,
+            VideoSettingsField::Title => settings.metadata.title = original.metadata.title,
+            VideoSettingsField::Commentary => {
+                settings.metadata.commentary = original.metadata.commentary
+            }
+            VideoSettingsField::Default => unreachable!(),
         }
-        if self.settings_change_stream(index, settings) {
-            self.video_settings.insert(index, settings);
-        } else {
-            self.video_settings.remove(&index);
-        }
+        self.store_video_settings(index, settings);
     }
 
     /// Resets one `SubtitleSettings` field to its original value. `Codec` clears
@@ -9208,6 +9579,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(file.path.clone(), edit);
@@ -9407,6 +9784,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::H264,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         )]);
         assert!(staged_edit_stages_anything(&video), "video settings");
@@ -9681,6 +10064,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(path.clone(), edit);
@@ -9794,6 +10183,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(path.clone(), edit);
@@ -9851,6 +10246,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(path.clone(), edit);
@@ -9906,6 +10307,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(path.clone(), edit);
@@ -9957,6 +10364,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         assert_that!(app.has_track_edits()).is_true();
@@ -10019,6 +10432,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         std::fs::write(&path, b"changed contents").unwrap();
@@ -10076,6 +10495,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         std::fs::write(&path, b"changed contents").unwrap();
@@ -10316,6 +10741,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.staged_edits.insert(path.clone(), edit);
@@ -10409,6 +10840,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         edit.subtitle_changes.insert(
@@ -10544,6 +10981,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         assert_that!(app.media_info().unwrap().streams.len()).is_equal_to(3);
@@ -10794,6 +11237,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Av1,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.selected_stream = app
@@ -11008,6 +11457,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::Original,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
 
@@ -11398,6 +11853,9 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let (notification_tx, notification_rx) = std::sync::mpsc::channel();
         app.set_completion_notification_sender(Some(notification_tx));
+        // A completion notification only makes sense while the terminal is not the
+        // focused window; this test is about routing and summarizing, not that gate.
+        app.set_terminal_focused(false);
         app.dialog = Some(Dialog::BatchProcessing);
         app.active_batch = Some(crate::staging::BatchState {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -11504,6 +11962,97 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty),
             "failed files must not produce completion notifications"
         );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Builds a one-item batch already `Running` and a channel primed with the single
+    /// `EditEvent::Finished` that completes it, ready for `receive_edit_results`.
+    /// Shared by the two focus-gating tests below so each is just its
+    /// `set_terminal_focused` call and its assertion on the notification channel.
+    fn app_with_a_finished_batch_of_one() -> (
+        App,
+        std::sync::mpsc::Receiver<EditEvent>,
+        std::sync::mpsc::Receiver<std::path::PathBuf>,
+        std::path::PathBuf,
+    ) {
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        let path = app.files[0].path.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+        app.set_completion_notification_sender(Some(notification_tx));
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: path.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+        result_tx
+            .send(EditEvent::Finished {
+                path,
+                outcome: EditOutcome::Completed {
+                    output_path: directory.join("a.mp4"),
+                    media_changed: true,
+                },
+            })
+            .unwrap();
+        (app, result_rx, notification_rx, directory)
+    }
+
+    #[test]
+    fn a_completed_edit_should_suppress_its_notification_when_focus_was_never_reported() {
+        // Regression: focus reporting only ever announces a *change*. A session that
+        // starts an edit and just watches it run — never once switching away — gets no
+        // `FocusGained`/`FocusLost` event at all, and previously left `terminal_focused`
+        // stuck on a "never told otherwise, so notify" default. That defeated the
+        // feature in what is normally the common case.
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(
+            notification_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "launch is assumed focused; with no focus event at all, it must stay assumed"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_completed_edit_should_suppress_its_notification_while_the_terminal_is_focused() {
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+        app.set_terminal_focused(true);
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(
+            notification_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "a focused terminal already shows the result; it must not also notify"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_completed_edit_should_notify_once_the_terminal_reports_losing_focus() {
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+        // Focus can flip back and forth before the edit finishes; only the last report
+        // should matter, not whether the terminal was ever focused at all.
+        app.set_terminal_focused(true);
+        app.set_terminal_focused(false);
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(notification_rx.try_recv(), Ok(directory.join("a.mp4")));
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -11876,6 +12425,12 @@ mod tests {
             VideoSettings {
                 codec: VideoCodec::Hevc,
                 resolution: VideoResolution::P720,
+                metadata: VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: VideoRotation::None,
             },
         );
         app.selected_stream = app
@@ -11891,9 +12446,266 @@ mod tests {
 
         // Assert: resolution reverted to Original, codec change (a different field)
         // survives.
-        let settings = app.video_settings.get(&0).copied().unwrap();
+        let settings = app.video_settings.get(&0).cloned().unwrap();
         assert_that!(settings.resolution).is_equal_to(VideoResolution::Original);
         assert_that!(settings.codec).is_equal_to(VideoCodec::Hevc);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn video_metadata_and_default_should_stage_without_changing_neighboring_video() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "tags": {"language": "eng"}, "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "tags": {"language": "fra"}, "disposition": {"default": 0}}
+            ]),
+        );
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_video_settings();
+
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Title;
+        app.start_video_title_input();
+        for character in "Director's cut".chars() {
+            app.input_text_char(character);
+        }
+        app.escape_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Language;
+        app.activate_video_settings();
+        let cursor = app
+            .filtered_video_languages()
+            .iter()
+            .position(|choice| choice.code == "nld")
+            .unwrap();
+        app.video_settings_popup.as_mut().unwrap().language_cursor = cursor;
+        app.activate_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Default;
+        app.activate_video_settings();
+
+        assert_that!(app.video_settings[&1].metadata.title.as_deref()).contains("Director's cut");
+        assert_that!(app.video_settings[&1].metadata.language.as_str()).is_equal_to("nld");
+        assert_that!(app.video_field_changed(VideoSettingsField::Title)).is_true();
+        assert_that!(app.video_field_changed(VideoSettingsField::Language)).is_true();
+        assert_that!(app.video_field_changed(VideoSettingsField::Default)).is_true();
+        // Toggling default on track 1 clears it from every other video track, so track
+        // 0's originally-default flag is gone even though nothing about it was staged.
+        assert_that!(app.default_streams.clone()).is_equal_to(BTreeSet::from([1]));
+        assert_that!(app.video_settings.contains_key(&0)).is_false();
+
+        // Resetting Title and Language independently leaves the other staged and
+        // Default untouched.
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Title;
+        app.reset_focused_field();
+        assert_that!(app.video_settings[&1].metadata.title.as_deref()).is_none();
+        assert_that!(app.video_settings[&1].metadata.language.as_str()).is_equal_to("nld");
+        // Resetting Default reverts only the focused track (1) to its own original
+        // disposition (not default); it does not restore track 0's original default,
+        // since a reset only ever touches the field under focus.
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Default;
+        app.reset_focused_field();
+        assert_that!(app.default_streams.clone()).is_equal_to(BTreeSet::new());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The one role a picture track can hold, staged the way audio's roles are: toggled
+    /// from the dialog, reverted by `r`, and stored only while it differs from the source.
+    #[test]
+    fn video_commentary_should_toggle_stage_and_reset_against_the_source_flag() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "tags": {"language": "eng"}},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "tags": {"language": "eng"}, "disposition": {"comment": 1}}
+            ]),
+        );
+
+        // A track that starts without the flag: the dialog opens unchecked, one toggle
+        // stages it, a second toggle matches the source again and drops the staged edit.
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        assert_that!(app.effective_video_settings(0).unwrap().metadata.commentary).is_false();
+        app.activate_video_settings();
+        assert_that!(app.video_settings[&0].metadata.commentary).is_true();
+        assert_that!(app.video_field_changed(VideoSettingsField::Commentary)).is_true();
+        app.activate_video_settings();
+        assert_that!(app.video_settings.contains_key(&0)).is_false();
+        assert_that!(app.video_field_changed(VideoSettingsField::Commentary)).is_false();
+
+        // And a track that starts with it: the dialog opens checked, unticking stages the
+        // removal, and `r` puts the source's flag back without touching a staged title.
+        app.escape_video_settings();
+        focus_track(&mut app, TrackRef::Embedded(1));
+        app.open_video_settings();
+        assert_that!(app.effective_video_settings(1).unwrap().metadata.commentary).is_true();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Title;
+        app.start_video_title_input();
+        for character in "Angle 2".chars() {
+            app.input_text_char(character);
+        }
+        app.escape_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        app.activate_video_settings();
+        assert_that!(app.video_settings[&1].metadata.commentary).is_false();
+        app.reset_focused_field();
+        assert_that!(app.video_settings[&1].metadata.commentary).is_true();
+        assert_that!(app.video_settings[&1].metadata.title.as_deref()).contains("Angle 2");
+
+        // The neighboring video track was never staged by any of it.
+        assert_that!(app.video_settings.contains_key(&0)).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rotation is staged as an absolute angle read from the source, so the dialog opens
+    /// on whatever the file already says and `r` puts that value back.
+    #[test]
+    fn video_rotation_should_stage_from_the_sources_own_angle_and_reset_to_it() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080,
+                 "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90}]},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080}
+            ]),
+        );
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+
+        // The source's own angle, normalized: ffmpeg writes 270° as -90.
+        assert_that!(app.effective_video_settings(0).unwrap().rotation)
+            .is_equal_to(VideoRotation::Cw270);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().rotation_cursor)
+            .is_equal_to(VideoRotation::ALL.len() - 1);
+
+        // Staging a different angle, chosen from the dropdown.
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        app.activate_video_settings();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::Dropdown);
+        app.video_settings_popup.as_mut().unwrap().rotation_cursor = 1;
+        app.activate_video_settings();
+        assert_that!(app.video_settings[&0].rotation).is_equal_to(VideoRotation::Cw90);
+        assert_that!(app.video_field_changed(VideoSettingsField::Rotation)).is_true();
+
+        // Choosing the source's own angle again is not an edit at all.
+        app.activate_video_settings();
+        app.video_settings_popup.as_mut().unwrap().rotation_cursor = VideoRotation::ALL.len() - 1;
+        app.activate_video_settings();
+        assert_that!(app.video_settings.contains_key(&0)).is_false();
+        assert_that!(app.video_field_changed(VideoSettingsField::Rotation)).is_false();
+
+        // Clearing it to upright stages an edit, and `r` restores the source's angle
+        // without disturbing a staged codec change.
+        app.activate_video_settings();
+        app.video_settings_popup.as_mut().unwrap().rotation_cursor = 0;
+        app.activate_video_settings();
+        assert_that!(app.video_settings[&0].rotation).is_equal_to(VideoRotation::None);
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Codec;
+        app.activate_video_settings();
+        let hevc = app
+            .video_codec_choices(0)
+            .iter()
+            .position(|choice| choice.value == VideoCodec::Hevc)
+            .unwrap();
+        app.video_settings_popup.as_mut().unwrap().codec_cursor = hevc;
+        app.activate_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        app.reset_focused_field();
+        assert_that!(app.video_settings[&0].rotation).is_equal_to(VideoRotation::Cw270);
+        assert_that!(app.video_settings[&0].codec).is_equal_to(VideoCodec::Hevc);
+
+        // The neighboring video track was never staged by any of it.
+        assert_that!(app.video_settings.contains_key(&1)).is_false();
+        assert_that!(app.effective_video_settings(1).unwrap().rotation)
+            .is_equal_to(VideoRotation::None);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// WebM always re-encodes to VP9, and an encode bakes the rotation into the picture
+    /// instead of tagging it, so there is no matrix left for the container to store.
+    #[test]
+    fn video_rotation_field_should_only_be_offered_by_containers_that_store_a_matrix() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"}
+            ]),
+        );
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+
+        for (container, offered) in [
+            (ContainerFormat::Matroska, true),
+            (ContainerFormat::Mp4, true),
+            (ContainerFormat::Mov, true),
+            (ContainerFormat::WebM, false),
+        ] {
+            app.container_target = Some(container);
+            assert_eq!(
+                app.visible_video_fields()
+                    .contains(&VideoSettingsField::Rotation),
+                offered,
+                "{container:?} should {} the Rotation field",
+                if offered { "offer" } else { "hide" }
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// MOV and WebM store no commentary flag, so the field is hidden rather than offering
+    /// a tick the remux would silently drop.
+    #[test]
+    fn video_commentary_field_should_only_be_offered_by_containers_that_store_it() {
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "disposition": {"comment": 1}}
+            ]),
+        );
+        focus_track(&mut app, TrackRef::Embedded(0));
+        app.open_video_settings();
+
+        for (container, offered) in [
+            (ContainerFormat::Matroska, true),
+            (ContainerFormat::Mp4, true),
+            (ContainerFormat::Mov, false),
+            (ContainerFormat::WebM, false),
+        ] {
+            app.container_target = Some(container);
+            assert_eq!(
+                app.visible_video_fields()
+                    .contains(&VideoSettingsField::Commentary),
+                offered,
+                "{container:?} should {} the Commentary field",
+                if offered { "offer" } else { "hide" }
+            );
+            // Hiding it never edits the staged model — the container target is not a
+            // decision the user made about this flag, and they may change it back.
+            assert_that!(app.effective_video_settings(0).unwrap().metadata.commentary).is_true();
+            assert_that!(app.video_settings.contains_key(&0)).is_false();
+        }
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -13063,8 +13875,13 @@ mod tests {
             stream_index: 0,
             field: VideoSettingsField::Codec,
             mode: VideoSettingsMode::Summary,
+            help_visible: false,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::new(String::new()),
             custom_resolution: None,
         });
         app.move_video_settings_cursor(1);
@@ -15964,6 +16781,30 @@ mod tests {
                     title_input: active,
                 });
             }
+            TextInputSite::VideoTitle | TextInputSite::VideoLanguageSearch => {
+                let language_search = SearchState {
+                    input: active.clone(),
+                    match_count: 0,
+                    field_width: 0,
+                };
+                app.video_settings_popup = Some(VideoSettingsPopup {
+                    stream_index: 0,
+                    field: VideoSettingsField::Title,
+                    mode: if site == TextInputSite::VideoTitle {
+                        VideoSettingsMode::TitleEdit
+                    } else {
+                        VideoSettingsMode::LanguageDropdown
+                    },
+                    help_visible: false,
+                    codec_cursor: 0,
+                    resolution_cursor: 0,
+                    rotation_cursor: 0,
+                    language_cursor: 0,
+                    language_search,
+                    title_input: active,
+                    custom_resolution: None,
+                });
+            }
             TextInputSite::SubtitleTitle | TextInputSite::LanguageSearch => {
                 let language_search = SearchState {
                     input: active.clone(),
@@ -15991,8 +16832,13 @@ mod tests {
                     stream_index: 0,
                     field: VideoSettingsField::Resolution,
                     mode: VideoSettingsMode::CustomResolution,
+                    help_visible: false,
                     codec_cursor: 0,
                     resolution_cursor: 0,
+                    rotation_cursor: 0,
+                    language_cursor: 0,
+                    language_search: SearchState::default(),
+                    title_input: TextInputState::new(String::new()),
                     custom_resolution: Some(CustomResolutionDraft {
                         width: active,
                         height: TextInputState::new(String::new()),
@@ -16015,10 +16861,12 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 8] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 10] = [
         TextInputSite::ContainerMetadata,
         TextInputSite::AudioTitle,
         TextInputSite::AudioLanguageSearch,
+        TextInputSite::VideoTitle,
+        TextInputSite::VideoLanguageSearch,
         TextInputSite::SubtitleTitle,
         TextInputSite::LanguageSearch,
         TextInputSite::CustomResolution,
@@ -16042,6 +16890,8 @@ mod tests {
                 TextInputSite::ContainerMetadata => TextInputConfig::CONTAINER_METADATA,
                 TextInputSite::AudioTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::AudioLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
+                TextInputSite::VideoTitle => TextInputConfig::SUBTITLE_TITLE,
+                TextInputSite::VideoLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
@@ -16216,9 +17066,9 @@ mod tests {
             // Search and numeric fields refuse the space that would otherwise separate
             // the words, so for them a single run is the whole "word".
             let (typed, after_word) = match site {
-                TextInputSite::LanguageSearch | TextInputSite::AudioLanguageSearch => {
-                    ("onetwo", "")
-                }
+                TextInputSite::LanguageSearch
+                | TextInputSite::AudioLanguageSearch
+                | TextInputSite::VideoLanguageSearch => ("onetwo", ""),
                 TextInputSite::CustomResolution => ("1234", ""),
                 _ => ("one two", "one "),
             };
@@ -17720,10 +18570,10 @@ mod tests {
             .unwrap();
         app.open_video_settings();
 
-        // Act / Assert: in summary mode they move between the two fields.
+        // Act / Assert: in summary mode they move between the visible fields.
         app.move_video_settings_to_endpoint(true);
         assert_that!(app.video_settings_popup.as_ref().unwrap().field)
-            .is_equal_to(VideoSettingsField::Resolution);
+            .is_equal_to(VideoSettingsField::Commentary);
         app.move_video_settings_to_endpoint(false);
         assert_that!(app.video_settings_popup.as_ref().unwrap().field)
             .is_equal_to(VideoSettingsField::Codec);

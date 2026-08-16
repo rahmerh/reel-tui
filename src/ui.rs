@@ -276,6 +276,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         default_sidecars: &app.default_sidecars,
                         changed: &changed,
                         audio_settings: &app.audio_settings,
+                        video_settings: &app.video_settings,
                         subtitle_changes: &app.subtitle_changes,
                         source_container: app.source_container(),
                         container_target: app.container_target,
@@ -389,6 +390,7 @@ fn media_text(
         default_sidecars,
         changed,
         audio_settings,
+        video_settings,
         subtitle_changes,
         source_container,
         container_target,
@@ -442,8 +444,15 @@ fn media_text(
                     .then(|| stream_index(stream).and_then(|index| audio_settings.get(&index)))
                     .flatten()
                     .map(|settings| audio_stream_for_display(stream, settings));
+                let staged_video = (kind == "video")
+                    .then(|| stream_index(stream).and_then(|index| video_settings.get(&index)))
+                    .flatten()
+                    .map(|settings| video_stream_for_display(stream, settings));
                 lines.push(stream_line(
-                    staged_audio.as_ref().unwrap_or(stream),
+                    staged_audio
+                        .as_ref()
+                        .or(staged_video.as_ref())
+                        .unwrap_or(stream),
                     selection_index,
                     selected == Some(selection_index),
                     stream_index(stream).is_some_and(|index| deleted.contains(&index)),
@@ -723,6 +732,7 @@ struct MediaTextState<'a> {
     default_sidecars: &'a std::collections::BTreeSet<usize>,
     changed: &'a std::collections::BTreeSet<u64>,
     audio_settings: &'a std::collections::BTreeMap<u64, AudioSettings>,
+    video_settings: &'a std::collections::BTreeMap<u64, crate::edit::VideoSettings>,
     subtitle_changes: &'a std::collections::BTreeMap<
         crate::subtitle::SubtitleSource,
         crate::subtitle::SubtitleChange,
@@ -1006,6 +1016,10 @@ fn stream_line_with_subtitle_context(
             {
                 details.push(format!("{fps} fps"));
             }
+            let rotation = crate::edit::stream_rotation(stream);
+            if rotation != crate::edit::VideoRotation::None {
+                details.push(format!("↻{}°", rotation.degrees()));
+            }
         }
         "audio" => {
             if let Some(layout) = string(stream, "channel_layout") {
@@ -1025,7 +1039,7 @@ fn stream_line_with_subtitle_context(
         }
     }
 
-    if !subtitle && let Some(flags) = disposition_flag_tag(stream, default) {
+    if !subtitle && let Some(flags) = disposition_flag_tag(stream, kind, default) {
         details.push(flags);
     }
 
@@ -1296,44 +1310,38 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
         }
     }
 
-    // 2. Metadata Text Fields. The third column is the hint shown while the field is
-    // empty: an example of the value wanted, not a restatement of the label.
+    // 2. Metadata Text Fields.
     let text_fields = [
         (
             "Title",
             ContainerSettingsField::Title,
             effective.title.as_deref(),
-            "e.g. Big Buck Bunny",
         ),
         (
             "Comment",
             ContainerSettingsField::Comment,
             effective.comment.as_deref(),
-            "a note about this file",
         ),
         (
             "Date",
             ContainerSettingsField::Date,
             effective.date.as_deref(),
-            "e.g. 2008-04-10",
         ),
         (
             "Genre",
             ContainerSettingsField::Genre,
             effective.genre.as_deref(),
-            "e.g. Animation",
         ),
         (
             "Artist",
             ContainerSettingsField::Artist,
             effective.artist.as_deref(),
-            "e.g. Blender Foundation",
         ),
     ];
 
     lines.push(Line::from(""));
 
-    for (label, field, val, hint) in text_fields {
+    for (label, field, val) in text_fields {
         field_lines.push((field, lines.len()));
         let editing = selected(field) && popup.mode == ContainerSettingsMode::TextEdit;
         let value = if editing {
@@ -1345,7 +1353,6 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
             TextField::new(label, value, TextInputConfig::CONTAINER_METADATA.width)
                 .selected(selected(field))
                 .changed(changed(field))
-                .placeholder(hint)
                 .reject(app.text_input_reject(TextInputSite::ContainerMetadata)),
         ));
     }
@@ -1516,7 +1523,6 @@ fn search_line(search: &mut SearchState, area: Rect, reject: Option<InputReject>
         )
         .bar()
         .selected(search.is_active)
-        .placeholder("type to filter")
         .suffix(match_suffix(search.match_count))
         .reject(reject),
     )
@@ -1603,7 +1609,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "K",
-        "Explain the highlighted container, audio, or subtitle field",
+        "Explain the highlighted container, video, audio, or subtitle field",
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
@@ -2206,19 +2212,19 @@ fn audio_field_help_title(field: AudioSettingsField) -> String {
 fn audio_field_help_text(popup: &crate::app::AudioSettingsPopup) -> Text<'static> {
     let description = match popup.field {
         AudioSettingsField::Codec => {
-            "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality."
+            "Sets the audio format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec converts the audio and may affect quality.\n\nAAC and Opus are efficient lossy codecs that stay small at strong quality, with Opus usually edging out AAC at low bitrates and AAC having the widest hardware support. AC3 and E-AC3 are the lossy surround formats TVs and receivers decode natively, with E-AC3 fitting more channels (up to 7.1) into less space than AC3's 5.1. MP3 and Vorbis are older lossy formats kept mainly for compatibility. FLAC and ALAC are lossless, reproducing the source exactly at roughly double a lossy track's size."
         }
         AudioSettingsField::ChannelLayout => {
-            "Sets the number and arrangement of output channels, such as Mono, Stereo, or 5.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not implemented."
+            "Sets the number and arrangement of output channels, such as Mono, Stereo, 5.1 surround, or 7.1 surround. Choosing fewer channels downmixes the audio and reduces its spatial separation. Reel does not create missing channels, so upmixing is not possible yet.\n\n7.1 and 5.1 surround keep multiple speaker channels for a full home-theatre mix; 7.1 adds a rear-centre pair over 5.1's front-left/right/centre, LFE, and rear-left/right. Stereo is a plain 2-channel mix, the safest choice for headphones or a TV's built-in speakers. Mono collapses everything to a single channel, useful mainly for old recordings or spoken-word tracks with no stereo content to lose."
         }
         AudioSettingsField::Language => {
             "Identifies the language spoken on this audio track to players and media libraries. It changes metadata only; it does not translate or dub the audio."
         }
         AudioSettingsField::Title => {
-            "An optional name shown by players, such as “English 5.1” or “Director commentary.” Use it to distinguish audio tracks that otherwise look alike."
+            "An optional name shown by players. Use it to distinguish audio tracks that otherwise look alike."
         }
         AudioSettingsField::Default => {
-            "Marks this as the audio track a player should prefer automatically.\n\nReel allows only 1 default audio track and automatically clears the flag from any other audio track when this one is selected."
+            "Marks this as the audio track a player should prefer automatically.\n\nOnly 1 default audio track is possible, and marking one clears the flag from any other audio track."
         }
         AudioSettingsField::Commentary => {
             "Marks the track as commentary rather than the main programme audio, for example a director or cast commentary. This flag is metadata only; it does not change the audio content."
@@ -2361,7 +2367,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                             TextInputConfig::LANGUAGE_SEARCH.width,
                         )
                         .selected(popup.language_search.is_active)
-                        .placeholder("type to filter")
                         .suffix(match_suffix(app.filtered_audio_languages().len()))
                         .reject(app.text_input_reject(TextInputSite::AudioLanguageSearch)),
                     ));
@@ -2391,7 +2396,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     )
                     .selected(selected(field))
                     .changed(changed(field))
-                    .placeholder("name shown in player menus")
                     .reject(app.text_input_reject(TextInputSite::AudioTitle)),
                 ));
             }
@@ -2453,6 +2457,40 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+fn video_field_help_title(field: VideoSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static> {
+    let description = match popup.field {
+        VideoSettingsField::Codec => {
+            "Sets the video format written to the output. Keeping the current codec avoids re-encoding unless another technical setting requires it; choosing a different codec re-encodes the video and may affect quality and processing time.\n\nH.264 is the most widely compatible codec, playable on virtually any device, at the cost of a larger file for the same quality. HEVC (H.265) roughly halves the file size at equal quality but needs newer hardware to play smoothly and encodes more slowly. AV1 compresses tighter still and is royalty-free, at the price of the slowest encode times and the newest, least universal hardware support."
+        }
+        VideoSettingsField::Resolution => {
+            "Sets the output frame size. Choosing a preset fits the picture into that frame without stretching it, padding with black bars if the source's aspect ratio differs. Only the Custom option lets you stretch the picture to fill the frame exactly instead."
+        }
+        VideoSettingsField::Rotation => {
+            "This changes metadata only. It doesn't rotate the encoded pixels — it just tags the track so a player rotates it at playback."
+        }
+        VideoSettingsField::Language => {
+            "Identifies the language associated with this video track to players and media libraries. It changes metadata only.\n\nEvery track in a container can carry a language tag, not just audio — video only needs one when the picture itself is tied to a language, such as hardcoded subtitles burned into the frame, or one of several alternate-language video angles on a disc rip. If neither applies, it's fine to leave this at its default."
+        }
+        VideoSettingsField::Title => {
+            "An optional name shown by players, such as “Director's cut” or “Extended version.” Use it to distinguish video tracks that otherwise look alike."
+        }
+        VideoSettingsField::Default => {
+            "Marks this as the video track a player should prefer automatically.\n\nOnly 1 default video track is possible, and marking one clears the flag from any other video track."
+        }
+        VideoSettingsField::Commentary => {
+            "Marks this as a commentary angle rather than the feature itself, such as a picture-in-picture director's track. This flag is metadata only."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
 fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.video_settings_popup.as_ref() else {
         return;
@@ -2461,90 +2499,222 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
         render_custom_resolution_dialog(frame, app);
         return;
     }
-    let settings = app
-        .video_settings
-        .get(&popup.stream_index)
-        .copied()
-        .unwrap_or_default();
-    let codec_choices = app.video_codec_choices(popup.stream_index);
-    let codec_label = codec_choices
-        .iter()
-        .find(|choice| choice.value == settings.codec)
-        .map(|choice| choice.label.as_str())
-        .unwrap_or("Unknown");
-    let resolution_choices = app.resolution_choices(popup.stream_index);
-    let resolution_label = resolution_choices
-        .iter()
-        .find(|choice| choice.selected(settings.resolution))
-        .map(|choice| choice.label.clone())
-        .unwrap_or_else(|| settings.resolution.label());
+    let Some(settings) = app.effective_video_settings(popup.stream_index) else {
+        return;
+    };
+    let selected = |field| popup.field == field;
+    let changed = |field| app.video_field_changed(field);
+    let expanded = |field| popup.mode == VideoSettingsMode::Dropdown && selected(field);
+    let mut lines = Vec::new();
+    let mut field_lines = Vec::new();
+    let mut dropdown_start = None;
 
-    let codec_expanded =
-        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Codec;
-    let resolution_expanded =
-        popup.mode == VideoSettingsMode::Dropdown && popup.field == VideoSettingsField::Resolution;
-    // Each field's options are pushed straight after that field's own row. Collecting
-    // both rows first and appending the options at the end would hang an expanded
-    // Codec list underneath Resolution.
-    let mut lines = vec![setting_line(
-        "Codec",
-        codec_label,
-        popup.field == VideoSettingsField::Codec,
-        settings.codec != crate::edit::VideoCodec::Original,
-        codec_expanded,
-    )];
-    if codec_expanded {
-        let last_index = codec_choices.len().saturating_sub(1);
-        for (position, choice) in codec_choices.iter().enumerate() {
-            let label = match &choice.reason {
-                Some(reason) => format!("{} — {reason}", choice.label),
-                None => choice.label.clone(),
+    for field in app.visible_video_fields() {
+        let previous_field = field_lines.last().map(|(field, _)| *field);
+        let follows_expanded_field = previous_field == Some(popup.field)
+            && matches!(
+                popup.mode,
+                VideoSettingsMode::Dropdown | VideoSettingsMode::LanguageDropdown
+            );
+        let starts_group = matches!(
+            field,
+            VideoSettingsField::Language | VideoSettingsField::Default
+        );
+        if previous_field.is_some() && (follows_expanded_field || starts_group) {
+            lines.push(Line::from(""));
+        }
+        let line_index = lines.len();
+        field_lines.push((field, line_index));
+        match field {
+            VideoSettingsField::Codec => {
+                let choices = app.video_codec_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.value == settings.codec)
+                    .map(|choice| choice.label.as_str())
+                    .unwrap_or("Unknown");
+                lines.push(setting_line(
+                    field.label(),
+                    label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let label = choice.reason.as_ref().map_or_else(
+                            || choice.label.clone(),
+                            |reason| format!("{} — {reason}", choice.label),
+                        );
+                        lines.push(dropdown_line(
+                            &label,
+                            position == popup.codec_cursor,
+                            choice.value == settings.codec,
+                            choice.enabled,
+                            changed(field) && choice.value == settings.codec,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Resolution => {
+                let choices = app.resolution_choices(popup.stream_index);
+                let label = choices
+                    .iter()
+                    .find(|choice| choice.selected(settings.resolution))
+                    .map(|choice| choice.label.clone())
+                    .unwrap_or_else(|| settings.resolution.label());
+                lines.push(setting_line(
+                    field.label(),
+                    &label,
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = choices.len().saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate() {
+                        let choice_selected = choice.selected(settings.resolution);
+                        lines.push(dropdown_line(
+                            &choice.label,
+                            position == popup.resolution_cursor,
+                            choice_selected,
+                            choice.enabled,
+                            changed(field) && choice_selected,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Rotation => {
+                lines.push(setting_line(
+                    field.label(),
+                    settings.rotation.label(),
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = crate::edit::VideoRotation::ALL.len().saturating_sub(1);
+                    for (position, rotation) in crate::edit::VideoRotation::ALL.iter().enumerate() {
+                        let rotation_selected = *rotation == settings.rotation;
+                        lines.push(dropdown_line(
+                            rotation.label(),
+                            position == popup.rotation_cursor,
+                            rotation_selected,
+                            true,
+                            changed(field) && rotation_selected,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Language => {
+                let language = language_choice(&settings.metadata.language)
+                    .map(|choice| choice.label())
+                    .unwrap_or_else(|| "Undetermined (und)".to_string());
+                lines.push(setting_line(
+                    field.label(),
+                    &language,
+                    selected(field),
+                    changed(field),
+                    popup.mode == VideoSettingsMode::LanguageDropdown,
+                ));
+                if popup.mode == VideoSettingsMode::LanguageDropdown {
+                    lines.push(text_field_line(
+                        TextField::new(
+                            "Search",
+                            FieldValue::Editing(&popup.language_search.input),
+                            TextInputConfig::LANGUAGE_SEARCH.width,
+                        )
+                        .selected(popup.language_search.is_active)
+                        .suffix(match_suffix(app.filtered_video_languages().len()))
+                        .reject(app.text_input_reject(TextInputSite::VideoLanguageSearch)),
+                    ));
+                    dropdown_start = Some(lines.len());
+                    let choices = app.filtered_video_languages();
+                    let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+                    let end = (start + 10).min(choices.len());
+                    let last = end.saturating_sub(1);
+                    for (position, choice) in choices.iter().enumerate().take(end).skip(start) {
+                        lines.push(dropdown_line(
+                            &choice.label(),
+                            position == popup.language_cursor,
+                            choice.code == settings.metadata.language,
+                            true,
+                            changed(field) && choice.code == settings.metadata.language,
+                            position == last,
+                        ));
+                    }
+                }
+            }
+            VideoSettingsField::Title => {
+                lines.push(text_field_line(
+                    TextField::new(
+                        field.label(),
+                        FieldValue::Editing(&popup.title_input),
+                        TextInputConfig::SUBTITLE_TITLE.width,
+                    )
+                    .selected(selected(field))
+                    .changed(changed(field))
+                    .reject(app.text_input_reject(TextInputSite::VideoTitle)),
+                ));
+            }
+            VideoSettingsField::Default => lines.push(subtitle_checkbox_line(
+                field.label(),
+                app.default_streams.contains(&popup.stream_index),
+                selected(field),
+                changed(field),
+                None,
+            )),
+            VideoSettingsField::Commentary => lines.push(subtitle_checkbox_line(
+                field.label(),
+                settings.metadata.commentary,
+                selected(field),
+                changed(field),
+                None,
+            )),
+        }
+    }
+
+    let focus_line = match popup.mode {
+        VideoSettingsMode::Dropdown => {
+            let cursor = match popup.field {
+                VideoSettingsField::Codec => popup.codec_cursor,
+                VideoSettingsField::Rotation => popup.rotation_cursor,
+                _ => popup.resolution_cursor,
             };
-            let selected = choice.value == settings.codec;
-            lines.push(dropdown_line(
-                &label,
-                position == popup.codec_cursor,
-                selected,
-                choice.enabled,
-                settings.codec != crate::edit::VideoCodec::Original && selected,
-                position == last_index,
-            ));
+            dropdown_start.unwrap_or(0) + cursor
         }
-    }
-    lines.push(setting_line(
-        "Resolution",
-        &resolution_label,
-        popup.field == VideoSettingsField::Resolution,
-        settings.resolution != crate::edit::VideoResolution::Original,
-        resolution_expanded,
-    ));
-    if resolution_expanded {
-        let last_index = resolution_choices.len().saturating_sub(1);
-        for (position, choice) in resolution_choices.iter().enumerate() {
-            let selected = choice.selected(settings.resolution);
-            lines.push(dropdown_line(
-                &choice.label,
-                position == popup.resolution_cursor,
-                selected,
-                choice.enabled,
-                settings.resolution != crate::edit::VideoResolution::Original && selected,
-                position == last_index,
-            ));
+        VideoSettingsMode::LanguageDropdown => {
+            let choices = app.filtered_video_languages();
+            let start = popup.language_cursor.saturating_sub(5).min(choices.len());
+            dropdown_start.unwrap_or(0) + popup.language_cursor.saturating_sub(start)
         }
-    }
-
-    let text = padded_popup_text(Text::from(lines));
-    let height = (text.lines.len() as u16 + 2).max(7);
-    let area = centered_fixed(frame.area(), 58, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" Video track #{} settings ", popup.stream_index)),
-        ),
-        area,
+        VideoSettingsMode::Summary | VideoSettingsMode::TitleEdit => field_lines
+            .iter()
+            .find_map(|(field, line)| (*field == popup.field).then_some(*line))
+            .unwrap_or(0),
+        VideoSettingsMode::CustomResolution => 0,
+    };
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: format!(" Video track #{} settings ", popup.stream_index),
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    video_field_help_text(popup),
+                    video_field_help_title(popup.field),
+                )
+            }),
+            min_height: 14,
+        },
     );
 }
 
@@ -2574,7 +2744,6 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         &draft.width,
         draft.field == CustomResolutionField::Width,
         width_changed,
-        "e.g. 1920",
         reject,
     ));
     lines.push(Line::from(""));
@@ -2583,7 +2752,6 @@ fn render_custom_resolution_dialog(frame: &mut Frame, app: &App) {
         &draft.height,
         draft.field == CustomResolutionField::Height,
         height_changed,
-        "e.g. 1080",
         reject,
     ));
     lines.push(Line::from(""));
@@ -2618,7 +2786,6 @@ fn custom_input_line(
     input: &TextInputState,
     focused: bool,
     changed: bool,
-    placeholder: &str,
     reject: Option<InputReject>,
 ) -> Line<'static> {
     text_field_line(
@@ -2629,7 +2796,6 @@ fn custom_input_line(
         )
         .selected(focused)
         .changed(changed)
-        .placeholder(placeholder)
         .reject(reject),
     )
 }
@@ -2732,7 +2898,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                 TextInputConfig::LANGUAGE_SEARCH.width,
             )
             .selected(popup.language_search.is_active)
-            .placeholder("type to filter")
             .suffix(match_suffix(choices.len()))
             .reject(app.text_input_reject(TextInputSite::LanguageSearch)),
         ));
@@ -2776,7 +2941,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             )
             .selected(selected(SubtitleSettingsField::Title))
             .changed(changed(SubtitleSettingsField::Title))
-            .placeholder("name shown in player menus")
             .reason(
                 app.subtitle_field_reason(SubtitleSettingsField::Title)
                     .as_deref(),
@@ -3158,8 +3322,6 @@ struct TextField<'a> {
     selected: bool,
     changed: bool,
     chrome: FieldChrome,
-    /// Shown in place of an empty value while the field is idle.
-    placeholder: Option<&'a str>,
     /// Trailing dim text, such as a match count.
     suffix: Option<String>,
     /// Why the field is unavailable; also renders it disabled.
@@ -3177,7 +3339,6 @@ impl<'a> TextField<'a> {
             selected: false,
             changed: false,
             chrome: FieldChrome::Row,
-            placeholder: None,
             suffix: None,
             reason: None,
             reject: None,
@@ -3196,11 +3357,6 @@ impl<'a> TextField<'a> {
 
     fn bar(mut self) -> Self {
         self.chrome = FieldChrome::Bar;
-        self
-    }
-
-    fn placeholder(mut self, placeholder: &'a str) -> Self {
-        self.placeholder = Some(placeholder);
         self
     }
 
@@ -3281,7 +3437,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         selected,
         changed,
         chrome,
-        placeholder,
         suffix,
         reason,
         reject,
@@ -3337,8 +3492,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         }
     };
 
-    let placeholder = placeholder.filter(|_| before.is_empty() && after.is_empty());
-
     let mut spans = Vec::new();
     let label_style = Style::default().fg(if selected { Color::Cyan } else { Color::Gray });
     let mut frame_style = if reject.is_some() {
@@ -3386,19 +3539,7 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         ));
     }
     spans.push(Span::styled(after, value_style));
-    let mut filled = used + caret_columns;
-    if let Some(placeholder) = placeholder {
-        let (text, columns) = take_columns(
-            &placeholder.chars().collect::<Vec<_>>(),
-            0,
-            width.saturating_sub(filled),
-        );
-        filled += columns;
-        spans.push(Span::styled(
-            text,
-            value_style.fg(Color::DarkGray).italic().not_bold(),
-        ));
-    }
+    let filled = used + caret_columns;
     spans.push(Span::styled(
         " ".repeat(width.saturating_sub(filled)),
         value_style,
@@ -3568,8 +3709,15 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
             let index_label = number_string(stream, "index").unwrap_or_else(|| index.to_string());
             let kind = string(stream, "codec_type").unwrap_or("unknown");
             if kind == "video" {
+                let staged = app
+                    .video_settings
+                    .get(&index)
+                    .map(|settings| video_stream_for_display(stream, settings));
                 return Some((
-                    Text::from(video_information_lines(stream, default)),
+                    Text::from(video_information_lines(
+                        staged.as_ref().unwrap_or(stream),
+                        default,
+                    )),
                     format!(" Video #{index_label} "),
                 ));
             }
@@ -3643,6 +3791,10 @@ fn video_information_lines(stream: &BTreeMap<String, Value>, default: bool) -> V
         .and_then(format_frame_rate)
     {
         technical.push(field_line(0, "Frame rate", &format!("{frame_rate} fps")));
+    }
+    let rotation = crate::edit::stream_rotation(stream);
+    if rotation != crate::edit::VideoRotation::None {
+        technical.push(field_line(0, "Rotation", rotation.label()));
     }
 
     let mut picture = Vec::new();
@@ -3766,24 +3918,17 @@ fn video_scan_type(stream: &BTreeMap<String, Value>) -> Option<&'static str> {
     }
 }
 
+/// The roles a picture track can hold. The language and accessibility dispositions a
+/// muxer writes onto video tracks alongside the audio ones say nothing about a picture,
+/// so they are left out here for the same reason `disposition_flags` leaves them out of
+/// the overview row.
 fn video_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
     let mut roles = Vec::new();
     if default {
         roles.push("Default".to_string());
     }
-    for (key, label) in [
-        ("forced", "Forced"),
-        ("hearing_impaired", "Hearing Impaired"),
-        ("visual_impaired", "Visual Impaired"),
-        ("comment", "Commentary"),
-        ("dub", "Dub"),
-    ] {
-        if disposition_enabled(stream, key) {
-            roles.push(label.to_string());
-        }
-    }
-    if disposition_enabled(stream, "original") {
-        roles.push("Original".to_string());
+    if disposition_enabled(stream, "comment") {
+        roles.push("Commentary".to_string());
     }
     if crate::probe::is_attached_picture(stream) {
         roles.push("Cover art".to_string());
@@ -3906,6 +4051,65 @@ fn audio_stream_for_display(
             ("dub", settings.metadata.dubbed),
         ] {
             dispositions.insert(name.to_string(), Value::from(u8::from(enabled)));
+        }
+    }
+    staged
+}
+
+/// The video stream as the overview row and `i` panel should show it once an edit is
+/// staged: the source with the staged metadata written over it, so a commentary flag or a
+/// retitled track reads back the way it will be saved.
+///
+/// Metadata only, unlike `audio_stream_for_display`. The technical fields keep describing
+/// the file as it is now — a staged codec or resolution is a re-encode that has not
+/// happened yet, and the row's `~` marker already says an edit is pending.
+fn video_stream_for_display(
+    stream: &BTreeMap<String, Value>,
+    settings: &crate::edit::VideoSettings,
+) -> BTreeMap<String, Value> {
+    let mut staged = stream.clone();
+    let tags = staged
+        .entry("tags".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(tags) = tags.as_object_mut() {
+        tags.insert(
+            "language".to_string(),
+            Value::String(settings.metadata.language.clone()),
+        );
+        match &settings.metadata.title {
+            Some(title) => {
+                tags.insert("title".to_string(), Value::String(title.clone()));
+            }
+            None => {
+                tags.remove("title");
+                tags.remove("name");
+                tags.remove("handler_name");
+            }
+        }
+    }
+    let dispositions = staged
+        .entry("disposition".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(dispositions) = dispositions.as_object_mut() {
+        dispositions.insert(
+            "comment".to_string(),
+            Value::from(u8::from(settings.metadata.commentary)),
+        );
+    }
+    // Rewritten wholesale rather than edited in place: the probe reports the angle inside
+    // a Display Matrix entry, and reel only ever needs the angle back out of it.
+    match settings.rotation {
+        crate::edit::VideoRotation::None => {
+            staged.remove("side_data_list");
+        }
+        rotation => {
+            staged.insert(
+                "side_data_list".to_string(),
+                serde_json::json!([{
+                    "side_data_type": "Display Matrix",
+                    "rotation": rotation.degrees(),
+                }]),
+            );
         }
     }
     staged
@@ -4505,13 +4709,16 @@ fn tag<'a>(stream: &'a std::collections::BTreeMap<String, Value>, key: &str) -> 
         .and_then(Value::as_str)
 }
 
-/// A video or audio track's flags, written the way a subtitle track writes its own:
-/// one bracketed group of short codes rather than a run of separate `[word]` tags.
-fn disposition_flag_tag(
-    stream: &std::collections::BTreeMap<String, Value>,
-    default: bool,
-) -> Option<String> {
-    const FLAGS: [(&str, &str); 6] = [
+/// The dispositions a track of `kind` can meaningfully carry, as short codes.
+///
+/// Matroska stores its flags the same way on every track — mkvmerge marks the video
+/// track of an original-language release `original` alongside the audio — but a picture
+/// track has no language to be original or dubbed in, and no hearing- or vision-impaired
+/// variant, so those flags describe nothing about it. `video_roles` drops the same ones
+/// from the `i` panel.
+fn disposition_flags(kind: &str) -> &'static [(&'static str, &'static str)] {
+    const VIDEO: [(&str, &str); 1] = [("comment", "CM")];
+    const OTHER: [(&str, &str); 6] = [
         ("forced", "F"),
         ("hearing_impaired", "HI"),
         ("visual_impaired", "VI"),
@@ -4520,13 +4727,23 @@ fn disposition_flag_tag(
         ("original", "OG"),
     ];
 
+    if kind == "video" { &VIDEO } else { &OTHER }
+}
+
+/// A video or audio track's flags, written the way a subtitle track writes its own:
+/// one bracketed group of short codes rather than a run of separate `[word]` tags.
+fn disposition_flag_tag(
+    stream: &std::collections::BTreeMap<String, Value>,
+    kind: &str,
+    default: bool,
+) -> Option<String> {
     let mut active = Vec::new();
     if default {
         active.push("D");
     }
     if let Some(disposition) = stream.get("disposition").and_then(Value::as_object) {
         active.extend(
-            FLAGS
+            disposition_flags(kind)
                 .iter()
                 .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
                 .map(|(_, code)| *code),
@@ -4729,9 +4946,10 @@ mod tests {
         app.paste_text("zzq");
         let searching = drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert
-        assert_that!(&unfiltered).does_not_contain("type to filter");
-        assert_that!(&empty).contains("type to filter");
+        // Assert: the search bar (and its match-count suffix) only renders once the
+        // search has started.
+        assert_that!(&unfiltered).does_not_contain("matches");
+        assert_that!(&empty).contains("matches");
         assert_that!(&searching).contains("zzq");
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -4959,6 +5177,31 @@ mod tests {
         assert_that!(video_roles(&plain, true)).is_equal_to(vec!["Default".to_string()]);
     }
 
+    #[test]
+    fn a_video_tracks_roles_should_omit_the_language_and_accessibility_flags() {
+        // Arrange: mkvmerge writes `original` onto the video track of an
+        // original-language release, and a muxer can copy the rest across just as
+        // blindly. None of them describe a picture.
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "hevc",
+            "disposition": {
+                "original": 1,
+                "dub": 1,
+                "forced": 1,
+                "hearing_impaired": 1,
+                "visual_impaired": 1,
+                "comment": 1
+            },
+        }))
+        .unwrap();
+
+        // Act / Assert: only the roles a picture track can actually hold survive.
+        assert_that!(video_roles(&stream, true))
+            .is_equal_to(vec!["Default".to_string(), "Commentary".to_string()]);
+    }
+
     /// An app with a probed file: one video, one audio, two embedded subtitles and two
     /// sidecars. Enough for every section of the overview to be non-empty.
     fn probed_app(tag: &str) -> (App, std::path::PathBuf) {
@@ -5020,6 +5263,137 @@ mod tests {
         (app, directory)
     }
 
+    /// A staged flag the user cannot see is a flag they cannot trust: the dialog's tick,
+    /// the overview row's badge and the `i` panel's role list all have to follow the
+    /// staged edit rather than the file on disk.
+    #[test]
+    fn staging_video_commentary_should_show_in_the_dialog_row_and_information_panel() {
+        // Arrange
+        let (mut app, directory) = probed_app("video-commentary");
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(0))
+            .unwrap();
+
+        /// The checkbox drawn to the right of the Commentary label.
+        fn commentary_box(screen: &str) -> String {
+            let start = screen
+                .find("Commentary")
+                .expect("the Commentary field should be drawn");
+            screen[start..].chars().take(30).collect()
+        }
+
+        // Act / Assert: nothing staged, so the box is empty and the row carries no badge.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(commentary_box(&dialog).as_str()).contains("[ ]");
+        app.escape_video_settings();
+        let before = draw(&mut app, 110, 34).join("\n");
+        assert_that!(before.as_str()).does_not_contain("[CM]");
+
+        // Act: tick it.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        app.activate_video_settings();
+
+        // Assert: the dialog, the overview row and the panel all say so.
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(commentary_box(&dialog).as_str()).contains("[x]");
+        app.escape_video_settings();
+        let after = draw(&mut app, 110, 34).join("\n");
+        assert_that!(after.as_str()).contains("[CM]");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).contains("Commentary");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rotation is the one video field whose value is worth seeing without opening the
+    /// dialog, so it has to reach the overview row and the `i` panel — from the staged
+    /// edit while one is pending, and from the file otherwise.
+    #[test]
+    fn staging_video_rotation_should_show_in_the_dialog_row_and_information_panel() {
+        // Arrange
+        let (mut app, directory) = probed_app("video-rotation");
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(0))
+            .unwrap();
+
+        // Act / Assert: an unrotated file says nothing about rotation anywhere.
+        let before = draw(&mut app, 110, 34).join("\n");
+        assert_that!(before.as_str()).does_not_contain("↻");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).does_not_contain("Rotation");
+
+        // Act: stage a quarter turn through the dropdown.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        app.activate_video_settings();
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(dialog.as_str())
+            .contains("Rotation")
+            .contains("90° clockwise")
+            .contains("180°")
+            .contains("270° clockwise");
+        app.video_settings_popup.as_mut().unwrap().rotation_cursor = 1;
+        app.activate_video_settings();
+        app.escape_video_settings();
+
+        // Assert: the collapsed row, the overview badge and the panel all follow it.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        let summary = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(summary.as_str()).contains("90° clockwise");
+        app.escape_video_settings();
+        let after = draw(&mut app, 110, 34).join("\n");
+        assert_that!(after.as_str()).contains("↻90°");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).contains("Rotation: 90° clockwise");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A rotation already on the file shows without anything being staged, and clearing it
+    /// takes the badge away rather than leaving the file's own angle on screen.
+    #[test]
+    fn a_rotated_source_should_show_its_angle_until_the_edit_clears_it() {
+        // Arrange
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -180}]
+        }))
+        .unwrap();
+
+        // Act / Assert: straight from the file.
+        let line = stream_line(&stream, 0, false, false, false, false, false).to_string();
+        assert_that!(&line).contains("↻180°");
+        assert_that!(rendered(video_information_lines(&stream, false)).as_str())
+            .contains("Rotation: 180°");
+
+        // And through a staged edit that clears it.
+        let upright = video_stream_for_display(
+            &stream,
+            &crate::edit::VideoSettings {
+                rotation: crate::edit::VideoRotation::None,
+                ..crate::edit::VideoSettings::default()
+            },
+        );
+        assert_that!(stream_line(&upright, 0, false, false, false, false, false).to_string())
+            .does_not_contain("↻");
+        assert_that!(rendered(video_information_lines(&upright, false)).as_str())
+            .does_not_contain("Rotation");
+    }
+
     /// Draws the whole application and returns the screen, one string per row.
     fn draw(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
@@ -5056,7 +5430,12 @@ mod tests {
                     mode: VideoSettingsMode::Summary,
                     codec_cursor: 0,
                     resolution_cursor: 0,
+                    rotation_cursor: 0,
                     custom_resolution: None,
+                    help_visible: false,
+                    language_cursor: 0,
+                    language_search: SearchState::default(),
+                    title_input: TextInputState::default(),
                 });
             }
             Dialog::AudioSettings => {
@@ -5382,6 +5761,12 @@ mod tests {
             crate::edit::VideoSettings {
                 codec: crate::edit::VideoCodec::Hevc,
                 resolution: crate::edit::VideoResolution::P1080,
+                metadata: crate::edit::VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: crate::edit::VideoRotation::None,
             },
         );
         app.staged_edits.insert(path, edit);
@@ -5536,6 +5921,12 @@ mod tests {
                     crate::edit::VideoSettings {
                         codec: crate::edit::VideoCodec::Hevc,
                         resolution: crate::edit::VideoResolution::Original,
+                        metadata: crate::edit::VideoMetadata {
+                            language: "und".to_string(),
+                            title: None,
+                            commentary: false,
+                        },
+                        rotation: crate::edit::VideoRotation::None,
                     },
                 );
             } else {
@@ -5769,6 +6160,7 @@ mod tests {
                 default_sidecars: &app.default_sidecars,
                 changed: &changed,
                 audio_settings: &app.audio_settings,
+                video_settings: &app.video_settings,
                 subtitle_changes: &app.subtitle_changes,
                 source_container: app.source_container(),
                 container_target: app.container_target,
@@ -5913,6 +6305,8 @@ mod tests {
         assert_that!(panel.as_str()).contains("Progressive");
         assert_that!(panel.as_str()).contains("Default");
         assert_that!(panel.as_str()).contains("Main feature");
+        // The source's `original` flag describes its language, not its picture.
+        assert_that!(panel.as_str()).does_not_contain("Original");
 
         // And a plainer stream: bit depth inferred from the pixel format, SDR transfer,
         // interlaced scan, and a height that matches no marketing tier.
@@ -7676,7 +8070,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_line_should_include_track_essentials_and_original_for_audio_and_video() {
+    fn stream_line_should_include_track_essentials_and_the_flags_that_fit_the_kind() {
         // Arrange
         let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
@@ -7707,8 +8101,9 @@ mod tests {
             .does_not_contain("Main")
             .does_not_contain("48");
 
-        // The same generic disposition formatter draws video rows, so Original must
-        // not quietly remain audio-only.
+        // A picture track has no language and no accessibility variant, so the flags
+        // that describe those — which mkvmerge writes onto the video track alongside the
+        // audio one — stay off the video row. Default and Commentary remain.
         let video = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
                 "index": 0,
@@ -7716,12 +8111,41 @@ mod tests {
                 "codec_name": "h264",
                 "width": 1920,
                 "height": 1080,
-                "disposition": {"original": 1}
+                "disposition": {
+                    "original": 1,
+                    "dub": 1,
+                    "forced": 1,
+                    "hearing_impaired": 1,
+                    "visual_impaired": 1,
+                    "comment": 1
+                }
             }),
         )
         .unwrap();
-        let video_line = stream_line(&video, 0, false, false, false, false, false).to_string();
-        assert_that!(video_line).contains("H264").contains("[OG]");
+        let video_line = stream_line(&video, 0, false, false, false, false, true).to_string();
+        assert_that!(&video_line)
+            .contains("H264")
+            .contains("1920×1080")
+            .contains("[D/CM]")
+            .does_not_contain("OG")
+            .does_not_contain("DUB")
+            .does_not_contain("HI")
+            .does_not_contain("VI")
+            .does_not_contain("/F");
+
+        // With nothing but those flags set, the video row carries no bracketed group at
+        // all rather than an empty one.
+        let language_only = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "disposition": {"original": 1, "dub": 1}
+            }),
+        )
+        .unwrap();
+        assert_that!(stream_line(&language_only, 0, false, false, false, false, false).to_string())
+            .does_not_contain("[");
     }
 
     #[test]
@@ -8532,7 +8956,7 @@ mod tests {
             "Title: Main feature".to_string(),
             "".to_string(),
             "Language: English".to_string(),
-            "Role: Default · Commentary · Original".to_string(),
+            "Role: Default · Commentary".to_string(),
             "".to_string(),
             "Format: H.264 (AVC)".to_string(),
             "Resolution: 1920×1080 · 16:9 · 1080p".to_string(),
@@ -8832,6 +9256,12 @@ mod tests {
             crate::edit::VideoSettings {
                 codec: crate::edit::VideoCodec::Hevc,
                 resolution: crate::edit::VideoResolution::Original,
+                metadata: crate::edit::VideoMetadata {
+                    language: "und".to_string(),
+                    title: None,
+                    commentary: false,
+                },
+                rotation: crate::edit::VideoRotation::None,
             },
         );
         let choices = app.video_codec_choices(0);
@@ -8844,7 +9274,12 @@ mod tests {
                 .position(|choice| choice.value == crate::edit::VideoCodec::Hevc)
                 .unwrap(),
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         let video = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
         assert_that!(video.as_str()).contains("HEVC");
@@ -8916,6 +9351,87 @@ mod tests {
     }
 
     #[test]
+    fn staged_video_display_should_overwrite_metadata_and_leave_the_picture_alone() {
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "tags": {"language": "eng", "title": "Old title", "handler_name": "VideoHandler"},
+            "disposition": {"comment": 1, "attached_pic": 1}
+        }))
+        .unwrap();
+        let mut settings = crate::edit::VideoSettings {
+            codec: crate::edit::VideoCodec::Hevc,
+            resolution: crate::edit::VideoResolution::P720,
+            metadata: crate::edit::VideoMetadata {
+                language: "nld".to_string(),
+                title: Some("Director's cut".to_string()),
+                commentary: false,
+            },
+            rotation: crate::edit::VideoRotation::None,
+        };
+
+        let staged = video_stream_for_display(&stream, &settings);
+        assert_eq!(tag(&staged, "language"), Some("nld"));
+        assert_eq!(
+            crate::edit::video_stream_title(&staged).as_deref(),
+            Some("Director's cut")
+        );
+        assert!(!stream_commentary(&staged));
+        // A staged re-encode has not happened yet, so the technical fields still describe
+        // the file on disk. An unrelated disposition survives untouched.
+        assert_eq!(string(&staged, "codec_name"), Some("h264"));
+        assert_eq!(number_string(&staged, "height").as_deref(), Some("1080"));
+        assert!(crate::probe::is_attached_picture(&staged));
+
+        // Clearing the title drops every tag the panel would fall back to, and the
+        // commentary flag follows the staged value back on.
+        settings.metadata.title = None;
+        settings.metadata.commentary = true;
+        let cleared = video_stream_for_display(&stream, &settings);
+        assert_that!(crate::edit::video_stream_title(&cleared)).is_none();
+        assert!(stream_commentary(&cleared));
+
+        // A stream carrying neither tags nor dispositions still stages cleanly.
+        let bare: BTreeMap<String, Value> =
+            serde_json::from_value(serde_json::json!({"codec_name": "h264"})).unwrap();
+        let staged = video_stream_for_display(&bare, &settings);
+        assert_eq!(tag(&staged, "language"), Some("nld"));
+        assert!(stream_commentary(&staged));
+    }
+
+    #[test]
+    fn video_field_help_should_explain_every_field() {
+        let (mut app, directory) = probed_app("video-field-help");
+        open_dialog(&mut app, Dialog::VideoSettings);
+        let expected = [
+            (VideoSettingsField::Codec, "avoids re-encoding"),
+            (VideoSettingsField::Resolution, "without stretching"),
+            (
+                VideoSettingsField::Rotation,
+                "doesn't rotate the encoded pixels",
+            ),
+            (VideoSettingsField::Language, "changes metadata only"),
+            (VideoSettingsField::Title, "distinguish video tracks"),
+            (VideoSettingsField::Default, "Only 1 default video track"),
+            (VideoSettingsField::Commentary, "picture-in-picture"),
+        ];
+
+        for (field, phrase) in expected {
+            let popup = app.video_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            let popup = app.video_settings_popup.as_ref().unwrap();
+            assert_that!(video_field_help_text(popup).to_string().as_str()).contains(phrase);
+            assert_eq!(
+                video_field_help_title(field),
+                format!(" Information about {} ", field.label())
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn audio_field_help_should_explain_every_field() {
         let (mut app, directory) = probed_app("audio-field-help");
         open_dialog(&mut app, Dialog::AudioSettings);
@@ -8923,11 +9439,11 @@ mod tests {
             (AudioSettingsField::Codec, "avoids re-encoding"),
             (
                 AudioSettingsField::ChannelLayout,
-                "upmixing is not implemented",
+                "upmixing is not possible",
             ),
             (AudioSettingsField::Language, "does not translate or dub"),
             (AudioSettingsField::Title, "distinguish audio tracks"),
-            (AudioSettingsField::Default, "only 1 default audio track"),
+            (AudioSettingsField::Default, "Only 1 default audio track"),
             (
                 AudioSettingsField::Commentary,
                 "director or cast commentary",
@@ -9694,7 +10210,7 @@ mod tests {
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted container, audio, or subtitle field",
+            "Explain the highlighted container, video, audio, or subtitle field",
             "i",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
@@ -10291,6 +10807,29 @@ mod tests {
         }
         app.audio_settings_popup = None;
 
+        // Act / Assert: every video field.
+        for field in VideoSettingsField::ALL {
+            app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+                stream_index: 0,
+                field,
+                mode: VideoSettingsMode::Summary,
+                help_visible: true,
+                codec_cursor: 0,
+                resolution_cursor: 0,
+                rotation_cursor: 0,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::new(String::new()),
+                custom_resolution: None,
+            });
+            let popup = app.video_settings_popup.as_ref().unwrap();
+            let help = video_field_help_text(popup);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_video_settings_dialog(frame, &app)
+            });
+        }
+        app.video_settings_popup = None;
+
         // Act / Assert: subtitle fields.
         for field in [
             SubtitleSettingsField::Codec,
@@ -10344,7 +10883,12 @@ mod tests {
             mode: VideoSettingsMode::Dropdown,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
@@ -10521,36 +11065,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_field_should_hint_at_its_value_and_drop_the_hint_when_typed_into() {
-        // Arrange
-        let config = TextInputConfig::CONTAINER_METADATA;
-        let empty = TextInputState::new(String::new());
-        let typed = TextInputState::new("B".to_string());
-
-        // Act
-        let hinted = text_field_line(
-            TextField::new("Title", FieldValue::Editing(&empty), config.width)
-                .placeholder("e.g. Big Buck Bunny"),
-        );
-        let filled = text_field_line(
-            TextField::new("Title", FieldValue::Editing(&typed), config.width)
-                .placeholder("e.g. Big Buck Bunny"),
-        );
-
-        // Assert: the hint reads as an example rather than as a stored value, and it
-        // does not change the row's width.
-        assert_that!(hinted.to_string().as_str()).contains("e.g. Big Buck Bunny");
-        assert_that!(filled.to_string().as_str()).does_not_contain("e.g.");
-        assert_that!(hinted.width()).is_equal_to(filled.width());
-        let hint = hinted
-            .spans
-            .iter()
-            .find(|span| span.content.contains("e.g."))
-            .expect("the hint should be rendered");
-        assert_that!(hint.style.fg).is_equal_to(Some(Color::DarkGray));
-    }
-
-    #[test]
     fn a_search_bar_should_be_framed_like_a_settings_row() {
         // Arrange
         let mut search = SearchState::default();
@@ -10598,31 +11112,11 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_empty_search_bar_should_show_its_placeholder() {
-        // Arrange
-        let mut search = SearchState::default();
-        let area = Rect::new(0, 0, 60, 1);
-
-        // Act
-        let idle = search_line(&mut search, area, None).to_string();
-        search.activate();
-        let active = search_line(&mut search, area, None).to_string();
-
-        // Assert
-        assert_that!(idle.as_str())
-            .contains("type to filter")
-            .does_not_contain(FIELD_CARET);
-        assert_that!(active.as_str())
-            .contains("type to filter")
-            .contains(FIELD_CARET);
-    }
-
-    #[test]
     fn custom_input_should_use_a_flat_dark_surface_and_cursor() {
         // Act
         let mut input = TextInputState::new("1280".to_string());
         input.activate();
-        let line = custom_input_line("Width", &input, true, false, "e.g. 1920", None);
+        let line = custom_input_line("Width", &input, true, false, None);
 
         // Assert
         assert_that!(line.to_string())
@@ -10642,7 +11136,7 @@ mod tests {
     fn custom_input_should_mark_a_changed_value_yellow_and_italic() {
         // Act
         let input = TextInputState::new("1280".to_string());
-        let line = custom_input_line("Width", &input, false, true, "e.g. 1920", None);
+        let line = custom_input_line("Width", &input, false, true, None);
 
         // Assert
         let value = value_span(&line, "1280");

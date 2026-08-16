@@ -34,8 +34,10 @@ use harness::{
 };
 use reel_tui::app::{
     AudioSettingsField, ContainerSettingsField, Layer, SubtitleSettingsField, TrackRef,
+    VideoSettingsField,
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
+use reel_tui::edit::VideoRotation;
 
 /// An FFmpeg older than the supported floor has to stop `reel` at the door.
 ///
@@ -584,6 +586,10 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
     let (notification_tx, notification_rx) = std::sync::mpsc::channel();
     app.app
         .set_completion_notification_sender(Some(notification_tx));
+    // This scenario is about notifications firing at all, not the separate
+    // focus-gating behavior covered by its own scenario — a fresh app starts assumed
+    // focused, which would otherwise suppress every notification checked below.
+    app.app.set_terminal_focused(false);
     for name in ["alpha.mkv", "bravo.mkv"] {
         app.open(name);
         let second_audio = app
@@ -653,6 +659,66 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
         notified,
         ["alpha.mkv", "bravo.mkv"],
         "each successfully processed file should emit one completion notification"
+    );
+}
+
+/// A completion notification is meant to tell you about a file the terminal isn't
+/// currently showing — while it's the focused window, the result is already on
+/// screen. `App::set_terminal_focused` drives this from `main`'s
+/// `FocusGained`/`FocusLost` events; this scenario proves the real save path honors
+/// the flag both ways, not just the gate's unit-level logic in isolation.
+#[test]
+fn a_focused_terminal_should_not_receive_the_completion_notification_an_unfocused_one_would() {
+    let test =
+        "a_focused_terminal_should_not_receive_the_completion_notification_an_unfocused_one_would";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("notification-focus-gating");
+    for name in ["focused.mkv", "unfocused.mkv"] {
+        write_media(
+            &scratch.join(name),
+            &MediaSpec::mkv().audio(&["eng", "nld"]),
+        );
+    }
+
+    let mut app = Harness::start(scratch);
+    let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+    app.app
+        .set_completion_notification_sender(Some(notification_tx));
+
+    for (name, focused) in [("focused.mkv", true), ("unfocused.mkv", false)] {
+        app.app.set_terminal_focused(focused);
+        app.open(name);
+        let second_audio = app
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(2))
+            .expect("the second audio should have a track row");
+        app.select_track_row(second_audio);
+        app.press(key(KeyCode::Char('d')));
+        app.press(key(KeyCode::Esc));
+        assert_eq!(app.app.layer, Layer::Files);
+
+        app.process_all();
+        app.assert_batch_succeeded();
+        // A one-file batch reopens that file's Streams view on completion; the next
+        // iteration's `open` needs the file list to select from.
+        if app.app.layer != Layer::Files {
+            app.press(key(KeyCode::Esc));
+            assert_eq!(app.app.layer, Layer::Files);
+        }
+    }
+
+    let notified = notification_rx
+        .try_iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notified,
+        ["unfocused.mkv"],
+        "focused.mkv finished while the terminal was focused and must stay silent; \
+         unfocused.mkv finished after focus was reported lost and must notify"
     );
 }
 
@@ -1340,9 +1406,20 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     app.pump();
     assert_eq!(
         app.screen().matches("[OG]").count(),
-        2,
-        "Original should be visible on both the video and audio overview rows:\n{}",
+        1,
+        "Original should be visible on the audio overview row:\n{}",
         app.screen()
+    );
+    let video_row = app
+        .screen()
+        .lines()
+        .find(|line| line.contains("H264"))
+        .expect("the video overview row should be on screen")
+        .to_string();
+    assert!(
+        !video_row.contains("OG"),
+        "the source's `original` flag describes its language, not its picture, so it \
+         should not reach the video row: {video_row}"
     );
     let edited_row = app
         .app
@@ -1367,7 +1444,9 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     app.pump();
     assert!(
         app.screen().contains("Information about Channel layout")
-            && app.screen().contains("upmixing is not implemented"),
+            // The phrase wraps across rows at this popup width, so the check uses a
+            // substring short enough to land on one wrapped line.
+            && app.screen().contains("possible yet"),
         "help should follow the highlighted audio field:\n{}",
         app.screen()
     );
@@ -1440,6 +1519,221 @@ fn editing_an_audio_track_should_encode_every_staged_field_and_preserve_its_neig
     }
     assert!(stream_disposition(edited, "original"));
     assert!(!stream_disposition(edited, "dub"));
+}
+
+#[test]
+/// Video tracks get the same language/title/default/commentary metadata editing as audio
+/// and subtitle tracks, without forcing a re-encode and without disturbing an unrelated
+/// neighboring track. The source starts flagged `original`, the language role mkvmerge
+/// stamps onto a picture track: Reel neither shows it nor offers it, and a metadata edit
+/// must leave it exactly as it found it rather than dropping it on the way through.
+fn editing_a_video_tracks_metadata_should_persist_and_preserve_its_neighbor() {
+    let test = "editing_a_video_tracks_metadata_should_persist_and_preserve_its_neighbor";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("video-metadata");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng"])
+            .video_disposition("original")
+            .audio_dispositions(&["default"]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let video_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(0))
+        .expect("the video track should have a row");
+    app.open_video_settings(video_row);
+
+    // K opens contextual help for the highlighted video field, matching every other
+    // metadata editor.
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    assert!(app.app.video_settings_popup.as_ref().unwrap().help_visible);
+    assert!(
+        app.screen().contains("Information about Codec")
+            && app.screen().contains("video format written to the output"),
+        "Codec help should be rendered beside the video editor:\n{}",
+        app.screen()
+    );
+
+    app.choose_video_language("dutch", "nld");
+    app.type_video_title("Director's cut");
+    app.toggle_video_field(VideoSettingsField::Default);
+    app.toggle_video_field(VideoSettingsField::Commentary);
+
+    assert!(
+        app.app.selected_container_conflicts().is_empty(),
+        "a supported Matroska video language should not conflict: {:?}",
+        app.app.selected_container_conflicts()
+    );
+
+    app.close_video_settings();
+
+    // The staged commentary flag reaches the overview row before it reaches the file.
+    let staged_video_row = app
+        .screen()
+        .lines()
+        .find(|line| line.contains("H264"))
+        .expect("the video overview row should be on screen")
+        .to_string();
+    assert!(
+        staged_video_row.contains("CM"),
+        "a staged commentary flag should show on the video row: {staged_video_row}"
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        codec_names(&after),
+        ["h264", "aac"],
+        "metadata-only edits must not force a re-encode of either track"
+    );
+    let video = &after.streams[0];
+    let audio = &after.streams[1];
+
+    assert_eq!(stream_tag(video, "language"), Some("nld"));
+    assert_eq!(stream_tag(video, "title"), Some("Director's cut"));
+    assert!(stream_disposition(video, "default"));
+    assert!(stream_disposition(video, "comment"));
+    // Untouched because Reel never offers it on a picture track: a flag it does not show
+    // is a flag it must not silently drop either.
+    assert!(stream_disposition(video, "original"));
+
+    // The neighboring audio track's own metadata and default flag are untouched: video
+    // and audio defaults are tracked independently, and the commentary flag went only
+    // where it was staged.
+    assert_eq!(stream_tag(audio, "language"), Some("eng"));
+    assert!(stream_disposition(audio, "default"));
+    assert!(!stream_disposition(audio, "comment"));
+}
+
+/// Sideways phone footage is the commonest defect a video track has, and the fix is a
+/// tag rather than a re-encode: the picture is untouched, the codec is untouched, and the
+/// save takes a remux rather than an encode. The source already carries a rotation, so
+/// this also covers replacing one angle with another and clearing one back to upright —
+/// the case that needs an explicit `-display_rotation 0` rather than a missing argument.
+#[test]
+fn rotating_a_video_track_should_tag_the_picture_without_re_encoding_it() {
+    let test = "rotating_a_video_track_should_tag_the_picture_without_re_encoding_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("video-rotation");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().size(64, 48).video_rotation(90),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    app.pump();
+    assert!(
+        app.screen().contains("↻90°"),
+        "the source's own rotation should be on the overview row:\n{}",
+        app.screen()
+    );
+
+    let video_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(0))
+        .expect("the video track should have a row");
+    app.open_video_settings(video_row);
+    app.choose_video_rotation(VideoRotation::Cw180);
+    app.close_video_settings();
+    assert!(
+        app.screen().contains("↻180°"),
+        "the staged angle should replace the source's on the row:\n{}",
+        app.screen()
+    );
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        codec_names(&after),
+        ["h264", "aac"],
+        "a rotation is metadata: neither track may be re-encoded"
+    );
+    let video = &after.streams[0];
+    assert_eq!(stream_rotation_degrees(video), Some(-180));
+    // The picture itself is untouched — an encode would have transposed these.
+    assert_eq!(stream_number(video, "width"), Some(64));
+    assert_eq!(stream_number(video, "height"), Some(48));
+
+    // And clearing it removes the matrix rather than leaving the old angle behind. The
+    // save re-probes in the background, so the view catches up a beat later.
+    app.settle(Duration::from_secs(2));
+    assert!(
+        app.screen().contains("↻180°"),
+        "the saved rotation should be read back onto the row:\n{}",
+        app.screen()
+    );
+    app.open_video_settings(video_row);
+    app.choose_video_rotation(VideoRotation::None);
+    app.close_video_settings();
+    app.process_all();
+    app.assert_batch_succeeded();
+
+    let cleared = probe(&app.path("clip.mkv"));
+    assert_eq!(stream_rotation_degrees(&cleared.streams[0]), None);
+    assert!(
+        !app.screen().contains("↻"),
+        "a cleared rotation should leave no badge behind:\n{}",
+        app.screen()
+    );
+}
+
+/// Rotation and a re-encode in one save: ffmpeg applies the angle to the picture instead
+/// of tagging it, so the output must come out upright with its dimensions swapped and no
+/// matrix left over. Locking this in matters because reel validates the encoded size, and
+/// an unrotated expectation would reject the file ffmpeg wrote exactly as asked.
+#[test]
+fn rotating_while_re_encoding_should_bake_the_angle_into_the_picture() {
+    let test = "rotating_while_re_encoding_should_bake_the_angle_into_the_picture";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:libx265"]);
+
+    let scratch = Scratch::new("video-rotation-encode");
+    // Larger than the usual fixture on purpose: x265 aborts ("double free or corruption")
+    // when it is handed a transposed frame as small as the default 64×48, with or without
+    // a rotation involved — a plain `transpose` filter crashes it just the same.
+    write_media(&scratch.join("clip.mkv"), &MediaSpec::mkv().size(320, 240));
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let video_row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(0))
+        .expect("the video track should have a row");
+    app.open_video_settings(video_row);
+    app.choose_video_rotation(VideoRotation::Cw90);
+    app.close_video_settings();
+    app.choose_video_codec(video_row, "HEVC / H.265");
+
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let after = probe(&app.path("clip.mkv"));
+    let video = &after.streams[0];
+    assert_eq!(codec_names(&after), ["hevc", "aac"]);
+    // Baked in: the frame is transposed and there is no matrix left to carry.
+    assert_eq!(stream_number(video, "width"), Some(240));
+    assert_eq!(stream_number(video, "height"), Some(320));
+    assert_eq!(stream_rotation_degrees(video), None);
 }
 
 /// > [1786639801] Failed: /home/bas/Downloads/reel/test.mkv (destination:
@@ -1689,6 +1983,18 @@ fn stream_number(stream: &BTreeMap<String, serde_json::Value>, key: &str) -> Opt
         serde_json::Value::String(number) => number.parse().ok(),
         _ => None,
     })
+}
+
+/// The raw angle in a stream's display matrix, read straight from the probe rather than
+/// through `VideoRotation`, so a scenario asserts what ffmpeg actually wrote — including
+/// its sign convention — rather than reel's normalized view of it.
+fn stream_rotation_degrees(stream: &BTreeMap<String, serde_json::Value>) -> Option<i64> {
+    stream
+        .get("side_data_list")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|entry| entry.get("rotation").and_then(serde_json::Value::as_i64))
 }
 
 fn stream_tag<'a>(stream: &'a BTreeMap<String, serde_json::Value>, key: &str) -> Option<&'a str> {

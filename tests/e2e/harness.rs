@@ -23,9 +23,9 @@ use ratatui::backend::TestBackend;
 use reel_tui::app::{
     App, AudioSettingsField, AudioSettingsMode, ContainerSettingsField, ContainerSettingsMode,
     Dialog, Layer, ResolutionChoiceValue, SubtitleSettingsField, SubtitleSettingsMode, TrackRef,
-    VideoSettingsMode,
+    VideoSettingsField, VideoSettingsMode,
 };
-use reel_tui::edit::{EditEvent, spawn_edit_worker_pools};
+use reel_tui::edit::{EditEvent, VideoRotation, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
 use reel_tui::probe::{
@@ -916,6 +916,164 @@ impl Harness {
         self.press(key(KeyCode::Enter));
         self.press(key(KeyCode::Esc));
         assert_eq!(self.app.dialog, None, "Esc should close video settings");
+    }
+
+    /// Opens video settings for the track at `row`.
+    pub fn open_video_settings(&mut self, row: usize) {
+        self.select_track_row(row);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app.dialog,
+            Some(Dialog::VideoSettings),
+            "Enter on row {row} should open video settings"
+        );
+    }
+
+    /// Opens the rotation dropdown on an already-open video popup and picks `rotation`.
+    pub fn choose_video_rotation(&mut self, rotation: VideoRotation) {
+        self.focus_video_field(VideoSettingsField::Rotation);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(VideoSettingsMode::Dropdown),
+            "Enter on Rotation should open its dropdown"
+        );
+        let target = VideoRotation::ALL
+            .iter()
+            .position(|candidate| *candidate == rotation)
+            .expect("every rotation is offered");
+        for _ in 0..VideoRotation::ALL.len() * 2 {
+            let cursor = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.rotation_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .effective_video_settings(
+                    self.app
+                        .video_settings_popup
+                        .as_ref()
+                        .expect("video settings should be open")
+                        .stream_index
+                )
+                .map(|settings| settings.rotation),
+            Some(rotation),
+        );
+    }
+
+    /// Filters the video language dropdown and selects the expected ISO 639-2 code.
+    pub fn choose_video_language(&mut self, query: &str, code: &str) {
+        self.focus_video_field(VideoSettingsField::Language);
+        self.press(key(KeyCode::Enter));
+        self.press(key(KeyCode::Char('/')));
+        for character in query.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+
+        let choices = self.app.filtered_video_languages();
+        let target = choices
+            .iter()
+            .position(|choice| choice.code == code)
+            .unwrap_or_else(|| {
+                panic!(
+                    "language search {query:?} did not offer {code}; choices: {:?}",
+                    choices
+                        .iter()
+                        .map(|choice| (&choice.code, &choice.name))
+                        .collect::<Vec<_>>()
+                )
+            });
+        for _ in 0..choices.len() * 2 {
+            let cursor = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.language_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Down)),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Up)),
+            };
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Replaces the video title through the popup's ordinary text editor.
+    pub fn type_video_title(&mut self, title: &str) {
+        self.focus_video_field(VideoSettingsField::Title);
+        self.press(key(KeyCode::Char('i')));
+        assert_eq!(
+            self.app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(VideoSettingsMode::TitleEdit),
+            "i on Title should enter ordinary text editing"
+        );
+        self.press(ctrl('u'));
+        for character in title.chars() {
+            self.press(key(KeyCode::Char(character)));
+        }
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Toggles the Default checkbox through the video popup.
+    pub fn toggle_video_field(&mut self, field: VideoSettingsField) {
+        self.focus_video_field(field);
+        self.press(key(KeyCode::Enter));
+    }
+
+    /// Closes the video popup while retaining its staged changes.
+    pub fn close_video_settings(&mut self) {
+        self.press(key(KeyCode::Esc));
+        assert_eq!(self.app.dialog, None, "Esc should close video settings");
+    }
+
+    fn focus_video_field(&mut self, field: VideoSettingsField) {
+        let fields = self.app.visible_video_fields();
+        let target = fields
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap_or_else(|| panic!("{} is not visible", field.label()));
+        for _ in 0..fields.len() * 2 {
+            let current = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.field)
+                .expect("video settings should be open");
+            let position = fields
+                .iter()
+                .position(|candidate| *candidate == current)
+                .expect("the focused video field should be visible");
+            match position.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        assert_eq!(
+            self.app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.field),
+            Some(field),
+            "could not focus {}",
+            field.label()
+        );
     }
 
     /// The codec choices the open subtitle settings popup is currently offering.
