@@ -2470,7 +2470,7 @@ fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static
             "Sets the output frame size. Choosing a preset fits the picture into that frame without stretching it, padding with black bars if the source's aspect ratio differs. Only the Custom option lets you stretch the picture to fill the frame exactly instead."
         }
         VideoSettingsField::Rotation => {
-            "Turns the picture for playback by tagging the track, without touching the encoded video.\n\nChoosing to re-encode instead permanently rotates the picture's pixels into the new orientation, so it plays right-side up even on a player that ignores rotation tags — and the tag itself becomes unnecessary, since the picture no longer needs one."
+            "This changes metadata only. It doesn't rotate the encoded pixels — it just tags the track so a player rotates it at playback."
         }
         VideoSettingsField::Language => {
             "Identifies the language associated with this video track to players and media libraries. It changes metadata only.\n\nEvery track in a container can carry a language tag, not just audio — video only needs one when the picture itself is tied to a language, such as hardcoded subtitles burned into the frame, or one of several alternate-language video angles on a disc rip. If neither applies, it's fine to leave this at its default."
@@ -9409,7 +9409,7 @@ mod tests {
             (VideoSettingsField::Resolution, "without stretching"),
             (
                 VideoSettingsField::Rotation,
-                "without touching the encoded video",
+                "doesn't rotate the encoded pixels",
             ),
             (VideoSettingsField::Language, "changes metadata only"),
             (VideoSettingsField::Title, "distinguish video tracks"),
