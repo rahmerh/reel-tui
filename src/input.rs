@@ -1712,6 +1712,7 @@ mod tests {
                 mode: VideoSettingsMode::Dropdown,
                 codec_cursor: 0,
                 resolution_cursor: 0,
+                rotation_cursor: 0,
                 custom_resolution: None,
                 help_visible: false,
                 language_cursor: 0,
@@ -1742,6 +1743,7 @@ mod tests {
             mode: VideoSettingsMode::CustomResolution,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: Some(CustomResolutionDraft {
                 width: TextInputState::default(),
                 height: TextInputState::default(),
@@ -2123,6 +2125,7 @@ mod tests {
             mode: VideoSettingsMode::Summary,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
             help_visible: false,
             language_cursor: 0,
@@ -2132,7 +2135,7 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(
             app.video_settings_popup.as_ref().unwrap().field,
-            VideoSettingsField::Default
+            VideoSettingsField::Commentary
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
@@ -2181,6 +2184,7 @@ mod tests {
                 mode: VideoSettingsMode::CustomResolution,
                 codec_cursor: 0,
                 resolution_cursor: 0,
+                rotation_cursor: 0,
                 custom_resolution: Some(CustomResolutionDraft {
                     width: TextInputState::new("1280".to_string()),
                     height: TextInputState::new("720".to_string()),

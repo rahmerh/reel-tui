@@ -276,6 +276,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         default_sidecars: &app.default_sidecars,
                         changed: &changed,
                         audio_settings: &app.audio_settings,
+                        video_settings: &app.video_settings,
                         subtitle_changes: &app.subtitle_changes,
                         source_container: app.source_container(),
                         container_target: app.container_target,
@@ -389,6 +390,7 @@ fn media_text(
         default_sidecars,
         changed,
         audio_settings,
+        video_settings,
         subtitle_changes,
         source_container,
         container_target,
@@ -442,8 +444,15 @@ fn media_text(
                     .then(|| stream_index(stream).and_then(|index| audio_settings.get(&index)))
                     .flatten()
                     .map(|settings| audio_stream_for_display(stream, settings));
+                let staged_video = (kind == "video")
+                    .then(|| stream_index(stream).and_then(|index| video_settings.get(&index)))
+                    .flatten()
+                    .map(|settings| video_stream_for_display(stream, settings));
                 lines.push(stream_line(
-                    staged_audio.as_ref().unwrap_or(stream),
+                    staged_audio
+                        .as_ref()
+                        .or(staged_video.as_ref())
+                        .unwrap_or(stream),
                     selection_index,
                     selected == Some(selection_index),
                     stream_index(stream).is_some_and(|index| deleted.contains(&index)),
@@ -723,6 +732,7 @@ struct MediaTextState<'a> {
     default_sidecars: &'a std::collections::BTreeSet<usize>,
     changed: &'a std::collections::BTreeSet<u64>,
     audio_settings: &'a std::collections::BTreeMap<u64, AudioSettings>,
+    video_settings: &'a std::collections::BTreeMap<u64, crate::edit::VideoSettings>,
     subtitle_changes: &'a std::collections::BTreeMap<
         crate::subtitle::SubtitleSource,
         crate::subtitle::SubtitleChange,
@@ -1006,6 +1016,10 @@ fn stream_line_with_subtitle_context(
             {
                 details.push(format!("{fps} fps"));
             }
+            let rotation = crate::edit::stream_rotation(stream);
+            if rotation != crate::edit::VideoRotation::None {
+                details.push(format!("↻{}°", rotation.degrees()));
+            }
         }
         "audio" => {
             if let Some(layout) = string(stream, "channel_layout") {
@@ -1025,7 +1039,7 @@ fn stream_line_with_subtitle_context(
         }
     }
 
-    if !subtitle && let Some(flags) = disposition_flag_tag(stream, default) {
+    if !subtitle && let Some(flags) = disposition_flag_tag(stream, kind, default) {
         details.push(flags);
     }
 
@@ -2465,6 +2479,9 @@ fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static
         VideoSettingsField::Resolution => {
             "Sets the output frame size. Keeping Original avoids re-encoding unless another technical setting requires it; choosing a smaller size scales the picture down."
         }
+        VideoSettingsField::Rotation => {
+            "Turns the picture for playback by tagging the track, without touching the encoded video, so it saves in seconds and loses no quality.\n\nRe-encoding the same track instead applies the rotation to the picture itself, and the tag is no longer needed."
+        }
         VideoSettingsField::Language => {
             "Identifies the language associated with this video track to players and media libraries. It changes metadata only."
         }
@@ -2473,6 +2490,9 @@ fn video_field_help_text(popup: &crate::app::VideoSettingsPopup) -> Text<'static
         }
         VideoSettingsField::Default => {
             "Marks this as the video track a player should prefer automatically.\n\nReel allows only 1 default video track and automatically clears the flag from any other video track when this one is selected."
+        }
+        VideoSettingsField::Commentary => {
+            "Marks this as a commentary angle rather than the feature itself, such as a picture-in-picture director's track. This flag is metadata only."
         }
     };
     help_paragraphs(vec![(
@@ -2579,6 +2599,30 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                     }
                 }
             }
+            VideoSettingsField::Rotation => {
+                lines.push(setting_line(
+                    field.label(),
+                    settings.rotation.label(),
+                    selected(field),
+                    changed(field),
+                    expanded(field),
+                ));
+                if expanded(field) {
+                    dropdown_start = Some(lines.len());
+                    let last = crate::edit::VideoRotation::ALL.len().saturating_sub(1);
+                    for (position, rotation) in crate::edit::VideoRotation::ALL.iter().enumerate() {
+                        let rotation_selected = *rotation == settings.rotation;
+                        lines.push(dropdown_line(
+                            rotation.label(),
+                            position == popup.rotation_cursor,
+                            rotation_selected,
+                            true,
+                            changed(field) && rotation_selected,
+                            position == last,
+                        ));
+                    }
+                }
+            }
             VideoSettingsField::Language => {
                 let language = language_choice(&settings.metadata.language)
                     .map(|choice| choice.label())
@@ -2639,15 +2683,22 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                 changed(field),
                 None,
             )),
+            VideoSettingsField::Commentary => lines.push(subtitle_checkbox_line(
+                field.label(),
+                settings.metadata.commentary,
+                selected(field),
+                changed(field),
+                None,
+            )),
         }
     }
 
     let focus_line = match popup.mode {
         VideoSettingsMode::Dropdown => {
-            let cursor = if popup.field == VideoSettingsField::Codec {
-                popup.codec_cursor
-            } else {
-                popup.resolution_cursor
+            let cursor = match popup.field {
+                VideoSettingsField::Codec => popup.codec_cursor,
+                VideoSettingsField::Rotation => popup.rotation_cursor,
+                _ => popup.resolution_cursor,
             };
             dropdown_start.unwrap_or(0) + cursor
         }
@@ -3699,8 +3750,15 @@ fn details_popup_content(app: &App) -> Option<(Text<'static>, String)> {
             let index_label = number_string(stream, "index").unwrap_or_else(|| index.to_string());
             let kind = string(stream, "codec_type").unwrap_or("unknown");
             if kind == "video" {
+                let staged = app
+                    .video_settings
+                    .get(&index)
+                    .map(|settings| video_stream_for_display(stream, settings));
                 return Some((
-                    Text::from(video_information_lines(stream, default)),
+                    Text::from(video_information_lines(
+                        staged.as_ref().unwrap_or(stream),
+                        default,
+                    )),
                     format!(" Video #{index_label} "),
                 ));
             }
@@ -3774,6 +3832,10 @@ fn video_information_lines(stream: &BTreeMap<String, Value>, default: bool) -> V
         .and_then(format_frame_rate)
     {
         technical.push(field_line(0, "Frame rate", &format!("{frame_rate} fps")));
+    }
+    let rotation = crate::edit::stream_rotation(stream);
+    if rotation != crate::edit::VideoRotation::None {
+        technical.push(field_line(0, "Rotation", rotation.label()));
     }
 
     let mut picture = Vec::new();
@@ -3897,24 +3959,17 @@ fn video_scan_type(stream: &BTreeMap<String, Value>) -> Option<&'static str> {
     }
 }
 
+/// The roles a picture track can hold. The language and accessibility dispositions a
+/// muxer writes onto video tracks alongside the audio ones say nothing about a picture,
+/// so they are left out here for the same reason `disposition_flags` leaves them out of
+/// the overview row.
 fn video_roles(stream: &BTreeMap<String, Value>, default: bool) -> Vec<String> {
     let mut roles = Vec::new();
     if default {
         roles.push("Default".to_string());
     }
-    for (key, label) in [
-        ("forced", "Forced"),
-        ("hearing_impaired", "Hearing Impaired"),
-        ("visual_impaired", "Visual Impaired"),
-        ("comment", "Commentary"),
-        ("dub", "Dub"),
-    ] {
-        if disposition_enabled(stream, key) {
-            roles.push(label.to_string());
-        }
-    }
-    if disposition_enabled(stream, "original") {
-        roles.push("Original".to_string());
+    if disposition_enabled(stream, "comment") {
+        roles.push("Commentary".to_string());
     }
     if crate::probe::is_attached_picture(stream) {
         roles.push("Cover art".to_string());
@@ -4037,6 +4092,65 @@ fn audio_stream_for_display(
             ("dub", settings.metadata.dubbed),
         ] {
             dispositions.insert(name.to_string(), Value::from(u8::from(enabled)));
+        }
+    }
+    staged
+}
+
+/// The video stream as the overview row and `i` panel should show it once an edit is
+/// staged: the source with the staged metadata written over it, so a commentary flag or a
+/// retitled track reads back the way it will be saved.
+///
+/// Metadata only, unlike `audio_stream_for_display`. The technical fields keep describing
+/// the file as it is now — a staged codec or resolution is a re-encode that has not
+/// happened yet, and the row's `~` marker already says an edit is pending.
+fn video_stream_for_display(
+    stream: &BTreeMap<String, Value>,
+    settings: &crate::edit::VideoSettings,
+) -> BTreeMap<String, Value> {
+    let mut staged = stream.clone();
+    let tags = staged
+        .entry("tags".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(tags) = tags.as_object_mut() {
+        tags.insert(
+            "language".to_string(),
+            Value::String(settings.metadata.language.clone()),
+        );
+        match &settings.metadata.title {
+            Some(title) => {
+                tags.insert("title".to_string(), Value::String(title.clone()));
+            }
+            None => {
+                tags.remove("title");
+                tags.remove("name");
+                tags.remove("handler_name");
+            }
+        }
+    }
+    let dispositions = staged
+        .entry("disposition".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(dispositions) = dispositions.as_object_mut() {
+        dispositions.insert(
+            "comment".to_string(),
+            Value::from(u8::from(settings.metadata.commentary)),
+        );
+    }
+    // Rewritten wholesale rather than edited in place: the probe reports the angle inside
+    // a Display Matrix entry, and reel only ever needs the angle back out of it.
+    match settings.rotation {
+        crate::edit::VideoRotation::None => {
+            staged.remove("side_data_list");
+        }
+        rotation => {
+            staged.insert(
+                "side_data_list".to_string(),
+                serde_json::json!([{
+                    "side_data_type": "Display Matrix",
+                    "rotation": rotation.degrees(),
+                }]),
+            );
         }
     }
     staged
@@ -4636,13 +4750,16 @@ fn tag<'a>(stream: &'a std::collections::BTreeMap<String, Value>, key: &str) -> 
         .and_then(Value::as_str)
 }
 
-/// A video or audio track's flags, written the way a subtitle track writes its own:
-/// one bracketed group of short codes rather than a run of separate `[word]` tags.
-fn disposition_flag_tag(
-    stream: &std::collections::BTreeMap<String, Value>,
-    default: bool,
-) -> Option<String> {
-    const FLAGS: [(&str, &str); 6] = [
+/// The dispositions a track of `kind` can meaningfully carry, as short codes.
+///
+/// Matroska stores its flags the same way on every track — mkvmerge marks the video
+/// track of an original-language release `original` alongside the audio — but a picture
+/// track has no language to be original or dubbed in, and no hearing- or vision-impaired
+/// variant, so those flags describe nothing about it. `video_roles` drops the same ones
+/// from the `i` panel.
+fn disposition_flags(kind: &str) -> &'static [(&'static str, &'static str)] {
+    const VIDEO: [(&str, &str); 1] = [("comment", "CM")];
+    const OTHER: [(&str, &str); 6] = [
         ("forced", "F"),
         ("hearing_impaired", "HI"),
         ("visual_impaired", "VI"),
@@ -4651,13 +4768,23 @@ fn disposition_flag_tag(
         ("original", "OG"),
     ];
 
+    if kind == "video" { &VIDEO } else { &OTHER }
+}
+
+/// A video or audio track's flags, written the way a subtitle track writes its own:
+/// one bracketed group of short codes rather than a run of separate `[word]` tags.
+fn disposition_flag_tag(
+    stream: &std::collections::BTreeMap<String, Value>,
+    kind: &str,
+    default: bool,
+) -> Option<String> {
     let mut active = Vec::new();
     if default {
         active.push("D");
     }
     if let Some(disposition) = stream.get("disposition").and_then(Value::as_object) {
         active.extend(
-            FLAGS
+            disposition_flags(kind)
                 .iter()
                 .filter(|(key, _)| disposition.get(*key).and_then(Value::as_i64) == Some(1))
                 .map(|(_, code)| *code),
@@ -5090,6 +5217,31 @@ mod tests {
         assert_that!(video_roles(&plain, true)).is_equal_to(vec!["Default".to_string()]);
     }
 
+    #[test]
+    fn a_video_tracks_roles_should_omit_the_language_and_accessibility_flags() {
+        // Arrange: mkvmerge writes `original` onto the video track of an
+        // original-language release, and a muxer can copy the rest across just as
+        // blindly. None of them describe a picture.
+        let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "hevc",
+            "disposition": {
+                "original": 1,
+                "dub": 1,
+                "forced": 1,
+                "hearing_impaired": 1,
+                "visual_impaired": 1,
+                "comment": 1
+            },
+        }))
+        .unwrap();
+
+        // Act / Assert: only the roles a picture track can actually hold survive.
+        assert_that!(video_roles(&stream, true))
+            .is_equal_to(vec!["Default".to_string(), "Commentary".to_string()]);
+    }
+
     /// An app with a probed file: one video, one audio, two embedded subtitles and two
     /// sidecars. Enough for every section of the overview to be non-empty.
     fn probed_app(tag: &str) -> (App, std::path::PathBuf) {
@@ -5151,6 +5303,137 @@ mod tests {
         (app, directory)
     }
 
+    /// A staged flag the user cannot see is a flag they cannot trust: the dialog's tick,
+    /// the overview row's badge and the `i` panel's role list all have to follow the
+    /// staged edit rather than the file on disk.
+    #[test]
+    fn staging_video_commentary_should_show_in_the_dialog_row_and_information_panel() {
+        // Arrange
+        let (mut app, directory) = probed_app("video-commentary");
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(0))
+            .unwrap();
+
+        /// The checkbox drawn to the right of the Commentary label.
+        fn commentary_box(screen: &str) -> String {
+            let start = screen
+                .find("Commentary")
+                .expect("the Commentary field should be drawn");
+            screen[start..].chars().take(30).collect()
+        }
+
+        // Act / Assert: nothing staged, so the box is empty and the row carries no badge.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(commentary_box(&dialog).as_str()).contains("[ ]");
+        app.escape_video_settings();
+        let before = draw(&mut app, 110, 34).join("\n");
+        assert_that!(before.as_str()).does_not_contain("[CM]");
+
+        // Act: tick it.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Commentary;
+        app.activate_video_settings();
+
+        // Assert: the dialog, the overview row and the panel all say so.
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(commentary_box(&dialog).as_str()).contains("[x]");
+        app.escape_video_settings();
+        let after = draw(&mut app, 110, 34).join("\n");
+        assert_that!(after.as_str()).contains("[CM]");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).contains("Commentary");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rotation is the one video field whose value is worth seeing without opening the
+    /// dialog, so it has to reach the overview row and the `i` panel — from the staged
+    /// edit while one is pending, and from the file otherwise.
+    #[test]
+    fn staging_video_rotation_should_show_in_the_dialog_row_and_information_panel() {
+        // Arrange
+        let (mut app, directory) = probed_app("video-rotation");
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == crate::app::TrackRef::Embedded(0))
+            .unwrap();
+
+        // Act / Assert: an unrotated file says nothing about rotation anywhere.
+        let before = draw(&mut app, 110, 34).join("\n");
+        assert_that!(before.as_str()).does_not_contain("↻");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).does_not_contain("Rotation");
+
+        // Act: stage a quarter turn through the dropdown.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        app.activate_video_settings();
+        let dialog = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(dialog.as_str())
+            .contains("Rotation")
+            .contains("90° clockwise")
+            .contains("180°")
+            .contains("270° clockwise");
+        app.video_settings_popup.as_mut().unwrap().rotation_cursor = 1;
+        app.activate_video_settings();
+        app.escape_video_settings();
+
+        // Assert: the collapsed row, the overview badge and the panel all follow it.
+        app.open_video_settings();
+        app.video_settings_popup.as_mut().unwrap().field = VideoSettingsField::Rotation;
+        let summary = drawn(110, 34, |frame| render_video_settings_dialog(frame, &app));
+        assert_that!(summary.as_str()).contains("90° clockwise");
+        app.escape_video_settings();
+        let after = draw(&mut app, 110, 34).join("\n");
+        assert_that!(after.as_str()).contains("↻90°");
+        let (panel, _) = details_popup_content(&app).unwrap();
+        assert_that!(panel.to_string().as_str()).contains("Rotation: 90° clockwise");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A rotation already on the file shows without anything being staged, and clearing it
+    /// takes the badge away rather than leaving the file's own angle on screen.
+    #[test]
+    fn a_rotated_source_should_show_its_angle_until_the_edit_clears_it() {
+        // Arrange
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -180}]
+        }))
+        .unwrap();
+
+        // Act / Assert: straight from the file.
+        let line = stream_line(&stream, 0, false, false, false, false, false).to_string();
+        assert_that!(&line).contains("↻180°");
+        assert_that!(rendered(video_information_lines(&stream, false)).as_str())
+            .contains("Rotation: 180°");
+
+        // And through a staged edit that clears it.
+        let upright = video_stream_for_display(
+            &stream,
+            &crate::edit::VideoSettings {
+                rotation: crate::edit::VideoRotation::None,
+                ..crate::edit::VideoSettings::default()
+            },
+        );
+        assert_that!(stream_line(&upright, 0, false, false, false, false, false).to_string())
+            .does_not_contain("↻");
+        assert_that!(rendered(video_information_lines(&upright, false)).as_str())
+            .does_not_contain("Rotation");
+    }
+
     /// Draws the whole application and returns the screen, one string per row.
     fn draw(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
@@ -5187,6 +5470,7 @@ mod tests {
                     mode: VideoSettingsMode::Summary,
                     codec_cursor: 0,
                     resolution_cursor: 0,
+                    rotation_cursor: 0,
                     custom_resolution: None,
                     help_visible: false,
                     language_cursor: 0,
@@ -5520,7 +5804,9 @@ mod tests {
                 metadata: crate::edit::VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: crate::edit::VideoRotation::None,
             },
         );
         app.staged_edits.insert(path, edit);
@@ -5678,7 +5964,9 @@ mod tests {
                         metadata: crate::edit::VideoMetadata {
                             language: "und".to_string(),
                             title: None,
+                            commentary: false,
                         },
+                        rotation: crate::edit::VideoRotation::None,
                     },
                 );
             } else {
@@ -5912,6 +6200,7 @@ mod tests {
                 default_sidecars: &app.default_sidecars,
                 changed: &changed,
                 audio_settings: &app.audio_settings,
+                video_settings: &app.video_settings,
                 subtitle_changes: &app.subtitle_changes,
                 source_container: app.source_container(),
                 container_target: app.container_target,
@@ -6056,6 +6345,8 @@ mod tests {
         assert_that!(panel.as_str()).contains("Progressive");
         assert_that!(panel.as_str()).contains("Default");
         assert_that!(panel.as_str()).contains("Main feature");
+        // The source's `original` flag describes its language, not its picture.
+        assert_that!(panel.as_str()).does_not_contain("Original");
 
         // And a plainer stream: bit depth inferred from the pixel format, SDR transfer,
         // interlaced scan, and a height that matches no marketing tier.
@@ -7819,7 +8110,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_line_should_include_track_essentials_and_original_for_audio_and_video() {
+    fn stream_line_should_include_track_essentials_and_the_flags_that_fit_the_kind() {
         // Arrange
         let stream = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
@@ -7850,8 +8141,9 @@ mod tests {
             .does_not_contain("Main")
             .does_not_contain("48");
 
-        // The same generic disposition formatter draws video rows, so Original must
-        // not quietly remain audio-only.
+        // A picture track has no language and no accessibility variant, so the flags
+        // that describe those — which mkvmerge writes onto the video track alongside the
+        // audio one — stay off the video row. Default and Commentary remain.
         let video = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
             serde_json::json!({
                 "index": 0,
@@ -7859,12 +8151,41 @@ mod tests {
                 "codec_name": "h264",
                 "width": 1920,
                 "height": 1080,
-                "disposition": {"original": 1}
+                "disposition": {
+                    "original": 1,
+                    "dub": 1,
+                    "forced": 1,
+                    "hearing_impaired": 1,
+                    "visual_impaired": 1,
+                    "comment": 1
+                }
             }),
         )
         .unwrap();
-        let video_line = stream_line(&video, 0, false, false, false, false, false).to_string();
-        assert_that!(video_line).contains("H264").contains("[OG]");
+        let video_line = stream_line(&video, 0, false, false, false, false, true).to_string();
+        assert_that!(&video_line)
+            .contains("H264")
+            .contains("1920×1080")
+            .contains("[D/CM]")
+            .does_not_contain("OG")
+            .does_not_contain("DUB")
+            .does_not_contain("HI")
+            .does_not_contain("VI")
+            .does_not_contain("/F");
+
+        // With nothing but those flags set, the video row carries no bracketed group at
+        // all rather than an empty one.
+        let language_only = serde_json::from_value::<std::collections::BTreeMap<String, Value>>(
+            serde_json::json!({
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "disposition": {"original": 1, "dub": 1}
+            }),
+        )
+        .unwrap();
+        assert_that!(stream_line(&language_only, 0, false, false, false, false, false).to_string())
+            .does_not_contain("[");
     }
 
     #[test]
@@ -8675,7 +8996,7 @@ mod tests {
             "Title: Main feature".to_string(),
             "".to_string(),
             "Language: English".to_string(),
-            "Role: Default · Commentary · Original".to_string(),
+            "Role: Default · Commentary".to_string(),
             "".to_string(),
             "Format: H.264 (AVC)".to_string(),
             "Resolution: 1920×1080 · 16:9 · 1080p".to_string(),
@@ -8978,7 +9299,9 @@ mod tests {
                 metadata: crate::edit::VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: crate::edit::VideoRotation::None,
             },
         );
         let choices = app.video_codec_choices(0);
@@ -8991,6 +9314,7 @@ mod tests {
                 .position(|choice| choice.value == crate::edit::VideoCodec::Hevc)
                 .unwrap(),
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
             help_visible: false,
             language_cursor: 0,
@@ -9064,6 +9388,87 @@ mod tests {
         titled.metadata.title = None;
         let original = audio_stream_for_display(&titled_stream, &titled);
         assert_eq!(string(&original, "codec_name"), Some("aac"));
+    }
+
+    #[test]
+    fn staged_video_display_should_overwrite_metadata_and_leave_the_picture_alone() {
+        let stream: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "tags": {"language": "eng", "title": "Old title", "handler_name": "VideoHandler"},
+            "disposition": {"comment": 1, "attached_pic": 1}
+        }))
+        .unwrap();
+        let mut settings = crate::edit::VideoSettings {
+            codec: crate::edit::VideoCodec::Hevc,
+            resolution: crate::edit::VideoResolution::P720,
+            metadata: crate::edit::VideoMetadata {
+                language: "nld".to_string(),
+                title: Some("Director's cut".to_string()),
+                commentary: false,
+            },
+            rotation: crate::edit::VideoRotation::None,
+        };
+
+        let staged = video_stream_for_display(&stream, &settings);
+        assert_eq!(tag(&staged, "language"), Some("nld"));
+        assert_eq!(
+            crate::edit::video_stream_title(&staged).as_deref(),
+            Some("Director's cut")
+        );
+        assert!(!stream_commentary(&staged));
+        // A staged re-encode has not happened yet, so the technical fields still describe
+        // the file on disk. An unrelated disposition survives untouched.
+        assert_eq!(string(&staged, "codec_name"), Some("h264"));
+        assert_eq!(number_string(&staged, "height").as_deref(), Some("1080"));
+        assert!(crate::probe::is_attached_picture(&staged));
+
+        // Clearing the title drops every tag the panel would fall back to, and the
+        // commentary flag follows the staged value back on.
+        settings.metadata.title = None;
+        settings.metadata.commentary = true;
+        let cleared = video_stream_for_display(&stream, &settings);
+        assert_that!(crate::edit::video_stream_title(&cleared)).is_none();
+        assert!(stream_commentary(&cleared));
+
+        // A stream carrying neither tags nor dispositions still stages cleanly.
+        let bare: BTreeMap<String, Value> =
+            serde_json::from_value(serde_json::json!({"codec_name": "h264"})).unwrap();
+        let staged = video_stream_for_display(&bare, &settings);
+        assert_eq!(tag(&staged, "language"), Some("nld"));
+        assert!(stream_commentary(&staged));
+    }
+
+    #[test]
+    fn video_field_help_should_explain_every_field() {
+        let (mut app, directory) = probed_app("video-field-help");
+        open_dialog(&mut app, Dialog::VideoSettings);
+        let expected = [
+            (VideoSettingsField::Codec, "avoids re-encoding"),
+            (VideoSettingsField::Resolution, "scales the picture down"),
+            (
+                VideoSettingsField::Rotation,
+                "without touching the encoded video",
+            ),
+            (VideoSettingsField::Language, "changes metadata only"),
+            (VideoSettingsField::Title, "distinguish video tracks"),
+            (VideoSettingsField::Default, "only 1 default video track"),
+            (VideoSettingsField::Commentary, "picture-in-picture"),
+        ];
+
+        for (field, phrase) in expected {
+            let popup = app.video_settings_popup.as_mut().unwrap();
+            popup.field = field;
+            let popup = app.video_settings_popup.as_ref().unwrap();
+            assert_that!(video_field_help_text(popup).to_string().as_str()).contains(phrase);
+            assert_eq!(
+                video_field_help_title(field),
+                format!(" Information about {} ", field.label())
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -10442,6 +10847,29 @@ mod tests {
         }
         app.audio_settings_popup = None;
 
+        // Act / Assert: every video field.
+        for field in VideoSettingsField::ALL {
+            app.video_settings_popup = Some(crate::app::VideoSettingsPopup {
+                stream_index: 0,
+                field,
+                mode: VideoSettingsMode::Summary,
+                help_visible: true,
+                codec_cursor: 0,
+                resolution_cursor: 0,
+                rotation_cursor: 0,
+                language_cursor: 0,
+                language_search: SearchState::default(),
+                title_input: TextInputState::new(String::new()),
+                custom_resolution: None,
+            });
+            let popup = app.video_settings_popup.as_ref().unwrap();
+            let help = video_field_help_text(popup);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_video_settings_dialog(frame, &app)
+            });
+        }
+        app.video_settings_popup = None;
+
         // Act / Assert: subtitle fields.
         for field in [
             SubtitleSettingsField::Codec,
@@ -10495,6 +10923,7 @@ mod tests {
             mode: VideoSettingsMode::Dropdown,
             codec_cursor: 0,
             resolution_cursor: 0,
+            rotation_cursor: 0,
             custom_resolution: None,
             help_visible: false,
             language_cursor: 0,

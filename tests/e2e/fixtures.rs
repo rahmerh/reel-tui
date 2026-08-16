@@ -38,6 +38,10 @@ pub struct MediaSpec {
     pub duration: f32,
     pub video_codec: &'static str,
     pub video_disposition: Option<&'static str>,
+    /// Degrees of display rotation tagged onto the first video track. Applied in a second
+    /// copy pass, because `-display_rotation` is an input option and the fixture's own
+    /// inputs are `lavfi` sources with nothing to rotate.
+    pub video_rotation: Option<u32>,
     /// Language tag per audio track; the first is marked default unless an explicit
     /// disposition is supplied for it.
     pub audio_languages: Vec<&'static str>,
@@ -63,6 +67,7 @@ impl Default for MediaSpec {
             duration: 1.0,
             video_codec: "libx264",
             video_disposition: None,
+            video_rotation: None,
             audio_languages: vec!["eng"],
             audio_dispositions: Vec::new(),
             audio_codec: "aac",
@@ -105,6 +110,11 @@ impl MediaSpec {
 
     pub fn video_disposition(mut self, disposition: &'static str) -> Self {
         self.video_disposition = Some(disposition);
+        self
+    }
+
+    pub fn video_rotation(mut self, degrees: u32) -> Self {
+        self.video_rotation = Some(degrees);
         self
     }
 
@@ -251,6 +261,32 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
 
     for srt_path in srt_paths {
         let _ = fs::remove_file(srt_path);
+    }
+
+    if let Some(degrees) = spec.video_rotation {
+        let rotated = parent.join(format!(".fixture-{stem}-rotated"));
+        let output = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-display_rotation:v:0",
+                &degrees.to_string(),
+                "-i",
+            ])
+            .arg(path)
+            .args(["-map", "0", "-c", "copy", "-f", spec.muxer])
+            .arg(&rotated)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            output.status.success(),
+            "failed to rotate fixture {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::rename(&rotated, path).unwrap();
     }
 }
 

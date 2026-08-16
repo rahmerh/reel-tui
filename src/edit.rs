@@ -480,9 +480,28 @@ impl ContainerFormat {
         }
     }
 
+    /// Whether this container stores a commentary flag on a track at all. Measured to be
+    /// the same capability for a picture track as for a soundtrack — Matroska and MP4
+    /// round-trip `-disposition:v:0 comment`, MOV and WebM drop it — so video reuses the
+    /// audio rule rather than restating it.
+    pub fn supports_commentary_flag(self) -> bool {
+        self.supports_audio_role(AudioRole::Commentary)
+    }
+
+    /// Whether this container stores a display matrix. Measured: Matroska, MP4 and MOV
+    /// all round-trip `-display_rotation`. WebM is excluded because reaching it always
+    /// re-encodes to VP9, and a re-encode bakes the rotation into the pixels instead of
+    /// tagging it — there is no matrix left to store.
+    pub fn supports_display_rotation(self) -> bool {
+        !matches!(self, Self::WebM)
+    }
+
     pub fn retain_supported_video_metadata(self, metadata: &mut VideoMetadata) {
         if !self.supports_stream_language() {
             metadata.language = "und".to_string();
+        }
+        if !self.supports_commentary_flag() {
+            metadata.commentary = false;
         }
     }
 }
@@ -586,16 +605,77 @@ impl VideoResolution {
     }
 }
 
+/// How a player should turn a picture before drawing it, stored as a display matrix
+/// beside the stream rather than baked into the pixels.
+///
+/// Only the four right angles. ffmpeg accepts any angle and the matrix stores it, but
+/// `ffprobe` reports the angle as a truncated integer (30° reads back as 29, 359° as 0),
+/// so reel could not verify what it wrote; and the matrix rotates a frame inside its own
+/// declared size, which has no sensible meaning off the right angles — renderers that
+/// implement it at all disagree about what to do with the corners.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoRotation {
+    #[default]
+    None,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+impl VideoRotation {
+    pub const ALL: [Self; 4] = [Self::None, Self::Cw90, Self::Cw180, Self::Cw270];
+
+    pub fn degrees(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Cw90 => 90,
+            Self::Cw180 => 180,
+            Self::Cw270 => 270,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Cw90 => "90° clockwise",
+            Self::Cw180 => "180°",
+            Self::Cw270 => "270° clockwise",
+        }
+    }
+
+    /// The angle ffmpeg wrote, read back. It normalizes on write — 270 comes back as
+    /// `-90` and 180 as `-180` — so anything but a multiple of 360 apart from a right
+    /// angle is a file reel did not write, and reads as unrotated.
+    pub fn from_degrees(degrees: i64) -> Self {
+        match degrees.rem_euclid(360) {
+            90 => Self::Cw90,
+            180 => Self::Cw180,
+            270 => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
+    /// Whether the picture's width and height swap when this rotation is applied.
+    pub fn swaps_dimensions(self) -> bool {
+        matches!(self, Self::Cw90 | Self::Cw270)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoMetadata {
     pub language: String,
     pub title: Option<String>,
+    /// The one role a picture track can hold: a picture-in-picture commentary angle.
+    /// The language and accessibility roles audio offers describe a soundtrack, not a
+    /// picture, so video does not carry them.
+    pub commentary: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoSettings {
     pub codec: VideoCodec,
     pub resolution: VideoResolution,
+    pub rotation: VideoRotation,
     pub metadata: VideoMetadata,
 }
 
@@ -615,9 +695,11 @@ impl Default for VideoSettings {
         Self {
             codec: VideoCodec::Original,
             resolution: VideoResolution::Original,
+            rotation: VideoRotation::None,
             metadata: VideoMetadata {
                 language: "und".to_string(),
                 title: None,
+                commentary: false,
             },
         }
     }
@@ -3591,7 +3673,22 @@ fn validate_result(
                 "The video track at position {position} has the wrong metadata."
             ));
         }
-        if source_stream.is_some_and(|stream| !requires_transcode(stream, settings)) {
+        let transcoded = source_stream.is_none_or(|stream| requires_transcode(stream, settings));
+        // An encode applies the rotation to the picture itself and leaves no matrix
+        // behind, so the tag is only expected on the copy path.
+        let expected_rotation = if transcoded {
+            VideoRotation::None
+        } else {
+            settings.rotation
+        };
+        if stream_rotation(stream) != expected_rotation {
+            return Err(format!(
+                "The video track at position {position} has the wrong rotation: expected {}, found {}.",
+                expected_rotation.degrees(),
+                stream_rotation(stream).degrees(),
+            ));
+        }
+        if !transcoded {
             continue;
         }
         let expected_codec = settings
@@ -3603,7 +3700,7 @@ fn validate_result(
                 "The encoded video track at position {position} has the wrong codec."
             ));
         }
-        if !output_resolution_matches(stream, settings.resolution) {
+        if !output_resolution_matches(stream, source_stream, settings) {
             return Err(format!(
                 "The encoded video track at position {position} has the wrong resolution."
             ));
@@ -3692,7 +3789,9 @@ pub(crate) fn audio_stream_title(stream: &BTreeMap<String, Value>) -> Option<Str
 }
 
 fn video_metadata_matches(stream: &BTreeMap<String, Value>, expected: &VideoMetadata) -> bool {
-    stream_language(stream) == expected.language && video_stream_title(stream) == expected.title
+    stream_language(stream) == expected.language
+        && video_stream_title(stream) == expected.title
+        && stream_commentary(stream) == expected.commentary
 }
 
 /// Mirrors `audio_stream_title`, but ignores ffmpeg's default MP4/MOV *video* handler name
@@ -3721,6 +3820,25 @@ pub(crate) fn stream_disposition(stream: &BTreeMap<String, Value>, name: &str) -
         .and_then(|values| values.get(name))
         .and_then(Value::as_i64)
         == Some(1)
+}
+
+/// The rotation a stream's display matrix asks for, or `None` when it carries no matrix.
+///
+/// `ffprobe -show_streams` already reports this under `side_data_list`, so nothing about
+/// probing or the on-disk probe cache has to change to read it.
+pub(crate) fn stream_rotation(stream: &BTreeMap<String, Value>) -> VideoRotation {
+    stream
+        .get("side_data_list")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("rotation"))
+        .find_map(|rotation| {
+            rotation
+                .as_i64()
+                .or_else(|| rotation.as_f64().map(|degrees| degrees.round() as i64))
+        })
+        .map_or(VideoRotation::None, VideoRotation::from_degrees)
 }
 
 fn validate_output_container(
@@ -3802,18 +3920,23 @@ fn run_ffmpeg(
         )
     });
     let mut command = Command::new("ffmpeg");
-    command
-        .args([
-            "-v",
-            "error",
-            "-nostdin",
-            "-y",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            "-i",
-        ])
-        .arg(plan.source);
+    command.args([
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]);
+    // `-display_rotation` is an input option, so unlike everything else below it has to
+    // be emitted before the source it applies to.
+    for (specifier, rotation) in display_rotation_args(plan.source_info, plan.video_settings) {
+        command
+            .arg(format!("-display_rotation:{specifier}"))
+            .arg(rotation);
+    }
+    command.arg("-i").arg(plan.source);
     for replacement in plan.replacements {
         command.arg("-i").arg(&replacement.path);
     }
@@ -4048,6 +4171,7 @@ fn run_ffmpeg(
                         .arg(video_disposition(
                             stream,
                             plan.default_streams.contains(source_index),
+                            &metadata,
                         ));
                     continue;
                 }
@@ -4247,21 +4371,28 @@ fn audio_disposition(
     }
 }
 
-/// Mirrors `audio_disposition`/`subtitle_disposition`, but video only ever models
-/// `default` — there is no established ffmpeg/Matroska convention for a video-stream
-/// role the way there is for audio (commentary, dub, ...) or subtitle (forced, cc, ...).
-/// Any other flag already on the source stream (e.g. `attached_pic`) is preserved.
-fn video_disposition(stream: &BTreeMap<String, Value>, default: bool) -> String {
+/// Mirrors `audio_disposition`/`subtitle_disposition`, but video models only `default`
+/// and `comment` — the roles audio offers besides those describe a soundtrack's language
+/// or its accessibility variant, neither of which a picture has. Any other flag already
+/// on the source stream (e.g. `attached_pic`) is preserved.
+fn video_disposition(
+    stream: &BTreeMap<String, Value>,
+    default: bool,
+    metadata: &VideoMetadata,
+) -> String {
+    let replaced = ["default", "comment"];
     let mut dispositions = stream
         .get("disposition")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|values| values.iter())
-        .filter(|(name, value)| value.as_i64() == Some(1) && name.as_str() != "default")
+        .filter(|(name, value)| value.as_i64() == Some(1) && !replaced.contains(&name.as_str()))
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
-    if default {
-        dispositions.insert("default".to_string());
+    for (enabled, name) in [(default, "default"), (metadata.commentary, "comment")] {
+        if enabled {
+            dispositions.insert(name.to_string());
+        }
     }
     if dispositions.is_empty() {
         "0".to_string()
@@ -4537,6 +4668,7 @@ fn video_metadata(stream: &BTreeMap<String, Value>) -> VideoMetadata {
     VideoMetadata {
         language: stream_language(stream),
         title: video_stream_title(stream),
+        commentary: stream_commentary(stream),
     }
 }
 
@@ -4560,6 +4692,37 @@ fn should_write_video_metadata(
     changing_container: bool,
 ) -> bool {
     stream_kind == Some("video") && (has_settings || changing_container)
+}
+
+/// The `-display_rotation` arguments for every video track carrying staged settings,
+/// paired with the stream specifier they apply to.
+///
+/// ffmpeg counts video tracks separately here (`v:0`, `v:1`, ...) rather than using the
+/// absolute stream index reel keys its plans on, and the count is over the *input* file,
+/// so it follows the source's own ordering rather than the output track plan.
+///
+/// Only staged tracks get an argument. A copy remux carries an existing display matrix
+/// across untouched, so a container change alone is no reason to rewrite one — unlike the
+/// metadata `should_write_video_metadata` gates, which a container change does rewrite.
+fn display_rotation_args(
+    info: &MediaInfo,
+    video_settings: &BTreeMap<u64, VideoSettings>,
+) -> Vec<(String, String)> {
+    let mut args = Vec::new();
+    let mut video_index = 0;
+    for stream in &info.streams {
+        if stream_kind(stream) != Some("video") {
+            continue;
+        }
+        if let Some(settings) = stream_index(stream).and_then(|index| video_settings.get(&index)) {
+            args.push((
+                format!("v:{video_index}"),
+                settings.rotation.degrees().to_string(),
+            ));
+        }
+        video_index += 1;
+    }
+    args
 }
 
 /// The bitrate Reel picks for a lossy encode. Deliberately not user-selectable: the readme
@@ -4612,14 +4775,34 @@ fn resolution_filter(resolution: VideoResolution) -> Option<String> {
     }
 }
 
+/// Whether an encoded track came out the size the settings asked for.
+///
+/// A preset or custom size is the whole answer on its own: the scale filter fits the
+/// picture into exactly that frame, padding it if a rotation made it portrait. Keeping
+/// the original size is the case rotation changes — an encode bakes a 90°/270° rotation
+/// into the picture, so the output is the source's dimensions swapped.
 fn output_resolution_matches(
     stream: &BTreeMap<String, Value>,
-    resolution: VideoResolution,
+    source: Option<&BTreeMap<String, Value>>,
+    settings: &VideoSettings,
 ) -> bool {
     let width = stream_dimension(stream, "width");
     let height = stream_dimension(stream, "height");
-    match resolution {
-        VideoResolution::Original => true,
+    match settings.resolution {
+        VideoResolution::Original => {
+            let Some(source) = source.filter(|_| settings.rotation.swaps_dimensions()) else {
+                return true;
+            };
+            match (
+                stream_dimension(source, "width"),
+                stream_dimension(source, "height"),
+            ) {
+                (Some(source_width), Some(source_height)) => {
+                    width == Some(source_height) && height == Some(source_width)
+                }
+                _ => true,
+            }
+        }
         VideoResolution::Custom(custom) => {
             width == Some(custom.width) && height == Some(custom.height)
         }
@@ -4950,7 +5133,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -5253,7 +5438,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
         let subtitle_changes = [SubtitleChange {
@@ -5691,7 +5878,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -5725,7 +5914,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -5763,7 +5954,9 @@ mod tests {
                     metadata: VideoMetadata {
                         language: "und".to_string(),
                         title: None,
+                        commentary: false,
                     },
+                    rotation: VideoRotation::None,
                 },
             )]);
 
@@ -5803,7 +5996,9 @@ mod tests {
                     metadata: VideoMetadata {
                         language: "und".to_string(),
                         title: None,
+                        commentary: false,
                     },
+                    rotation: VideoRotation::None,
                 },
             )])
         };
@@ -5984,7 +6179,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -6031,7 +6228,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -6080,7 +6279,9 @@ mod tests {
                     metadata: VideoMetadata {
                         language: "und".to_string(),
                         title: None,
+                        commentary: false,
                     },
+                    rotation: VideoRotation::None,
                 },
             )])
         };
@@ -6139,7 +6340,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -6177,7 +6380,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -6258,35 +6463,49 @@ mod tests {
         ]);
 
         // Act / Assert
-        assert_that!(output_resolution_matches(
-            &exact,
-            VideoResolution::Custom(CustomResolution {
+        let sized = |resolution| VideoSettings {
+            resolution,
+            ..VideoSettings::default()
+        };
+        let custom = |scaling| {
+            sized(VideoResolution::Custom(CustomResolution {
                 width: 1280,
                 height: 720,
-                scaling: CustomScaling::FitPad,
-            }),
+                scaling,
+            }))
+        };
+
+        // Act / Assert
+        assert_that!(output_resolution_matches(
+            &exact,
+            None,
+            &custom(CustomScaling::FitPad)
         ))
         .is_true();
         assert_that!(output_resolution_matches(
             &exact,
-            VideoResolution::Custom(CustomResolution {
-                width: 1280,
-                height: 720,
-                scaling: CustomScaling::Stretch,
-            }),
+            None,
+            &custom(CustomScaling::Stretch)
         ))
         .is_true();
         assert_that!(output_resolution_matches(
             &bounded,
-            VideoResolution::Custom(CustomResolution {
-                width: 1280,
-                height: 720,
-                scaling: CustomScaling::FitPad,
-            }),
+            None,
+            &custom(CustomScaling::FitPad)
         ))
         .is_false();
-        assert_that!(output_resolution_matches(&exact, VideoResolution::P720)).is_true();
-        assert_that!(output_resolution_matches(&bounded, VideoResolution::P720)).is_false();
+        assert_that!(output_resolution_matches(
+            &exact,
+            None,
+            &sized(VideoResolution::P720)
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &bounded,
+            None,
+            &sized(VideoResolution::P720)
+        ))
+        .is_false();
     }
 
     /// Only the messages that mean "what you staged no longer matches the file" may be
@@ -7323,7 +7542,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
         let exported = [SubtitleChange {
@@ -7975,7 +8196,9 @@ mod tests {
             metadata: VideoMetadata {
                 language: "und".to_string(),
                 title: None,
+                commentary: false,
             },
+            rotation: VideoRotation::None,
         };
         let to_720p = VideoSettings {
             codec: VideoCodec::Original,
@@ -7983,7 +8206,9 @@ mod tests {
             metadata: VideoMetadata {
                 language: "und".to_string(),
                 title: None,
+                commentary: false,
             },
+            rotation: VideoRotation::None,
         };
 
         // Act
@@ -8039,7 +8264,9 @@ mod tests {
                     metadata: VideoMetadata {
                         language: "und".to_string(),
                         title: None,
+                        commentary: false,
                     },
+                    rotation: VideoRotation::None,
                 },
             )]),
             &[],
@@ -8851,7 +9078,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
 
@@ -8943,7 +9172,9 @@ mod tests {
                     metadata: VideoMetadata {
                         language: "und".to_string(),
                         title: None,
+                        commentary: false,
                     },
+                    rotation: VideoRotation::None,
                 },
             )]);
 
@@ -10650,6 +10881,7 @@ mod tests {
             metadata: VideoMetadata {
                 language: "nld".to_string(),
                 title: Some("Director's cut".to_string()),
+                commentary: true,
             },
             ..VideoSettings::default()
         };
@@ -10688,11 +10920,13 @@ mod tests {
         assert_that!(stream_language(&output.streams[0])).is_equal_to("nld".to_string());
         assert_that!(video_stream_title(&output.streams[0]).as_deref()).contains("Director's cut");
         assert_that!(is_default(&output.streams[0])).is_true();
+        assert_that!(stream_commentary(&output.streams[0])).is_true();
         // The neighboring audio track's metadata and default flag are untouched by the
-        // video-only edit.
+        // video-only edit, including the commentary flag the video track just gained.
         assert_that!(stream_language(&output.streams[1])).is_equal_to("eng".to_string());
         assert_that!(audio_stream_title(&output.streams[1]).as_deref()).contains("Main audio");
         assert_that!(is_default(&output.streams[1])).is_true();
+        assert_that!(stream_commentary(&output.streams[1])).is_false();
         let leftovers = fs::read_dir(&directory)
             .unwrap()
             .filter_map(Result::ok)
@@ -10700,6 +10934,145 @@ mod tests {
             .filter(|name| name != "movie.mkv")
             .collect::<Vec<_>>();
         assert_that!(leftovers).is_empty();
+    }
+
+    /// Rotation rides on the copy path: the tag is written, the picture is not touched,
+    /// and the neighboring video track keeps the rotation it already had — the specifier
+    /// counts video tracks, so addressing the wrong one is a real failure mode.
+    #[test]
+    fn apply_edits_should_write_the_staged_rotation_without_re_encoding() {
+        require_tools(
+            "apply_edits_should_write_the_staged_rotation_without_re_encoding",
+            &["ffmpeg"],
+        );
+        let directory = scratch_directory("video-rotation");
+        let _cleanup = DirectoryCleanup(Some(directory.clone()));
+        let source = directory.join("movie.mkv");
+        let plain = directory.join("plain.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x32:r=1:d=1")
+            .args(["-f", "lavfi", "-i"])
+            .arg("color=c=red:s=64x32:r=1:d=1")
+            .args(["-map", "0:v", "-map", "1:v", "-c:v", "ffv1"])
+            .arg(&plain)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        // `-display_rotation` is an input option, so tagging the second video track is a
+        // separate pass over the finished file.
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-display_rotation:v:1", "180", "-i"])
+            .arg(&plain)
+            .args(["-map", "0", "-c", "copy"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        fs::remove_file(&plain).unwrap();
+        let before = media_info(&source).unwrap();
+        assert_that!(stream_rotation(&before.streams[0])).is_equal_to(VideoRotation::None);
+        assert_that!(stream_rotation(&before.streams[1])).is_equal_to(VideoRotation::Cw180);
+
+        let video_settings = BTreeMap::from([(
+            0,
+            VideoSettings {
+                rotation: VideoRotation::Cw90,
+                ..VideoSettings::default()
+            },
+        )]);
+        apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
+                video_settings: &video_settings,
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        let output = media_info(&source).unwrap();
+        assert_that!(stream_rotation(&output.streams[0])).is_equal_to(VideoRotation::Cw90);
+        assert_that!(stream_rotation(&output.streams[1])).is_equal_to(VideoRotation::Cw180);
+        // Metadata only: the codec is untouched and the picture keeps its own dimensions
+        // rather than being transposed by an encode.
+        assert_that!(output.streams[0].get("codec_name").and_then(Value::as_str)).contains("ffv1");
+        assert_that!(stream_dimension(&output.streams[0], "width")).contains(64);
+        assert_that!(stream_dimension(&output.streams[0], "height")).contains(32);
+    }
+
+    /// Clearing a rotation has to remove the matrix rather than leave the old angle in
+    /// place: `-display_rotation 0` is what does that, and a missing argument would let
+    /// the copy remux carry the source's rotation straight through.
+    #[test]
+    fn apply_edits_should_clear_a_rotation_the_source_already_had() {
+        require_tools(
+            "apply_edits_should_clear_a_rotation_the_source_already_had",
+            &["ffmpeg"],
+        );
+        let directory = scratch_directory("video-rotation-clear");
+        let _cleanup = DirectoryCleanup(Some(directory.clone()));
+        let source = directory.join("movie.mkv");
+        let plain = directory.join("plain.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x32:r=1:d=1")
+            .args(["-c:v", "ffv1"])
+            .arg(&plain)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-display_rotation:v:0", "90", "-i"])
+            .arg(&plain)
+            .args(["-c", "copy"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        fs::remove_file(&plain).unwrap();
+        assert_that!(stream_rotation(&media_info(&source).unwrap().streams[0]))
+            .is_equal_to(VideoRotation::Cw90);
+
+        let video_settings = BTreeMap::from([(0, VideoSettings::default())]);
+        apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
+                video_settings: &video_settings,
+                subtitle_changes: &[],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        let output = media_info(&source).unwrap();
+        assert_that!(stream_rotation(&output.streams[0])).is_equal_to(VideoRotation::None);
     }
 
     #[test]
@@ -10811,7 +11184,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -10831,7 +11206,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -10852,7 +11229,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         )]);
         assert_that!(plan_requires_transcode(
@@ -11040,18 +11419,204 @@ mod tests {
             "disposition": {"default": 0, "attached_pic": 1, "forced": 1}
         }))
         .unwrap();
+        let plain = video_metadata_of(false);
         // An unrelated flag ("attached_pic") already on the source survives regardless
         // of the default flag Reel is asked to write.
-        assert_that!(video_disposition(&stream, false).as_str()).is_equal_to("attached_pic+forced");
-        assert_that!(video_disposition(&stream, true).as_str())
+        assert_that!(video_disposition(&stream, false, &plain).as_str())
+            .is_equal_to("attached_pic+forced");
+        assert_that!(video_disposition(&stream, true, &plain).as_str())
             .is_equal_to("attached_pic+default+forced");
+    }
+
+    /// The commentary flag is written from the staged metadata, not carried over from the
+    /// source, so clearing it has to actually drop it — a `-disposition` argument replaces
+    /// the whole set, and a flag left out of the string is a flag removed.
+    #[test]
+    fn video_disposition_should_write_the_staged_commentary_flag() {
+        let commented = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "disposition": {"comment": 1, "attached_pic": 1}
+        }))
+        .unwrap();
+        assert_that!(video_disposition(&commented, false, &video_metadata_of(false)).as_str())
+            .is_equal_to("attached_pic");
+        assert_that!(video_disposition(&commented, true, &video_metadata_of(true)).as_str())
+            .is_equal_to("attached_pic+comment+default");
+
+        let plain =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({})).unwrap();
+        assert_that!(video_disposition(&plain, false, &video_metadata_of(true)).as_str())
+            .is_equal_to("comment");
     }
 
     #[test]
     fn video_disposition_should_report_zero_when_nothing_is_set() {
         let stream =
             serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({})).unwrap();
-        assert_that!(video_disposition(&stream, false).as_str()).is_equal_to("0");
+        assert_that!(video_disposition(&stream, false, &video_metadata_of(false)).as_str())
+            .is_equal_to("0");
+    }
+
+    #[test]
+    fn stream_rotation_should_read_the_display_matrix_and_normalize_the_angle() {
+        let rotated = |value: Value| {
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+                "side_data_list": [{"side_data_type": "Display Matrix", "rotation": value}]
+            }))
+            .unwrap()
+        };
+
+        // ffmpeg normalizes on write: a 270° request reads back as -90, 180 as -180.
+        for (reported, expected) in [
+            (serde_json::json!(90), VideoRotation::Cw90),
+            (serde_json::json!(-90), VideoRotation::Cw270),
+            (serde_json::json!(270), VideoRotation::Cw270),
+            (serde_json::json!(-180), VideoRotation::Cw180),
+            (serde_json::json!(180), VideoRotation::Cw180),
+            (serde_json::json!(0), VideoRotation::None),
+            (serde_json::json!(-360), VideoRotation::None),
+            // Written by something other than reel, and unrepresentable in the dialog.
+            (serde_json::json!(45), VideoRotation::None),
+            // Some builds report the angle as a double.
+            (serde_json::json!(90.0), VideoRotation::Cw90),
+        ] {
+            assert_eq!(
+                stream_rotation(&rotated(reported.clone())),
+                expected,
+                "a reported rotation of {reported} should read as {expected:?}",
+            );
+        }
+
+        // A stream with no matrix, an unrelated side-data entry, or a malformed list all
+        // read as unrotated rather than failing.
+        let bare =
+            serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({})).unwrap();
+        assert_eq!(stream_rotation(&bare), VideoRotation::None);
+        let unrelated = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "side_data_list": [{"side_data_type": "Stereo 3D"}]
+        }))
+        .unwrap();
+        assert_eq!(stream_rotation(&unrelated), VideoRotation::None);
+        let malformed = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "side_data_list": "not an array"
+        }))
+        .unwrap();
+        assert_eq!(stream_rotation(&malformed), VideoRotation::None);
+    }
+
+    /// `-display_rotation` counts video tracks on its own (`v:0`, `v:1`), so the specifier
+    /// is not the absolute stream index reel keys its plans on. A file whose second video
+    /// track is stream #3 has to be addressed as `v:1`.
+    #[test]
+    fn display_rotation_args_should_address_staged_tracks_by_their_video_index() {
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            {"index": 3, "codec_type": "video", "codec_name": "hevc"}
+        ]));
+        let rotated = |rotation| VideoSettings {
+            rotation,
+            ..VideoSettings::default()
+        };
+
+        // Nothing staged: no arguments at all, so a copy remux carries any existing
+        // matrix across untouched.
+        assert_that!(display_rotation_args(&info, &BTreeMap::new())).is_empty();
+
+        // The second video track, addressed by video index rather than stream index.
+        let settings = BTreeMap::from([(3, rotated(VideoRotation::Cw90))]);
+        assert_that!(display_rotation_args(&info, &settings))
+            .is_equal_to(vec![("v:1".to_string(), "90".to_string())]);
+
+        // Both tracks staged, including one cleared back to upright — which is written as
+        // an explicit 0, the argument that removes an existing matrix.
+        let settings = BTreeMap::from([
+            (0, rotated(VideoRotation::None)),
+            (3, rotated(VideoRotation::Cw270)),
+        ]);
+        assert_that!(display_rotation_args(&info, &settings)).is_equal_to(vec![
+            ("v:0".to_string(), "0".to_string()),
+            ("v:1".to_string(), "270".to_string()),
+        ]);
+
+        // A staged audio track is not a video track and never produces an argument.
+        let settings = BTreeMap::from([(1, rotated(VideoRotation::Cw90))]);
+        assert_that!(display_rotation_args(&info, &settings)).is_empty();
+    }
+
+    #[test]
+    fn output_resolution_matches_should_expect_swapped_dimensions_for_a_baked_rotation() {
+        let source = BTreeMap::from([
+            ("width".to_string(), Value::from(1920)),
+            ("height".to_string(), Value::from(1080)),
+        ]);
+        let portrait = BTreeMap::from([
+            ("width".to_string(), Value::from(1080)),
+            ("height".to_string(), Value::from(1920)),
+        ]);
+        let landscape = source.clone();
+        let rotated = |rotation| VideoSettings {
+            rotation,
+            ..VideoSettings::default()
+        };
+
+        // An encode applies the rotation to the picture, so keeping the original size
+        // means the source's dimensions swapped.
+        assert_that!(output_resolution_matches(
+            &portrait,
+            Some(&source),
+            &rotated(VideoRotation::Cw90)
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &landscape,
+            Some(&source),
+            &rotated(VideoRotation::Cw90)
+        ))
+        .is_false();
+        assert_that!(output_resolution_matches(
+            &portrait,
+            Some(&source),
+            &rotated(VideoRotation::Cw270)
+        ))
+        .is_true();
+
+        // A half turn keeps the frame shape, and an unrotated encode is unconstrained.
+        assert_that!(output_resolution_matches(
+            &landscape,
+            Some(&source),
+            &rotated(VideoRotation::Cw180)
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &portrait,
+            Some(&source),
+            &rotated(VideoRotation::None)
+        ))
+        .is_true();
+
+        // Without dimensions to compare against there is nothing to check.
+        let sizeless = BTreeMap::new();
+        assert_that!(output_resolution_matches(
+            &portrait,
+            Some(&sizeless),
+            &rotated(VideoRotation::Cw90)
+        ))
+        .is_true();
+        assert_that!(output_resolution_matches(
+            &portrait,
+            None,
+            &rotated(VideoRotation::Cw90)
+        ))
+        .is_true();
+    }
+
+    fn video_metadata_of(commentary: bool) -> VideoMetadata {
+        VideoMetadata {
+            language: "und".to_string(),
+            title: None,
+            commentary,
+        }
     }
 
     #[test]
@@ -11085,7 +11650,7 @@ mod tests {
     }
 
     #[test]
-    fn video_metadata_matches_should_compare_language_and_title() {
+    fn video_metadata_matches_should_compare_language_title_and_commentary() {
         let stream = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
             "tags": {"language": "nld", "title": "Director's cut"}
         }))
@@ -11093,6 +11658,7 @@ mod tests {
         let matching = VideoMetadata {
             language: "nld".to_string(),
             title: Some("Director's cut".to_string()),
+            commentary: false,
         };
         assert_that!(video_metadata_matches(&stream, &matching)).is_true();
 
@@ -11104,27 +11670,59 @@ mod tests {
 
         let wrong_title = VideoMetadata {
             title: Some("Theatrical cut".to_string()),
-            ..matching
+            ..matching.clone()
         };
         assert_that!(video_metadata_matches(&stream, &wrong_title)).is_false();
+
+        // The commentary flag is compared too, so a track that came back without it is
+        // not mistaken for one that kept it.
+        let wrong_commentary = VideoMetadata {
+            commentary: true,
+            ..matching
+        };
+        assert_that!(video_metadata_matches(&stream, &wrong_commentary)).is_false();
+
+        let flagged = serde_json::from_value::<BTreeMap<String, Value>>(serde_json::json!({
+            "tags": {"language": "nld", "title": "Director's cut"},
+            "disposition": {"comment": 1}
+        }))
+        .unwrap();
+        assert_that!(video_metadata_matches(&flagged, &wrong_commentary)).is_true();
     }
 
     #[test]
-    fn retain_supported_video_metadata_should_clear_language_only_on_mov() {
+    fn retain_supported_video_metadata_should_clear_what_the_container_cannot_store() {
         let mut metadata = VideoMetadata {
             language: "nld".to_string(),
             title: Some("Director's cut".to_string()),
+            commentary: true,
         };
         ContainerFormat::Mov.retain_supported_video_metadata(&mut metadata);
         assert_that!(metadata.language.as_str()).is_equal_to("und");
         assert_that!(metadata.title.as_deref()).contains("Director's cut");
+        assert_that!(metadata.commentary).is_false();
 
-        let mut unaffected = VideoMetadata {
-            language: "nld".to_string(),
-            title: None,
-        };
-        ContainerFormat::Matroska.retain_supported_video_metadata(&mut unaffected);
-        assert_that!(unaffected.language.as_str()).is_equal_to("nld");
+        // Measured per container: MOV and WebM drop `-disposition:v:0 comment`, MKV and
+        // MP4 write it back out.
+        for (container, expected_language, expected_commentary) in [
+            (ContainerFormat::Matroska, "nld", true),
+            (ContainerFormat::Mp4, "nld", true),
+            (ContainerFormat::WebM, "nld", false),
+        ] {
+            let mut metadata = VideoMetadata {
+                language: "nld".to_string(),
+                title: None,
+                commentary: true,
+            };
+            container.retain_supported_video_metadata(&mut metadata);
+            assert_that!(metadata.language.as_str()).is_equal_to(expected_language);
+            assert_eq!(
+                metadata.commentary,
+                expected_commentary,
+                "{container:?} should {} the commentary flag",
+                if expected_commentary { "keep" } else { "clear" }
+            );
+        }
     }
 
     #[test]
@@ -11525,7 +12123,9 @@ mod tests {
                 metadata: VideoMetadata {
                     language: "und".to_string(),
                     title: None,
+                    commentary: false,
                 },
+                rotation: VideoRotation::None,
             },
         );
         request.subtitle_changes.push(SubtitleChange {

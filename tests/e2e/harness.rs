@@ -25,7 +25,7 @@ use reel_tui::app::{
     Dialog, Layer, ResolutionChoiceValue, SubtitleSettingsField, SubtitleSettingsMode, TrackRef,
     VideoSettingsField, VideoSettingsMode,
 };
-use reel_tui::edit::{EditEvent, spawn_edit_worker_pools};
+use reel_tui::edit::{EditEvent, VideoRotation, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
 use reel_tui::probe::{
@@ -926,6 +926,50 @@ impl Harness {
             self.app.dialog,
             Some(Dialog::VideoSettings),
             "Enter on row {row} should open video settings"
+        );
+    }
+
+    /// Opens the rotation dropdown on an already-open video popup and picks `rotation`.
+    pub fn choose_video_rotation(&mut self, rotation: VideoRotation) {
+        self.focus_video_field(VideoSettingsField::Rotation);
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.mode),
+            Some(VideoSettingsMode::Dropdown),
+            "Enter on Rotation should open its dropdown"
+        );
+        let target = VideoRotation::ALL
+            .iter()
+            .position(|candidate| *candidate == rotation)
+            .expect("every rotation is offered");
+        for _ in 0..VideoRotation::ALL.len() * 2 {
+            let cursor = self
+                .app
+                .video_settings_popup
+                .as_ref()
+                .map(|popup| popup.rotation_cursor)
+                .unwrap_or_default();
+            match cursor.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => self.press(key(KeyCode::Char('j'))),
+                std::cmp::Ordering::Greater => self.press(key(KeyCode::Char('k'))),
+            };
+        }
+        self.press(key(KeyCode::Enter));
+        assert_eq!(
+            self.app
+                .effective_video_settings(
+                    self.app
+                        .video_settings_popup
+                        .as_ref()
+                        .expect("video settings should be open")
+                        .stream_index
+                )
+                .map(|settings| settings.rotation),
+            Some(rotation),
         );
     }
 
