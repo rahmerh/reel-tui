@@ -1076,6 +1076,12 @@ pub struct App {
     /// when notifications are enabled in the user's config; tests and other library
     /// consumers remain notification-free unless they explicitly opt in.
     completion_notification_tx: Option<Sender<PathBuf>>,
+    /// Whether the terminal last reported having focus, assumed `true` at launch —
+    /// focus reporting only ever announces a *change*, so a session that never once
+    /// loses focus (the ordinary case: you start an edit and watch it run) would
+    /// otherwise never receive a single event and stay stuck on whatever this started
+    /// as. `main`'s `FocusGained`/`FocusLost` events keep it current from there.
+    terminal_focused: bool,
     /// State for an in-flight "process all staged files" batch
     /// (`Dialog::BatchProcessing`/`ConfirmCancel`) — the sole edit-processing path;
     /// even a single staged file goes through a one-item batch, so `App` no longer
@@ -1202,6 +1208,7 @@ impl App {
             transcode_tx,
             remux_tx,
             completion_notification_tx: None,
+            terminal_focused: true,
             active_batch: None,
             pending_reset: None,
             reset_choice: ResetChoice::default(),
@@ -1237,6 +1244,12 @@ impl App {
 
     pub fn set_completion_notification_sender(&mut self, sender: Option<Sender<PathBuf>>) {
         self.completion_notification_tx = sender;
+    }
+
+    /// Records the terminal's last reported focus state, driven by `main`'s
+    /// `FocusGained`/`FocusLost` events.
+    pub fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_focused = focused;
     }
 
     /// Returns whether any snapshot was applied, so the main loop can skip redrawing
@@ -1965,7 +1978,9 @@ impl App {
                         ..
                     } => {
                         self.unstage_consumed_file(&path);
-                        if let Some(sender) = &self.completion_notification_tx {
+                        if !self.terminal_focused
+                            && let Some(sender) = &self.completion_notification_tx
+                        {
                             let _ = sender.send(output.clone());
                         }
                         output_path = Some(output);
@@ -11838,6 +11853,9 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let (notification_tx, notification_rx) = std::sync::mpsc::channel();
         app.set_completion_notification_sender(Some(notification_tx));
+        // A completion notification only makes sense while the terminal is not the
+        // focused window; this test is about routing and summarizing, not that gate.
+        app.set_terminal_focused(false);
         app.dialog = Some(Dialog::BatchProcessing);
         app.active_batch = Some(crate::staging::BatchState {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -11944,6 +11962,97 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty),
             "failed files must not produce completion notifications"
         );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Builds a one-item batch already `Running` and a channel primed with the single
+    /// `EditEvent::Finished` that completes it, ready for `receive_edit_results`.
+    /// Shared by the two focus-gating tests below so each is just its
+    /// `set_terminal_focused` call and its assertion on the notification channel.
+    fn app_with_a_finished_batch_of_one() -> (
+        App,
+        std::sync::mpsc::Receiver<EditEvent>,
+        std::sync::mpsc::Receiver<std::path::PathBuf>,
+        std::path::PathBuf,
+    ) {
+        let mut app = test_file_app(&["a.mkv"]);
+        let directory = app.directory.clone();
+        let path = app.files[0].path.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+        app.set_completion_notification_sender(Some(notification_tx));
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: path.clone(),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+        result_tx
+            .send(EditEvent::Finished {
+                path,
+                outcome: EditOutcome::Completed {
+                    output_path: directory.join("a.mp4"),
+                    media_changed: true,
+                },
+            })
+            .unwrap();
+        (app, result_rx, notification_rx, directory)
+    }
+
+    #[test]
+    fn a_completed_edit_should_suppress_its_notification_when_focus_was_never_reported() {
+        // Regression: focus reporting only ever announces a *change*. A session that
+        // starts an edit and just watches it run — never once switching away — gets no
+        // `FocusGained`/`FocusLost` event at all, and previously left `terminal_focused`
+        // stuck on a "never told otherwise, so notify" default. That defeated the
+        // feature in what is normally the common case.
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(
+            notification_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "launch is assumed focused; with no focus event at all, it must stay assumed"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_completed_edit_should_suppress_its_notification_while_the_terminal_is_focused() {
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+        app.set_terminal_focused(true);
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(
+            notification_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "a focused terminal already shows the result; it must not also notify"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_completed_edit_should_notify_once_the_terminal_reports_losing_focus() {
+        let (mut app, result_rx, notification_rx, directory) = app_with_a_finished_batch_of_one();
+        // Focus can flip back and forth before the edit finishes; only the last report
+        // should matter, not whether the terminal was ever focused at all.
+        app.set_terminal_focused(true);
+        app.set_terminal_focused(false);
+
+        app.receive_edit_results(&result_rx);
+
+        assert_eq!(notification_rx.try_recv(), Ok(directory.join("a.mp4")));
 
         std::fs::remove_dir_all(directory).unwrap();
     }

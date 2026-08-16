@@ -586,6 +586,10 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
     let (notification_tx, notification_rx) = std::sync::mpsc::channel();
     app.app
         .set_completion_notification_sender(Some(notification_tx));
+    // This scenario is about notifications firing at all, not the separate
+    // focus-gating behavior covered by its own scenario — a fresh app starts assumed
+    // focused, which would otherwise suppress every notification checked below.
+    app.app.set_terminal_focused(false);
     for name in ["alpha.mkv", "bravo.mkv"] {
         app.open(name);
         let second_audio = app
@@ -655,6 +659,66 @@ fn processing_all_should_save_multiple_staged_files_without_touching_unstaged_me
         notified,
         ["alpha.mkv", "bravo.mkv"],
         "each successfully processed file should emit one completion notification"
+    );
+}
+
+/// A completion notification is meant to tell you about a file the terminal isn't
+/// currently showing — while it's the focused window, the result is already on
+/// screen. `App::set_terminal_focused` drives this from `main`'s
+/// `FocusGained`/`FocusLost` events; this scenario proves the real save path honors
+/// the flag both ways, not just the gate's unit-level logic in isolation.
+#[test]
+fn a_focused_terminal_should_not_receive_the_completion_notification_an_unfocused_one_would() {
+    let test =
+        "a_focused_terminal_should_not_receive_the_completion_notification_an_unfocused_one_would";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("notification-focus-gating");
+    for name in ["focused.mkv", "unfocused.mkv"] {
+        write_media(
+            &scratch.join(name),
+            &MediaSpec::mkv().audio(&["eng", "nld"]),
+        );
+    }
+
+    let mut app = Harness::start(scratch);
+    let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+    app.app
+        .set_completion_notification_sender(Some(notification_tx));
+
+    for (name, focused) in [("focused.mkv", true), ("unfocused.mkv", false)] {
+        app.app.set_terminal_focused(focused);
+        app.open(name);
+        let second_audio = app
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| *track == TrackRef::Embedded(2))
+            .expect("the second audio should have a track row");
+        app.select_track_row(second_audio);
+        app.press(key(KeyCode::Char('d')));
+        app.press(key(KeyCode::Esc));
+        assert_eq!(app.app.layer, Layer::Files);
+
+        app.process_all();
+        app.assert_batch_succeeded();
+        // A one-file batch reopens that file's Streams view on completion; the next
+        // iteration's `open` needs the file list to select from.
+        if app.app.layer != Layer::Files {
+            app.press(key(KeyCode::Esc));
+            assert_eq!(app.app.layer, Layer::Files);
+        }
+    }
+
+    let notified = notification_rx
+        .try_iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notified,
+        ["unfocused.mkv"],
+        "focused.mkv finished while the terminal was focused and must stay silent; \
+         unfocused.mkv finished after focus was reported lost and must notify"
     );
 }
 
