@@ -1610,100 +1610,98 @@ impl App {
 
     pub fn select_next(&mut self) {
         self.notice = None;
-        if self.layer == Layer::Streams {
-            if self.move_within_subtitle_column(1, 1, false) {
-                return;
+        match self.layer {
+            Layer::Files => {
+                let result_count = self.file_panel_entries().len();
+                if result_count == 0 {
+                    return;
+                }
+                let next = self
+                    .list_state
+                    .selected()
+                    .map(|index| (index + 1).min(result_count - 1))
+                    .unwrap_or(0);
+                self.select(next);
             }
-            let count = self.stream_count();
-            if count > 0 {
-                self.selected_stream = (self.selected_stream + 1).min(count - 1);
+            Layer::Streams => {
+                if self.move_within_subtitle_column(1, 1, false) {
+                    return;
+                }
+                let count = self.stream_count();
+                if count > 0 {
+                    self.selected_stream = (self.selected_stream + 1).min(count - 1);
+                }
             }
-            return;
+            Layer::StreamDetails => self.scroll_details_down(1),
         }
-        if self.layer == Layer::StreamDetails {
-            self.scroll_details_down(1);
-            return;
-        }
-        let result_count = self.file_panel_entries().len();
-        if result_count == 0 {
-            return;
-        }
-        let next = self
-            .list_state
-            .selected()
-            .map(|index| (index + 1).min(result_count - 1))
-            .unwrap_or(0);
-        self.select(next);
     }
 
     pub fn select_previous(&mut self) {
         self.notice = None;
-        if self.layer == Layer::Streams {
-            if self.move_within_subtitle_column(-1, 1, false) {
-                return;
+        match self.layer {
+            Layer::Files => {
+                let previous = self
+                    .list_state
+                    .selected()
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or(0);
+                self.select(previous);
             }
-            self.selected_stream = self.selected_stream.saturating_sub(1);
-            return;
+            Layer::Streams => {
+                if self.move_within_subtitle_column(-1, 1, false) {
+                    return;
+                }
+                self.selected_stream = self.selected_stream.saturating_sub(1);
+            }
+            Layer::StreamDetails => self.scroll_details_up(1),
         }
-        if self.layer == Layer::StreamDetails {
-            self.scroll_details_up(1);
-            return;
-        }
-        let previous = self
-            .list_state
-            .selected()
-            .map(|index| index.saturating_sub(1))
-            .unwrap_or(0);
-        self.select(previous);
     }
 
     pub fn select_first(&mut self) {
         self.notice = None;
-        if self.layer == Layer::StreamDetails {
-            self.details_scroll = 0;
-            return;
-        }
-        if self.layer == Layer::Streams {
-            self.selected_stream = 0;
-            return;
-        }
-        if !self.file_panel_entries().is_empty() {
-            self.select(0);
+        match self.layer {
+            Layer::Files => {
+                if !self.file_panel_entries().is_empty() {
+                    self.select(0);
+                }
+            }
+            Layer::Streams => self.selected_stream = 0,
+            Layer::StreamDetails => self.details_scroll = 0,
         }
     }
 
     pub fn select_last(&mut self) {
         self.notice = None;
-        if self.layer == Layer::StreamDetails {
-            self.details_scroll = self.details_max_scroll;
-            return;
-        }
-        if self.layer == Layer::Streams {
-            if self.subtitle_columns_side_by_side {
-                let rows = self.track_rows();
-                let column = match self.selected_track() {
-                    Some(TrackRef::Embedded(index))
-                        if self
-                            .media_info()
-                            .and_then(|info| stream_by_index(info, index))
-                            .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
-                    {
-                        self.embedded_subtitle_positions(&rows)
-                    }
-                    Some(TrackRef::Sidecar(_)) => self.sidecar_positions(&rows),
-                    _ => self.embedded_subtitle_positions(&rows),
-                };
-                if let Some(last) = column.last() {
-                    self.selected_stream = *last;
-                    return;
+        match self.layer {
+            Layer::Files => {
+                let result_count = self.file_panel_entries().len();
+                if result_count > 0 {
+                    self.select(result_count - 1);
                 }
             }
-            self.selected_stream = self.stream_count().saturating_sub(1);
-            return;
-        }
-        let result_count = self.file_panel_entries().len();
-        if result_count > 0 {
-            self.select(result_count - 1);
+            Layer::Streams => {
+                if self.subtitle_columns_side_by_side {
+                    let rows = self.track_rows();
+                    let column = match self.selected_track() {
+                        Some(TrackRef::Embedded(index))
+                            if self
+                                .media_info()
+                                .and_then(|info| stream_by_index(info, index))
+                                .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+                        {
+                            self.embedded_subtitle_positions(&rows)
+                        }
+                        Some(TrackRef::Sidecar(_)) => self.sidecar_positions(&rows),
+                        _ => self.embedded_subtitle_positions(&rows),
+                    };
+                    if let Some(last) = column.last() {
+                        self.selected_stream = *last;
+                        return;
+                    }
+                }
+                self.selected_stream = self.stream_count().saturating_sub(1);
+            }
+            Layer::StreamDetails => self.details_scroll = self.details_max_scroll,
         }
     }
 
