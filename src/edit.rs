@@ -4401,7 +4401,7 @@ fn video_disposition(
     }
 }
 
-fn media_duration(info: &MediaInfo) -> Option<f64> {
+pub(crate) fn media_duration(info: &MediaInfo) -> Option<f64> {
     info.format
         .get("duration")
         .and_then(|value| match value {

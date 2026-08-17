@@ -896,11 +896,18 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.reset_focused_field();
         }
+        // Named layers rather than "anything but Files": on the subtitle timing page
+        // this would otherwise discard the open file's staged edits, which is both
+        // destructive and completely unrelated to what that page does.
         (KeyCode::Char('R'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-            if app.layer != Layer::Files =>
+            if matches!(app.layer, Layer::Streams | Layer::StreamDetails) =>
         {
             input.reset_sequence();
             app.request_reset_current_file();
+        }
+        (KeyCode::Char('c'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
+            input.reset_sequence();
+            app.open_subtitle_sync();
         }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
@@ -3245,6 +3252,123 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('z')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
         assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file on disk with one SubRip track, sitting in the Streams layer — the exact
+    /// state `c` is pressed from.
+    fn subtitle_track_app() -> (App, PathBuf) {
+        let (mut app, directory) = test_app();
+        fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        app.files = vec![FileEntry {
+            path: directory.join("movie.mkv"),
+            display_name: "movie.mkv".to_string(),
+            fingerprint: FileFingerprint {
+                length: 5,
+                modified: None,
+            },
+        }];
+        app.list_state.select(Some(0));
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, crate::app::TrackRef::Embedded(1)))
+            .unwrap();
+        (app, directory)
+    }
+
+    #[test]
+    fn c_should_open_the_subtitle_sync_page_from_the_streams_layer() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.subtitle_sync.is_some()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `R` discards the open file's staged edits. It used to be bound to "any layer that
+    /// is not Files", which would have made it fire on the timing page — a destructive
+    /// action with nothing to do with previewing subtitles.
+    #[test]
+    fn reset_current_file_should_not_be_reachable_from_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
+
+        // Assert: no reset dialog, and the page is still up.
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn c_should_be_inert_outside_the_streams_layer() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        app.layer = Layer::Files;
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Esc leaves the page through the ordinary back-key path rather than a binding of
+    /// its own, so it has to land on Streams and not fall through to quitting.
+    #[test]
+    fn escape_should_leave_the_subtitle_sync_page_for_the_streams_layer() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+
+        // Act
+        let outcome = handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert
+        assert_that!(outcome).is_equal_to(InputOutcome::Continue);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
 
         // Cleanup
         drop(app);

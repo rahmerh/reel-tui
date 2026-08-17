@@ -16,4 +16,5 @@ pub mod probe;
 pub mod requirements;
 pub mod staging;
 pub mod subtitle;
+pub mod sync;
 pub mod ui;

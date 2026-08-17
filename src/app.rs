@@ -36,6 +36,7 @@ use crate::{
         stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
         stream_original, stream_title,
     },
+    sync::{PreviewWorkspace, SubtitleSyncState},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -44,6 +45,10 @@ pub enum Layer {
     Files,
     Streams,
     StreamDetails,
+    /// The subtitle timing page: a full-screen view of one track's cues, opened with
+    /// `c` from [`Layer::Streams`]. Unlike the others this replaces the whole frame
+    /// rather than drawing over the file list.
+    SubtitleSync,
 }
 
 /// Which characters a text field accepts. An enum rather than a `fn(char) -> bool`
@@ -1058,6 +1063,13 @@ pub struct App {
     pub left_subtitle_order: Vec<TrackRef>,
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
+    /// The open subtitle timing page, if any. An `Option` rather than loose fields so
+    /// that dropping it — on `back`, on a file change, on quit — is what releases the
+    /// page's scratch directory, instead of every exit path having to remember to.
+    pub subtitle_sync: Option<SubtitleSyncState>,
+    /// Bumped for each page opening, so a worker result that arrives after the user has
+    /// moved on can be recognised as stale and dropped.
+    sync_generation: u64,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1195,6 +1207,8 @@ impl App {
             left_subtitle_order: Vec::new(),
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
+            subtitle_sync: None,
+            sync_generation: 0,
             container_target: None,
             container_metadata: None,
             container_settings_popup: None,
@@ -1633,6 +1647,7 @@ impl App {
                 }
             }
             Layer::StreamDetails => self.scroll_details_down(1),
+            Layer::SubtitleSync => self.move_sync_cue(1),
         }
     }
 
@@ -1654,6 +1669,7 @@ impl App {
                 self.selected_stream = self.selected_stream.saturating_sub(1);
             }
             Layer::StreamDetails => self.scroll_details_up(1),
+            Layer::SubtitleSync => self.move_sync_cue(-1),
         }
     }
 
@@ -1667,6 +1683,11 @@ impl App {
             }
             Layer::Streams => self.selected_stream = 0,
             Layer::StreamDetails => self.details_scroll = 0,
+            Layer::SubtitleSync => {
+                if let Some(state) = self.subtitle_sync.as_mut() {
+                    state.select_first();
+                }
+            }
         }
     }
 
@@ -1702,6 +1723,11 @@ impl App {
                 self.selected_stream = self.stream_count().saturating_sub(1);
             }
             Layer::StreamDetails => self.details_scroll = self.details_max_scroll,
+            Layer::SubtitleSync => {
+                if let Some(state) = self.subtitle_sync.as_mut() {
+                    state.select_last();
+                }
+            }
         }
     }
 
@@ -1733,6 +1759,10 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         self.details_scroll = 0;
         self.details_max_scroll = 0;
+        // The timing page belongs to one track of one file, so anything that changes
+        // which file is open has to close it — otherwise it would keep showing cues for
+        // a file the user has already navigated away from.
+        self.close_subtitle_sync();
         self.layer = Layer::Files;
         self.selected_stream = 0;
         self.outcome = None;
@@ -2166,6 +2196,96 @@ impl App {
         }
     }
 
+    /// Opens the subtitle timing page for the selected track.
+    ///
+    /// Only SubRip opens for now. Everything else — the other text formats as much as
+    /// the bitmap ones — is turned away by the same guard, since nothing here converts:
+    /// the page reads the track exactly as it is stored.
+    pub fn open_subtitle_sync(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        let Some(source) = self.selected_subtitle_source() else {
+            self.notice = Some("Select a subtitle track to preview its timing.".to_string());
+            return;
+        };
+        if let SubtitleSource::Embedded(index) = source
+            && self.deleted_streams.contains(&index)
+        {
+            self.notice =
+                Some("Unmark this subtitle track for deletion before previewing it.".to_string());
+            return;
+        }
+        let format = self.subtitle_source_format(&source);
+        if format != Some(SubtitleFormat::SubRip) {
+            let subject = format.map_or("This subtitle format", SubtitleFormat::overview_label);
+            self.notice = Some(format!(
+                "{subject} subtitle previewing is not implemented yet. Only SRT is supported."
+            ));
+            return;
+        }
+        let Some(media) = self.selected_file().map(|file| file.path.clone()) else {
+            return;
+        };
+        let workspace = match PreviewWorkspace::new() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.notice = Some(format!("Could not prepare a preview workspace: {error}"));
+                return;
+            }
+        };
+        // A missing or unparseable duration leaves this zero, which the timeline window
+        // widens back out to fit the cues it is given rather than collapsing.
+        let duration = self
+            .media_info()
+            .and_then(crate::edit::media_duration)
+            .map(Duration::from_secs_f64)
+            .unwrap_or_default();
+
+        self.notice = None;
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.subtitle_sync = Some(SubtitleSyncState::new(
+            self.sync_generation,
+            media,
+            source,
+            duration,
+            workspace,
+        ));
+        self.layer = Layer::SubtitleSync;
+    }
+
+    /// Closes the timing page, releasing its scratch directory and abandoning any
+    /// worker result still in flight for it.
+    ///
+    /// The single place `subtitle_sync` is cleared, so there is one answer to "what
+    /// happens to the workspace" rather than one per exit path.
+    fn close_subtitle_sync(&mut self) {
+        if self.subtitle_sync.take().is_some() {
+            self.sync_generation = self.sync_generation.wrapping_add(1);
+        }
+    }
+
+    /// The subtitle track under the cursor, if the cursor is on one at all.
+    fn selected_subtitle_source(&self) -> Option<SubtitleSource> {
+        match self.selected_track()? {
+            TrackRef::Embedded(index) => self
+                .selected_stream_info()
+                .is_some_and(|stream| stream_kind(stream) == Some("subtitle"))
+                .then_some(SubtitleSource::Embedded(index)),
+            TrackRef::Sidecar(index) => self
+                .sidecars
+                .get(index)
+                .map(|sidecar| SubtitleSource::Sidecar(sidecar.path.clone())),
+            TrackRef::Container => None,
+        }
+    }
+
+    fn move_sync_cue(&mut self, delta: isize) {
+        if let Some(state) = self.subtitle_sync.as_mut() {
+            state.select(delta);
+        }
+    }
+
     pub fn back(&mut self) -> bool {
         match self.layer {
             Layer::StreamDetails => {
@@ -2176,6 +2296,11 @@ impl App {
             }
             Layer::Streams => {
                 self.layer = Layer::Files;
+                true
+            }
+            Layer::SubtitleSync => {
+                self.close_subtitle_sync();
+                self.layer = Layer::Streams;
                 true
             }
             Layer::Files => false,
@@ -6191,7 +6316,12 @@ impl App {
     /// stops*, since the frame that shows the finished state (a settled gauge, an
     /// armed button) is by definition the first frame where this is false.
     pub fn is_animating(&self) -> bool {
-        matches!(self.dialog, Some(Dialog::BatchProcessing)) || self.conflict_countdown().is_some()
+        matches!(self.dialog, Some(Dialog::BatchProcessing))
+            || self.conflict_countdown().is_some()
+            || self
+                .subtitle_sync
+                .as_ref()
+                .is_some_and(SubtitleSyncState::is_busy)
     }
 
     pub fn scroll_conflicts(&mut self, direction: isize) {
@@ -6544,6 +6674,7 @@ impl App {
                 }
             }
             Layer::StreamDetails => self.scroll_details_down(10),
+            Layer::SubtitleSync => self.move_sync_cue(10),
         }
     }
 
@@ -6563,6 +6694,7 @@ impl App {
                 self.selected_stream = self.selected_stream.saturating_sub(10);
             }
             Layer::StreamDetails => self.scroll_details_up(10),
+            Layer::SubtitleSync => self.move_sync_cue(-10),
         }
     }
 
@@ -18674,6 +18806,367 @@ mod tests {
         assert_that!(app.container_settings_popup.as_ref().unwrap().help_visible)
             .is_equal_to(!before);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Puts the track cursor on an embedded stream by its container index, rather than
+    /// hard-coding a row number that `track_rows`' ordering could shift underneath.
+    fn select_embedded_row(app: &mut App, index: u64) {
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(index))
+            .expect("stream should have a track row");
+    }
+
+    fn app_with_subtitle_codec(codec: &str) -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": codec},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_open_the_page_for_an_embedded_subrip_track() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        let state = app.subtitle_sync.as_ref().expect("page should be open");
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
+        assert_that!(state.status.clone()).is_equal_to(crate::sync::SyncStatus::Preparing);
+        assert_that!(state.workspace().exists()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_open_the_page_for_a_subrip_sidecar() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let sidecar = test_sidecar(&app, "movie.en.srt", "eng");
+        let path = sidecar.path.clone();
+        app.sidecars.push(sidecar);
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| matches!(row, TrackRef::Sidecar(_)))
+            .expect("sidecar should have a track row");
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.subtitle_sync.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Sidecar(path));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Nothing on this page converts — it reads the track exactly as stored — so every
+    /// non-SubRip format is turned away by one guard, naming itself so the message is
+    /// about the track the user actually picked.
+    #[test]
+    fn open_subtitle_sync_should_refuse_every_format_other_than_subrip() {
+        for (codec, expected) in [
+            ("ass", "ASS"),
+            ("webvtt", "VTT"),
+            ("mov_text", "MOVTXT"),
+            ("hdmv_pgs_subtitle", "PGS"),
+            ("dvd_subtitle", "VobSub"),
+            ("nonsense_codec", "This subtitle format"),
+        ] {
+            // Arrange
+            let mut app = app_with_subtitle_codec(codec);
+            let directory = app.directory.clone();
+
+            // Act
+            app.open_subtitle_sync();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_sync.is_none()).is_true();
+            let notice = app.notice.clone().expect("a refusal should say why");
+            assert_that!(notice.contains(expected)).is_true();
+            assert_that!(notice.contains("not implemented yet")).is_true();
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_refuse_a_track_that_is_not_a_subtitle() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        select_embedded_row(&mut app, 1);
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(
+            app.notice
+                .clone()
+                .unwrap()
+                .contains("Select a subtitle track")
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_refuse_the_container_row() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| *row == TrackRef::Container)
+            .expect("container should have a track row");
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(
+            app.notice
+                .clone()
+                .unwrap()
+                .contains("Select a subtitle track")
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_refuse_a_track_marked_for_deletion() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().contains("deletion")).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_sync_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act / Assert: wrong layer.
+        app.layer = Layer::Files;
+        app.open_subtitle_sync();
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Act / Assert: right layer, but a dialog owns the keyboard.
+        app.layer = Layer::Streams;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_subtitle_sync();
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The scratch directory lives exactly as long as the page. Leaving it behind would
+    /// accumulate a copy of every previewed subtitle for the session's life.
+    #[test]
+    fn back_should_leave_the_sync_page_and_delete_its_workspace() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        let workspace = app
+            .subtitle_sync
+            .as_ref()
+            .unwrap()
+            .workspace()
+            .to_path_buf();
+        assert_that!(workspace.exists()).is_true();
+
+        // Act
+        let handled = app.back();
+
+        // Assert
+        assert_that!(handled).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(workspace.exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page shows one track of one file. Selecting a different file has to close it,
+    /// or it keeps showing cues belonging to a file that is no longer open.
+    #[test]
+    fn selecting_another_file_should_close_the_sync_page() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app.open_subtitle_sync();
+        let workspace = app
+            .subtitle_sync
+            .as_ref()
+            .unwrap()
+            .workspace()
+            .to_path_buf();
+
+        // Act
+        app.layer = Layer::Files;
+        app.select_next();
+
+        // Assert
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(workspace.exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `j`/`k` reach `App` with no layer guard of their own, so without an arm of its
+    /// own the timing page would silently scroll the file list behind it instead.
+    #[test]
+    fn select_next_should_move_the_cue_cursor_rather_than_the_file_list_on_the_sync_page() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app.open_subtitle_sync();
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(vec![
+            crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "one".into(),
+            },
+            crate::cue::Cue {
+                index: 1,
+                start: Duration::from_secs(3),
+                end: Duration::from_secs(4),
+                text: "two".into(),
+            },
+        ]);
+        let file_before = app.list_state.selected();
+
+        // Act
+        app.select_next();
+
+        // Assert
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.list_state.selected()).is_equal_to(file_before);
+
+        // Act / Assert: and back up again.
+        app.select_previous();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.list_state.selected()).is_equal_to(file_before);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn paging_and_jumping_should_move_the_cue_cursor_on_the_sync_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        let cues = (0..30)
+            .map(|index| crate::cue::Cue {
+                index,
+                start: Duration::from_secs(index as u64),
+                end: Duration::from_secs(index as u64 + 1),
+                text: format!("line {index}"),
+            })
+            .collect();
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(cues);
+
+        // Act / Assert
+        app.scroll_down();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(10);
+        app.scroll_up();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        app.select_last();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(29);
+        app.select_first();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page draws a loader while its cues are being read, and `main` only repaints
+    /// while something reports itself as animating.
+    #[test]
+    fn is_animating_should_hold_while_the_sync_page_is_preparing() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act / Assert
+        assert_that!(app.is_animating()).is_false();
+        app.open_subtitle_sync();
+        assert_that!(app.is_animating()).is_true();
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new());
+        assert_that!(app.is_animating()).is_false();
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

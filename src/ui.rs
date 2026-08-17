@@ -20,6 +20,7 @@ use crate::{
         SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
         TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
+    cue::{Cue, LaneLayout, TimelineWindow, format_timestamp},
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
@@ -28,6 +29,7 @@ use crate::{
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
+    sync::{SubtitleSyncState, SyncStatus},
 };
 
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
@@ -73,6 +75,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The one view that replaces the whole frame rather than drawing over the file list.
+    if app.layer == Layer::SubtitleSync {
+        render_subtitle_sync(frame, app, area);
+        if let Some(dialog) = app.dialog {
+            dim_backdrop(frame);
+            render_dialog(frame, app, dialog);
+        }
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -93,6 +105,257 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         dim_backdrop(frame);
         render_dialog(frame, app, dialog);
     }
+}
+
+/// Draws the subtitle timing page over the entire frame.
+///
+/// Only the cue list is built out so far; the timeline track and the video preview take
+/// the space below and above it once they exist.
+/// Two rows per cue in the list: its timing, then its text.
+const SYNC_CUE_ROWS: u16 = 2;
+
+/// Columns the cue panel needs to show "▸ 00:00:05.0 → 00:00:07.0" plus its borders.
+/// Its content is fixed-format, so it gets a floor rather than a share of the width.
+const SYNC_CUE_PANEL_WIDTH: u16 = 28;
+
+/// Draws the subtitle timing page over the entire frame.
+///
+/// Three panes: the frame at the selected cue on the left, the cue list on the right, and
+/// the timeline track across the bottom. The track's height follows the lane count, so a
+/// track whose cues never overlap spends one row on it and gives the rest to the preview.
+fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(state) = app.subtitle_sync.as_mut() else {
+        return;
+    };
+
+    let message = match &state.status {
+        SyncStatus::Preparing => Some(("Reading cues…".to_string(), Color::Gray)),
+        SyncStatus::Empty => Some((
+            "This subtitle track has no cues.".to_string(),
+            Color::Yellow,
+        )),
+        SyncStatus::Failed(message) => Some((message.clone(), Color::Red)),
+        SyncStatus::Ready => None,
+    };
+    if let Some((message, color)) = message {
+        let block = Block::bordered().title(" Subtitle timing ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .centered()
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(color)),
+            inner,
+        );
+        return;
+    }
+
+    // No minimum-size guard here: `render` already refuses anything under 50x10, and the
+    // deepest possible track (four lanes) needs only nine rows, so there is no reachable
+    // size this layout cannot draw. The cue panel's width is clamped rather than
+    // proportional so its fixed-format timestamps survive the narrowest of them.
+    let track_height = state.layout.lane_count as u16 + 2;
+    let cue_width = (area.width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48);
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(track_height)]).split(area);
+    let columns =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
+
+    render_sync_preview(frame, state, columns[0]);
+    render_sync_cues(frame, state, columns[1]);
+    render_sync_timeline(frame, state, rows[1]);
+}
+
+/// The frame at the selected cue.
+///
+/// Until the frame worker exists this shows the cue's text instead — which is also the
+/// path taken when the terminal has no image protocol or FFmpeg was built without libass,
+/// so it is not throwaway scaffolding.
+fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
+    let block = Block::bordered().title(" Preview ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Recorded for the frame worker, which has to scale to a pane only the renderer has
+    // measured.
+    state.preview_cells = (inner.width, inner.height);
+
+    let text = state
+        .selected_cue()
+        .map(|cue| cue.text.clone())
+        .unwrap_or_default();
+    // Vertically centred the way a burned-in subtitle sits low in frame, so the text does
+    // not jump when the real image arrives behind it.
+    let padding = usize::from(inner.height).saturating_sub(1) / 2;
+    let mut lines = vec![Line::from(""); padding];
+    lines.extend(text.lines().map(|line| {
+        Line::styled(
+            line.to_string(),
+            Style::default().fg(Color::White).bold().bg(Color::Black),
+        )
+    }));
+    frame.render_widget(
+        Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
+    let block = Block::bordered().title(" Cues ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    state.sync_scroll((inner.height / SYNC_CUE_ROWS) as usize);
+    let width = usize::from(inner.width);
+    let rows: Vec<ListItem> = state
+        .cues
+        .iter()
+        .enumerate()
+        .skip(state.list_scroll)
+        .take(state.list_rows)
+        .map(|(position, cue)| {
+            // Keyed on the row's position, not on `Cue::index`. The index is assigned by
+            // whoever produced the cues and nothing downstream re-derives it, so trusting
+            // it here would put the cursor on the wrong row for any list that did not
+            // number itself the way the parser happens to.
+            let selected = position == state.selected;
+            let timing = format!(
+                "{}{} → {}",
+                if selected { "▸ " } else { "  " },
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            );
+            let (timing_style, text_style) = if selected {
+                (
+                    Style::default().fg(Color::Cyan).bold(),
+                    Style::default().fg(Color::White),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
+                )
+            };
+            // Multi-line cues collapse onto one row with a separator rather than
+            // stealing a second row from the cue below them.
+            // `truncate_end`, not `truncate`: a cue is read from its start, so the
+            // opening words are what identify it. The tail-preserving variant exists for
+            // paths, where the filename is the part that matters.
+            let text = truncate_end(
+                &cue.text.replace('\n', " / "),
+                width.saturating_sub(2).max(1),
+            );
+            ListItem::new(vec![
+                Line::styled(timing, timing_style),
+                Line::styled(format!("  {text}"), text_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(List::new(rows), inner);
+}
+
+fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect) {
+    let block = Block::bordered().title(" Timeline ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(cue) = state.selected_cue() else {
+        return;
+    };
+    let window = TimelineWindow::centered(cue, state.duration, inner.width);
+    let lines = timeline_lines(&state.cues, &state.layout, &window, state.selected);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Lays every cue out across the track, one line per lane.
+///
+/// A pure function over the cue list rather than something that draws as it goes, so the
+/// column arithmetic that decides whether a cue is visible at all can be asserted directly.
+fn timeline_lines(
+    cues: &[Cue],
+    layout: &LaneLayout,
+    window: &TimelineWindow,
+    selected: usize,
+) -> Vec<Line<'static>> {
+    let width = window.width as usize;
+    // `pack_lanes` already guarantees at least one lane, including for an empty track, so
+    // there is nothing to clamp here.
+    let lanes = layout.lane_count;
+    let mut grid = vec![vec![(' ', Style::default()); width]; lanes];
+
+    // The selected cue is painted last so that it stays visible where a crowded lane has
+    // stacked another cue on top of it.
+    let order = (0..cues.len())
+        .filter(|index| *index != selected)
+        .chain(std::iter::once(selected));
+    for index in order {
+        let Some(cue) = cues.get(index) else {
+            continue;
+        };
+        let Some((first, last)) = window.span(cue) else {
+            continue;
+        };
+        let lane = layout
+            .lanes
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .min(lanes.saturating_sub(1));
+        let style = if index == selected {
+            Style::default().fg(Color::Cyan).bold()
+        } else if layout.overflowed.get(index).copied().unwrap_or(false) {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        // Indexed rather than bounds-checked: `span` clamps both ends inside the window
+        // and `cue_glyphs` returns exactly the columns it was asked for, so the last
+        // glyph lands on `last`, which is at most `width - 1`. A guard here would be a
+        // branch nothing can take.
+        let span_width = usize::from(last - first) + 1;
+        for (offset, glyph) in cue_glyphs(span_width).chars().enumerate() {
+            grid[lane][usize::from(first) + offset] = (glyph, style);
+        }
+    }
+
+    grid.into_iter()
+        .map(|lane| Line::from(runs(lane)))
+        .collect()
+}
+
+/// The bracketed span a cue of `width` columns is drawn as.
+///
+/// Narrow cues degrade rather than disappear: the brackets are dropped before the body is,
+/// so even a cue occupying a single column still marks that column.
+fn cue_glyphs(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "|".to_string(),
+        2 => "||".to_string(),
+        3 => "|─|".to_string(),
+        4 => "|<>|".to_string(),
+        _ => format!("|<{}>|", "─".repeat(width - 4)),
+    }
+}
+
+/// Collapses a painted row into one span per run of identical styling.
+fn runs(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let mut style: Option<Style> = None;
+    for (glyph, cell_style) in cells {
+        if style != Some(cell_style) && !text.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut text),
+                style.unwrap_or_default(),
+            ));
+        }
+        style = Some(cell_style);
+        text.push(glyph);
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style.unwrap_or_default()));
+    }
+    spans
 }
 
 fn dim_backdrop(frame: &mut Frame) {
@@ -321,7 +584,10 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn details_selected_stream(app: &App) -> Option<usize> {
-    (app.layer != Layer::Files && app.dialog.is_none()).then_some(app.selected_stream)
+    // Named layers rather than "anything but Files": the subtitle timing page replaces
+    // this pane entirely, so it has no track cursor to show here.
+    (matches!(app.layer, Layer::Streams | Layer::StreamDetails) && app.dialog.is_none())
+        .then_some(app.selected_stream)
 }
 
 fn subtitle_columns_fit(_content_width: u16, embedded: usize, external: usize) -> bool {
@@ -1613,6 +1879,7 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
+    keybinding(&mut lines, "c", "Preview subtitle timing (SRT tracks)");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
 
     keybindings_section(&mut lines, "Text input");
@@ -10239,7 +10506,9 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        assert_eq!(count, 2);
+        // "Move track down / up", "Mark or unmark track for deletion", and the SRT
+        // timing preview, which matches on "tracks".
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -11278,5 +11547,499 @@ mod tests {
         // Assert
         assert_eq!(action.style.fg, Some(Color::White));
         assert_eq!(action.style.bg, None);
+    }
+
+    #[test]
+    fn keybindings_text_should_list_the_subtitle_timing_key() {
+        // Act
+        let text = keybindings_text();
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Assert
+        assert_that!(rendered.contains("Preview subtitle timing")).is_true();
+    }
+
+    /// The timing page is the only view that owns the whole frame. If it merely drew on
+    /// top, the file list and details pane would still be underneath it.
+    #[test]
+    fn render_should_replace_the_whole_frame_with_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = test_app("sync-page", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        app.open_subtitle_sync();
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![crate::cue::Cue {
+                index: 0,
+                start: std::time::Duration::from_millis(62_300),
+                end: std::time::Duration::from_millis(64_000),
+                text: "Hello there".to_string(),
+            }]);
+
+        // Act
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert: all three panes are there, along with the cue, and the file panel the
+        // page replaced is not.
+        assert_that!(screen.contains("Preview")).is_true();
+        assert_that!(screen.contains("Cues")).is_true();
+        assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains("Hello there")).is_true();
+        assert_that!(screen.contains("00:01:02.3")).is_true();
+        assert_that!(screen.contains("movie.mkv")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_sync_page_should_report_progress_and_emptiness_without_pretending_to_have_cues() {
+        // Arrange
+        let (mut app, directory) = test_app("sync-states", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        app.open_subtitle_sync();
+
+        // Act / Assert: still reading.
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Reading cues")).is_true();
+
+        // Act / Assert: read, but the track holds nothing.
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new());
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("no cues")).is_true();
+
+        // Act / Assert: it went wrong, and says so.
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .fail("ffprobe said no".to_string());
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("ffprobe said no")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn sync_cue(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+        crate::cue::Cue {
+            index: 0,
+            start: std::time::Duration::from_millis(start),
+            end: std::time::Duration::from_millis(end),
+            text: text.to_string(),
+        }
+    }
+
+    /// An app sitting on the timing page with `cues` loaded, ready to render.
+    fn sync_page_app(tag: &str, cues: Vec<crate::cue::Cue>) -> (App, std::path::PathBuf) {
+        let (mut app, directory) = test_app(tag, &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        app.open_subtitle_sync();
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(cues);
+        (app, directory)
+    }
+
+    /// The track's height is the one part of the layout that is data-driven, so an
+    /// overlapping region has to cost the preview pane exactly the rows it gains.
+    #[test]
+    fn the_timeline_should_grow_a_row_per_lane_and_take_them_from_the_preview() {
+        // Arrange: one track whose cues never overlap, one where three do.
+        let (mut flat, flat_dir) = sync_page_app(
+            "sync-lanes-flat",
+            vec![sync_cue(0, 1000, "a"), sync_cue(2000, 3000, "b")],
+        );
+        let (mut stacked, stacked_dir) = sync_page_app(
+            "sync-lanes-stacked",
+            vec![
+                sync_cue(0, 5000, "a"),
+                sync_cue(1000, 6000, "b"),
+                sync_cue(2000, 7000, "c"),
+            ],
+        );
+
+        // Act
+        let flat_screen = drawn(80, 24, |frame| render(frame, &mut flat));
+        let stacked_screen = drawn(80, 24, |frame| render(frame, &mut stacked));
+
+        // Assert: one lane against three, so the preview pane loses two rows.
+        assert_that!(flat.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(1);
+        assert_that!(stacked.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(3);
+        let flat_preview = flat.subtitle_sync.as_ref().unwrap().preview_cells.1;
+        let stacked_preview = stacked.subtitle_sync.as_ref().unwrap().preview_cells.1;
+        assert_that!(flat_preview - stacked_preview).is_equal_to(2);
+        assert_that!(flat_screen.contains("Timeline")).is_true();
+        assert_that!(stacked_screen.contains("Timeline")).is_true();
+
+        // Cleanup
+        drop(flat);
+        drop(stacked);
+        std::fs::remove_dir_all(flat_dir).unwrap();
+        std::fs::remove_dir_all(stacked_dir).unwrap();
+    }
+
+    /// The frame worker scales to a pane only the renderer has measured. Without the
+    /// write-back it would be asked to produce a zero-sized image.
+    #[test]
+    fn rendering_should_report_the_measured_preview_size_back_to_the_page() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-measure", vec![sync_cue(0, 1000, "a")]);
+        assert_that!(app.subtitle_sync.as_ref().unwrap().preview_cells).is_equal_to((0, 0));
+
+        // Act
+        drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: 65% of 80 columns, less the pane's own borders.
+        let (width, height) = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        assert_that!(width).is_equal_to(50);
+        assert_that!(height).is_equal_to(19);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor has to be visible in both places at once — the list says which cue, the
+    /// track says where in the file it sits.
+    #[test]
+    fn the_selected_cue_should_be_marked_in_the_list_and_highlighted_in_the_track() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-selection",
+            vec![
+                sync_cue(1000, 3000, "first"),
+                sync_cue(5000, 7000, "second"),
+            ],
+        );
+        app.subtitle_sync.as_mut().unwrap().select(1);
+
+        // Act
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+        // Assert: exactly one row carries the marker, and it is the second cue's.
+        assert_that!(screen.matches('▸').count()).is_equal_to(1);
+        let marker = screen.find('▸').unwrap();
+        assert_that!(screen[marker..].starts_with("▸ 00:00:05.0")).is_true();
+
+        // Assert: and the track paints one cue cyan, the other not.
+        let cyan = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "<" && cell.style().fg == Some(Color::Cyan))
+            .count();
+        let dim = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "<" && cell.style().fg == Some(Color::DarkGray))
+            .count();
+        assert_that!(cyan).is_equal_to(1);
+        assert_that!(dim).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The deepest possible track is four lanes, which needs nine of the ten rows
+    /// `render` already guarantees — so there is no reachable size the page has to refuse,
+    /// and the smallest one still has to be legible rather than merely not crash.
+    #[test]
+    fn the_page_should_stay_usable_at_the_smallest_size_render_allows() {
+        // Arrange: four mutually overlapping cues, so the track claims six rows.
+        let (mut app, directory) = sync_page_app(
+            "sync-cramped",
+            vec![
+                sync_cue(0, 9000, "a"),
+                sync_cue(100, 9000, "bcdef"),
+                sync_cue(200, 9000, "c"),
+                sync_cue(300, 9000, "d"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(50, 10, |frame| render(frame, &mut app));
+
+        // Assert: every pane is still drawn, and the cue panel is wide enough that a
+        // timestamp survives whole rather than being truncated away.
+        assert_that!(app.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(4);
+        assert_that!(screen.contains("Preview")).is_true();
+        assert_that!(screen.contains("Cues")).is_true();
+        assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains("00:00:00.0 → 00:00:09.0")).is_true();
+        let (width, height) = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        assert_that!(width > 0 && height > 0).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// AGENTS.md forbids per-view keybinding hints; the global `?` popup is the only
+    /// place controls are documented. This keeps that from being undone by accident.
+    #[test]
+    fn the_sync_page_should_not_carry_inline_control_hints() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-no-hints", vec![sync_cue(0, 1000, "a")]);
+
+        // Act
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        for hint in ["j/k", "↑↓", "Enter", "Esc", " · "] {
+            assert_that!(screen.contains(hint)).is_false();
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cue_glyphs_should_shed_brackets_before_they_shed_the_cue() {
+        // Act / Assert
+        assert_that!(cue_glyphs(0).as_str()).is_equal_to("");
+        assert_that!(cue_glyphs(1).as_str()).is_equal_to("|");
+        assert_that!(cue_glyphs(2).as_str()).is_equal_to("||");
+        assert_that!(cue_glyphs(3).as_str()).is_equal_to("|─|");
+        assert_that!(cue_glyphs(4).as_str()).is_equal_to("|<>|");
+        assert_that!(cue_glyphs(5).as_str()).is_equal_to("|<─>|");
+        assert_that!(cue_glyphs(8).as_str()).is_equal_to("|<────>|");
+    }
+
+    fn timeline_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timeline_lines_should_put_overlapping_cues_on_their_own_rows() {
+        // Arrange
+        let cues = vec![sync_cue(0, 10_000, "a"), sync_cue(5000, 15_000, "b")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lines = timeline_lines(&cues, &layout, &window, 0);
+        let text = timeline_text(&lines);
+
+        // Assert
+        assert_that!(text.len()).is_equal_to(2);
+        // Both cues span 10 s of a 60 s window drawn 61 columns wide, so both are 11
+        // columns; the second starts five columns in.
+        let expected = cue_glyphs(11);
+        assert_that!(text[0].starts_with(&expected)).is_true();
+        assert_that!(text[1].starts_with(&format!("     {expected}"))).is_true();
+    }
+
+    /// A cue too brief to fill a column still has to mark the column it falls on, or the
+    /// view silently hides the very cues most likely to be mistimed.
+    #[test]
+    fn timeline_lines_should_keep_a_cue_shorter_than_one_column() {
+        // Arrange
+        let cues = vec![sync_cue(30_000, 30_100, "blink")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 60,
+        };
+
+        // Act
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0));
+
+        // Assert
+        assert_that!(text[0].contains('|')).is_true();
+        assert_that!(text[0].trim().chars().count()).is_equal_to(1);
+    }
+
+    #[test]
+    fn timeline_lines_should_skip_cues_outside_the_visible_window() {
+        // Arrange: the second cue sits an hour later, far outside a 60 s window.
+        let cues = vec![
+            sync_cue(1000, 3000, "here"),
+            sync_cue(3_600_000, 3_602_000, "later"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0));
+
+        // Assert: one cue drawn, and nothing wrapped around from the other.
+        assert_that!(text.len()).is_equal_to(1);
+        assert_that!(text[0].matches('|').count()).is_equal_to(2);
+    }
+
+    #[test]
+    fn timeline_lines_should_mark_a_crowded_cue_distinctly() {
+        // Arrange: five mutually overlapping cues against a cap of four.
+        let cues: Vec<_> = (0..5)
+            .map(|index| sync_cue(index * 100, 9000, "x"))
+            .collect();
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lines = timeline_lines(&cues, &layout, &window, 0);
+
+        // Assert: the overflowed cue is the only one painted magenta.
+        let magenta = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Magenta))
+            .count();
+        assert_that!(lines.len()).is_equal_to(4);
+        assert_that!(magenta > 0).is_true();
+
+        // Cleanup: none.
+    }
+
+    /// `Layer::SubtitleSync` and `subtitle_sync: Some(..)` are two pieces of state that
+    /// have to agree and nothing in the type system makes them. If they ever drift the
+    /// page must draw nothing rather than panic mid-frame.
+    #[test]
+    fn the_page_should_draw_nothing_when_the_layer_outlives_its_state() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-orphan", vec![sync_cue(0, 1000, "a")]);
+        app.subtitle_sync = None;
+        app.layer = Layer::SubtitleSync;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: an empty frame, and specifically not the file list showing through.
+        assert_that!(screen.trim().is_empty()).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `cues` and `selected` are public, so "ready but holding nothing" is reachable
+    /// state. The track has to skip itself rather than index past the end of the list.
+    #[test]
+    fn the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_underneath_it() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-emptied", vec![sync_cue(0, 1000, "a")]);
+        app.subtitle_sync.as_mut().unwrap().cues.clear();
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the panes are still framed, with no cue drawn inside them.
+        assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains('|')).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The selected index is walked unconditionally so it can be painted last, so a
+    /// selection pointing past the end of the list must be skipped rather than indexed.
+    #[test]
+    fn timeline_lines_should_skip_a_selection_that_is_not_in_the_cue_list() {
+        // Arrange
+        let layout = crate::cue::pack_lanes(&[], crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 20,
+        };
+
+        // Act: an empty track, with the cursor still sitting on cue zero.
+        let lines = timeline_lines(&[], &layout, &window, 0);
+
+        // Assert: one blank lane rather than an index panic.
+        assert_that!(lines.len()).is_equal_to(1);
+        assert_that!(timeline_text(&lines)[0].trim().is_empty()).is_true();
     }
 }
