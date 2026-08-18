@@ -13,6 +13,7 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
+use crate::preview::FrameSource;
 use crate::subtitle::SubtitleSource;
 
 /// How long the selection has to stop moving before a frame is asked for.
@@ -21,6 +22,29 @@ use crate::subtitle::SubtitleSource;
 /// with `j` held down would otherwise start an `ffmpeg` per repeat, each one an accurate
 /// seek that on a network mount reads from the preceding keyframe.
 pub const FRAME_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// How far the background pass has got in rendering the track's frames.
+///
+/// Its own enum rather than a pair of counters, because "not running" has three different
+/// meanings on this page and only one of them is worth a word on screen: a network mount
+/// is a decision the user did not make and would otherwise be left wondering about,
+/// whereas a build that cannot draw images at all already shows text previews everywhere.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmState {
+    /// No background pass, and nothing to say about it: the terminal draws no images, the
+    /// FFmpeg build cannot burn subtitles in, or the user turned prefetching off.
+    Off,
+    /// No background pass because the media is on a network mount, where rendering a
+    /// frame per cue means a thousand accurate seeks across the network. Said out loud on
+    /// the page, since the frames the user does land on still appear.
+    OffForNetwork,
+    /// `done` counts cues the pass has finished with, however it finished with them.
+    Working {
+        done: usize,
+        total: usize,
+    },
+    Done,
+}
 
 /// How far the page has got in loading a track's cues.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,12 +126,15 @@ pub struct SubtitleSyncState {
     /// Which page opening this is. Echoed by every worker message so results belonging
     /// to a page the user has already left can be dropped rather than applied.
     pub generation: u64,
-    /// The video frames are grabbed from — the container for an embedded track, or the
-    /// sidecar's companion media.
-    pub media: PathBuf,
+    /// Everything a frame grab needs about the media: the file itself — the container for
+    /// an embedded track, or the sidecar's companion media — how to tell it has changed,
+    /// and the size its frames are rendered at.
+    pub frames: FrameSource,
     pub source: SubtitleSource,
     pub duration: Duration,
     pub status: SyncStatus,
+    /// How far the background frame pass has got, or why there is not one.
+    pub warm: WarmState,
     pub cues: Vec<Cue>,
     pub layout: LaneLayout,
     pub selected: usize,
@@ -135,17 +162,18 @@ pub struct SubtitleSyncState {
 impl SubtitleSyncState {
     pub fn new(
         generation: u64,
-        media: PathBuf,
+        frames: FrameSource,
         source: SubtitleSource,
         duration: Duration,
         workspace: PreviewWorkspace,
     ) -> Self {
         Self {
             generation,
-            media,
+            frames,
             source,
             duration,
             status: SyncStatus::Preparing,
+            warm: WarmState::Off,
             cues: Vec::new(),
             layout: LaneLayout::default(),
             selected: 0,
@@ -161,6 +189,23 @@ impl SubtitleSyncState {
 
     pub fn workspace(&self) -> &Path {
         self.workspace.path()
+    }
+
+    pub fn media(&self) -> &Path {
+        &self.frames.media
+    }
+
+    /// Takes the background pass's latest count.
+    ///
+    /// `done == total` is "the pass is over", not "every cue was rendered" — a cue it
+    /// could not draw is finished with too. The status line only reports a count while
+    /// there is still one to report.
+    pub fn apply_warming(&mut self, done: usize, total: usize) {
+        self.warm = if done >= total {
+            WarmState::Done
+        } else {
+            WarmState::Working { done, total }
+        };
     }
 
     /// Takes the cues a worker parsed and makes the page ready.
@@ -183,6 +228,9 @@ impl SubtitleSyncState {
 
     pub fn fail(&mut self, message: String) {
         self.status = SyncStatus::Failed(message);
+        // Nothing to render frames for, so nothing to count. A pass already running for
+        // this page is stopped by the generation bump that closing it performs.
+        self.warm = WarmState::Off;
         self.cues.clear();
         self.layout = LaneLayout::default();
         self.drop_frame();
@@ -339,7 +387,13 @@ mod tests {
     fn state() -> SubtitleSyncState {
         SubtitleSyncState::new(
             1,
-            PathBuf::from("/media/show.mkv"),
+            FrameSource {
+                media: PathBuf::from("/media/show.mkv"),
+                media_length: 4096,
+                media_modified: None,
+                pixels: (960, 540),
+                workspace: PathBuf::from("/tmp/reel-tui-preview/state"),
+            },
             SubtitleSource::Embedded(2),
             Duration::from_secs(600),
             PreviewWorkspace::new().unwrap(),
@@ -713,5 +767,52 @@ mod tests {
         assert_that!(state.frame().is_some()).is_false();
         std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
         assert_that!(state.take_due_frame_request()).is_false();
+    }
+
+    /// The status line counts cues the pass is finished with, and stops counting when the
+    /// pass is over — however it ended, since a cue it could not draw is finished with too.
+    #[test]
+    fn warming_should_count_up_and_then_stop_counting() {
+        // Arrange
+        let mut state = ready(4);
+        assert_that!(state.warm).is_equal_to(WarmState::Off);
+
+        // Act / Assert
+        state.apply_warming(0, 4);
+        assert_that!(state.warm).is_equal_to(WarmState::Working { done: 0, total: 4 });
+        state.apply_warming(3, 4);
+        assert_that!(state.warm).is_equal_to(WarmState::Working { done: 3, total: 4 });
+        state.apply_warming(4, 4);
+        assert_that!(state.warm).is_equal_to(WarmState::Done);
+        // A pass that gave up early reports everything left as finished at once, which
+        // must read as done rather than as a count past the end.
+        state.apply_warming(9, 4);
+        assert_that!(state.warm).is_equal_to(WarmState::Done);
+        // An empty track has nothing to count and is over before it starts.
+        state.apply_warming(0, 0);
+        assert_that!(state.warm).is_equal_to(WarmState::Done);
+    }
+
+    /// A track that could not be read has no cues to render, so a count left on screen
+    /// from before it failed would be counting towards nothing.
+    #[test]
+    fn a_failed_track_should_stop_reporting_a_background_pass() {
+        // Arrange
+        let mut state = ready(3);
+        state.apply_warming(1, 3);
+
+        // Act
+        state.fail("ffmpeg exploded".to_string());
+
+        // Assert
+        assert_that!(state.warm).is_equal_to(WarmState::Off);
+    }
+
+    /// The media is named in every cache key and in every grab, so the page has to hand
+    /// out the one its frames were rendered against rather than a second copy.
+    #[test]
+    fn the_page_should_name_the_media_its_frames_come_from() {
+        // Act / Assert
+        assert_that!(state().media()).is_equal_to(Path::new("/media/show.mkv"));
     }
 }

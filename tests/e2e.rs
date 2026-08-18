@@ -21,12 +21,13 @@ mod harness;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use fixtures::{
-    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment,
+    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment, write_solid_png,
     write_vobsub_media,
 };
 use harness::{
@@ -38,6 +39,7 @@ use reel_tui::app::{
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
+use reel_tui::sync::WarmState;
 
 /// An FFmpeg older than the supported floor has to stop `reel` at the door.
 ///
@@ -2247,4 +2249,191 @@ fn stream_languages_of_type(info: &reel_tui::probe::MediaInfo, kind: &str) -> Ve
         .filter(|stream| stream.get("codec_type").and_then(serde_json::Value::as_str) == Some(kind))
         .map(|stream| stream_tag(stream, "language").unwrap_or("und").to_string())
         .collect()
+}
+
+/// Two cues whose text is easy to tell apart, and which a rewrite can change one of
+/// without touching the other.
+const CACHED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
+                           2\n00:00:03,000 --> 00:00:04,000\nSecond line\n\n";
+
+const RETYPED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
+                            2\n00:00:03,000 --> 00:00:04,000\nSecond line, rewritten\n\n";
+
+/// Opening the timing page renders every cue's frame in the background and keeps it on
+/// disk, so a second visit costs a decode rather than an `ffmpeg` seek — and a cue whose
+/// text changed is rendered again, because the cache is keyed on what the frame shows.
+///
+/// The cache is proven by planting a frame the application could not have produced: a
+/// solid magenta picture where one cue's frame belongs. A page that draws magenta is a
+/// page that read the cache. The same trick then shows that rewriting *that* cue's line
+/// stops it being drawn, while the cue left alone still is.
+#[test]
+fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
+    let test = "the_subtitle_timing_page_should_cache_and_prefetch_preview_frames";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-frame-cache");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // The background pass: every cue rendered without the cursor going near it, counting
+    // up on the status row while it works.
+    let counted = wait_for_frames(&mut app);
+    assert!(
+        counted,
+        "the page should count the frames it is generating while the pass runs"
+    );
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let cues = state.cues.clone();
+    assert_eq!(cues.len(), 2, "the sidecar holds two cues");
+    let keys: Vec<PathBuf> = cues
+        .iter()
+        .map(|cue| frame_path(&state.frames.key(cue)))
+        .collect();
+    for (cue, path) in cues.iter().zip(&keys) {
+        assert!(
+            path.is_file(),
+            "the background pass should have cached a frame for {:?} at {}",
+            cue.text,
+            path.display()
+        );
+    }
+    // And the count goes away once there is nothing left to report.
+    let screen = app.screen();
+    assert!(
+        !screen.contains("Generating preview frames"),
+        "a finished pass should stop reporting:\n{screen}"
+    );
+
+    // Plant a frame the application could not have rendered, then come back to it.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    write_solid_png(&keys[1], "magenta", 320, 240);
+    open_sidecar_timing_page(&mut app);
+    app.press(key(KeyCode::Char('j')));
+    app.wait_until("the second cue's frame", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.selected == 1 && state.frame().is_some())
+    });
+    let shades = app.preview_shades();
+    assert!(
+        shades
+            .iter()
+            .any(|(red, green, blue)| *red > 200 && *green < 80 && *blue > 200),
+        "the planted frame should be drawn from the cache rather than rendered again; \
+         shades: {shades:?}\nscreen:\n{}",
+        app.screen()
+    );
+
+    // Rewriting that cue's line changes what its frame would show, so its key changes
+    // with it: the planted frame is no longer what the page draws, while the cue that was
+    // left alone keeps the frame it already had.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    fs::write(&sidecar, RETYPED_CUES).unwrap();
+    open_sidecar_timing_page(&mut app);
+    wait_for_frames(&mut app);
+
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let retyped = state.cues.clone();
+    assert_eq!(
+        retyped[1].text, "Second line, rewritten",
+        "the page should re-read the sidecar it was opened on"
+    );
+    assert_eq!(
+        frame_path(&state.frames.key(&retyped[0])),
+        keys[0],
+        "the cue that did not change should reuse the frame already rendered for it"
+    );
+    let rewritten = frame_path(&state.frames.key(&retyped[1]));
+    assert_ne!(
+        rewritten, keys[1],
+        "a rewritten cue should not be served the frame of the line it replaced"
+    );
+    assert!(
+        rewritten.is_file(),
+        "the rewritten cue should have been rendered again at {}",
+        rewritten.display()
+    );
+
+    app.press(key(KeyCode::Char('j')));
+    app.wait_until("the rewritten cue's frame", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.selected == 1 && state.frame().is_some())
+    });
+    let shades = app.preview_shades();
+    assert!(
+        !shades
+            .iter()
+            .any(|(red, green, blue)| *red > 200 && *green < 80 && *blue > 200),
+        "the rewritten cue should be drawn from the video, not from the old line's frame; \
+         shades: {shades:?}\nscreen:\n{}",
+        app.screen()
+    );
+}
+
+/// Where a cached frame lives, under the `XDG_CACHE_HOME` the harness redirects.
+fn frame_path(key: &str) -> PathBuf {
+    PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
+        .join("reel-tui")
+        .join("preview_frames")
+        .join(format!("{key}.png"))
+}
+
+/// Opens the timing page on the sidecar track and waits for its cues.
+fn open_sidecar_timing_page(app: &mut Harness) {
+    let row = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Sidecar(0))
+        .expect("the sidecar should have a track row");
+    app.select_track_row(row);
+    app.press(key(KeyCode::Char('c')));
+    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    app.wait_until("the sidecar's cues to be read", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+}
+
+/// Pumps until the background pass is done, answering whether its count was ever drawn.
+///
+/// Its own loop rather than `wait_until`, because what is being watched is the screen the
+/// pass paints on the way past, not only the state it ends in.
+fn wait_for_frames(app: &mut Harness) -> bool {
+    let started = Instant::now();
+    let mut counted = false;
+    loop {
+        app.pump();
+        counted |= app.screen().contains("Generating preview frames [");
+        if app
+            .app
+            .subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.warm == WarmState::Done)
+        {
+            return counted;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "timed out waiting for the background frame pass:\n{}",
+            app.screen()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

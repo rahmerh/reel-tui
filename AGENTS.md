@@ -7,19 +7,20 @@ This repository builds a Rust 2024 library, `reel_tui` (`src/lib.rs`), and one b
 - `src/lib.rs`: Module declarations only; the crate root shared by the binary and the integration tests.
 - `src/main.rs`: Entry point, worker spawning, terminal setup, and the top-level event loop. Deliberately thin — anything testable belongs in the library.
 - `src/cli.rs`: Argument dispatch (`--help`, `--version`, the target directory) before the terminal is touched, so informational and usage-error output stays script-friendly.
-- `src/config.rs`: The user's `config.toml` — worker-pool sizes and the desktop-notification switch.
+- `src/config.rs`: The user's `config.toml` — worker-pool sizes, the desktop-notification switch, and the timing page's frame cache (`[preview] cache_mb`, `[preview.prefetch] enabled`/`network`).
 - `src/requirements.rs`: The external tool floors, enforced at startup. See **External Tool Floors** below.
 - `src/input.rs`: Key handling (`handle_key` and friends): the mapping from a `KeyEvent` to an `App` mutation.
 - `src/app.rs`: Application state, navigation layer management, probe/edit event dispatching, and persistent cache integration.
 - `src/staging.rs`: Staged edits and in-flight batch state (`StagedEdit`, `BatchState`), the shape a save is dispatched and reported through.
 - `src/ui.rs`: Ratatui rendering, split layout rendering, stream detail popups, and status indicators (including `[NET]` badge).
 - `src/files.rs`: Directory scanning, file tree nesting, and adaptive filesystem monitoring.
+- `src/framecache.rs`: The on-disk cache of rendered preview frames (`$XDG_CACHE_HOME/reel-tui/preview_frames/`). Content-addressed: the filename is a 128-bit FNV-1a hash of the media file, its length and mtime, the cue's timing and text, and the size the frame was rendered at — so an edited cue simply misses and is re-rendered, with no invalidation logic anywhere. Resolves its directory through `DiskCache::cache_dir()`, never from the environment, so both test redirections apply. Pure filesystem and hashing.
 - `src/probe.rs`: Asynchronous `ffprobe` worker thread, media metadata parsing, and tuned probing flags (`-probesize`, `-analyzeduration`).
 - `src/edit.rs`: Asynchronous `ffmpeg` remuxing, track reordering, container conversion, progress reporting, cancellation, and cross-filesystem transaction publishing (`move_or_copy_file`).
 - `src/subtitle.rs`: Subtitle stream inspection, sidecar file matching, format conversion, language tag translation, and OCR/libass capability detection (`ToolCapabilities`).
 - `src/cue.rs`: Cue-level subtitle data — SubRip parsing into individual cues, timeline lane packing, and the mapping from cue times to terminal columns. No dependency on `App`, `ratatui`, or subprocesses.
-- `src/sync.rs`: State for the subtitle timing page (`SubtitleSyncState`): which cues a track holds, which is selected, the frame on screen, and the scratch directory that is released when the page closes.
-- `src/preview.rs`: The timing page's two background workers — reading a track's cues (`.srt` sidecar or embedded `subrip`), and grabbing the video frame at the selected cue with that cue burned in. Deliberately does **not** route through `edit.rs`, so a read-only preview never writes `edit_errors.log`.
+- `src/sync.rs`: State for the subtitle timing page (`SubtitleSyncState`): which cues a track holds, which is selected, the frame on screen, how far the background frame pass has got (`WarmState`), and the scratch directory that is released when the page closes.
+- `src/preview.rs`: The timing page's three background workers — reading a track's cues (`.srt` sidecar or embedded `subrip`), grabbing the video frame at the selected cue with that cue burned in, and rendering the rest of the track's frames behind it. Frames are rendered at a fixed size derived from the source (not the pane, which changes) and cached through `framecache.rs`. Deliberately does **not** route through `edit.rs`, so a read-only preview never writes `edit_errors.log`.
 - `src/notification.rs`: Best-effort desktop notifications when a save finishes while the terminal is unfocused.
 - `src/mount.rs`: Network mount detection via `/proc/mounts` (NFS, SMB/CIFS, SSHFS, Rclone, Ceph, etc.) and `REEL_NETWORK_MODE` environment variable overrides.
 - `src/cache.rs`: Persistent on-disk probe metadata cache (`DiskCache`) stored at `$XDG_CACHE_HOME/reel-tui/probe_cache.json`.
@@ -38,7 +39,7 @@ Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. 
 - When a regression scenario comes from a failure in `~/.cache/reel-tui/edit_errors.log`, quote that log line in its doc comment. That log is the first place to look when hunting for an edit regression worth locking in; UI and workflow regressions need not originate there.
 - Fixtures are built by `tests/e2e/fixtures.rs` over `lavfi` sources, parameterised by codec and container. Codec/container realism is the point: the bugs this suite exists for come from combinations like `subrip` into MP4 or `mov_text` into Matroska, which the simpler `ffv1`/`pcm_s16le` unit fixtures cannot express.
 - The harness redirects `XDG_CACHE_HOME` to throwaway storage, so runs never touch the user's real probe cache or failure log. The unit-test binary is covered separately: `DiskCache::cache_dir()` returns throwaway storage under `cfg(test)` (`src/cache.rs`). **Both halves are load-bearing** — without them a test run rewrites `~/.cache/reel-tui/probe_cache.json` with `/tmp` fixture paths and fills `edit_errors.log` with deliberately-failing test edits, which is exactly the log this file tells you to read first. Never add a test that resolves the real cache directory.
-- **Prove every new test fails against the code it is meant to catch.** Break the behavior deliberately — revert the fix, or invert the condition the scenario exercises — confirm the test fails, then restore it. This applies to e2e scenarios and unit tests alike. A test that passes against broken code is worse than no test, because it converts an unchecked path into a checked-looking one. State in the change summary which tests were proven this way and how they were broken. A feature-level e2e scenario still need not reproduce every defect in that feature; focused regression coverage belongs in the unit suite.
+- **Write tests that would notice.** A test that passes against broken code converts an unchecked path into a checked-looking one, so assert the observable result rather than the fact that something ran. A feature-level e2e scenario need not reproduce every defect in that feature; focused regression coverage belongs in the unit suite.
 
 ## External Tool Floors
 
@@ -58,6 +59,7 @@ CI installs these from `.github/actions/media-tools`, never from the runner's di
 - **Persistent Probe Cache**: Media metadata is cached on disk in `$XDG_CACHE_HOME/reel-tui/probe_cache.json` indexed by path, file length, and mtime. Opening `reel` on network shares loads previously probed files instantly.
 - **Fast Probe Flags**: Remote media probing uses `-probesize 2000000 -analyzeduration 3000000` to prevent deep network seeking.
 - **Local Scratch Remuxing**: When remuxing on network mounts, intermediate work files write to local fast storage (`/tmp/reel-tui-scratch`) before performing a single final stream publish to destination.
+- **Preview Frame Cache**: Opening the subtitle timing page renders every cue's frame in the background and caches it on disk, so revisiting a cue — or re-opening the page — costs a decode rather than an `ffmpeg` seek. Off by default on network mounts, where a feature-length track is a thousand-odd accurate seeks across the network; the page says so in its status row rather than leaving the absence unexplained.
 - **Environment Overrides**: Set `REEL_NETWORK_MODE=1` (or `0`) to manually force or disable network performance tuning.
 
 ## Build, Test, and Development Commands

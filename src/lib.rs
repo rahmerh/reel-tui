@@ -9,6 +9,7 @@ pub mod config;
 pub mod cue;
 pub mod edit;
 pub mod files;
+pub mod framecache;
 pub mod input;
 pub mod mount;
 pub mod notification;

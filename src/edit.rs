@@ -2891,7 +2891,7 @@ fn subtitle_artifact_pairs(
     Ok(pairs)
 }
 
-fn primary_video_resolution(info: &MediaInfo) -> Option<(u64, u64)> {
+pub(crate) fn primary_video_resolution(info: &MediaInfo) -> Option<(u64, u64)> {
     info.streams
         .iter()
         .find(|stream| stream_kind(stream) == Some("video") && !is_attached_picture(stream))

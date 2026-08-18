@@ -15,6 +15,12 @@
 //! `AGENTS.md` designates as the first place to look when hunting an *edit* regression.
 //! A read-only preview has no business writing there, so this owns its ~30 lines of
 //! command construction instead.
+//!
+//! Three threads, because they are asked for different things at different rates: cues
+//! once per page opening, the selected cue's frame once per settled selection, and every
+//! *other* cue's frame in the background from the moment the cues land. Frames from all
+//! three paths go through [`crate::framecache`], so the second visit to a cue — and every
+//! visit after the page is re-opened — costs a decode rather than an `ffmpeg` seek.
 
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -22,7 +28,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Size;
 use ratatui_image::Resize;
@@ -30,6 +36,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, format_srt_timestamp, read_srt};
+use crate::framecache::{self, FrameKeyParts};
 
 /// Filename an embedded track is staged under inside the page's workspace.
 pub const CUES_FILE: &str = "cues.srt";
@@ -43,8 +50,41 @@ pub const CUES_FILE: &str = "cues.srt";
 /// `'`), which is a class of bug this feature simply does not have to have.
 pub const CUE_FILE: &str = "cue.srt";
 
+/// The same, for the background pass.
+///
+/// A *second* constant rather than the same one: the two workers run at the same time in
+/// the same workspace, and sharing the staging file would let the background pass
+/// overwrite the cue the interactive grab is about to burn in — a frame showing the wrong
+/// line, which is precisely what this page exists to let you judge.
+pub const WARM_CUE_FILE: &str = "warm.srt";
+
 /// How often a running `ffmpeg` is checked on, matching `edit.rs`'s runner.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The largest a frame is rendered before it is cached.
+///
+/// Fixed rather than the pane's own pixel size, which is what it used to be. A cached
+/// frame has to serve whatever size the pane happens to be later — otherwise resizing the
+/// terminal invalidates every frame on disk — and this is small enough that a whole film's
+/// cues fit in a cache measured in hundreds of megabytes while still holding more detail
+/// than any terminal can draw.
+const MAX_FRAME_PIXELS: (u32, u32) = (960, 540);
+
+/// How often the background pass reports where it has got to.
+///
+/// A track whose frames are already cached is walked in microseconds per cue, and an event
+/// per cue would push thousands of messages through the channel for a status line that
+/// only counts. The first and the last are always sent, so the line still appears and
+/// still finishes.
+const WARM_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Consecutive failures the background pass tolerates before it gives up on the track.
+///
+/// One cue that cannot be drawn is worth stepping over; three in a row means the media or
+/// the FFmpeg build cannot produce frames at all, and the alternative is spawning a doomed
+/// subprocess for every remaining cue in the file. The user still sees the real reason:
+/// selecting such a cue reports it under the preview, from the interactive path.
+const WARM_FAILURE_TOLERANCE: usize = 3;
 
 /// One track to read, described the way the worker needs it rather than the way `App`
 /// stores it — the worker knows nothing about `SubtitleSource` or which file is selected.
@@ -67,23 +107,72 @@ pub enum PrepareOutcome {
     Failed(String),
 }
 
+/// Everything about a frame grab that is the same for every cue in the track.
+///
+/// Shared by the interactive request and the background pass so the two cannot disagree
+/// about what they are rendering — a disagreement would show up as the two writing
+/// different pictures under the same cache key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameSource {
+    /// The video frames are grabbed from.
+    pub media: PathBuf,
+    /// The media's length and mtime, in the cache key so that re-encoding a file in place
+    /// does not serve the old file's frames under the new one's path.
+    pub media_length: u64,
+    pub media_modified: Option<SystemTime>,
+    /// The size every frame for this media is rendered at, from [`target_pixels`].
+    pub pixels: (u32, u32),
+    pub workspace: PathBuf,
+}
+
+impl FrameSource {
+    /// The cache key one cue's frame is stored under. Public because the e2e suite has
+    /// to look inside the frame cache to assert what a page did or did not render.
+    pub fn key(&self, cue: &Cue) -> String {
+        framecache::key(
+            FrameKeyParts {
+                media: &self.media,
+                media_length: self.media_length,
+                media_modified: self.media_modified,
+                pixels: self.pixels,
+            },
+            cue,
+        )
+    }
+}
+
 /// One cue to draw a video frame for.
 ///
-/// Carries the cue's own text rather than a pointer into the page's cue list: the worker
-/// writes it back out as a one-cue subtitle file, and cannot reach `App` to look it up.
+/// Carries the cue itself rather than a pointer into the page's cue list: the worker
+/// writes it back out as a one-cue subtitle file and hashes it into the cache key, and
+/// cannot reach `App` to look either up.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameRequest {
     pub generation: u64,
     /// Which cue in the page's list this is for, so a frame that arrives after the
     /// selection has moved on can be recognised as stale.
     pub cue_index: usize,
-    pub media: PathBuf,
-    pub workspace: PathBuf,
-    pub text: String,
+    pub source: FrameSource,
+    pub cue: Cue,
     /// Where to grab the frame, already clamped inside the media by the caller.
     pub seek: Duration,
-    /// The preview pane, in terminal cells, as the renderer measured it.
+    /// The preview pane, in terminal cells, as the renderer measured it. Only the encode
+    /// to a terminal protocol uses this — the picture itself is rendered at
+    /// `source.pixels` so that one cached frame serves every pane size.
     pub cells: Size,
+}
+
+/// A whole track to render frames for, ahead of the user reaching them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarmRequest {
+    pub generation: u64,
+    pub source: FrameSource,
+    pub cues: Vec<Cue>,
+    /// The media's duration, for holding a seek back from the very end. Zero means it
+    /// could not be parsed, and no clamping is applied — see [`seek_for`].
+    pub duration: Duration,
+    /// How large the frame cache is allowed to get, pruned to before the pass starts.
+    pub cache_limit: u64,
 }
 
 /// A frame ready to draw, or why there is none.
@@ -109,10 +198,10 @@ impl std::fmt::Debug for FrameOutcome {
     }
 }
 
-/// Anything either worker has to say about the open page.
+/// Anything any of the workers has to say about the open page.
 ///
-/// One channel for both, so the event loop keeps a single drain and cannot end up
-/// pumping one worker's results and not the other's.
+/// One channel for all three, so the event loop keeps a single drain and cannot end up
+/// pumping one worker's results and not another's.
 #[derive(Debug)]
 pub enum PreviewEvent {
     /// The track's cues, or why they could not be read.
@@ -126,12 +215,23 @@ pub enum PreviewEvent {
         cue_index: usize,
         outcome: FrameOutcome,
     },
+    /// How far the background pass has got.
+    ///
+    /// `done` counts cues the pass is finished with, which includes ones it cached, ones
+    /// it found already cached, and ones it could not draw — a cue is "done" when it is no
+    /// longer outstanding, not when it succeeded. `done == total` therefore means the pass
+    /// is over however it ended, which is exactly what the status line needs to know.
+    Warming {
+        generation: u64,
+        done: usize,
+        total: usize,
+    },
 }
 
-/// The UI thread's half of the preview worker.
+/// The UI thread's half of the preview workers.
 ///
-/// Wraps the request channel together with the generation cell rather than handing `App`
-/// both, because the two must move together: sending a request *is* what makes its
+/// Wraps the request channels together with the generation cell rather than handing `App`
+/// each separately, because they must move together: sending a request *is* what makes its
 /// generation the live one, and every other write to the cell means "abandon whatever is
 /// running".
 #[derive(Debug)]
@@ -139,9 +239,11 @@ pub struct PreviewHandles {
     prepare_tx: Sender<PrepareRequest>,
     /// `None` when the terminal offered no image protocol, which is also what tests get.
     /// The page then stays on its text preview, the same fallback a build without libass
-    /// takes.
+    /// takes — and nothing is rendered in the background either, since there would be
+    /// nothing to draw the result with.
     frame_tx: Option<Sender<FrameRequest>>,
-    /// The page generation both workers should still be working for, shared with them.
+    warm_tx: Option<Sender<WarmRequest>>,
+    /// The page generation every worker should still be working for, shared with them.
     ///
     /// An `AtomicU64` rather than a cancellation flag because it answers both questions
     /// a worker has — "is this request still wanted" and "should I stop now" — with one
@@ -166,6 +268,13 @@ impl PreviewHandles {
         }
     }
 
+    /// Asks for every cue in a track to be rendered in the background.
+    pub fn request_warm(&self, request: WarmRequest) {
+        if let Some(warm_tx) = self.warm_tx.as_ref() {
+            let _ = warm_tx.send(request);
+        }
+    }
+
     /// Whether frames are being produced at all, so the page can skip asking for one it
     /// would only have to fall back from.
     pub fn draws_frames(&self) -> bool {
@@ -180,11 +289,12 @@ impl PreviewHandles {
 }
 
 /// Starts the page's background workers: one that reads a track's cues, and — when the
-/// terminal can draw images at all — one that renders the frame at the selected cue.
+/// terminal can draw images at all — one that renders the frame at the selected cue and
+/// one that renders the rest of the track behind it.
 ///
-/// Two threads rather than one because they are asked for different things at different
-/// rates: cues once per page opening, frames once per settled selection. A single thread
-/// would make a held-down `j` queue behind an extraction that is demuxing a container.
+/// Three threads rather than one because they are asked for different things at different
+/// rates. A single thread would make a held-down `j` queue behind an extraction that is
+/// demuxing a container, or behind a thousand-cue background pass.
 pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receiver<PreviewEvent>) {
     let (prepare_tx, prepare_rx) = mpsc::channel::<PrepareRequest>();
     let (event_tx, event_rx) = mpsc::channel();
@@ -213,34 +323,53 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
         }
     });
 
-    let frame_tx = picker.map(|picker| {
-        let (frame_tx, frame_rx) = mpsc::channel::<FrameRequest>();
-        let frame_generation = Arc::clone(&live_generation);
-        std::thread::spawn(move || {
-            while let Ok(request) = frame_rx.recv() {
-                let request = newest(request, &frame_rx);
-                let Some(outcome) = frame(&request, &picker, &frame_generation) else {
-                    continue;
-                };
-                if event_tx
-                    .send(PreviewEvent::Frame {
-                        generation: request.generation,
-                        cue_index: request.cue_index,
-                        outcome,
-                    })
-                    .is_err()
-                {
-                    break;
+    // Both image workers exist only when there is something that could draw their output.
+    let (frame_tx, warm_tx) = match picker {
+        Some(picker) => {
+            let (frame_tx, frame_rx) = mpsc::channel::<FrameRequest>();
+            let frame_generation = Arc::clone(&live_generation);
+            let frame_events = event_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(request) = frame_rx.recv() {
+                    let request = newest(request, &frame_rx);
+                    let Some(outcome) = frame(&request, &picker, &frame_generation) else {
+                        continue;
+                    };
+                    if frame_events
+                        .send(PreviewEvent::Frame {
+                            generation: request.generation,
+                            cue_index: request.cue_index,
+                            outcome,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
-        frame_tx
-    });
+            });
+
+            let (warm_tx, warm_rx) = mpsc::channel::<WarmRequest>();
+            let warm_generation = Arc::clone(&live_generation);
+            std::thread::spawn(move || {
+                while let Ok(request) = warm_rx.recv() {
+                    // Coalescing for the same reason frames do: a request is one whole
+                    // track, and only the page that is actually open is worth walking.
+                    let request = newest(request, &warm_rx);
+                    if !warm(&request, &warm_generation, &event_tx) {
+                        break;
+                    }
+                }
+            });
+            (Some(frame_tx), Some(warm_tx))
+        }
+        None => (None, None),
+    };
 
     (
         PreviewHandles {
             prepare_tx,
             frame_tx,
+            warm_tx,
             live_generation,
         },
         event_rx,
@@ -261,6 +390,52 @@ fn newest<T>(request: T, receiver: &Receiver<T>) -> T {
     request
 }
 
+/// The size to render a frame at, given the source's own resolution.
+///
+/// Shrunk to fit inside [`MAX_FRAME_PIXELS`], never enlarged: upscaling a 320×240 clip to
+/// 960×720 spends cache and decode time inventing pixels the terminal then throws away
+/// again. An unknown resolution — a container ffprobe could not measure — takes the cap,
+/// since `force_original_aspect_ratio=decrease` makes it a bound rather than a shape.
+///
+/// Both sides are rounded down to an even number: an odd dimension is legal for PNG but
+/// makes the chroma-subsampled decode `ffmpeg` does on the way there a rounding case for
+/// no benefit.
+pub fn target_pixels(source: Option<(u32, u32)>) -> (u32, u32) {
+    let (cap_width, cap_height) = MAX_FRAME_PIXELS;
+    let Some((width, height)) = source.filter(|(width, height)| *width > 0 && *height > 0) else {
+        return MAX_FRAME_PIXELS;
+    };
+    if width <= cap_width && height <= cap_height {
+        return (even(width), even(height));
+    }
+    // Whichever axis overflows by more decides the scale, so the result fits both.
+    let scaled_height = height * cap_width / width;
+    if scaled_height <= cap_height {
+        (even(cap_width), even(scaled_height))
+    } else {
+        (even(width * cap_height / height), even(cap_height))
+    }
+}
+
+fn even(value: u32) -> u32 {
+    (value & !1).max(2)
+}
+
+/// Where in the media to grab the frame for `cue`.
+///
+/// The midpoint, held back from the very end: seeking to the last instant of a file lands
+/// past the final frame, and `-frames:v 1` then writes nothing at all. Only when the
+/// duration is actually known, though — a file whose duration would not parse arrives here
+/// as zero, and clamping against that would preview the first frame for every cue.
+pub fn seek_for(cue: &Cue, duration: Duration) -> Duration {
+    if duration.is_zero() {
+        cue.midpoint()
+    } else {
+        cue.midpoint()
+            .min(duration.saturating_sub(Duration::from_millis(200)))
+    }
+}
+
 /// Handles with no worker thread behind them, so `App`'s dispatch can be asserted from
 /// the request itself instead of through a real extraction.
 #[cfg(test)]
@@ -268,6 +443,7 @@ pub(crate) struct TestHandles {
     pub handles: PreviewHandles,
     pub prepare_rx: Receiver<PrepareRequest>,
     pub frame_rx: Receiver<FrameRequest>,
+    pub warm_rx: Receiver<WarmRequest>,
     pub live_generation: Arc<AtomicU64>,
 }
 
@@ -275,15 +451,18 @@ pub(crate) struct TestHandles {
 pub(crate) fn test_handles() -> TestHandles {
     let (prepare_tx, prepare_rx) = mpsc::channel();
     let (frame_tx, frame_rx) = mpsc::channel();
+    let (warm_tx, warm_rx) = mpsc::channel();
     let live_generation = Arc::new(AtomicU64::new(0));
     TestHandles {
         handles: PreviewHandles {
             prepare_tx,
             frame_tx: Some(frame_tx),
+            warm_tx: Some(warm_tx),
             live_generation: Arc::clone(&live_generation),
         },
         prepare_rx,
         frame_rx,
+        warm_rx,
         live_generation,
     }
 }
@@ -330,57 +509,277 @@ fn frame(
     if abandoned() {
         return None;
     }
-    let staged = request.workspace.join(CUE_FILE);
-    if let Err(error) = std::fs::write(&staged, one_cue_srt(&request.text)) {
-        return Some(FrameOutcome::Failed(format!(
-            "Could not stage the cue to burn in: {error}"
-        )));
-    }
-
-    let font = picker.font_size();
-    let pixels = (
-        u32::from(request.cells.width) * u32::from(font.width),
-        u32::from(request.cells.height) * u32::from(font.height),
-    );
-    let mut command = frame_command(&request.media, request.seek, pixels, &request.workspace);
     drawn(
-        run_cancellable(&mut command, &abandoned),
+        png(
+            &request.source,
+            &request.cue,
+            request.seek,
+            CUE_FILE,
+            &abandoned,
+        ),
         picker,
         request.cells,
     )
 }
 
-/// Turns a finished grab into something the page can draw.
+/// What one cue's PNG — cached or freshly grabbed — means for the page.
 ///
 /// Separated from `frame` for the same reason `extracted` is separated from `prepare`:
+/// the page closing mid-grab is an ending a test cannot reliably steer a real `ffmpeg`
+/// into, and it is the one that must not be mistaken for a frame that failed to draw.
+fn drawn(png: PngOutcome, picker: &Picker, cells: Size) -> Option<FrameOutcome> {
+    match png {
+        PngOutcome::Abandoned => None,
+        PngOutcome::Failed(message) => Some(FrameOutcome::Failed(message)),
+        PngOutcome::Ready(bytes) => Some(encode(&bytes, picker, cells)),
+    }
+}
+
+/// The PNG for one cue: from the cache when it is there, from `ffmpeg` when it is not.
+enum PngOutcome {
+    Ready(Vec<u8>),
+    /// The page went away while the grab was running.
+    Abandoned,
+    Failed(String),
+}
+
+/// Produces one cue's frame as PNG bytes, caching what it renders.
+///
+/// The cache lookup comes first and is the whole point of the module: a hit costs a file
+/// read where a miss costs an accurate seek into the container plus a libass burn.
+///
+/// `staged` names the file the cue is written to inside the workspace, so the interactive
+/// path and the background pass can run at the same time without overwriting each other's
+/// subtitle — see [`CUE_FILE`] and [`WARM_CUE_FILE`].
+fn png(
+    source: &FrameSource,
+    cue: &Cue,
+    seek: Duration,
+    staged: &str,
+    abandoned: &dyn Fn() -> bool,
+) -> PngOutcome {
+    let key = source.key(cue);
+    if let Some(bytes) = framecache::read(&key) {
+        return PngOutcome::Ready(bytes);
+    }
+    render(source, cue, seek, staged, &key, abandoned)
+}
+
+/// What the background pass made of one cue.
+///
+/// Its own outcome rather than `PngOutcome` because the pass has no use for the bytes,
+/// and because "was already there" is the case it is mostly made of.
+#[derive(Debug, Eq, PartialEq)]
+enum CacheOutcome {
+    Cached,
+    Rendered,
+    Abandoned,
+    Failed,
+}
+
+/// Makes sure one cue's frame is in the cache, rendering it only if it is not.
+///
+/// The lookup is a stat where [`png`]'s is a read, and that is the whole reason this
+/// exists separately: a track whose frames are all cached — every page opened a second
+/// time — would otherwise pull the entire cache off disk to throw the bytes away, which
+/// at a thousand cues is hundreds of megabytes of pointless I/O.
+fn cache_frame(
+    source: &FrameSource,
+    cue: &Cue,
+    seek: Duration,
+    staged: &str,
+    abandoned: &dyn Fn() -> bool,
+) -> CacheOutcome {
+    let key = source.key(cue);
+    if framecache::is_cached(&key) {
+        return CacheOutcome::Cached;
+    }
+    match render(source, cue, seek, staged, &key, abandoned) {
+        PngOutcome::Ready(_) => CacheOutcome::Rendered,
+        PngOutcome::Abandoned => CacheOutcome::Abandoned,
+        PngOutcome::Failed(_) => CacheOutcome::Failed,
+    }
+}
+
+/// Stages the cue and grabs its frame, caching whatever comes back.
+fn render(
+    source: &FrameSource,
+    cue: &Cue,
+    seek: Duration,
+    staged: &str,
+    key: &str,
+    abandoned: &dyn Fn() -> bool,
+) -> PngOutcome {
+    let path = source.workspace.join(staged);
+    if let Err(error) = std::fs::write(&path, one_cue_srt(&cue.text)) {
+        return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
+    }
+    let mut command = frame_command(
+        &source.media,
+        seek,
+        source.pixels,
+        &source.workspace,
+        staged,
+    );
+    grabbed(run_cancellable(&mut command, abandoned), key)
+}
+
+/// What a finished grab means, and the point the result is cached at.
+///
+/// Separated from `png` for the same reason `extracted` is separated from `prepare`:
 /// giving up part-way and failing to start are endings a test cannot reliably steer a
 /// real `ffmpeg` into, and they are the two that must not be mistaken for a blank frame.
-///
-/// The decode and the protocol encode happen here, on the worker thread, rather than on
-/// the UI thread — a kitty protocol is base64 over the whole image, which is milliseconds
-/// the event loop would otherwise spend not answering keys.
-fn drawn(run: RunOutcome, picker: &Picker, cells: Size) -> Option<FrameOutcome> {
+fn grabbed(run: RunOutcome, key: &str) -> PngOutcome {
     let output = match run {
-        RunOutcome::Abandoned => return None,
-        RunOutcome::Failed(message) => return Some(FrameOutcome::Failed(message)),
+        RunOutcome::Abandoned => return PngOutcome::Abandoned,
+        RunOutcome::Failed(message) => return PngOutcome::Failed(message),
         RunOutcome::Finished(output) if !output.status.success() => {
-            return Some(FrameOutcome::Failed(command_failure(
+            return PngOutcome::Failed(command_failure(
                 "Could not draw this frame",
                 &output.stderr,
-            )));
+            ));
         }
         RunOutcome::Finished(output) => output,
     };
+    // A successful run that wrote nothing is what seeking past the end of the media looks
+    // like. Not cached — there is nothing to cache, and storing an empty file would turn
+    // one bad grab into a permanently blank cue — but still passed on, so the decoder
+    // reports it as the unreadable frame it is.
+    if !output.stdout.is_empty() {
+        framecache::store(key, &output.stdout);
+    }
+    PngOutcome::Ready(output.stdout)
+}
 
-    let image = match image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Png) {
+/// Turns PNG bytes into something the page can draw.
+///
+/// The decode and the protocol encode happen on the worker thread rather than on the UI
+/// thread — a kitty protocol is base64 over the whole image, which is milliseconds the
+/// event loop would otherwise spend not answering keys.
+fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
+    let image = match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
         Ok(image) => image,
-        Err(error) => return Some(FrameOutcome::Failed(format!("Unreadable frame: {error}"))),
+        Err(error) => return FrameOutcome::Failed(format!("Unreadable frame: {error}")),
     };
-    match picker.new_protocol(image, cells, Resize::Fit(None)) {
-        Ok(protocol) => Some(FrameOutcome::Ready(Box::new(protocol))),
-        Err(error) => Some(FrameOutcome::Failed(format!(
-            "Could not draw this frame: {error}"
-        ))),
+    // `Scale`, not `Fit`. Both fit the picture to the pane proportionally, but `Fit`
+    // clamps its target to `min(pane, image)` and so never enlarges — which was fine when
+    // the grab was made at the pane's own pixel size, and is wrong now that it is made at
+    // a fixed one. A cached frame smaller in pixels than the pane would sit in a corner of
+    // it at its stored size. `Scale` is what fills the pane from a frame of any size, and
+    // it is also why a resize no longer re-runs `ffmpeg`: the same cached bytes re-encode
+    // to whatever the pane has become.
+    match picker.new_protocol(image, cells, Resize::Scale(None)) {
+        Ok(protocol) => FrameOutcome::Ready(Box::new(protocol)),
+        Err(error) => FrameOutcome::Failed(format!("Could not draw this frame: {error}")),
+    }
+}
+
+/// Renders every cue in a track into the cache, reporting progress as it goes.
+///
+/// Returns whether the worker should keep serving requests: `false` only when nobody is
+/// listening for events any more, which means the application has gone.
+///
+/// In list order rather than outwards from the selection. The interactive worker is a
+/// separate thread that always renders whatever the cursor is on right now, so this one
+/// never has to race the user — its job is only to make sure that by the time they get
+/// somewhere, the frame is already there.
+fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<PreviewEvent>) -> bool {
+    let abandoned = || live_generation.load(Ordering::Relaxed) != request.generation;
+    warm_track(request, &abandoned, events)
+}
+
+/// The pass itself, with "has the page gone" handed in.
+///
+/// Split from `warm` so a test can decide *when* the page goes: the two places this gives
+/// up — between cues, and part-way through rendering one — are a race against a real
+/// `ffmpeg` otherwise, and they are what stops a thousand-cue track running on for a page
+/// nobody is looking at.
+fn warm_track(
+    request: &WarmRequest,
+    abandoned: &dyn Fn() -> bool,
+    events: &Sender<PreviewEvent>,
+) -> bool {
+    if abandoned() {
+        return true;
+    }
+    // Before rendering, not after: the pass is about to add a frame per cue, and pruning
+    // first is what keeps the cache inside its limit rather than over it until next time.
+    framecache::prune(request.cache_limit);
+
+    let total = request.cues.len();
+    let mut progress = WarmProgress::new(request.generation, total);
+    if !progress.publish(events, 0) {
+        return false;
+    }
+
+    let mut failures = 0;
+    for (done, cue) in request.cues.iter().enumerate() {
+        if abandoned() {
+            // No final event: the page this counted for is gone, and a `Warming` for it
+            // would be dropped by `App` anyway.
+            return true;
+        }
+        // Checked per cue as the pass reaches it, rather than filtered up front, because
+        // the interactive worker may have rendered this very cue since the pass started.
+        match cache_frame(
+            &request.source,
+            cue,
+            seek_for(cue, request.duration),
+            WARM_CUE_FILE,
+            abandoned,
+        ) {
+            CacheOutcome::Cached | CacheOutcome::Rendered => failures = 0,
+            CacheOutcome::Abandoned => return true,
+            CacheOutcome::Failed => {
+                failures += 1;
+                if failures >= WARM_FAILURE_TOLERANCE {
+                    // Everything left is abandoned at once, so the status line finishes
+                    // rather than freezing part-way up a track that cannot produce frames
+                    // at all.
+                    return progress.publish(events, total);
+                }
+            }
+        }
+        if !progress.publish(events, done + 1) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The background pass's rate-limited progress reporting.
+struct WarmProgress {
+    generation: u64,
+    total: usize,
+    last_published: Option<Instant>,
+}
+
+impl WarmProgress {
+    fn new(generation: u64, total: usize) -> Self {
+        Self {
+            generation,
+            total,
+            last_published: None,
+        }
+    }
+
+    /// Publishes `done`, unless it is neither the first nor the last and the previous one
+    /// was too recent. Returns whether anyone is still listening.
+    fn publish(&mut self, events: &Sender<PreviewEvent>, done: usize) -> bool {
+        let due = self
+            .last_published
+            .is_none_or(|at| at.elapsed() >= WARM_PROGRESS_INTERVAL);
+        if !due && done < self.total {
+            return true;
+        }
+        self.last_published = Some(Instant::now());
+        events
+            .send(PreviewEvent::Warming {
+                generation: self.generation,
+                done,
+                total: self.total,
+            })
+            .is_ok()
     }
 }
 
@@ -400,12 +799,18 @@ fn one_cue_srt(text: &str) -> String {
     )
 }
 
-/// Grabs one frame with the staged cue burned into it, scaled to the preview pane.
+/// Grabs one frame with the staged cue burned into it, scaled to the cache's fixed size.
 ///
 /// Runs with the workspace as its working directory so `subtitles=cue.srt` is a constant:
 /// see [`CUE_FILE`]. The filters are ordered `subtitles` then `scale` so libass lays the
 /// text out against the source resolution — its `PlayRes` — before anything shrinks it.
-fn frame_command(media: &Path, seek: Duration, pixels: (u32, u32), workspace: &Path) -> Command {
+fn frame_command(
+    media: &Path,
+    seek: Duration,
+    pixels: (u32, u32),
+    workspace: &Path,
+    staged: &str,
+) -> Command {
     let (width, height) = pixels;
     let mut command = Command::new("ffmpeg");
     command
@@ -416,7 +821,7 @@ fn frame_command(media: &Path, seek: Duration, pixels: (u32, u32), workspace: &P
         .arg(media)
         .args(["-map", "0:v:0", "-frames:v", "1", "-vf"])
         .arg(format!(
-            "subtitles={CUE_FILE},scale={width}:{height}:force_original_aspect_ratio=decrease"
+            "subtitles={staged},scale={width}:{height}:force_original_aspect_ratio=decrease"
         ))
         .args(["-f", "image2pipe", "-vcodec", "png", "-"]);
     command
@@ -651,15 +1056,48 @@ mod tests {
         media
     }
 
+    fn cue(start: u64, end: u64, text: &str) -> Cue {
+        Cue {
+            index: 0,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            text: text.to_string(),
+        }
+    }
+
+    /// A source whose key is unique to the caller, so tests sharing the one cache
+    /// directory cannot collide on a key or read each other's frames.
+    fn source(media: &Path, workspace: &Path) -> FrameSource {
+        FrameSource {
+            media: media.to_path_buf(),
+            media_length: 4096,
+            media_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            pixels: (64, 48),
+            workspace: workspace.to_path_buf(),
+        }
+    }
+
     fn frame_request(media: &Path, workspace: &Path, seek: Duration) -> FrameRequest {
         FrameRequest {
             generation: 1,
             cue_index: 0,
-            media: media.to_path_buf(),
-            workspace: workspace.to_path_buf(),
-            text: "BURNED IN".to_string(),
+            source: source(media, workspace),
+            cue: cue(0, 1000, "BURNED IN"),
             seek,
             cells: Size::new(20, 10),
+        }
+    }
+
+    /// Frames land in the test binary's shared cache directory, so anything that reads or
+    /// writes one has to hold the guard `framecache` uses to keep its own directory-wide
+    /// tests from deleting it mid-assertion.
+    fn cache_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        crate::framecache::testing::one_key()
+    }
+
+    fn forget(source: &FrameSource, cue: &Cue) {
+        if let Some(path) = framecache::path(&source.key(cue)) {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -941,17 +1379,17 @@ mod tests {
         let sidecar = directory.join("clip.eng.srt");
         std::fs::write(&sidecar, SRT).unwrap();
         let (handles, events) = spawn_preview_workers(None);
-        // No picker means no frame worker, and asking for a frame anyway is a no-op
-        // rather than a panic — the page falls back to the cue's text.
+        // No picker means no frame worker and no background pass either — there would be
+        // nothing to draw their output with — and asking anyway is a no-op rather than a
+        // panic: the page falls back to the cue's text.
         assert_that!(handles.draws_frames()).is_false();
-        handles.request_frame(FrameRequest {
+        handles.request_frame(frame_request(&sidecar, &directory, Duration::ZERO));
+        handles.request_warm(WarmRequest {
             generation: 1,
-            cue_index: 0,
-            media: sidecar.clone(),
-            workspace: directory.clone(),
-            text: "unused".to_string(),
-            seek: Duration::ZERO,
-            cells: Size::new(10, 5),
+            source: source(&sidecar, &directory),
+            cues: vec![cue(0, 1000, "unused")],
+            duration: Duration::from_secs(6),
+            cache_limit: u64::MAX,
         });
         let request = |generation| PrepareRequest {
             generation,
@@ -999,6 +1437,7 @@ mod tests {
             Duration::from_millis(2500),
             (640, 480),
             Path::new("/tmp/reel-tui-preview/7-1"),
+            CUE_FILE,
         );
 
         // Assert
@@ -1144,41 +1583,45 @@ mod tests {
     #[test]
     fn a_grab_that_produced_no_image_should_not_be_reported_as_a_frame() {
         // Arrange
+        let _guard = cache_guard();
+        let key = format!("preview-endings-{}", std::process::id());
         let succeeded = Command::new("sh").args(["-c", "exit 0"]).output().unwrap();
         let refused = Command::new("sh")
             .args(["-c", "echo 'Invalid stream specifier' >&2; exit 1"])
             .output()
             .unwrap();
-        let cells = Size::new(20, 10);
 
         // Act
-        let abandoned = drawn(RunOutcome::Abandoned, &Picker::halfblocks(), cells);
-        let unstartable = drawn(
+        let abandoned = grabbed(RunOutcome::Abandoned, &key);
+        let unstartable = grabbed(
             RunOutcome::Failed("ffmpeg was not found in PATH.".to_string()),
-            &Picker::halfblocks(),
-            cells,
+            &key,
         );
-        let empty = drawn(
-            RunOutcome::Finished(succeeded),
-            &Picker::halfblocks(),
-            cells,
-        );
-        let rejected = drawn(RunOutcome::Finished(refused), &Picker::halfblocks(), cells);
+        let empty = grabbed(RunOutcome::Finished(succeeded), &key);
+        let rejected = grabbed(RunOutcome::Finished(refused), &key);
 
         // Assert
-        assert_that!(abandoned).is_none();
-        let Some(FrameOutcome::Failed(unstartable)) = unstartable else {
+        assert_that!(matches!(abandoned, PngOutcome::Abandoned)).is_true();
+        let PngOutcome::Failed(unstartable) = unstartable else {
             panic!("a command that never started should fail");
         };
         assert_that!(unstartable.as_str()).contains("not found in PATH");
-        let Some(FrameOutcome::Failed(empty)) = empty else {
+        let PngOutcome::Ready(empty) = empty else {
+            panic!("an empty grab is passed on to the decoder, which is what rejects it");
+        };
+        let FrameOutcome::Failed(message) =
+            encode(&empty, &Picker::halfblocks(), Size::new(20, 10))
+        else {
             panic!("an empty grab should fail rather than draw nothing");
         };
-        assert_that!(empty.as_str()).contains("Unreadable frame");
-        let Some(FrameOutcome::Failed(rejected)) = rejected else {
+        assert_that!(message.as_str()).contains("Unreadable frame");
+        let PngOutcome::Failed(rejected) = rejected else {
             panic!("a refused grab should fail");
         };
         assert_that!(rejected.as_str()).contains("Invalid stream specifier");
+        // And nothing empty or failed was ever written to the cache: a blank file there
+        // would make one bad grab a permanently blank cue.
+        assert_that!(framecache::is_cached(&key)).is_false();
     }
 
     /// The worker loop itself: the coalescing receive, the picker it owns, and the event
@@ -1193,17 +1636,14 @@ mod tests {
         let (handles, events) = spawn_preview_workers(Some(Picker::halfblocks()));
         assert_that!(handles.draws_frames()).is_true();
 
-        // Act: two requests, so the second is the one the coalescing loop settles on.
+        // Act: one request, because which of several the loop settles on is a race the
+        // worker wins as often as the test does — the coalescing itself is asserted
+        // directly in `a_queue_of_frame_requests_should_collapse_to_the_newest`.
         handles.abandon(1);
         handles.request_frame(FrameRequest {
-            cue_index: 1,
-            ..frame_request(&media, &directory, Duration::from_millis(1500))
+            cue_index: 3,
+            ..frame_request(&media, &directory, Duration::from_millis(2500))
         });
-        handles.request_frame(frame_request(
-            &media,
-            &directory,
-            Duration::from_millis(2500),
-        ));
 
         // Assert
         let event = events
@@ -1218,7 +1658,7 @@ mod tests {
             panic!("a frame request should answer with a frame, not with cues");
         };
         assert_that!(generation).is_equal_to(1);
-        assert_that!(cue_index).is_equal_to(0);
+        assert_that!(cue_index).is_equal_to(3);
         assert_that!(matches!(outcome, FrameOutcome::Ready(_))).is_true();
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1390,6 +1830,564 @@ mod tests {
 
         // Act: dropping the handles closes the request channel and ends the thread.
         drop(handles);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A PNG the decoder will accept, for seeding the cache with something a real grab
+    /// could not have produced from the media the request names.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(width, height)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("an in-memory PNG should encode");
+        bytes
+    }
+
+    /// The whole point of the cache: the second time a cue is asked for, no subprocess
+    /// runs at all. Proven by naming a media file that does not exist — an `ffmpeg` grab
+    /// could not possibly succeed, so a frame coming back means it never ran.
+    #[test]
+    fn a_cached_frame_should_be_drawn_without_running_ffmpeg() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-cached");
+        let request = FrameRequest {
+            source: source(&directory.join("never-existed.mkv"), &directory),
+            ..frame_request(
+                &directory.join("never-existed.mkv"),
+                &directory,
+                Duration::ZERO,
+            )
+        };
+        framecache::store(&request.source.key(&request.cue), &png_bytes(64, 48));
+
+        // Act
+        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert
+        let Some(FrameOutcome::Ready(protocol)) = outcome else {
+            panic!("a cached frame should be drawn, got {outcome:?}");
+        };
+        assert_that!(protocol.size().width > 0).is_true();
+        // Nothing was staged, which is the step every real grab starts with.
+        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        forget(&request.source, &request.cue);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame that had to be rendered is kept, and the keeping is what makes the second
+    /// visit free — including after the media itself has gone.
+    #[test]
+    fn a_rendered_frame_should_be_cached_for_the_next_visit() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_rendered_frame_should_be_cached_for_the_next_visit");
+        let directory = scratch("frame-caching");
+        let media = video(&directory);
+        let request = frame_request(&media, &directory, Duration::from_millis(2500));
+        forget(&request.source, &request.cue);
+
+        // Act
+        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert
+        assert_that!(matches!(outcome, Some(FrameOutcome::Ready(_)))).is_true();
+        assert_that!(framecache::is_cached(&request.source.key(&request.cue))).is_true();
+
+        // Act / Assert: and with the media deleted and the staged cue removed, the same
+        // request still draws — from the cache, since there is nothing left to grab.
+        std::fs::remove_file(&media).unwrap();
+        std::fs::remove_file(directory.join(CUE_FILE)).unwrap();
+        let again = frame(&request, &Picker::halfblocks(), &live(1));
+        assert_that!(matches!(again, Some(FrameOutcome::Ready(_)))).is_true();
+        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        forget(&request.source, &request.cue);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cache key covers one cue's text and timing, so a track whose cues differ cannot
+    /// share a frame between them — which is what would show the wrong line burned in.
+    #[test]
+    fn two_cues_should_not_share_a_frame() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-per-cue");
+        let source = source(&directory.join("clip.mkv"), &directory);
+
+        // Act / Assert
+        assert_that!(source.key(&cue(0, 1000, "first")).as_str())
+            .is_not_equal_to(source.key(&cue(0, 1000, "second")).as_str());
+        assert_that!(source.key(&cue(0, 1000, "first")).as_str())
+            .is_not_equal_to(source.key(&cue(500, 1000, "first")).as_str());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Frames are cached, so they cannot be rendered at the pane's size — the pane
+    /// changes. They are rendered at the source's own size instead, capped so that a
+    /// whole film's cues stay a cache a laptop can hold, and never enlarged.
+    #[test]
+    fn a_frame_should_be_rendered_at_the_sources_size_within_the_cap() {
+        // Act / Assert: a source inside the cap is left alone.
+        assert_that!(target_pixels(Some((640, 360)))).is_equal_to((640, 360));
+        // A 1080p source shrinks on its widest axis, keeping its shape.
+        assert_that!(target_pixels(Some((1920, 1080)))).is_equal_to((960, 540));
+        // A very wide source is bounded by width, a very tall one by height.
+        assert_that!(target_pixels(Some((3840, 1600)))).is_equal_to((960, 400));
+        assert_that!(target_pixels(Some((1200, 1600)))).is_equal_to((404, 540));
+        // Odd sizes round down to even, since the decode on the way here is subsampled.
+        assert_that!(target_pixels(Some((641, 361)))).is_equal_to((640, 360));
+        // A resolution ffprobe could not measure takes the cap, which
+        // `force_original_aspect_ratio=decrease` then treats as a bound rather than a
+        // shape — and a zero-sized one is the same case, not a division by zero.
+        assert_that!(target_pixels(None)).is_equal_to((960, 540));
+        assert_that!(target_pixels(Some((0, 1080)))).is_equal_to((960, 540));
+        assert_that!(target_pixels(Some((1920, 0)))).is_equal_to((960, 540));
+        // A source smaller than the two-pixel floor still has a size the scaler accepts.
+        assert_that!(target_pixels(Some((1, 1)))).is_equal_to((2, 2));
+    }
+
+    /// The interactive path and the background pass have to seek to the same instant for
+    /// the same cue, or the two would write different pictures under one cache key.
+    #[test]
+    fn a_seek_should_be_the_cues_midpoint_held_back_from_the_end_of_the_media() {
+        // Act / Assert: the midpoint, not the start — a cue's first frame is often the
+        // last frame of the previous shot.
+        assert_that!(seek_for(&cue(1000, 3000, "a"), Duration::from_secs(60)))
+            .is_equal_to(Duration::from_secs(2));
+        // A cue running past the end lands before the final frame, not on it: `-frames:v
+        // 1` writes nothing at all past the end.
+        assert_that!(seek_for(&cue(8000, 12_000, "a"), Duration::from_secs(10)))
+            .is_equal_to(Duration::from_millis(9800));
+        // A duration that would not parse arrives as zero, and clamping against that
+        // would preview the first frame of the media for every cue in the track.
+        assert_that!(seek_for(&cue(8000, 12_000, "a"), Duration::ZERO))
+            .is_equal_to(Duration::from_secs(10));
+    }
+
+    fn warm_request(media: &Path, workspace: &Path, cues: Vec<Cue>) -> WarmRequest {
+        WarmRequest {
+            generation: 1,
+            source: source(media, workspace),
+            cues,
+            duration: Duration::from_secs(6),
+            // Deliberately unbounded: `warm` prunes the cache it shares with every other
+            // test in this binary, and a real limit here would delete their frames.
+            cache_limit: u64::MAX,
+        }
+    }
+
+    fn warmed(events: &Receiver<PreviewEvent>) -> Vec<(usize, usize)> {
+        let mut progress = Vec::new();
+        while let Ok(PreviewEvent::Warming { done, total, .. }) = events.try_recv() {
+            progress.push((done, total));
+        }
+        progress
+    }
+
+    /// The background pass: every cue in the track rendered and cached ahead of the user
+    /// reaching it, counting up as it goes.
+    #[test]
+    fn the_background_pass_should_render_and_cache_every_cue() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("the_background_pass_should_render_and_cache_every_cue");
+        let directory = scratch("warm-all");
+        let media = video(&directory);
+        let cues = vec![cue(1000, 2000, "first"), cue(3000, 4000, "second")];
+        let request = warm_request(&media, &directory, cues.clone());
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        let (events_tx, events) = mpsc::channel();
+
+        // Act
+        let alive = warm(&request, &live(1), &events_tx);
+
+        // Assert
+        assert_that!(alive).is_true();
+        for cue in &cues {
+            assert_that!(framecache::is_cached(&request.source.key(cue))).is_true();
+        }
+        let progress = warmed(&events);
+        assert_that!(progress.first().copied()).is_equal_to(Some((0, 2)));
+        assert_that!(progress.last().copied()).is_equal_to(Some((2, 2)));
+
+        // Cleanup
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track that is already cached — the second time a page is opened — costs nothing
+    /// but the walk. Proven by naming a media file that does not exist.
+    #[test]
+    fn the_background_pass_should_skip_cues_that_are_already_cached() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("warm-cached");
+        let cues = vec![cue(1000, 2000, "first"), cue(3000, 4000, "second")];
+        let request = warm_request(
+            &directory.join("never-existed.mkv"),
+            &directory,
+            cues.clone(),
+        );
+        for cue in &cues {
+            framecache::store(&request.source.key(cue), &png_bytes(8, 8));
+        }
+        let (events_tx, events) = mpsc::channel();
+
+        // Act
+        warm(&request, &live(1), &events_tx);
+
+        // Assert: it got all the way to the end without staging a cue, which is the first
+        // thing any real grab does.
+        assert_that!(warmed(&events).last().copied()).is_equal_to(Some((2, 2)));
+        assert_that!(directory.join(WARM_CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page stops the pass. Without this, walking into a directory and back
+    /// out again leaves a thousand-cue render running for a page nobody is looking at.
+    #[test]
+    fn the_background_pass_should_stop_the_moment_its_page_closes() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("warm-abandoned");
+        let request = warm_request(
+            &directory.join("never-existed.mkv"),
+            &directory,
+            vec![cue(1000, 2000, "first")],
+        );
+        let (events_tx, events) = mpsc::channel();
+
+        // Act: the live page has moved on past this request's generation.
+        warm(&request, &live(9), &events_tx);
+
+        // Assert: not a single event, and nothing staged or spawned.
+        assert_that!(warmed(&events).as_slice()).is_empty();
+        assert_that!(directory.join(WARM_CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A media file that cannot produce frames at all must not cost one doomed subprocess
+    /// per cue. The pass steps over a failure or two and then gives up on the track,
+    /// finishing its count so the status line does not freeze part-way.
+    #[test]
+    fn the_background_pass_should_give_up_on_a_track_that_keeps_failing() {
+        // Arrange: five cues, each named so the staged file says which one was last tried.
+        let _guard = cache_guard();
+        require_ffmpeg("the_background_pass_should_give_up_on_a_track_that_keeps_failing");
+        let directory = scratch("warm-failing");
+        let cues: Vec<Cue> = (0..5)
+            .map(|index| cue(index * 1000, index * 1000 + 500, &format!("cue-{index}")))
+            .collect();
+        let request = warm_request(&directory.join("never-existed.mkv"), &directory, cues);
+        let (events_tx, events) = mpsc::channel();
+
+        // Act
+        let alive = warm(&request, &live(1), &events_tx);
+
+        // Assert: the count finishes, so the status line clears...
+        assert_that!(alive).is_true();
+        assert_that!(warmed(&events).last().copied()).is_equal_to(Some((5, 5)));
+        // ...but it stopped at the third cue rather than trying all five.
+        let staged = std::fs::read_to_string(directory.join(WARM_CUE_FILE)).unwrap();
+        assert_that!(staged.as_str()).contains("cue-2");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A fully cached track is walked in microseconds per cue. An event each would push
+    /// thousands of messages at the event loop for a line that only counts — but the
+    /// first and the last always go, or the line would never appear or never finish.
+    #[test]
+    fn progress_should_be_reported_at_the_ends_and_rate_limited_in_between() {
+        // Arrange
+        let (events_tx, events) = mpsc::channel();
+        let mut progress = WarmProgress::new(7, 3);
+
+        // Act
+        progress.publish(&events_tx, 0);
+        progress.publish(&events_tx, 1);
+        progress.publish(&events_tx, 2);
+        progress.publish(&events_tx, 3);
+
+        // Assert: the first and the last, not the two in between.
+        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 3), (3, 3)]);
+
+        // Act / Assert: and once the interval has passed, reporting resumes.
+        let mut progress = WarmProgress::new(7, 3);
+        progress.publish(&events_tx, 0);
+        std::thread::sleep(WARM_PROGRESS_INTERVAL + Duration::from_millis(20));
+        progress.publish(&events_tx, 1);
+        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 3), (1, 3)]);
+    }
+
+    /// Nobody left to report to means the application has gone, and the worker with it.
+    #[test]
+    fn progress_should_report_when_nobody_is_listening_any_more() {
+        // Arrange
+        let (events_tx, events) = mpsc::channel();
+        let mut progress = WarmProgress::new(1, 1);
+
+        // Act / Assert
+        assert_that!(progress.publish(&events_tx, 0)).is_true();
+        drop(events);
+        assert_that!(progress.publish(&events_tx, 1)).is_false();
+    }
+
+    /// The worker loop itself: one request per page opening, coalesced down to the page
+    /// that is actually open, and a shutdown when its results have nowhere to go.
+    #[test]
+    fn the_background_worker_should_answer_the_live_page_and_stop_when_nobody_is_listening() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("warm-worker");
+        let (handles, events) = spawn_preview_workers(Some(Picker::halfblocks()));
+        let request = |generation| WarmRequest {
+            generation,
+            ..warm_request(
+                &directory.join("never-existed.mkv"),
+                &directory,
+                vec![cue(1000, 2000, "only")],
+            )
+        };
+
+        // Act: an older page's request is queued behind the live one, and the coalescing
+        // receive is what drops it.
+        handles.abandon(5);
+        handles.request_warm(request(2));
+        handles.request_warm(request(5));
+
+        // Assert: only the live page is counted for.
+        let mut generations = Vec::new();
+        while let Ok(event) = events.recv_timeout(Duration::from_secs(30)) {
+            let PreviewEvent::Warming {
+                generation,
+                done,
+                total,
+            } = event
+            else {
+                panic!("a warm request should answer with progress");
+            };
+            generations.push(generation);
+            if done == total {
+                break;
+            }
+        }
+        assert_that!(generations.iter().all(|generation| *generation == 5)).is_true();
+
+        // Act / Assert: with the results channel gone, the worker stops rather than
+        // walking the track it has been handed.
+        drop(events);
+        handles.request_warm(request(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handles
+            .warm_tx
+            .as_ref()
+            .expect("this picker has a background worker")
+            .send(request(5))
+            .is_ok()
+        {
+            assert_that!(Instant::now() < deadline).is_true();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The pass's cache lookup is a stat, not a read: a track opened a second time is
+    /// entirely cached, and reading every frame back off disk to throw the bytes away
+    /// would be hundreds of megabytes of I/O for nothing. Proven by naming a media file
+    /// that does not exist — a render could not succeed, so `Cached` means none was tried.
+    #[test]
+    fn a_cue_already_in_the_cache_should_not_be_rendered_again() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("warm-lookup");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let first = cue(1000, 2000, "cached");
+        let second = cue(3000, 4000, "missing");
+        framecache::store(&source.key(&first), &png_bytes(8, 8));
+        forget(&source, &second);
+
+        // Act
+        let cached = cache_frame(&source, &first, Duration::ZERO, WARM_CUE_FILE, &|| false);
+        let missing = cache_frame(&source, &second, Duration::ZERO, WARM_CUE_FILE, &|| false);
+        let abandoned = cache_frame(&source, &second, Duration::ZERO, WARM_CUE_FILE, &|| true);
+
+        // Assert
+        assert_that!(cached).is_equal_to(CacheOutcome::Cached);
+        assert_that!(missing).is_equal_to(CacheOutcome::Failed);
+        assert_that!(abandoned).is_equal_to(CacheOutcome::Abandoned);
+
+        // Cleanup
+        forget(&source, &first);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame fills the pane whether the cached picture is larger or smaller than it.
+    ///
+    /// Regression test: frames used to be grabbed at the pane's own pixel size, so they
+    /// always filled it. Grabbing at a fixed size instead — which is what lets one cached
+    /// frame serve every pane size — broke that, because `Resize::Fit` clamps its target
+    /// to `min(pane, image)` and so never enlarges. The preview drew at the cached picture's
+    /// own size in the corner of a pane several times larger.
+    #[test]
+    fn a_frame_should_fill_the_pane_it_is_drawn_in() {
+        // Arrange: a pane of 40x20 cells, which at halfblocks is 40x40 pixels.
+        let pane = Size::new(40, 20);
+
+        // Act: one picture far smaller than the pane, one far larger.
+        let FrameOutcome::Ready(smaller) = encode(&png_bytes(8, 8), &Picker::halfblocks(), pane)
+        else {
+            panic!("a readable PNG should encode");
+        };
+        let FrameOutcome::Ready(larger) = encode(&png_bytes(400, 400), &Picker::halfblocks(), pane)
+        else {
+            panic!("a readable PNG should encode");
+        };
+
+        // Assert: both fill the pane rather than sitting inside it at their own size.
+        assert_that!(smaller.size()).is_equal_to(pane);
+        assert_that!(larger.size()).is_equal_to(pane);
+    }
+
+    /// A picture whose shape differs from the pane's keeps its proportions, filling the
+    /// axis that runs out first — a stretched frame would misrepresent where a subtitle
+    /// sits in the picture, which is the one thing this page is for.
+    #[test]
+    fn a_frame_should_keep_its_proportions_while_filling() {
+        // Arrange: a pane of 40x10 cells is 40x20 pixels at halfblocks — wider than tall.
+        let pane = Size::new(40, 10);
+
+        // Act: a square picture.
+        let FrameOutcome::Ready(square) = encode(&png_bytes(64, 64), &Picker::halfblocks(), pane)
+        else {
+            panic!("a readable PNG should encode");
+        };
+
+        // Assert: it fills the height, and takes only the width its shape allows.
+        assert_that!(square.size().height).is_equal_to(10);
+        assert_that!(square.size().width).is_equal_to(20);
+    }
+
+    /// The endings a real grab cannot be steered into on demand, on the way out to the
+    /// page rather than on the way in from `ffmpeg`.
+    #[test]
+    fn a_frame_the_page_stopped_waiting_for_should_not_be_drawn_or_reported() {
+        // Act
+        let abandoned = drawn(
+            PngOutcome::Abandoned,
+            &Picker::halfblocks(),
+            Size::new(20, 10),
+        );
+        let failed = drawn(
+            PngOutcome::Failed("ffmpeg was not found in PATH.".to_string()),
+            &Picker::halfblocks(),
+            Size::new(20, 10),
+        );
+        let ready = drawn(
+            PngOutcome::Ready(png_bytes(64, 48)),
+            &Picker::halfblocks(),
+            Size::new(20, 10),
+        );
+
+        // Assert: nothing at all for a page that has gone, a reason for one that failed.
+        assert_that!(abandoned.is_none()).is_true();
+        let Some(FrameOutcome::Failed(message)) = failed else {
+            panic!("a grab that failed should say why");
+        };
+        assert_that!(message.as_str()).contains("not found in PATH");
+        assert_that!(matches!(ready, Some(FrameOutcome::Ready(_)))).is_true();
+    }
+
+    /// Leaving the page part-way through the pass stops it where it stands: no further
+    /// cue is rendered, and no count is published for a page that is gone.
+    #[test]
+    fn the_background_pass_should_stop_between_cues_when_the_page_goes() {
+        // Arrange: five cues, and a page that closes after the first is dealt with.
+        let _guard = cache_guard();
+        let directory = scratch("warm-mid-pass");
+        let cues: Vec<Cue> = (0..5)
+            .map(|index| cue(index * 1000, index * 1000 + 500, &format!("cue-{index}")))
+            .collect();
+        let request = warm_request(&directory.join("never-existed.mkv"), &directory, cues);
+        let (events_tx, events) = mpsc::channel();
+        let checks = std::cell::Cell::new(0);
+        let closes_after_the_first = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        };
+
+        // Act
+        let alive = warm_track(&request, &closes_after_the_first, &events_tx);
+
+        // Assert: the pass ends without a final count, since the page it counted for is
+        // gone — and it ended early, rather than walking the remaining cues.
+        assert_that!(alive).is_true();
+        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 5)]);
+        assert_that!(checks.get()).is_equal_to(3);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Closing the page during a cue's own render is the other half of the same rule:
+    /// the running `ffmpeg` is killed and the pass stops, rather than the killed grab
+    /// counting as a failure and the next cue starting another one.
+    #[test]
+    fn the_background_pass_should_stop_when_a_cue_is_abandoned_mid_render() {
+        // Arrange: the page is open when the loop checks, and gone once the grab is
+        // running — which is exactly the order a real closure arrives in.
+        let _guard = cache_guard();
+        require_ffmpeg("the_background_pass_should_stop_when_a_cue_is_abandoned_mid_render");
+        let directory = scratch("warm-mid-render");
+        let media = video(&directory);
+        let cues = vec![cue(1000, 2000, "first"), cue(3000, 4000, "second")];
+        let request = warm_request(&media, &directory, cues.clone());
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        let (events_tx, events) = mpsc::channel();
+        let checks = std::cell::Cell::new(0);
+        let closes_during_the_grab = || {
+            checks.set(checks.get() + 1);
+            // The loop's own check is the first; everything after it is `ffmpeg` being
+            // polled, and by then the page has gone.
+            checks.get() > 1
+        };
+
+        // Act
+        let alive = warm_track(&request, &closes_during_the_grab, &events_tx);
+
+        // Assert: stopped with nothing cached and nothing counted past the start.
+        assert_that!(alive).is_true();
+        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 2)]);
+        for cue in &cues {
+            assert_that!(framecache::is_cached(&request.source.key(cue))).is_false();
+        }
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

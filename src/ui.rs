@@ -30,7 +30,7 @@ use crate::{
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
-    sync::{SubtitleSyncState, SyncStatus},
+    sync::{SubtitleSyncState, SyncStatus, WarmState},
 };
 
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
@@ -177,21 +177,70 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // show which cue is selected is broken in a way a missing axis is not. Only the very
     // deepest track at the very smallest size actually hits this. The ruler line is still
     // built and simply clipped by the `Paragraph`, so the two shapes cannot drift apart.
+    //
+    // The status row is charged to the same budget: it appears only while the background
+    // frame pass has something to say, so on the sizes where it and the axis cannot both
+    // fit, the axis gives way for as long as the pass runs and comes back when it ends.
+    let status = sync_status_line(state);
+    let status_height = u16::from(status.is_some());
     let lanes = state.layout.lane_count as u16;
     let cue_panel_floor = SYNC_CUE_BLOCK_ROWS + 2;
-    let track_height = if area.height.saturating_sub(lanes + SYNC_TRACK_CHROME) >= cue_panel_floor {
+    let track_height = if area
+        .height
+        .saturating_sub(lanes + SYNC_TRACK_CHROME + status_height)
+        >= cue_panel_floor
+    {
         lanes + SYNC_TRACK_CHROME
     } else {
         lanes + SYNC_TRACK_CHROME - 1
     };
     let cue_width = (area.width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48);
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(track_height)]).split(area);
+    let rows = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(track_height),
+        Constraint::Length(status_height),
+    ])
+    .split(area);
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
     render_sync_preview(frame, state, columns[0]);
     render_sync_cues(frame, state, columns[1]);
     render_sync_timeline(frame, state, rows[1]);
+    if let Some((message, color)) = status {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(&message, rows[2].width as usize),
+                Style::default().fg(color),
+            )),
+            rows[2],
+        );
+    }
+}
+
+/// What the page has to say about the background frame pass, if anything.
+///
+/// Deliberately only two cases say anything at all. A pass that has finished, or one that
+/// was never going to run because the terminal draws no images, leaves the row absent —
+/// there is nothing there for the user to act on, and a line that says "done" forever is
+/// just furniture. A network mount is the exception: the frames are missing for a reason
+/// the user did not choose, so the page says so rather than leaving them wondering why
+/// this directory feels slower than the last one.
+///
+/// This is a status line, not control help — the keybindings popup (`?`) remains the only
+/// place this application documents its keys.
+fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
+    match state.warm {
+        WarmState::Working { done, total } => Some((
+            format!(" Generating preview frames [{done}/{total}]"),
+            Color::Cyan,
+        )),
+        WarmState::OffForNetwork => Some((
+            " Preview frames are not generated on network mounts.".to_string(),
+            Color::DarkGray,
+        )),
+        WarmState::Off | WarmState::Done => None,
+    }
 }
 
 /// The frame at the selected cue, with that cue burned into it.
@@ -12725,5 +12774,90 @@ mod tests {
         // Assert: one blank lane rather than an index panic.
         assert_that!(lines.len()).is_equal_to(1);
         assert_that!(timeline_text(&lines)[0].trim().is_empty()).is_true();
+    }
+
+    /// The count is the only sign the background pass is running, and it goes away when
+    /// there is nothing left to report — a line reading "done" forever is furniture.
+    #[test]
+    fn the_page_should_count_the_frames_being_generated_while_the_pass_runs() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-warming",
+            vec![
+                sync_cue(1000, 3000, "first"),
+                sync_cue(5000, 7000, "second"),
+            ],
+        );
+
+        // Act / Assert: nothing to say before the pass starts.
+        assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("Generating"))
+            .is_false();
+
+        // Act / Assert: counting while it runs...
+        app.subtitle_sync.as_mut().unwrap().apply_warming(3, 42);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Generating preview frames [3/42]")).is_true();
+
+        // ...and silent again once it is over.
+        app.subtitle_sync.as_mut().unwrap().apply_warming(42, 42);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Generating")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Frames are missing on a network mount for a reason the user did not choose, so the
+    /// page says so rather than leaving them wondering why this directory feels different.
+    #[test]
+    fn the_page_should_say_when_a_network_mount_is_why_there_are_no_frames() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-network", vec![sync_cue(1000, 3000, "one")]);
+
+        // Act
+        app.subtitle_sync.as_mut().unwrap().warm = WarmState::OffForNetwork;
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("not generated on network mounts")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The status row is charged to the same budget the time axis is: at a size where
+    /// both fit, both are drawn, and where they cannot, the axis gives way for as long as
+    /// the pass runs — the cue under the cursor is never what goes.
+    #[test]
+    fn the_status_row_should_take_its_row_from_the_axis_rather_than_from_the_cue_list() {
+        // Arrange: four lanes, which is the deepest track the timeline draws.
+        let (mut app, directory) = sync_page_app(
+            "sync-status-room",
+            vec![
+                sync_cue(0, 9000, "a"),
+                sync_cue(1000, 9000, "b"),
+                sync_cue(2000, 9000, "c"),
+                sync_cue(3000, 9000, "d"),
+            ],
+        );
+        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+
+        // Act / Assert: twelve rows fit the axis without the status line, and the status
+        // line costs it — the cue block stays either way.
+        let screen = drawn(50, 12, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Generating preview frames [1/4]")).is_true();
+        assert_that!(screen.contains('▲')).is_false();
+        assert_that!(screen.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
+
+        // Act / Assert: one more row and both fit.
+        let screen = drawn(50, 13, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Generating preview frames [1/4]")).is_true();
+        assert_that!(screen.contains('▲')).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

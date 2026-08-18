@@ -28,7 +28,8 @@ use crate::{
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
     preview::{
-        FrameOutcome, FrameRequest, PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles,
+        FrameOutcome, FrameRequest, FrameSource, PrepareOutcome, PrepareRequest, PreviewEvent,
+        PreviewHandles, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -39,8 +40,33 @@ use crate::{
         stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
         stream_original, stream_title,
     },
-    sync::{PreviewWorkspace, SubtitleSyncState},
+    sync::{PreviewWorkspace, SubtitleSyncState, WarmState},
 };
+
+/// What the subtitle timing page's frame cache and background pass are allowed to do.
+///
+/// Resolved by `main` from `config.toml` and from whether the directory sits on a network
+/// mount, so `App` holds one answer rather than re-deriving the policy at each decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreviewSettings {
+    /// Whether opening a page renders every cue's frame in the background.
+    pub prefetch: bool,
+    /// Whether the media is on a network mount. Only used to explain a *disabled* pass:
+    /// it is the one reason the page says out loud, because it is not the user's doing.
+    pub network: bool,
+    /// How large the frame cache may get before its oldest frames are dropped.
+    pub cache_limit: u64,
+}
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        Self {
+            prefetch: true,
+            network: false,
+            cache_limit: crate::config::Config::default().preview_cache_bytes(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Layer {
@@ -1078,6 +1104,10 @@ pub struct App {
     /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
     /// sites construct, so new workers arrive through a setter rather than a parameter.
     preview: Option<PreviewHandles>,
+    /// What the timing page's background frame pass is allowed to do, from `config.toml`
+    /// and from whether the directory is on a network mount. Set by `main` beside the
+    /// worker handles; the default is what a test or a library consumer gets.
+    preview_settings: PreviewSettings,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1217,6 +1247,7 @@ impl App {
             subtitle_capabilities: ToolCapabilities::detect_cached(),
             subtitle_sync: None,
             sync_generation: 0,
+            preview_settings: PreviewSettings::default(),
             preview: None,
             container_target: None,
             container_metadata: None,
@@ -1273,6 +1304,12 @@ impl App {
     /// the page still opens and still closes cleanly, it just never leaves its loader.
     pub fn set_preview_handles(&mut self, handles: Option<PreviewHandles>) {
         self.preview = handles;
+    }
+
+    /// Supplies the timing page's caching and prefetching policy, resolved by `main` from
+    /// `config.toml` and the mount the directory is on.
+    pub fn set_preview_settings(&mut self, settings: PreviewSettings) {
+        self.preview_settings = settings;
     }
 
     /// Records the terminal's last reported focus state, driven by `main`'s
@@ -2257,15 +2294,36 @@ impl App {
             .map(Duration::from_secs_f64)
             .unwrap_or_default();
 
+        // Read once per page opening rather than per frame: it is in every cache key, so
+        // that re-encoding a file in place cannot serve the old file's frames under the
+        // new one's path. A file whose metadata will not read at all still previews — it
+        // just keys on the path alone, which is what the zeroes here mean.
+        let metadata = std::fs::metadata(&media).ok();
+        let frames = FrameSource {
+            media,
+            media_length: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+            media_modified: metadata.and_then(|metadata| metadata.modified().ok()),
+            // A fixed size derived from the source, not from the pane: a cached frame has
+            // to keep serving after the terminal is resized.
+            pixels: crate::preview::target_pixels(
+                self.media_info()
+                    .and_then(crate::edit::primary_video_resolution)
+                    .and_then(|(width, height)| {
+                        Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+                    }),
+            ),
+            workspace: workspace.path().to_path_buf(),
+        };
+
         self.notice = None;
         self.sync_generation = self.sync_generation.wrapping_add(1);
         let state =
-            SubtitleSyncState::new(self.sync_generation, media, source, duration, workspace);
+            SubtitleSyncState::new(self.sync_generation, frames, source, duration, workspace);
         if let Some(preview) = self.preview.as_ref() {
             // A sidecar is its own input and needs no extraction; an embedded track is
             // read out of the media file by its absolute stream index.
             let (input, stream_index) = match &state.source {
-                SubtitleSource::Embedded(index) => (state.media.clone(), Some(*index)),
+                SubtitleSource::Embedded(index) => (state.media().to_path_buf(), Some(*index)),
                 SubtitleSource::Sidecar(path) => (path.clone(), None),
             };
             preview.request(PrepareRequest {
@@ -2302,6 +2360,7 @@ impl App {
     /// an event was drained, so the main loop can skip redrawing when none arrived.
     pub fn receive_preview_events(&mut self, receiver: &Receiver<PreviewEvent>) -> bool {
         let mut received = false;
+        let mut prepared = false;
         while let Ok(event) = receiver.try_recv() {
             received = true;
             let Some(state) = self.subtitle_sync.as_mut() else {
@@ -2312,9 +2371,17 @@ impl App {
                     generation,
                     outcome,
                 } if generation == state.generation => match outcome {
-                    PrepareOutcome::Ready(cues) => state.apply_prepared(cues),
+                    PrepareOutcome::Ready(cues) => {
+                        state.apply_prepared(cues);
+                        prepared = true;
+                    }
                     PrepareOutcome::Failed(message) => state.fail(message),
                 },
+                PreviewEvent::Warming {
+                    generation,
+                    done,
+                    total,
+                } if generation == state.generation => state.apply_warming(done, total),
                 PreviewEvent::Frame {
                     generation,
                     cue_index,
@@ -2326,7 +2393,62 @@ impl App {
                 _ => {}
             }
         }
+        // After the drain, not inside it: dispatching needs the workers and the settings,
+        // which are `self` fields the loop's borrow of `subtitle_sync` rules out.
+        if prepared {
+            self.start_warming();
+        }
         received
+    }
+
+    /// Renders the whole track's frames in the background, or records why it is not.
+    ///
+    /// Called once per track, the moment its cues land. The interactive worker still
+    /// answers the selection on its own thread, so this never has to race the cursor —
+    /// its job is to have the frame ready before the cursor arrives.
+    fn start_warming(&mut self) {
+        let settings = self.preview_settings;
+        // The same two gates `start_pending_preview` applies: without a terminal that can
+        // draw images or an FFmpeg that can burn subtitles in, every frame this rendered
+        // would be one the page could never show.
+        let can_draw = self
+            .preview
+            .as_ref()
+            .is_some_and(PreviewHandles::draws_frames)
+            && self.subtitle_capabilities.can_burn_subtitles();
+        let request = {
+            let Some(state) = self.subtitle_sync.as_mut() else {
+                return;
+            };
+            if !can_draw || state.cues.is_empty() {
+                state.warm = WarmState::Off;
+                None
+            } else if !settings.prefetch {
+                state.warm = if settings.network {
+                    WarmState::OffForNetwork
+                } else {
+                    WarmState::Off
+                };
+                None
+            } else {
+                state.warm = WarmState::Working {
+                    done: 0,
+                    total: state.cues.len(),
+                };
+                Some(WarmRequest {
+                    generation: state.generation,
+                    source: state.frames.clone(),
+                    cues: state.cues.clone(),
+                    duration: state.duration,
+                    cache_limit: settings.cache_limit,
+                })
+            }
+        };
+        if let Some(request) = request
+            && let Some(preview) = self.preview.as_ref()
+        {
+            preview.request_warm(request);
+        }
     }
 
     /// Asks for the frame at the selected cue, once the selection has settled.
@@ -2360,25 +2482,16 @@ impl App {
         let Some(cue) = state.selected_cue() else {
             return;
         };
-        // Held back from the very end of the media: seeking to the last instant of a file
-        // lands past the final frame, and `-frames:v 1` then writes nothing at all.
-        //
-        // Only when the duration is actually known, though. `open_subtitle_sync` leaves it
-        // zero for a file whose duration would not parse, and clamping against that would
-        // seek every cue on such a file to the very first frame.
-        let seek = if state.duration.is_zero() {
-            cue.midpoint()
-        } else {
-            cue.midpoint()
-                .min(state.duration.saturating_sub(Duration::from_millis(200)))
-        };
+        // `seek_for` rather than the midpoint outright: a cue running to the end of the
+        // media has to be held back from the very last instant, and the background pass
+        // has to make exactly the same decision — a disagreement would have the two
+        // writing different pictures under one cache key.
         preview.request_frame(FrameRequest {
             generation: state.generation,
             cue_index: state.selected,
-            media: state.media.clone(),
-            workspace: state.workspace().to_path_buf(),
-            text: cue.text.clone(),
-            seek,
+            source: state.frames.clone(),
+            cue: cue.clone(),
+            seek: crate::preview::seek_for(cue, state.duration),
             cells: state.preview_cells,
         });
     }
@@ -11449,7 +11562,7 @@ mod tests {
             CacheKey::for_file(&movie),
             ProbeOutcome::Video(media(serde_json::json!([
                 {"index": 0, "codec_type": "video", "codec_name": "h264",
-                 "width": 1920, "height": 1080},
+                 "width": 640, "height": 360},
                 {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
                  "tags": {"language": "eng"}}
             ]))),
@@ -19309,7 +19422,7 @@ mod tests {
         let state = app.subtitle_sync.as_ref().expect("page should be open");
         let request = requests.try_recv().expect("the worker should be asked");
         assert_that!(request.generation).is_equal_to(state.generation);
-        assert_that!(request.input.clone()).is_equal_to(state.media.clone());
+        assert_that!(request.input.clone()).is_equal_to(state.media().to_path_buf());
         assert_that!(request.stream_index).is_equal_to(Some(2));
         assert_that!(request.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
 
@@ -19533,9 +19646,9 @@ mod tests {
         let request = frames.try_recv().expect("a frame should be asked for");
         assert_that!(request.generation).is_equal_to(state.generation);
         assert_that!(request.cue_index).is_equal_to(0);
-        assert_that!(request.media.clone()).is_equal_to(state.media.clone());
-        assert_that!(request.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
-        assert_that!(request.text.as_str()).is_equal_to("one");
+        assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
+        assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+        assert_that!(request.cue.text.as_str()).is_equal_to("one");
         // The midpoint of the cue, not its start: a cue's first frame is often the last
         // frame of the previous shot. This file's duration would not parse, so there is
         // nothing to hold the seek back from — clamping against the resulting zero would
@@ -19761,5 +19874,254 @@ mod tests {
                 )
                 .expect("halfblocks should encode any image"),
         )
+    }
+
+    /// A track's cues arriving is what starts the background pass, and the worker cannot
+    /// see the page — so the request has to carry the whole track, the media it burns
+    /// onto, and how much cache it may fill.
+    #[test]
+    fn preparing_a_track_should_start_rendering_every_cue_in_the_background() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let cues = vec![
+            crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "one".into(),
+            },
+            crate::cue::Cue {
+                index: 1,
+                start: Duration::from_secs(5),
+                end: Duration::from_secs(7),
+                text: "two".into(),
+            },
+        ];
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready(cues.clone()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        let request = warms.try_recv().expect("the whole track should be queued");
+        assert_that!(request.generation).is_equal_to(generation);
+        assert_that!(request.cues.clone()).is_equal_to(cues);
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
+        assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+        assert_that!(request.duration).is_equal_to(state.duration);
+        assert_that!(request.cache_limit)
+            .is_equal_to(crate::config::Config::default().preview_cache_bytes());
+        // And the page starts counting, so the status line appears with the first frame
+        // rather than after it.
+        assert_that!(state.warm).is_equal_to(WarmState::Working { done: 0, total: 2 });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Frames are cached, so they cannot be rendered to fit the pane — they are rendered
+    /// at the source's own resolution, within a cap.
+    #[test]
+    fn a_background_pass_should_render_at_the_sources_resolution() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 640, "height": 360},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 1);
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert: the source's own size, which is inside the cache's cap — not the cap,
+        // and not the pane, which is not even measured yet.
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.frames.pixels).is_equal_to((640, 360));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A thousand accurate seeks across NFS is not a trade the user made by opening a
+    /// page, so the pass is off there — and the page says so, because the absence is not
+    /// their doing. The frames they actually land on are still rendered on demand.
+    #[test]
+    fn a_network_mount_should_say_why_it_is_not_rendering_frames_in_the_background() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_settings(PreviewSettings {
+            prefetch: false,
+            network: true,
+            ..PreviewSettings::default()
+        });
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        let state = prepared_page(&mut app);
+
+        // Assert
+        assert_that!(warms.try_recv().is_err()).is_true();
+        assert_that!(state).is_equal_to(WarmState::OffForNetwork);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Turned off in `config.toml` on a local disk, there is nothing to explain — the
+    /// page says nothing rather than reporting a setting back at the user who set it.
+    #[test]
+    fn prefetching_turned_off_should_be_silent() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_settings(PreviewSettings {
+            prefetch: false,
+            network: false,
+            ..PreviewSettings::default()
+        });
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        let state = prepared_page(&mut app);
+
+        // Assert
+        assert_that!(warms.try_recv().is_err()).is_true();
+        assert_that!(state).is_equal_to(WarmState::Off);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An FFmpeg that cannot burn a cue in would make every frame the pass rendered a
+    /// failure, and an empty track has nothing to render at all.
+    #[test]
+    fn nothing_should_be_rendered_in_the_background_without_cues_or_the_tools_to_draw_them() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act / Assert: cues, but no libass.
+        assert_that!(prepared_page(&mut app)).is_equal_to(WarmState::Off);
+        assert_that!(warms.try_recv().is_err()).is_true();
+
+        // Act / Assert: libass, but a track with no cues in it.
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.back();
+        app.open_subtitle_sync();
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready(Vec::new()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.subtitle_sync.as_ref().unwrap().warm).is_equal_to(WarmState::Off);
+        assert_that!(warms.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Opens a page and hands it two cues, answering with what the background pass made
+    /// of them.
+    fn prepared_page(app: &mut App) -> WarmState {
+        app.open_subtitle_sync();
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready(vec![
+                    crate::cue::Cue {
+                        index: 0,
+                        start: Duration::from_secs(1),
+                        end: Duration::from_secs(3),
+                        text: "one".into(),
+                    },
+                    crate::cue::Cue {
+                        index: 1,
+                        start: Duration::from_secs(5),
+                        end: Duration::from_secs(7),
+                        text: "two".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        app.subtitle_sync.as_ref().unwrap().warm
+    }
+
+    /// The count on screen comes from the worker, and a count for a page the user has
+    /// already left has to be dropped like every other stale result.
+    #[test]
+    fn receive_preview_events_should_count_only_for_the_page_that_is_open() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Warming {
+                generation,
+                done: 1,
+                total: 2,
+            })
+            .unwrap();
+        sender
+            .send(PreviewEvent::Warming {
+                generation: generation.wrapping_sub(1),
+                done: 2,
+                total: 2,
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert: the live page's count landed and the older page's did not overwrite it.
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().warm)
+            .is_equal_to(WarmState::Working { done: 1, total: 2 });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

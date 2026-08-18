@@ -17,6 +17,15 @@ pub struct Config {
     pub remux_workers: usize,
     pub network_transcode_workers: usize,
     pub network_remux_workers: usize,
+    /// How large the subtitle timing page's frame cache may get, in megabytes, before its
+    /// oldest frames are dropped.
+    pub preview_cache_mb: u64,
+    /// Whether opening the timing page renders every cue's frame in the background.
+    pub preview_prefetch: bool,
+    /// The same, for media on a network mount. Off by default: a feature-length track is
+    /// a thousand-odd accurate seeks, and doing that across NFS or SMB unasked is not a
+    /// trade the user made.
+    pub network_preview_prefetch: bool,
 }
 
 impl Default for Config {
@@ -27,6 +36,9 @@ impl Default for Config {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
+            preview_cache_mb: DEFAULT_PREVIEW_CACHE_MB,
+            preview_prefetch: true,
+            network_preview_prefetch: false,
         }
     }
 }
@@ -35,10 +47,19 @@ impl Default for Config {
 /// number of threads.
 const MAX_WORKERS: usize = 16;
 
+/// Frames are a few hundred kilobytes each and a feature-length subtitle track has a
+/// thousand or two cues, so this holds a handful of whole films at once.
+const DEFAULT_PREVIEW_CACHE_MB: u64 = 512;
+
+/// A cache large enough to matter, and a ceiling a mistyped value cannot cross. Zero is
+/// allowed and means "keep nothing", which is a real answer for a machine short on disk.
+const MAX_PREVIEW_CACHE_MB: u64 = 64 * 1024;
+
 #[derive(Deserialize, Default)]
 struct RawConfig {
     notifications: Option<RawNotifications>,
     workers: Option<RawWorkers>,
+    preview: Option<RawPreview>,
 }
 
 #[derive(Deserialize, Default)]
@@ -51,6 +72,18 @@ struct RawWorkers {
     transcode: Option<usize>,
     remux: Option<usize>,
     network: Option<RawNetworkWorkers>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPreview {
+    cache_mb: Option<u64>,
+    prefetch: Option<RawPrefetch>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPrefetch {
+    enabled: Option<bool>,
+    network: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -111,6 +144,8 @@ impl Config {
         let notifications = raw.notifications.unwrap_or_default();
         let workers = raw.workers.unwrap_or_default();
         let network = workers.network.unwrap_or_default();
+        let preview = raw.preview.unwrap_or_default();
+        let prefetch = preview.prefetch.unwrap_or_default();
         Self {
             notifications: notifications.enabled.unwrap_or(defaults.notifications),
             transcode_workers: clamp(workers.transcode.unwrap_or(defaults.transcode_workers)),
@@ -121,7 +156,31 @@ impl Config {
                     .unwrap_or(defaults.network_transcode_workers),
             ),
             network_remux_workers: clamp(network.remux.unwrap_or(defaults.network_remux_workers)),
+            preview_cache_mb: preview
+                .cache_mb
+                .unwrap_or(defaults.preview_cache_mb)
+                .min(MAX_PREVIEW_CACHE_MB),
+            preview_prefetch: prefetch.enabled.unwrap_or(defaults.preview_prefetch),
+            network_preview_prefetch: prefetch
+                .network
+                .unwrap_or(defaults.network_preview_prefetch),
         }
+    }
+
+    /// Whether to render a whole track's frames in the background, given whether the
+    /// target directory is on a network mount.
+    pub fn effective_prefetch(&self, is_network_mount: bool) -> bool {
+        if is_network_mount {
+            self.network_preview_prefetch
+        } else {
+            self.preview_prefetch
+        }
+    }
+
+    /// The frame cache's ceiling in bytes, which is the unit everything below the config
+    /// file works in.
+    pub fn preview_cache_bytes(&self) -> u64 {
+        self.preview_cache_mb * 1024 * 1024
     }
 
     /// The worker counts to actually pass to `spawn_edit_worker_pools`, given whether
@@ -182,7 +241,7 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n",
+            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_mb = 128\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n",
         )
         .unwrap();
         let config = Config::load_from(&path);
@@ -194,6 +253,9 @@ mod tests {
                 remux_workers: 8,
                 network_transcode_workers: 3,
                 network_remux_workers: 4,
+                preview_cache_mb: 128,
+                preview_prefetch: false,
+                network_preview_prefetch: true,
             }
         );
         fs::remove_dir_all(directory).unwrap();
@@ -347,6 +409,9 @@ mod tests {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
+            preview_cache_mb: DEFAULT_PREVIEW_CACHE_MB,
+            preview_prefetch: true,
+            network_preview_prefetch: false,
         };
         assert_eq!(config.effective_workers(false), (1, 5));
         assert_eq!(config.effective_workers(true), (1, 1));
@@ -366,6 +431,74 @@ mod tests {
             config,
             Config {
                 notifications: false,
+                ..Config::default()
+            }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rendering a frame per cue means a thousand accurate seeks, which is fine on a
+    /// local disk and is not something to start unasked across NFS or SMB.
+    #[test]
+    fn prefetching_should_follow_the_mount_the_directory_is_on() {
+        let defaults = Config::default();
+        assert!(defaults.effective_prefetch(false));
+        assert!(!defaults.effective_prefetch(true));
+
+        // Both are settable, so a fast share can opt in and a slow laptop can opt out.
+        let configured = Config {
+            preview_prefetch: false,
+            network_preview_prefetch: true,
+            ..defaults
+        };
+        assert!(!configured.effective_prefetch(false));
+        assert!(configured.effective_prefetch(true));
+    }
+
+    /// The config file talks in megabytes because that is what a person thinks in;
+    /// everything below it works in bytes.
+    #[test]
+    fn the_frame_cache_limit_should_be_offered_in_bytes() {
+        assert_eq!(
+            Config::default().preview_cache_bytes(),
+            DEFAULT_PREVIEW_CACHE_MB * 1024 * 1024
+        );
+        // Zero is a real answer — "cache nothing" — for a machine short on disk.
+        let none = Config {
+            preview_cache_mb: 0,
+            ..Config::default()
+        };
+        assert_eq!(none.preview_cache_bytes(), 0);
+    }
+
+    /// A mistyped cache size must not let the frame cache eat the disk, the same way a
+    /// mistyped worker count must not spawn a hundred threads.
+    #[test]
+    fn an_absurd_cache_size_should_be_capped() {
+        let directory = scratch("cache-size");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[preview]\ncache_mb = 99999999\n").unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(config.preview_cache_mb, MAX_PREVIEW_CACHE_MB);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// One preview key set in isolation must not reset the others, the same as every
+    /// other leaf in this file.
+    #[test]
+    fn a_lone_preview_key_should_keep_the_other_preview_defaults() {
+        let directory = scratch("preview-partial");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[preview.prefetch]\nnetwork = true\n").unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(
+            config,
+            Config {
+                network_preview_prefetch: true,
                 ..Config::default()
             }
         );

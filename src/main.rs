@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use ratatui_image::picker::Picker;
-use reel_tui::app::App;
+use reel_tui::app::{App, PreviewSettings};
 use reel_tui::cli;
 use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
@@ -54,6 +54,11 @@ fn run(target_dir: PathBuf) -> Result<()> {
         app_config.notifications,
     ));
     app.set_preview_handles(Some(preview_handles));
+    app.set_preview_settings(PreviewSettings {
+        prefetch: app_config.effective_prefetch(is_network_mount),
+        network: is_network_mount,
+        cache_limit: app_config.preview_cache_bytes(),
+    });
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {

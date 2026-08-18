@@ -431,3 +431,23 @@ fn srt_body(language: &str, duration: f32) -> String {
     let millis = ((end - whole as f32) * 1000.0) as u32;
     format!("1\n00:00:00,000 --> 00:00:{whole:02},{millis:03}\n{language} subtitle line\n\n")
 }
+
+/// Writes a single solid-colour PNG, for planting in the preview frame cache.
+///
+/// A cached frame the application could not possibly have rendered from the fixture
+/// video, so a page that draws it is a page that read the cache rather than running
+/// `ffmpeg` again.
+pub fn write_solid_png(path: &Path, color: &str, width: u32, height: u32) {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("color=c={color}:s={width}x{height}"))
+        .args(["-frames:v", "1"])
+        .arg(path)
+        .output()
+        .expect("ffmpeg should be runnable");
+    assert!(
+        output.status.success() && path.exists(),
+        "failed to write the solid frame fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
