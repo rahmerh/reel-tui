@@ -6,13 +6,21 @@ This repository builds a Rust 2024 library, `reel_tui` (`src/lib.rs`), and one b
 
 - `src/lib.rs`: Module declarations only; the crate root shared by the binary and the integration tests.
 - `src/main.rs`: Entry point, worker spawning, terminal setup, and the top-level event loop. Deliberately thin — anything testable belongs in the library.
+- `src/cli.rs`: Argument dispatch (`--help`, `--version`, the target directory) before the terminal is touched, so informational and usage-error output stays script-friendly.
+- `src/config.rs`: The user's `config.toml` — worker-pool sizes and the desktop-notification switch.
+- `src/requirements.rs`: The external tool floors, enforced at startup. See **External Tool Floors** below.
 - `src/input.rs`: Key handling (`handle_key` and friends): the mapping from a `KeyEvent` to an `App` mutation.
 - `src/app.rs`: Application state, navigation layer management, probe/edit event dispatching, and persistent cache integration.
+- `src/staging.rs`: Staged edits and in-flight batch state (`StagedEdit`, `BatchState`), the shape a save is dispatched and reported through.
 - `src/ui.rs`: Ratatui rendering, split layout rendering, stream detail popups, and status indicators (including `[NET]` badge).
 - `src/files.rs`: Directory scanning, file tree nesting, and adaptive filesystem monitoring.
 - `src/probe.rs`: Asynchronous `ffprobe` worker thread, media metadata parsing, and tuned probing flags (`-probesize`, `-analyzeduration`).
 - `src/edit.rs`: Asynchronous `ffmpeg` remuxing, track reordering, container conversion, progress reporting, cancellation, and cross-filesystem transaction publishing (`move_or_copy_file`).
-- `src/subtitle.rs`: Subtitle stream inspection, sidecar file matching, format conversion, language tag translation, and OCR capability detection.
+- `src/subtitle.rs`: Subtitle stream inspection, sidecar file matching, format conversion, language tag translation, and OCR/libass capability detection (`ToolCapabilities`).
+- `src/cue.rs`: Cue-level subtitle data — SubRip parsing into individual cues, timeline lane packing, and the mapping from cue times to terminal columns. No dependency on `App`, `ratatui`, or subprocesses.
+- `src/sync.rs`: State for the subtitle timing page (`SubtitleSyncState`): which cues a track holds, which is selected, the frame on screen, and the scratch directory that is released when the page closes.
+- `src/preview.rs`: The timing page's two background workers — reading a track's cues (`.srt` sidecar or embedded `subrip`), and grabbing the video frame at the selected cue with that cue burned in. Deliberately does **not** route through `edit.rs`, so a read-only preview never writes `edit_errors.log`.
+- `src/notification.rs`: Best-effort desktop notifications when a save finishes while the terminal is unfocused.
 - `src/mount.rs`: Network mount detection via `/proc/mounts` (NFS, SMB/CIFS, SSHFS, Rclone, Ceph, etc.) and `REEL_NETWORK_MODE` environment variable overrides.
 - `src/cache.rs`: Persistent on-disk probe metadata cache (`DiskCache`) stored at `$XDG_CACHE_HOME/reel-tui/probe_cache.json`.
 

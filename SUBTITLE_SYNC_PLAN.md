@@ -3,8 +3,9 @@
 > **Delete this file before merging to `main`.** It is a working handoff for an
 > in-progress branch, not documentation of the finished feature.
 
-Handoff for the `subtitle-sync-preview` branch. Steps 0–5 are done; only step 6, the
-final gate, remains. The full original design is at
+Handoff for the `subtitle-sync-preview` branch. Steps 0–5 are done, and step 6's gate has
+been run once — but the branch is **not** merging yet, so this file stays until it is. See
+"Step 6" for what has been run and what has to be re-run at the actual merge. The full original design is at
 `~/.claude/plans/okay-so-let-s-create-cryptic-ember.md`.
 
 ## What this feature is
@@ -219,13 +220,21 @@ from the harness `pump`. 904 unit tests pass; fmt, clippy, `cargo publish --dry-
 
 ## Step 6 — final gate
 
+Run once at the end of the preview work. **Everything here that runs a check has to run
+again immediately before the branch actually merges** — the gate is only worth what the
+tree it ran against is.
+
 - `keybindings_text()` entry — **already done in Step 2**.
-- **Delete this file.**
-- `AGENTS.md` module list: add `cue.rs`, `preview.rs`, `sync.rs`, and backfill the five it
-  already omits (`cli.rs`, `config.rs`, `notification.rs`, `requirements.rs`, `staging.rs`).
-- `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
-- `cargo publish --dry-run` — specifically proves the chafa-free feature set.
-- Full e2e suite **once**, as the pre-merge gate.
+- `AGENTS.md` module list — **done**: `cue.rs`, `preview.rs` and `sync.rs` added, and the
+  five it already omitted (`cli.rs`, `config.rs`, `notification.rs`, `requirements.rs`,
+  `staging.rs`) backfilled.
+- **Delete this file** — *not* done, and deliberately: more work is planned on this branch,
+  and this is its handoff. Delete it in the commit that makes the branch merge-ready.
+- `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test` — clean.
+- `cargo publish --dry-run` — passes; this is what proves the chafa-free feature set.
+- Full e2e suite — **31 scenarios, all passing**. The run that matters: every pre-existing
+  scenario now spawns the preview workers and drains their channel through
+  `Harness::pump`, and this was the first time all of them exercised that together.
 - Merged coverage:
   ```sh
   cargo +nightly llvm-cov clean --workspace
