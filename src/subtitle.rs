@@ -395,6 +395,10 @@ pub struct ToolCapabilities {
     pub ffmpeg: bool,
     pub ffmpeg_encoders: BTreeSet<String>,
     pub ffmpeg_muxers: BTreeSet<String>,
+    /// Filter names from `ffmpeg -filters`, consulted only by the subtitle timing page's
+    /// frame preview. A build without libass has no `subtitles` filter, and asking one to
+    /// burn a cue in fails per keypress rather than once.
+    pub ffmpeg_filters: BTreeSet<String>,
     pub seconv: bool,
     pub tesseract_languages: Vec<String>,
 }
@@ -408,6 +412,7 @@ impl ToolCapabilities {
     fn detect() -> Self {
         let encoders = command_stdout("ffmpeg", &["-hide_banner", "-encoders"]);
         let muxers = command_stdout("ffmpeg", &["-hide_banner", "-muxers"]);
+        let filters = command_stdout("ffmpeg", &["-hide_banner", "-filters"]);
         let ffmpeg = encoders.is_some() && muxers.is_some();
         let seconv = command_stdout("seconv", &["--help"])
             .as_deref()
@@ -427,9 +432,23 @@ impl ToolCapabilities {
                 .as_deref()
                 .map(parse_capability_names)
                 .unwrap_or_default(),
+            ffmpeg_filters: filters
+                .as_deref()
+                .map(parse_filter_names)
+                .unwrap_or_default(),
             seconv,
             tesseract_languages,
         }
+    }
+
+    /// Whether `ffmpeg` can draw a subtitle onto a video frame.
+    ///
+    /// `subtitles` is the libass one, present only in a build configured with it;
+    /// `scale` is what fits the result to the preview pane. Without both, the timing
+    /// page falls back to showing the cue's text, which is also what a terminal with no
+    /// image protocol gets.
+    pub fn can_burn_subtitles(&self) -> bool {
+        self.ffmpeg_filters.contains("subtitles") && self.ffmpeg_filters.contains("scale")
     }
 
     pub fn format_choices(
@@ -555,6 +574,24 @@ fn parse_capability_names(output: &str) -> BTreeSet<String> {
                 || flags.starts_with('A')
                 || flags.starts_with('S'))
             .then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Filter names from `ffmpeg -filters`.
+///
+/// A separate parser from `parse_capability_names` because the listings differ where it
+/// matters: a filter's flag column is `TSC`-style with no `E`, and its third field is the
+/// `V->V` signature. Keying on that signature is what separates the entries from the
+/// legend above them, which is printed in the same shape (`T.. = Timeline support`).
+fn parse_filter_names(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _flags = fields.next()?;
+            let name = fields.next()?;
+            fields.next()?.contains("->").then(|| name.to_string())
         })
         .collect()
 }
@@ -1368,6 +1405,7 @@ mod tests {
                 "mov_text".to_string(),
             ]),
             ffmpeg_muxers: BTreeSet::new(),
+            ffmpeg_filters: BTreeSet::new(),
             seconv: false,
             tesseract_languages: Vec::new(),
         };
@@ -1431,6 +1469,7 @@ mod tests {
             ffmpeg: true,
             ffmpeg_encoders: BTreeSet::from(["subrip".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
+            ffmpeg_filters: BTreeSet::new(),
             seconv: false,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1468,6 +1507,7 @@ mod tests {
             ffmpeg: true,
             ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "dvdsub".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
+            ffmpeg_filters: BTreeSet::new(),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1563,6 +1603,7 @@ mod tests {
             ffmpeg: true,
             ffmpeg_encoders: BTreeSet::from(["dvdsub".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
+            ffmpeg_filters: BTreeSet::new(),
             seconv: false,
             tesseract_languages: Vec::new(),
         };
@@ -1595,6 +1636,7 @@ mod tests {
             ffmpeg: false,
             ffmpeg_encoders: BTreeSet::new(),
             ffmpeg_muxers: BTreeSet::new(),
+            ffmpeg_filters: BTreeSet::new(),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1807,6 +1849,52 @@ mod tests {
         assert_that!(stream_cc(&eia_608)).is_true();
         assert_that!(stream_cc(&eia_708)).is_true();
         assert_that!(stream_cc(&neither)).is_false();
+    }
+
+    /// The filter listing prints its legend in the same shape as its entries, and its
+    /// flag column carries none of the letters the encoder parser keys on — so this needs
+    /// its own rule, and getting it wrong means either no filters or a filter named "=".
+    #[test]
+    fn parse_filter_names_should_take_the_entries_and_leave_the_legend() {
+        // Arrange: the real shape of `ffmpeg -filters`.
+        let output = "Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  A = Audio input/output
+  ------
+ .. acompressor    A->A       Audio compressor.
+ .. scale          V->V       Scale the input video size.
+ ..C subtitles     V->V       Render text subtitles using the libass library.
+ T.. overlay       VV->V      Overlay a video source on top of the input.
+        ";
+
+        // Act
+        let filters = parse_filter_names(output);
+
+        // Assert
+        assert_that!(filters.contains("subtitles")).is_true();
+        assert_that!(filters.contains("scale")).is_true();
+        assert_that!(filters.contains("overlay")).is_true();
+        assert_that!(filters.contains("=")).is_false();
+        assert_that!(filters.contains("Timeline")).is_false();
+        assert_that!(filters.len()).is_equal_to(4);
+    }
+
+    /// A build without libass has no `subtitles` filter at all, and the timing page has
+    /// to notice before it starts one doomed `ffmpeg` per settled selection.
+    #[test]
+    fn can_burn_subtitles_should_require_both_filters_the_frame_grab_uses() {
+        // Arrange
+        let with = |names: [&str; 2]| ToolCapabilities {
+            ffmpeg_filters: names.iter().map(|name| name.to_string()).collect(),
+            ..ToolCapabilities::default()
+        };
+
+        // Act / Assert
+        assert_that!(with(["subtitles", "scale"]).can_burn_subtitles()).is_true();
+        assert_that!(with(["scale", "overlay"]).can_burn_subtitles()).is_false();
+        assert_that!(with(["subtitles", "overlay"]).can_burn_subtitles()).is_false();
+        assert_that!(ToolCapabilities::default().can_burn_subtitles()).is_false();
     }
 
     #[test]

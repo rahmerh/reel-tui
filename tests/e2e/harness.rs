@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui_image::picker::Picker;
 use reel_tui::app::{
     App, AudioSettingsField, AudioSettingsMode, ContainerSettingsField, ContainerSettingsMode,
     Dialog, Layer, ResolutionChoiceValue, SubtitleSettingsField, SubtitleSettingsMode, TrackRef,
@@ -28,7 +29,7 @@ use reel_tui::app::{
 use reel_tui::edit::{EditEvent, VideoRotation, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
-use reel_tui::preview::{PreviewEvent, spawn_preview_worker};
+use reel_tui::preview::{PreviewEvent, spawn_preview_workers};
 use reel_tui::probe::{
     ProbeOutcome, ProbeResponse, spawn_conflict_probe_worker, spawn_probe_worker,
 };
@@ -120,7 +121,11 @@ impl Harness {
         let (request_tx, probe_rx) = spawn_probe_worker();
         let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
         let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
-        let (preview_handles, preview_rx) = spawn_preview_worker();
+        // Halfblocks rather than a queried protocol: `Picker::from_query_stdio` writes to
+        // the real terminal and waits for a reply that a test runner never sends. Halfblocks
+        // also happen to be the one protocol whose output `TestBackend` can be asserted on,
+        // since it draws ordinary cells with colors rather than an escape sequence.
+        let (preview_handles, preview_rx) = spawn_preview_workers(Some(Picker::halfblocks()));
         let mut app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
         app.set_preview_handles(Some(preview_handles));
         Self {
@@ -153,6 +158,7 @@ impl Harness {
         self.app.receive_edit_results(&self.edit_rx);
         self.app.receive_preview_events(&self.preview_rx);
         self.app.start_pending_probe();
+        self.app.start_pending_preview();
         self.app.maybe_open_conflict_dialog();
         let app = &mut self.app;
         self.terminal.draw(|frame| ui::render(frame, app)).unwrap();
@@ -1146,6 +1152,28 @@ impl Harness {
     }
 
     /// The terminal contents as one string, for assertions and failure messages.
+    /// The distinct image colours on screen, which is as much of a rendered frame as
+    /// `TestBackend` can be asked about.
+    ///
+    /// Its `Buffer` stores a symbol and a style per cell and never exposes the backend's
+    /// writer, so kitty, sixel and iTerm2 escape sequences are invisible to it entirely.
+    /// The halfblocks protocol the harness picks is the one that draws through ordinary
+    /// cells, and an `Rgb` background is something no part of this UI paints except an
+    /// image — so "more than one" means a decoded picture rather than a blank pane or a
+    /// solid fill.
+    pub fn preview_shades(&self) -> BTreeSet<(u8, u8, u8)> {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter_map(|cell| match cell.style().bg {
+                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn screen(&self) -> String {
         let buffer = self.terminal.backend().buffer();
         (0..buffer.area.height)

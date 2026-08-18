@@ -215,6 +215,21 @@ pub fn format_timestamp(at: Duration) -> String {
     )
 }
 
+/// Renders a cue time the way SubRip writes one, to the millisecond.
+///
+/// The comma is not a stylistic choice: `ffmpeg`'s SubRip demuxer is what reads the file
+/// this produces, and a period there makes it a different format.
+pub fn format_srt_timestamp(at: Duration) -> String {
+    let seconds = at.as_secs();
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+        at.subsec_millis()
+    )
+}
+
 /// How many rows the timeline track will stack overlapping cues onto before it starts
 /// crowding them together.
 pub const MAX_LANES: usize = 4;
@@ -727,6 +742,20 @@ mod tests {
         assert_that!(format_timestamp(Duration::ZERO).as_str()).is_equal_to("00:00:00.0");
         assert_that!(format_timestamp(milliseconds(62_300)).as_str()).is_equal_to("00:01:02.3");
         assert_that!(format_timestamp(milliseconds(3_723_999)).as_str()).is_equal_to("01:02:03.9");
+    }
+
+    /// The comma is what makes it SubRip. `ffmpeg`'s demuxer reads the file this writes,
+    /// and a period there is a different format entirely.
+    #[test]
+    fn format_srt_timestamp_should_write_subrip_time_to_the_millisecond() {
+        // Act / Assert
+        assert_that!(format_srt_timestamp(Duration::ZERO).as_str()).is_equal_to("00:00:00,000");
+        assert_that!(format_srt_timestamp(milliseconds(62_300)).as_str())
+            .is_equal_to("00:01:02,300");
+        assert_that!(format_srt_timestamp(milliseconds(3_723_999)).as_str())
+            .is_equal_to("01:02:03,999");
+        assert_that!(format_srt_timestamp(Duration::from_secs(600)).as_str())
+            .is_equal_to("00:10:00,000");
     }
 
     #[test]

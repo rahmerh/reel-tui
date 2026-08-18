@@ -7,10 +7,20 @@
 //! including its temp directory, without each exit path having to remember to.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ratatui::layout::Size;
+use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
 use crate::subtitle::SubtitleSource;
+
+/// How long the selection has to stop moving before a frame is asked for.
+///
+/// Matches the file list's probe debounce (`App::start_pending_probe`). Walking a cue list
+/// with `j` held down would otherwise start an `ffmpeg` per repeat, each one an accurate
+/// seek that on a network mount reads from the preceding keyframe.
+pub const FRAME_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// How far the page has got in loading a track's cues.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +76,26 @@ fn unique_name() -> String {
     )
 }
 
+/// A drawn frame and the cue it belongs to.
+///
+/// A struct with its own `Debug` rather than a tuple in the state, because `Protocol`
+/// holds encoded image data and has none of its own — and without this the whole page
+/// state would lose its derived `Debug`, which every test failure message prints.
+struct Frame {
+    cue_index: usize,
+    protocol: Box<Protocol>,
+}
+
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Frame")
+            .field("cue_index", &self.cue_index)
+            .field("size", &self.protocol.size())
+            .finish()
+    }
+}
+
 /// Everything the subtitle timing page draws and navigates.
 #[derive(Debug)]
 pub struct SubtitleSyncState {
@@ -90,7 +120,15 @@ pub struct SubtitleSyncState {
     /// Recorded here because the frame grab has to scale to a pane whose size only the
     /// renderer knows, and because a change to it is what tells the worker the frame it
     /// already produced is the wrong size now.
-    pub preview_cells: (u16, u16),
+    pub preview_cells: Size,
+    /// The frame on screen, once one has been drawn.
+    frame: Option<Frame>,
+    /// Why the last frame request produced nothing, shown under the text preview.
+    pub frame_error: Option<String>,
+    /// Set when something invalidated the frame — the selection moved, the cues arrived,
+    /// the pane resized — and cleared when the request is actually sent, one debounce
+    /// later.
+    frame_pending_since: Option<Instant>,
     workspace: PreviewWorkspace,
 }
 
@@ -113,7 +151,10 @@ impl SubtitleSyncState {
             selected: 0,
             list_scroll: 0,
             list_rows: 0,
-            preview_cells: (0, 0),
+            preview_cells: Size::new(0, 0),
+            frame: None,
+            frame_error: None,
+            frame_pending_since: None,
             workspace,
         }
     }
@@ -137,12 +178,75 @@ impl SubtitleSyncState {
         self.cues = cues;
         self.selected = 0;
         self.list_scroll = 0;
+        self.request_frame();
     }
 
     pub fn fail(&mut self, message: String) {
         self.status = SyncStatus::Failed(message);
         self.cues.clear();
         self.layout = LaneLayout::default();
+        self.drop_frame();
+        self.frame_pending_since = None;
+    }
+
+    /// The frame to draw, if there is one for the cue currently selected.
+    ///
+    /// Keyed on the selection rather than handed out unconditionally, so the moment the
+    /// cursor moves the pane shows the new cue's text instead of the previous cue's
+    /// picture — a stale frame under a fresh cue reads as the burn-in being wrong.
+    pub fn frame(&self) -> Option<&Protocol> {
+        self.frame
+            .as_ref()
+            .filter(|frame| frame.cue_index == self.selected)
+            .map(|frame| frame.protocol.as_ref())
+    }
+
+    /// Takes a rendered frame, ignoring one for a cue that is no longer selected.
+    pub fn apply_frame(&mut self, cue_index: usize, protocol: Box<Protocol>) {
+        self.frame_error = None;
+        self.frame = Some(Frame {
+            cue_index,
+            protocol,
+        });
+    }
+
+    pub fn fail_frame(&mut self, message: String) {
+        self.drop_frame();
+        self.frame_error = Some(message);
+    }
+
+    fn drop_frame(&mut self) {
+        self.frame = None;
+    }
+
+    /// Marks the frame on screen as no longer the right one, starting the debounce.
+    pub fn request_frame(&mut self) {
+        self.frame_pending_since = Some(Instant::now());
+    }
+
+    /// Whether a frame request has waited out its debounce, consuming it if so.
+    ///
+    /// Consuming here rather than in the caller keeps "asked for" and "waiting to ask"
+    /// from ever both being true, which is what would let one settled selection start two
+    /// `ffmpeg` processes.
+    pub fn take_due_frame_request(&mut self) -> bool {
+        let due = self
+            .frame_pending_since
+            .is_some_and(|since| since.elapsed() >= FRAME_DEBOUNCE);
+        if due {
+            self.frame_pending_since = None;
+        }
+        due
+    }
+
+    /// Records the pane size the renderer measured, asking for a new frame when it
+    /// changed — the frame already drawn was encoded for the old size, and `Image` draws
+    /// nothing at all rather than clipping when it no longer fits.
+    pub fn set_preview_cells(&mut self, cells: Size) {
+        if self.preview_cells != cells {
+            self.preview_cells = cells;
+            self.request_frame();
+        }
     }
 
     pub fn selected_cue(&self) -> Option<&Cue> {
@@ -172,6 +276,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = next;
+        self.request_frame();
         true
     }
 
@@ -180,6 +285,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = 0;
+        self.request_frame();
         true
     }
 
@@ -192,6 +298,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = last;
+        self.request_frame();
         true
     }
 
@@ -236,6 +343,28 @@ mod tests {
             SubtitleSource::Embedded(2),
             Duration::from_secs(600),
             PreviewWorkspace::new().unwrap(),
+        )
+    }
+
+    /// A protocol occupying exactly `width` x `height` cells.
+    ///
+    /// Sized in pixels from the halfblocks font size, because `Resize::Fit` takes the
+    /// cell size from the image's own proportions rather than from what it was asked for.
+    fn protocol(width: u16, height: u16) -> Box<Protocol> {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let font = picker.font_size();
+        let image = image::DynamicImage::new_rgb8(
+            u32::from(width) * u32::from(font.width),
+            u32::from(height) * u32::from(font.height),
+        );
+        Box::new(
+            picker
+                .new_protocol(
+                    image,
+                    Size::new(width, height),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks should encode any image"),
         )
     }
 
@@ -462,5 +591,127 @@ mod tests {
 
         // Assert
         assert_that!(first.path() == second.path()).is_false();
+    }
+
+    /// The page's state is printed whole in every test failure and in the harness's
+    /// timeout dump, and `Protocol` contributes nothing to that on its own.
+    #[test]
+    fn a_stored_frame_should_describe_itself_by_cue_and_size() {
+        // Arrange
+        let mut state = ready(2);
+        state.apply_frame(1, protocol(10, 5));
+
+        // Act
+        let described = format!("{:?}", state.frame);
+
+        // Assert
+        assert_that!(described.as_str()).contains("cue_index: 1");
+        assert_that!(described.as_str()).contains("width: 10");
+        assert_that!(described.as_str()).contains("height: 5");
+    }
+
+    /// A frame belongs to the cue it was drawn for. Showing it under a different cue
+    /// would read as the burn-in being wrong, which is the one thing this page exists to
+    /// let you judge.
+    #[test]
+    fn a_frame_should_only_be_drawn_for_the_cue_it_was_rendered_for() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act
+        state.apply_frame(0, protocol(10, 5));
+
+        // Assert
+        assert_that!(state.frame().is_some()).is_true();
+        state.select(1);
+        assert_that!(state.frame().is_some()).is_false();
+        state.select(-1);
+        assert_that!(state.frame().is_some()).is_true();
+    }
+
+    #[test]
+    fn a_frame_that_could_not_be_drawn_should_replace_the_one_on_screen_with_its_reason() {
+        // Arrange
+        let mut state = ready(3);
+        state.apply_frame(0, protocol(10, 5));
+
+        // Act
+        state.fail_frame("libass is missing".to_string());
+
+        // Assert
+        assert_that!(state.frame().is_some()).is_false();
+        assert_that!(state.frame_error.clone()).is_equal_to(Some("libass is missing".to_string()));
+
+        // Act / Assert: and a frame that does arrive clears the reason again.
+        state.apply_frame(0, protocol(10, 5));
+        assert_that!(state.frame_error.clone()).is_none();
+    }
+
+    /// Everything that invalidates the frame has to go through the same debounce, or a
+    /// held-down `j` starts an ffmpeg per key repeat.
+    #[test]
+    fn moving_the_selection_should_ask_for_a_frame_only_once_the_movement_settles() {
+        // Arrange
+        let mut state = ready(5);
+        state.take_due_frame_request();
+
+        // Act
+        state.select(1);
+
+        // Assert: pending, but not yet due.
+        assert_that!(state.take_due_frame_request()).is_false();
+        std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
+        assert_that!(state.take_due_frame_request()).is_true();
+        // And consumed: one settled selection is one request.
+        assert_that!(state.take_due_frame_request()).is_false();
+    }
+
+    #[test]
+    fn every_way_the_frame_goes_stale_should_ask_for_a_new_one() {
+        // Arrange
+        let mut state = state();
+        let due = |state: &mut SubtitleSyncState| {
+            std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
+            state.take_due_frame_request()
+        };
+
+        // Act / Assert: the cues arriving.
+        state.apply_prepared(vec![cue(0, 1000, "a"), cue(2000, 3000, "b")]);
+        assert_that!(due(&mut state)).is_true();
+
+        // Act / Assert: the pane being measured, and then resized.
+        state.set_preview_cells(Size::new(40, 20));
+        assert_that!(due(&mut state)).is_true();
+        state.set_preview_cells(Size::new(40, 20));
+        assert_that!(due(&mut state)).is_false();
+        state.set_preview_cells(Size::new(30, 20));
+        assert_that!(due(&mut state)).is_true();
+
+        // Act / Assert: jumping to either end of the list.
+        assert_that!(state.select_last()).is_true();
+        assert_that!(due(&mut state)).is_true();
+        assert_that!(state.select_first()).is_true();
+        assert_that!(due(&mut state)).is_true();
+
+        // Act / Assert: and a refusal to move asks for nothing.
+        assert_that!(state.select_first()).is_false();
+        assert_that!(due(&mut state)).is_false();
+    }
+
+    /// A track that failed to load has no cue to draw, so a request left pending from
+    /// opening the page would grab a frame for a cue list that does not exist.
+    #[test]
+    fn a_failed_track_should_drop_its_frame_and_stop_asking_for_one() {
+        // Arrange
+        let mut state = ready(3);
+        state.apply_frame(0, protocol(10, 5));
+
+        // Act
+        state.fail("ffmpeg exploded".to_string());
+
+        // Assert
+        assert_that!(state.frame().is_some()).is_false();
+        std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
+        assert_that!(state.take_due_frame_request()).is_false();
     }
 }

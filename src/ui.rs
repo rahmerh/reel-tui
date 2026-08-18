@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
+use ratatui_image::Image;
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -166,18 +167,30 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     render_sync_timeline(frame, state, rows[1]);
 }
 
-/// The frame at the selected cue.
+/// The frame at the selected cue, with that cue burned into it.
 ///
-/// Until the frame worker exists this shows the cue's text instead — which is also the
-/// path taken when the terminal has no image protocol or FFmpeg was built without libass,
-/// so it is not throwaway scaffolding.
+/// Falls back to drawing the cue's text when there is no frame: while one is being
+/// rendered, when the terminal has no image protocol, and when FFmpeg was built without
+/// libass. All three land here, so the fallback is a real path rather than scaffolding.
 fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
     let block = Block::bordered().title(" Preview ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Recorded for the frame worker, which has to scale to a pane only the renderer has
-    // measured.
-    state.preview_cells = (inner.width, inner.height);
+    // measured, and which has to be told when that measurement changes.
+    state.set_preview_cells(inner.as_size());
+
+    // `Image` draws nothing at all — not even clipped — when the protocol is larger than
+    // the area it is given, so a frame encoded for a pane that has since shrunk is left
+    // for the text fallback rather than rendered into an empty box.
+    if let Some(protocol) = state
+        .frame()
+        .filter(|protocol| protocol.size().width <= inner.width)
+        .filter(|protocol| protocol.size().height <= inner.height)
+    {
+        frame.render_widget(Image::new(protocol), inner);
+        return;
+    }
 
     let text = state
         .selected_cue()
@@ -11730,8 +11743,8 @@ mod tests {
         // Assert: one lane against three, so the preview pane loses two rows.
         assert_that!(flat.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(1);
         assert_that!(stacked.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(3);
-        let flat_preview = flat.subtitle_sync.as_ref().unwrap().preview_cells.1;
-        let stacked_preview = stacked.subtitle_sync.as_ref().unwrap().preview_cells.1;
+        let flat_preview = flat.subtitle_sync.as_ref().unwrap().preview_cells.height;
+        let stacked_preview = stacked.subtitle_sync.as_ref().unwrap().preview_cells.height;
         assert_that!(flat_preview - stacked_preview).is_equal_to(2);
         assert_that!(flat_screen.contains("Timeline")).is_true();
         assert_that!(stacked_screen.contains("Timeline")).is_true();
@@ -11743,21 +11756,143 @@ mod tests {
         std::fs::remove_dir_all(stacked_dir).unwrap();
     }
 
+    /// A protocol for a two-colour image occupying exactly `width` x `height` cells, so
+    /// the drawn cells can be told apart from an empty pane and from a solid fill.
+    ///
+    /// The image is sized in pixels from the halfblocks font size, because `Resize::Fit`
+    /// derives the cell size from the image's own proportions — asking for a cell size
+    /// with an image of some other shape silently produces a smaller protocol than asked
+    /// for, which is exactly how an "oversized" fixture ends up fitting after all.
+    fn striped_protocol(width: u16, height: u16) -> Box<ratatui_image::protocol::Protocol> {
+        let font = ratatui_image::picker::Picker::halfblocks().font_size();
+        let mut image = image::RgbImage::new(
+            u32::from(width) * u32::from(font.width),
+            u32::from(height) * u32::from(font.height),
+        );
+        for (x, _y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = if x % 2 == 0 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let protocol = ratatui_image::picker::Picker::halfblocks()
+            .new_protocol(
+                image::DynamicImage::ImageRgb8(image),
+                ratatui::layout::Size::new(width, height),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks should encode any image");
+        assert_eq!(
+            protocol.size(),
+            ratatui::layout::Size::new(width, height),
+            "the fixture must occupy the cells it claims to"
+        );
+        Box::new(protocol)
+    }
+
+    /// Cells and their colours from a rendered frame, which is as much of an image as
+    /// `TestBackend` can be asked about: it stores symbol and style per cell and never
+    /// exposes the escape sequences a kitty or sixel protocol would write instead.
+    fn drawn_cells(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut Frame),
+    ) -> Vec<(String, ratatui::style::Style)> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.style()))
+            .collect()
+    }
+
+    /// The point of the whole feature: the frame the worker drew is what the pane shows.
+    ///
+    /// Asserted through the halfblocks protocol, the one `TestBackend` can see — it draws
+    /// ordinary `▀` cells with foreground and background colours, where kitty, sixel and
+    /// iTerm2 write escape sequences the buffer never stores.
+    #[test]
+    fn the_preview_pane_should_draw_the_frame_the_worker_rendered() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-frame", vec![sync_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+
+        // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: cells carrying real image colour, in more than one shade — a blank
+        // pane has none, and a solid fill would have exactly one. Halfblocks paints a
+        // plain space wherever a cell's two halves came out the same colour, so the
+        // colour is the signal here rather than the `▀` glyph.
+        let shades: std::collections::BTreeSet<_> = painted
+            .iter()
+            .filter_map(|(_, style)| match style.bg {
+                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            })
+            .collect();
+        assert_that!(shades.is_empty()).is_false();
+        assert_that!(shades.len() > 1).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Image` renders nothing at all — not even clipped — when the protocol is bigger
+    /// than the area, so a frame encoded before the pane shrank would blank the preview
+    /// entirely rather than fall back.
+    #[test]
+    fn a_frame_too_big_for_the_pane_should_fall_back_to_the_cue_text() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-frame-big", vec![sync_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width + 10, cells.height + 10));
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: twice — once in the cue list, once as the preview pane's fallback.
+        // Counting is the point: the cue list draws the text either way, so a preview
+        // left blank by an image `Image` silently refused to draw still "contains" it.
+        assert_that!(screen.matches("spoken").count()).is_equal_to(2);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The frame worker scales to a pane only the renderer has measured. Without the
     /// write-back it would be asked to produce a zero-sized image.
     #[test]
     fn rendering_should_report_the_measured_preview_size_back_to_the_page() {
         // Arrange
         let (mut app, directory) = sync_page_app("sync-measure", vec![sync_cue(0, 1000, "a")]);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().preview_cells).is_equal_to((0, 0));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().preview_cells)
+            .is_equal_to(ratatui::layout::Size::new(0, 0));
 
         // Act
         drawn(80, 24, |frame| render(frame, &mut app));
 
         // Assert: 65% of 80 columns, less the pane's own borders.
-        let (width, height) = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        assert_that!(width).is_equal_to(50);
-        assert_that!(height).is_equal_to(19);
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        assert_that!(cells.width).is_equal_to(50);
+        assert_that!(cells.height).is_equal_to(19);
 
         // Cleanup
         drop(app);
@@ -11835,8 +11970,8 @@ mod tests {
         assert_that!(screen.contains("Cues")).is_true();
         assert_that!(screen.contains("Timeline")).is_true();
         assert_that!(screen.contains("00:00:00.0 → 00:00:09.0")).is_true();
-        let (width, height) = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        assert_that!(width > 0 && height > 0).is_true();
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        assert_that!(cells.width > 0 && cells.height > 0).is_true();
 
         // Cleanup
         drop(app);

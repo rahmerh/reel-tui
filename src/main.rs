@@ -7,13 +7,14 @@ use crossterm::event::{
     Event, KeyEventKind,
 };
 use crossterm::execute;
+use ratatui_image::picker::Picker;
 use reel_tui::app::App;
 use reel_tui::cli;
 use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
 use reel_tui::input::{InputOutcome, InputState, handle_key};
 use reel_tui::notification::completion_notification_sender;
-use reel_tui::preview::spawn_preview_worker;
+use reel_tui::preview::spawn_preview_workers;
 use reel_tui::probe::{spawn_conflict_probe_worker, spawn_probe_worker};
 use reel_tui::{config, mount, ui};
 
@@ -41,7 +42,13 @@ fn run(target_dir: PathBuf) -> Result<()> {
     let (transcode_workers, remux_workers) = app_config.effective_workers(is_network_mount);
     let (transcode_tx, remux_tx, edit_rx) =
         spawn_edit_worker_pools(transcode_workers, remux_workers);
-    let (preview_handles, preview_rx) = spawn_preview_worker();
+    // Queried here, before `ratatui::run` enters raw mode and the alternate screen: the
+    // query writes an escape sequence to the terminal and reads its reply off stdin, which
+    // needs a cooked terminal and an stdin nothing else is draining. Inside the closure it
+    // hangs or corrupts the first frame. A terminal that answers nothing falls back to
+    // halfblocks, which every terminal can draw.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let (preview_handles, preview_rx) = spawn_preview_workers(Some(picker));
     let mut app = App::new(target_dir, request_tx, conflict_tx, transcode_tx, remux_tx)?;
     app.set_completion_notification_sender(completion_notification_sender(
         app_config.notifications,
@@ -69,6 +76,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
             dirty |= app.receive_edit_results(&edit_rx);
             dirty |= app.receive_preview_events(&preview_rx);
             app.start_pending_probe();
+            app.start_pending_preview();
             dirty |= app.maybe_open_conflict_dialog();
             if redraw.tick(std::mem::take(&mut dirty), app.is_animating()) {
                 terminal.draw(|frame| ui::render(frame, &mut app))?;

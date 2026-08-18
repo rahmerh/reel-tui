@@ -3,8 +3,8 @@
 > **Delete this file before merging to `main`.** It is a working handoff for an
 > in-progress branch, not documentation of the finished feature.
 
-Handoff for the `subtitle-sync-preview` branch. Steps 0–4 are done; steps 5–6 are not
-started. The full original design is at
+Handoff for the `subtitle-sync-preview` branch. Steps 0–5 are done; only step 6, the
+final gate, remains. The full original design is at
 `~/.claude/plans/okay-so-let-s-create-cryptic-ember.md`.
 
 ## What this feature is
@@ -84,11 +84,10 @@ already cover every path) and a `span.is_zero()` guard in `column()` (unreachabl
 are clean; `cargo install --path .` has been run.
 
 ### Known incomplete behavior right now
-The preview pane shows the selected cue's **text**, not a video frame. That is Step 5, and
-the text pane is not scaffolding — it is the same fallback used when the terminal has no
-image protocol or FFmpeg lacks libass. Everything else works end to end: `c` opens the
-page, the cues load, `j`/`k` move the selection, the timeline stacks overlapping cues, and
-Esc releases the page with its workspace.
+Nothing is stubbed. `c` opens the page, the cues load, `j`/`k` move the selection, the
+timeline stacks overlapping cues, the preview shows the video frame at the selected cue
+with that cue burned in, and Esc releases the page with its workspace. What is left is
+step 6's pre-merge gate.
 
 ---
 
@@ -163,70 +162,65 @@ module). All new `app.rs` branches covered both ways. **25 deliberate breaks all
 Both e2e scenarios landed here rather than one, since Step 4 is what makes cue loading a
 user-visible behavior. Scenario 1 asserts everything except the frame; Step 5 extends it.
 
-## Step 5 — frame preview (`ratatui-image`)
+## Step 5 — frame preview (`ratatui-image`) — DONE
 
-Highest risk, deliberately last and fully isolated.
+`Protocol`, `Picker` and `DynamicImage` are all `Send` (asserted, permanently, in
+`preview.rs`), so the protocol is built on the worker thread as designed and the fallback
+of shipping a `DynamicImage` to the UI thread was never needed.
 
-**First action:** `fn assert_send<T: Send>(){} assert_send::<Protocol>();` If `Protocol`
-isn't `Send`, send `DynamicImage` from the worker and build the protocol on the UI thread
-instead (trivial for halfblocks, a few ms of base64 for kitty).
+- **Dependencies** exactly as planned, `default-features = false` — `cargo publish
+  --dry-run` passes, which is what proves no `chafa-dyn`/pkg-config crept in.
+- **`Picker::from_query_stdio()` in `main.rs` before `ratatui::run`**, falling back to
+  `Picker::halfblocks()` rather than the planned `from_fontsize((8, 16))`: that
+  constructor is `#[deprecated]` since 9.0.0 and would fail `-D warnings`. Halfblocks is
+  its recommended replacement and is what the e2e harness uses.
+- **Frame command** as planned: `-ss` before `-i`, `subtitles` before `scale`,
+  `current_dir(workspace)` plus the bare `cue.srt`, one retimed cue covering
+  `00:00:00,000 --> 00:10:00,000`. No escaper exists anywhere, and a test asserts the
+  working directory and the whole argument vector together.
+- **Coalescing** is `fn newest<T>(request, &Receiver<T>) -> T`, extracted so the
+  discard-all-but-the-last behavior is asserted directly rather than raced against a
+  worker thread.
+- **`FrameOutcome`/`PreviewEvent`** share the prepare worker's single channel, so
+  `main.rs` and the harness keep one drain and cannot pump one worker and not the other.
+- **Debounce** is `SubtitleSyncState::take_due_frame_request`, which *consumes* the
+  request — "asked for" and "waiting to ask" can never both be true, so one settled
+  selection is exactly one `ffmpeg`. Everything that invalidates a frame (cues arriving,
+  selection moving, the pane being resized) goes through the same 120 ms gate.
+- **libass probe** as planned: `ToolCapabilities::ffmpeg_filters` from `ffmpeg -filters`
+  with its own parser (the filter listing's flag column carries none of the letters the
+  encoder parser keys on, and its legend is printed in entry shape), plus
+  `can_burn_subtitles()`. Only 6 struct-literal sites needed touching, all in tests.
+- **The frame is keyed to its cue**: `state.frame()` returns `None` the instant the
+  selection moves, so a stale picture never sits under a fresh cue — which on a *timing*
+  page would read as the burn-in being wrong.
 
-```toml
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
-```
-Verified: 11.0.6 depends on `ratatui ^0.30.1` (this project is on 0.30.2) and
-`crossterm ^0.29` (matches). **`default-features = false` is non-negotiable** — the default
-set includes `chafa-dyn`, which pulls a system C library via pkg-config and breaks CI,
-`cargo publish --dry-run`, and any user without libchafa. Sixel/Kitty/iTerm2/halfblocks are
-all built in without it.
+Three things the plan did not anticipate, all found by tests:
 
-`main.rs`, beside `check_ffmpeg_suite()` and **before** `ratatui::run` enters raw mode:
-```rust
-// Queries the terminal for its graphics protocol, which needs cooked mode and a clean
-// stdin — so it must run before `ratatui::run` enters raw mode and the alternate screen.
-let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
-```
-Never call `from_query_stdio` in a test — it queries the real terminal and hangs.
+1. **A missing duration made every seek zero.** `open_subtitle_sync` deliberately tolerates
+   an unparseable duration, and clamping the midpoint against that zero previewed the
+   media's first frame for every cue in the track. The clamp now applies only when the
+   duration is actually known.
+2. **`Image` draws nothing at all — not even clipped — when the protocol is larger than
+   its area.** A frame encoded before the pane shrank would therefore blank the preview
+   rather than fall back, so the renderer checks the size and lets the text path take it.
+3. **Encoding for a zero-cell area trips a `debug_assert!` inside `ratatui-image`** and
+   takes the worker thread with it. `start_pending_preview`'s "has the renderer measured
+   the pane yet" guard is load-bearing, not merely an optimization.
 
-The frame command, run with `Command::current_dir(&workspace)`:
-```
-ffmpeg -v error -nostdin -y -ss {midpoint} -i {media}
-       -map 0:v:0 -frames:v 1
-       -vf "subtitles=cue.srt,scale={W}:{H}:force_original_aspect_ratio=decrease"
-       -f image2pipe -vcodec png -
-```
-- **Escaping is eliminated, not solved.** `subtitles=` values need three layers of quoting
-  (filtergraph `[],;`, filter-arg `:`, option-parser `'` and `\`). Running in the workspace
-  and passing the bare relative name makes the value a constant safe string. Write no
-  escaper; write a test asserting `current_dir` + bare filename.
-- **A retimed one-cue SRT guarantees the burn is visible.** Write `workspace/cue.srt` with
-  just the selected cue at `00:00:00,000 --> 00:10:00,000`. With `-ss` *before* `-i`,
-  ffmpeg seeks accurately and resets output timestamps to ≈0, so the cue burns onto
-  whatever frame emerges regardless of frame rounding or container `start_time`.
-  Reject `-copyts`: it breaks on non-zero `start_time` (MPEG-TS routinely starts at 1.4 s
-  or 10 s) and makes libass re-index the whole SRT every grab.
-- Seek to `cue.midpoint()`, clamped to `duration - 200ms`.
-- Filter order `subtitles` then `scale` — burn at source resolution so libass lays out
-  against the source `PlayRes`, then downscale.
-- Build the `Protocol` **on the worker thread**; render with the stateless `Image` widget.
-  `StatefulImage` blocks on resize/encode inside `ui::render`.
-- Coalescing worker (`while let Ok(newer) = rx.try_recv() { request = newer; }`), 120 ms
-  debounce via `start_pending_preview` mirroring `start_pending_probe` (`app.rs:1754`),
-  shared `Arc<AtomicU64>` generation early-out before spawning ffmpeg, and an `AtomicBool`
-  polled in `run_cancellable`'s 25 ms loop so leaving the page kills a slow network seek.
-- **libass probe**: extend `ToolCapabilities` (`subtitle.rs:393`) with
-  `ffmpeg_filters: BTreeSet<String>` from `ffmpeg -hide_banner -filters`, memoized by the
-  existing `detect_cached()` `OnceLock`, plus `can_burn_subtitles()`. 17 struct-literal
-  sites but 8 use `..Default::default()`, so churn is small. Verified present locally
-  (n8.1.2, `--enable-libass`) and in CI (BtbN GPL static builds). The no-libass fallback
-  shares its path with the no-`Picker` fallback, so it stays exercised.
-
-Extend e2e scenario 1 with the frame assertions here; everything else in it already passes.
+**Coverage: `sync.rs` 100% line + 100% branch; `preview.rs` 97.14% line, and every
+uncovered line and branch in it is inside its own `#[cfg(test)]` module except one arm** —
+`picker.new_protocol`'s `Err`, which only the sixel/kitty/iTerm2 encoders can produce and
+no test can reach, since halfblocks is the only protocol usable without a real terminal
+and it does not fail. **19 deliberate breaks all proven** (C1–C19), including the two the
+plan named: the frame worker ignoring `cue_index`, and `start_pending_preview` dropped
+from the harness `pump`. 904 unit tests pass; fmt, clippy, `cargo publish --dry-run` and
+`cargo install --path .` are all clean.
 
 ## Step 6 — final gate
 
 - `keybindings_text()` entry — **already done in Step 2**.
+- **Delete this file.**
 - `AGENTS.md` module list: add `cue.rs`, `preview.rs`, `sync.rs`, and backfill the five it
   already omits (`cli.rs`, `config.rs`, `notification.rs`, `requirements.rs`, `staging.rs`).
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
@@ -253,8 +247,10 @@ less machinery than teaching `write_media` to persist one.
    one fixture, 3 cues with one overlap, carrying both an embedded `subrip` track and a
    `clip.eng.srt` sidecar, so a single build covers both prepare paths. Open → `c` → wait
    for cues → assert count, `lane_count == 2`, text + timestamp + `▸` marker on screen →
-   `j` → marker follows → Esc → layer, state cleared, workspace gone → `l` → `c` on the
-   sidecar. **Step 5 adds the frame assertions here.**
+   wait for the frame → assert the pane holds more than one `Rgb` colour → `j` → marker
+   follows, and so does the frame → Esc → layer, state cleared, workspace gone → `l` →
+   `c` on the sidecar. The fixture is 320x240 and six seconds long because a seek past the
+   end of the media produces no frame at all.
    Note `l`, not `j`: with an embedded track *and* a sidecar the subtitle rows are drawn as
    two columns, and `j` deliberately stays inside its column — walking with `j` spins
    forever, which is what the first run of this scenario did.
@@ -267,9 +263,11 @@ less machinery than teaching `write_media` to persist one.
    order with an Esc between them, because `Harness::open` only ever walks the file panel
    downward. Proven by dropping the format guard.
 
-Harness: `pump` gained `receive_preview_events`; `Harness::start` calls
-`spawn_preview_worker()` and `set_preview_handles`. Step 5 adds `start_pending_preview` and
-`Picker::halfblocks()`.
+Harness: `pump` gained `receive_preview_events` and `start_pending_preview`;
+`Harness::start` calls `spawn_preview_workers(Some(Picker::halfblocks()))` and
+`set_preview_handles`. `Harness::preview_shades` collects the distinct `Rgb` backgrounds on
+screen — nothing else in this UI paints one, so more than one means a decoded picture
+rather than a blank pane or a solid fill.
 
 **What `TestBackend` cannot cover** — state this in the final change summary rather than
 papering over it: its `Buffer` stores symbol+style per cell and does not expose the backend
@@ -280,10 +278,11 @@ a solid fill), and that scaling preserves aspect.
 
 ## Remaining risks
 
-1. **`Protocol: Send`** — verify first thing in Step 5; contained fallback exists.
-2. **`Picker::from_query_stdio()` before raw mode** — inside `ratatui::run`'s closure it
-   hangs or corrupts the first frame.
-3. **`chafa-dyn`** — forgetting `default-features = false` breaks CI and `cargo publish`.
+1. ~~**`Protocol: Send`**~~ — confirmed `Send`; asserted permanently in `preview.rs`.
+2. ~~**`Picker::from_query_stdio()` before raw mode**~~ — done in `main.rs` before
+   `ratatui::run`. Never call it from a test; it queries the real terminal and hangs.
+3. ~~**`chafa-dyn`**~~ — `default-features = false` is in place and `cargo publish
+   --dry-run` passes.
 4. **Frame-grab latency on network mounts** — accurate seek over NFS is a full read from
    the preceding keyframe. Debounce, coalescing, early-out and kill-on-exit all help;
    beyond that the honest answer is an indeterminate loader. This is the one place the

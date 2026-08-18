@@ -27,7 +27,9 @@ use crate::{
         video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
-    preview::{PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles},
+    preview::{
+        FrameOutcome, FrameRequest, PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles,
+    },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
@@ -2295,9 +2297,9 @@ impl App {
         }
     }
 
-    /// Applies cues the preview worker parsed, ignoring anything belonging to a page
-    /// the user has already left. Returns whether an event was drained, so the main
-    /// loop can skip redrawing when none arrived.
+    /// Applies what the preview workers produced — a track's cues, a cue's frame —
+    /// ignoring anything belonging to a page the user has already left. Returns whether
+    /// an event was drained, so the main loop can skip redrawing when none arrived.
     pub fn receive_preview_events(&mut self, receiver: &Receiver<PreviewEvent>) -> bool {
         let mut received = false;
         while let Ok(event) = receiver.try_recv() {
@@ -2305,15 +2307,80 @@ impl App {
             let Some(state) = self.subtitle_sync.as_mut() else {
                 continue;
             };
-            if event.generation != state.generation {
-                continue;
-            }
-            match event.outcome {
-                PrepareOutcome::Ready(cues) => state.apply_prepared(cues),
-                PrepareOutcome::Failed(message) => state.fail(message),
+            match event {
+                PreviewEvent::Prepared {
+                    generation,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    PrepareOutcome::Ready(cues) => state.apply_prepared(cues),
+                    PrepareOutcome::Failed(message) => state.fail(message),
+                },
+                PreviewEvent::Frame {
+                    generation,
+                    cue_index,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    FrameOutcome::Ready(protocol) => state.apply_frame(cue_index, protocol),
+                    FrameOutcome::Failed(message) => state.fail_frame(message),
+                },
+                _ => {}
             }
         }
         received
+    }
+
+    /// Asks for the frame at the selected cue, once the selection has settled.
+    ///
+    /// Called every loop iteration beside `start_pending_probe`, and debounced for the
+    /// same reason: a held-down `j` would otherwise start an accurate seek per key repeat.
+    pub fn start_pending_preview(&mut self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        // Asking for a frame that can only fail is worse than not asking: it is one
+        // `ffmpeg` per settled selection producing the same message the page already
+        // shows. Both fallbacks — a terminal with no image protocol, a build without
+        // libass — land on the cue's text instead.
+        if !preview.draws_frames() || !self.subtitle_capabilities.can_burn_subtitles() {
+            return;
+        }
+        let Some(state) = self.subtitle_sync.as_mut() else {
+            return;
+        };
+        // A pane with no cells has nothing to scale to, and the renderer has not measured
+        // one yet on the first frame after the page opens. Not merely wasteful: encoding
+        // an image for a zero-cell area trips a `debug_assert!` inside `ratatui-image`
+        // and takes the worker thread down with it.
+        if state.preview_cells.width == 0 || state.preview_cells.height == 0 {
+            return;
+        }
+        if !state.take_due_frame_request() {
+            return;
+        }
+        let Some(cue) = state.selected_cue() else {
+            return;
+        };
+        // Held back from the very end of the media: seeking to the last instant of a file
+        // lands past the final frame, and `-frames:v 1` then writes nothing at all.
+        //
+        // Only when the duration is actually known, though. `open_subtitle_sync` leaves it
+        // zero for a file whose duration would not parse, and clamping against that would
+        // seek every cue on such a file to the very first frame.
+        let seek = if state.duration.is_zero() {
+            cue.midpoint()
+        } else {
+            cue.midpoint()
+                .min(state.duration.saturating_sub(Duration::from_millis(200)))
+        };
+        preview.request_frame(FrameRequest {
+            generation: state.generation,
+            cue_index: state.selected,
+            media: state.media.clone(),
+            workspace: state.workspace().to_path_buf(),
+            text: cue.text.clone(),
+            seek,
+            cells: state.preview_cells,
+        });
     }
 
     /// The subtitle track under the cursor, if the cursor is on one at all.
@@ -8873,6 +8940,7 @@ mod tests {
                 "mov_text".to_string(),
             ]),
             ffmpeg_muxers: BTreeSet::from(["matroska".to_string()]),
+            ffmpeg_filters: BTreeSet::from(["subtitles".to_string(), "scale".to_string()]),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         }
@@ -19230,8 +19298,9 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        let (handles, requests, _) = crate::preview::test_handles();
-        app.set_preview_handles(Some(handles));
+        let preview = crate::preview::test_handles();
+        let requests = preview.prepare_rx;
+        app.set_preview_handles(Some(preview.handles));
 
         // Act
         app.open_subtitle_sync();
@@ -19263,8 +19332,9 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Sidecar(_)))
             .expect("sidecar should have a track row");
-        let (handles, requests, _) = crate::preview::test_handles();
-        app.set_preview_handles(Some(handles));
+        let preview = crate::preview::test_handles();
+        let requests = preview.prepare_rx;
+        app.set_preview_handles(Some(preview.handles));
 
         // Act
         app.open_subtitle_sync();
@@ -19286,8 +19356,9 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        let (handles, requests, live) = crate::preview::test_handles();
-        app.set_preview_handles(Some(handles));
+        let preview = crate::preview::test_handles();
+        let (requests, live) = (preview.prepare_rx, preview.live_generation);
+        app.set_preview_handles(Some(preview.handles));
         app.open_subtitle_sync();
         let request = requests.try_recv().expect("the worker should be asked");
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
@@ -19318,7 +19389,7 @@ mod tests {
 
         // Act
         sender
-            .send(PreviewEvent {
+            .send(PreviewEvent::Prepared {
                 generation,
                 outcome: PrepareOutcome::Ready(vec![crate::cue::Cue {
                     index: 0,
@@ -19351,7 +19422,7 @@ mod tests {
 
         // Act
         sender
-            .send(PreviewEvent {
+            .send(PreviewEvent::Prepared {
                 generation,
                 outcome: PrepareOutcome::Failed("ffmpeg said no".to_string()),
             })
@@ -19390,7 +19461,7 @@ mod tests {
 
         // Act
         sender
-            .send(PreviewEvent {
+            .send(PreviewEvent::Prepared {
                 generation: stale,
                 outcome: cues(),
             })
@@ -19405,7 +19476,7 @@ mod tests {
         // drained rather than panicking or reopening anything.
         app.back();
         sender
-            .send(PreviewEvent {
+            .send(PreviewEvent::Prepared {
                 generation: stale,
                 outcome: cues(),
             })
@@ -19415,5 +19486,280 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A page whose cues have loaded, with the pane measured and the debounce waited out,
+    /// which is the state every frame request is made from.
+    fn app_ready_for_a_frame(app: &mut App) {
+        app.open_subtitle_sync();
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(vec![
+            crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "one".into(),
+            },
+            crate::cue::Cue {
+                index: 1,
+                start: Duration::from_secs(5),
+                end: Duration::from_secs(7),
+                text: "two".into(),
+            },
+        ]);
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+    }
+
+    /// The worker cannot see the page, so everything it needs has to be in the request:
+    /// which file, where to stage the cue, what the cue says, where to seek, and how big
+    /// the pane the renderer measured is.
+    #[test]
+    fn start_pending_preview_should_ask_for_the_frame_at_the_selected_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        let state = app.subtitle_sync.as_ref().unwrap();
+        let request = frames.try_recv().expect("a frame should be asked for");
+        assert_that!(request.generation).is_equal_to(state.generation);
+        assert_that!(request.cue_index).is_equal_to(0);
+        assert_that!(request.media.clone()).is_equal_to(state.media.clone());
+        assert_that!(request.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+        assert_that!(request.text.as_str()).is_equal_to("one");
+        // The midpoint of the cue, not its start: a cue's first frame is often the last
+        // frame of the previous shot. This file's duration would not parse, so there is
+        // nothing to hold the seek back from — clamping against the resulting zero would
+        // preview the first frame of the media for every cue in the track.
+        assert_that!(request.seek).is_equal_to(Duration::from_secs(2));
+        assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 20));
+
+        // Act / Assert: and one settled selection asks exactly once.
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Seeking to the last instant of a file lands past the final frame, and
+    /// `-frames:v 1` then writes nothing at all — a cue running to the end of the media
+    /// is the ordinary case, not an edge one.
+    #[test]
+    fn a_frame_request_should_be_held_back_from_the_very_end_of_the_media() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.duration = Duration::from_secs(10);
+        state.apply_prepared(vec![crate::cue::Cue {
+            index: 0,
+            start: Duration::from_secs(8),
+            end: Duration::from_secs(12),
+            text: "past the end".into(),
+        }]);
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert: the midpoint would be 10s, which is the whole duration.
+        let request = frames.try_recv().expect("a frame should be asked for");
+        assert_that!(request.seek).is_equal_to(Duration::from_millis(9800));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An FFmpeg without libass cannot burn a cue in, so asking would be one doomed
+    /// subprocess per settled selection producing a message the page already shows.
+    #[test]
+    fn start_pending_preview_should_ask_for_nothing_without_the_tools_to_draw_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The renderer measures the pane, so the first loop iteration after the page opens
+    /// has nothing to scale to — asking then would request a zero-sized image.
+    #[test]
+    fn start_pending_preview_should_wait_for_the_renderer_to_measure_the_pane() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "one".into(),
+            }]);
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Act / Assert: and the request survives until the pane has been measured.
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Without a page open, or without workers, there is nothing to ask for and nobody to
+    /// ask — both are ordinary states, not errors.
+    #[test]
+    fn start_pending_preview_should_be_inert_without_a_page_or_workers() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+
+        // Act / Assert: no workers at all.
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+
+        // Act / Assert: workers, but no page.
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.back();
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_show_the_frame_the_worker_drew() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Frame {
+                generation,
+                cue_index: 0,
+                outcome: FrameOutcome::Ready(test_protocol()),
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().frame().is_some()).is_true();
+
+        // Act / Assert: a frame that could not be drawn replaces it with its reason.
+        sender
+            .send(PreviewEvent::Frame {
+                generation,
+                cue_index: 0,
+                outcome: FrameOutcome::Failed("no libass".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.frame().is_some()).is_false();
+        assert_that!(state.frame_error.clone()).is_equal_to(Some("no libass".to_string()));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame drawn for a page the user has already left must not appear on the page
+    /// they opened next — different track, possibly different file.
+    #[test]
+    fn receive_preview_events_should_drop_a_frame_belonging_to_another_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let stale = app.subtitle_sync.as_ref().unwrap().generation;
+        app.back();
+        app_ready_for_a_frame(&mut app);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Frame {
+                generation: stale,
+                cue_index: 0,
+                outcome: FrameOutcome::Ready(test_protocol()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_sync.as_ref().unwrap().frame().is_some()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn test_protocol() -> Box<ratatui_image::protocol::Protocol> {
+        Box::new(
+            ratatui_image::picker::Picker::halfblocks()
+                .new_protocol(
+                    image::DynamicImage::new_rgb8(40, 40),
+                    ratatui::layout::Size::new(10, 5),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks should encode any image"),
+        )
     }
 }

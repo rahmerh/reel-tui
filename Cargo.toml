@@ -25,10 +25,12 @@ test = false
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
 isolang = { version = "2.0", features = ["list_languages"] }
 notify = "8.2"
 notify-rust = "4"
 ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.4"

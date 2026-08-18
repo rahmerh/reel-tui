@@ -107,6 +107,13 @@ impl MediaSpec {
         self
     }
 
+    /// Seconds of video. Scenarios that grab a frame at a cue need the media to actually
+    /// last as long as their cues do.
+    pub fn duration(mut self, seconds: f32) -> Self {
+        self.duration = seconds;
+        self
+    }
+
     pub fn size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;

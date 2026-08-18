@@ -971,9 +971,15 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     let scratch = Scratch::new("subtitle-sync");
     write_media(
         &scratch.join("clip.mkv"),
-        &MediaSpec::mkv().audio(&["eng"]).subtitles(vec![
-            SubtitleSpec::new("nld", "subrip").cues(OVERLAPPING_CUES),
-        ]),
+        // Big enough and long enough to grab a real frame at a cue: the cues run to five
+        // seconds, and a seek past the end produces no frame at all.
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"])
+            .subtitles(vec![
+                SubtitleSpec::new("nld", "subrip").cues(OVERLAPPING_CUES),
+            ]),
     );
     fs::write(scratch.join("clip.eng.srt"), SIDECAR_CUES).unwrap();
 
@@ -1014,7 +1020,28 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         "the first cue should start out selected:\n{screen}"
     );
 
-    // Navigating the list moves the selection, and only the selection.
+    // The frame: a real `ffmpeg` seek with the cue burned in by libass, decoded and
+    // encoded for the pane by the worker.
+    app.wait_until("a frame for the first cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    let shades = app.preview_shades();
+    assert!(
+        shades.len() > 1,
+        "the preview should hold a decoded image rather than a blank or solid pane; \
+         shades: {shades:?}\nscreen:\n{}",
+        app.screen()
+    );
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().frame_error,
+        None,
+        "a frame that drew should leave no failure behind"
+    );
+
+    // Navigating the list moves the selection, and only the selection — and the frame
+    // follows it, rather than the previous cue's picture staying under the new cue.
     app.press(key(KeyCode::Char('j')));
     app.pump();
     assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
@@ -1023,6 +1050,11 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         screen.contains("▸ 00:00:01.5"),
         "j should move the marker onto the second cue:\n{screen}"
     );
+    app.wait_until("a frame for the second cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
 
     // Leaving releases the page and its scratch directory.
     app.press(key(KeyCode::Esc));
