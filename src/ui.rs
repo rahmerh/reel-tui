@@ -112,12 +112,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 ///
 /// Only the cue list is built out so far; the timeline track and the video preview take
 /// the space below and above it once they exist.
-/// Two rows per cue in the list: its timing, then its text.
-const SYNC_CUE_ROWS: u16 = 2;
+/// Rows one cue's block occupies: two borders with a line of text between them. The
+/// timing rides on the top border, which is what keeps a cue down to three rows.
+const SYNC_CUE_BLOCK_ROWS: u16 = 3;
 
-/// Columns the cue panel needs to show "▸ 00:00:05.0 → 00:00:07.0" plus its borders.
-/// Its content is fixed-format, so it gets a floor rather than a share of the width.
-const SYNC_CUE_PANEL_WIDTH: u16 = 28;
+/// Rows one cue costs the panel: its block, plus the arrow leading to the next one.
+const SYNC_CUE_ROWS: u16 = SYNC_CUE_BLOCK_ROWS + 1;
+
+/// Columns the cue panel needs to show " 00:00:05.0 → 00:00:07.0 " on a block's top
+/// border, plus that block's corners and the panel's own borders. Its content is
+/// fixed-format, so it gets a floor rather than a share of the width.
+const SYNC_CUE_PANEL_WIDTH: u16 = 30;
 
 /// Rows the timeline track spends on everything that is not a lane: its two borders and
 /// the time axis beneath the lanes.
@@ -173,7 +178,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // deepest track at the very smallest size actually hits this. The ruler line is still
     // built and simply clipped by the `Paragraph`, so the two shapes cannot drift apart.
     let lanes = state.layout.lane_count as u16;
-    let cue_panel_floor = SYNC_CUE_ROWS + 2;
+    let cue_panel_floor = SYNC_CUE_BLOCK_ROWS + 2;
     let track_height = if area.height.saturating_sub(lanes + SYNC_TRACK_CHROME) >= cue_panel_floor {
         lanes + SYNC_TRACK_CHROME
     } else {
@@ -239,53 +244,109 @@ fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    state.sync_scroll((inner.height / SYNC_CUE_ROWS) as usize);
-    let width = usize::from(inner.width);
-    let rows: Vec<ListItem> = state
+    // `height + 1` because the last block on screen needs no arrow under it, so a panel
+    // seven rows tall holds two blocks rather than one. At least one either way, so the
+    // shortest panel the layout can produce still shows the cue under the cursor rather
+    // than nothing at all — a block that does not fit whole is clipped from the bottom,
+    // which costs its lower border and leaves its timing and text in place.
+    state.sync_scroll(usize::from(((inner.height + 1) / SYNC_CUE_ROWS).max(1)));
+
+    let last = state.cues.len().saturating_sub(1);
+    for (offset, (position, cue)) in state
         .cues
         .iter()
         .enumerate()
         .skip(state.list_scroll)
         .take(state.list_rows)
-        .map(|(position, cue)| {
-            // Keyed on the row's position, not on `Cue::index`. The index is assigned by
-            // whoever produced the cues and nothing downstream re-derives it, so trusting
-            // it here would put the cursor on the wrong row for any list that did not
-            // number itself the way the parser happens to.
-            let selected = position == state.selected;
-            let timing = format!(
-                "{}{} → {}",
-                if selected { "▸ " } else { "  " },
-                format_timestamp(cue.start),
-                format_timestamp(cue.end)
+        .enumerate()
+    {
+        let top = inner.y + offset as u16 * SYNC_CUE_ROWS;
+        // Saturating rather than guarded: `sync_scroll` above already limits the loop to
+        // the blocks that start inside the panel, so a height of zero here is unreachable
+        // — and a zero-height block draws nothing, where the subtraction underflowing
+        // would panic. There is no branch to leave untested either way.
+        // Keyed on the row's position, not on `Cue::index`. The index is assigned by
+        // whoever produced the cues and nothing downstream re-derives it, so trusting it
+        // here would put the cursor on the wrong block for any list that did not number
+        // itself the way the parser happens to.
+        render_sync_cue(
+            frame,
+            cue,
+            position == state.selected,
+            Rect {
+                x: inner.x,
+                y: top,
+                width: inner.width,
+                height: SYNC_CUE_BLOCK_ROWS.min(inner.bottom().saturating_sub(top)),
+            },
+        );
+
+        // Between the blocks rather than after each one: the arrow says "and then this",
+        // so the last cue has nothing to point at.
+        let arrow = top + SYNC_CUE_BLOCK_ROWS;
+        if arrow < inner.bottom() && position < last {
+            frame.render_widget(
+                Paragraph::new("↓")
+                    .centered()
+                    .style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    x: inner.x,
+                    y: arrow,
+                    width: inner.width,
+                    height: 1,
+                },
             );
-            let (timing_style, text_style) = if selected {
-                (
-                    Style::default().fg(Color::Cyan).bold(),
-                    Style::default().fg(Color::White),
-                )
-            } else {
-                (
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::Gray),
-                )
-            };
-            // Multi-line cues collapse onto one row with a separator rather than
-            // stealing a second row from the cue below them.
-            // `truncate_end`, not `truncate`: a cue is read from its start, so the
-            // opening words are what identify it. The tail-preserving variant exists for
-            // paths, where the filename is the part that matters.
-            let text = truncate_end(
-                &cue.text.replace('\n', " / "),
-                width.saturating_sub(2).max(1),
-            );
-            ListItem::new(vec![
-                Line::styled(timing, timing_style),
-                Line::styled(format!("  {text}"), text_style),
-            ])
-        })
-        .collect();
-    frame.render_widget(List::new(rows), inner);
+        }
+    }
+}
+
+/// One cue as a block: its timing on the top border, its text inside.
+///
+/// The selected one is filled solid rather than outlined — its border is painted the same
+/// cyan as its background, so the block reads as one shape and needs no marker character
+/// to say which cue the cursor is on.
+fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, area: Rect) {
+    let timing = format!(
+        " {} → {} ",
+        format_timestamp(cue.start),
+        format_timestamp(cue.end)
+    );
+    let (block, text_style) = if selected {
+        let fill = Style::default().bg(Color::Cyan).fg(Color::White);
+        (
+            Block::bordered()
+                .style(fill)
+                // Border painted in the fill's own colour so it disappears into it: the
+                // block reads as one solid shape rather than an outline round a fill.
+                .border_style(Style::default().bg(Color::Cyan).fg(Color::Cyan))
+                .title(Line::styled(timing, fill.bold())),
+            fill,
+        )
+    } else {
+        (
+            Block::bordered()
+                .border_style(Style::default().fg(Color::White))
+                .title(Line::styled(timing, Style::default().fg(Color::DarkGray))),
+            Style::default().fg(Color::Gray),
+        )
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Multi-line cues collapse onto one row with a separator rather than stealing a row
+    // from the cue below them.
+    //
+    // `truncate_end`, not `truncate`: a cue is read from its start, so the opening words
+    // are what identify it. The tail-preserving variant exists for paths, where the
+    // filename is the part that matters.
+    let text = truncate_end(
+        &cue.text.replace('\n', " / "),
+        usize::from(inner.width).saturating_sub(1).max(1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {text}"), text_style)),
+        inner,
+    );
 }
 
 fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect) {
@@ -11983,10 +12044,11 @@ mod tests {
         // Act
         drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert: 65% of 80 columns, less the pane's own borders, and the rows left after
-        // the track takes its lane, its two borders and its time axis.
+        // Assert: 80 columns less the cue panel's floor width, less the pane's own
+        // borders, and the rows left after the track takes its lane, its two borders and
+        // its time axis.
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        assert_that!(cells.width).is_equal_to(50);
+        assert_that!(cells.width).is_equal_to(48);
         assert_that!(cells.height).is_equal_to(18);
 
         // Cleanup
@@ -12015,10 +12077,24 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
 
-        // Assert: exactly one row carries the marker, and it is the second cue's.
-        assert_that!(screen.matches('▸').count()).is_equal_to(1);
-        let marker = screen.find('▸').unwrap();
-        assert_that!(screen[marker..].starts_with("▸ 00:00:05.0")).is_true();
+        // Assert: exactly one block is filled, and it is the second cue's. Keyed on the
+        // fill rather than on a marker character, because the fill is what a reader sees.
+        let filled: Vec<&ratatui::buffer::Cell> = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.style().bg == Some(Color::Cyan))
+            .collect();
+        assert_that!(filled.is_empty()).is_false();
+        for cell in &filled {
+            if cell.symbol().chars().any(char::is_alphanumeric) {
+                assert_that!(cell.style().fg).is_equal_to(Some(Color::White));
+            }
+        }
+        let timing = screen
+            .find("00:00:05.0")
+            .expect("the selected cue's timing should be on screen");
+        assert_that!(screen[..timing].ends_with('\u{250c}') || screen[..timing].ends_with(' '))
+            .is_true();
 
         // Assert: and the track paints one cue cyan, the other not.
         let cyan = buffer
@@ -12065,18 +12141,25 @@ mod tests {
         assert_that!(screen.contains("Preview")).is_true();
         assert_that!(screen.contains("Cues")).is_true();
         assert_that!(screen.contains("Timeline")).is_true();
-        // The cue-list row, marker and all, rather than the title's copy of the same span.
-        assert_that!(screen.contains("▸ 00:00:00.0 → 00:00:09.0")).is_true();
+        // The cue block's own border, rather than the title's copy of the same span.
+        assert_that!(screen.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
+        // With room to spare after it, so the panel's floor width is doing its job.
+        assert_that!(screen.contains("→ 00:00:09.0 ")).is_true();
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
         assert_that!(cells.width > 0 && cells.height > 0).is_true();
 
-        // Act / Assert: four lanes plus an axis do not fit in ten rows alongside a row of
-        // the cue list, so the axis gives way — and one more row brings it back.
-        // Keyed on the selection marks, which nothing but the axis draws.
+        // Act / Assert: four lanes plus an axis do not fit alongside a whole cue block, so
+        // the axis gives way until the page can afford both. Keyed on the selection marks,
+        // which nothing but the axis draws.
         assert_that!(screen.contains('▲')).is_false();
+        // Eleven rows buy the block its text row back, still without the axis...
         let taller = drawn(50, 11, |frame| render(frame, &mut app));
+        assert_that!(taller.contains('▲')).is_false();
+        assert_that!(taller.contains("│ a")).is_true();
+        // ...and twelve fit both.
+        let taller = drawn(50, 12, |frame| render(frame, &mut app));
         assert_that!(taller.contains('▲')).is_true();
-        assert_that!(taller.contains("▸ 00:00:00.0 → 00:00:09.0")).is_true();
+        assert_that!(taller.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
 
         // Cleanup
         drop(app);
@@ -12101,6 +12184,118 @@ mod tests {
         assert_that!(marks.len()).is_equal_to(2);
         for (_, style) in marks {
             assert_that!(style.fg).is_equal_to(Some(Color::Cyan));
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every cue is a block: outlined white when it is not the selection, filled solid
+    /// cyan with white text when it is. The fill is the cursor, which is why no marker
+    /// character survives beside the timings.
+    #[test]
+    fn each_cue_should_be_a_block_the_selection_fills() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-blocks",
+            vec![
+                sync_cue(1000, 3000, "first"),
+                sync_cue(5000, 7000, "second"),
+                sync_cue(9000, 11_000, "third"),
+            ],
+        );
+        app.subtitle_sync.as_mut().unwrap().select(1);
+
+        // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+        let screen: String = painted.iter().map(|(symbol, _)| symbol.as_str()).collect();
+
+        // Assert: three blocks, each with its timing on its top border.
+        assert_that!(screen.matches("┌ 00:00:01.0 → 00:00:03.0").count()).is_equal_to(1);
+        assert_that!(screen.matches("┌ 00:00:05.0 → 00:00:07.0").count()).is_equal_to(1);
+        assert_that!(screen.matches("┌ 00:00:09.0 → 00:00:11.0").count()).is_equal_to(1);
+        assert_that!(screen.contains('▸')).is_false();
+
+        // Assert: the unselected blocks are outlined white...
+        let outline = painted
+            .iter()
+            .filter(|(symbol, style)| symbol == "└" && style.fg == Some(Color::White))
+            .count();
+        assert_that!(outline).is_equal_to(2);
+
+        // ...and the selected one is filled, borders and all, with white text on it.
+        let filled: Vec<&(String, Style)> = painted
+            .iter()
+            .filter(|(_, style)| style.bg == Some(Color::Cyan))
+            .collect();
+        // Three rows of a block whose width is the panel's, less its own borders.
+        assert_that!(filled.len() > 3).is_true();
+        // Its writing is white; its border shares the fill's colour and so is not.
+        for (symbol, style) in &filled {
+            if symbol.chars().any(char::is_alphanumeric) {
+                assert_that!(style.fg).is_equal_to(Some(Color::White));
+            }
+        }
+        let filled_text: String = filled.iter().map(|(symbol, _)| symbol.as_str()).collect();
+        assert_that!(filled_text.contains("00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(filled_text.contains("second")).is_true();
+        // The cue above it is not filled.
+        assert_that!(filled_text.contains("first")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The arrows say "and then this", so they go between the blocks — never after the
+    /// last one, which has nothing to point at.
+    #[test]
+    fn an_arrow_should_lead_from_each_cue_to_the_next_but_not_past_the_last() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-arrows",
+            vec![
+                sync_cue(1000, 3000, "first"),
+                sync_cue(5000, 7000, "second"),
+                sync_cue(9000, 11_000, "third"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: two arrows for three cues.
+        assert_that!(screen.matches('↓').count()).is_equal_to(2);
+
+        // Act / Assert: and a single cue has none at all.
+        let (mut lone, lone_directory) =
+            sync_page_app("sync-one-arrow", vec![sync_cue(1000, 3000, "only")]);
+        let screen = drawn(80, 24, |frame| render(frame, &mut lone));
+        assert_that!(screen.contains('↓')).is_false();
+
+        // Cleanup
+        drop(app);
+        drop(lone);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(lone_directory).unwrap();
+    }
+
+    /// A panel seven rows tall holds two blocks, because the second needs no arrow under
+    /// it. Getting this wrong wastes a whole cue's worth of the panel.
+    #[test]
+    fn the_panel_should_fit_a_block_in_the_rows_the_last_arrow_does_not_need() {
+        // Arrange: cues enough to overflow any panel this test renders.
+        let cues = (0..8)
+            .map(|index| sync_cue(index * 2000, index * 2000 + 1000, "x"))
+            .collect();
+        let (mut app, directory) = sync_page_app("sync-fit", cues);
+
+        // Act / Assert: the panel's inner height is the page height less the track and the
+        // panel's own borders, so these two sizes bracket the arrow-free last block.
+        for (height, blocks) in [(20, 3), (21, 4)] {
+            drawn(80, height, |frame| render(frame, &mut app));
+            assert_that!(app.subtitle_sync.as_ref().unwrap().list_rows).is_equal_to(blocks);
         }
 
         // Cleanup

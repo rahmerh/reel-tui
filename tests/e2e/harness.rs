@@ -1151,7 +1151,22 @@ impl Harness {
         }
     }
 
-    /// The terminal contents as one string, for assertions and failure messages.
+    /// Everything drawn on the selection's fill, as one string.
+    ///
+    /// The timing page marks the selected cue by filling its block rather than by putting
+    /// a character beside it, so "which cue is selected" is a question about colour that
+    /// only the buffer can answer.
+    pub fn filled_selection(&self) -> String {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.style().bg == Some(ratatui::style::Color::Cyan))
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     /// The distinct image colours on screen, which is as much of a rendered frame as
     /// `TestBackend` can be asked about.
     ///
@@ -1174,6 +1189,7 @@ impl Harness {
             .collect()
     }
 
+    /// The terminal contents as one string, for assertions and failure messages.
     pub fn screen(&self) -> String {
         let buffer = self.terminal.backend().buffer();
         (0..buffer.area.height)

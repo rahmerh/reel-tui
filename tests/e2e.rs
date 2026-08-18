@@ -1015,9 +1015,10 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         screen.contains("Overlapping opener") && screen.contains("00:00:00.5 → 00:00:02.0"),
         "the cue list should show cue text and timing:\n{screen}"
     );
+    let selected = app.filled_selection();
     assert!(
-        screen.contains("▸ 00:00:00.5"),
-        "the first cue should start out selected:\n{screen}"
+        selected.contains("00:00:00.5 → 00:00:02.0") && selected.contains("Overlapping opener"),
+        "the first cue's block should start out filled: {selected:?}\n{screen}"
     );
     assert!(
         screen.contains("Timeline (00:00:00.5 → 00:00:02.0)"),
@@ -1062,9 +1063,10 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     app.pump();
     assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
     let screen = app.screen();
+    let selected = app.filled_selection();
     assert!(
-        screen.contains("▸ 00:00:01.5"),
-        "j should move the marker onto the second cue:\n{screen}"
+        selected.contains("00:00:01.5 → 00:00:03.0") && selected.contains("Overlapping answer"),
+        "j should move the fill onto the second cue: {selected:?}\n{screen}"
     );
     assert!(
         screen.contains("Timeline (00:00:01.5 → 00:00:03.0)"),
