@@ -28,6 +28,7 @@ use reel_tui::app::{
 use reel_tui::edit::{EditEvent, VideoRotation, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
+use reel_tui::preview::{PreviewEvent, spawn_preview_worker};
 use reel_tui::probe::{
     ProbeOutcome, ProbeResponse, spawn_conflict_probe_worker, spawn_probe_worker,
 };
@@ -105,6 +106,7 @@ pub struct Harness {
     probe_rx: Receiver<ProbeResponse>,
     conflict_rx: Receiver<ProbeResponse>,
     edit_rx: Receiver<EditEvent>,
+    preview_rx: Receiver<PreviewEvent>,
     /// Declared last so the directory outlives the `App` and workers on drop.
     scratch: Scratch,
 }
@@ -118,7 +120,9 @@ impl Harness {
         let (request_tx, probe_rx) = spawn_probe_worker();
         let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
         let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
-        let app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
+        let (preview_handles, preview_rx) = spawn_preview_worker();
+        let mut app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
+        app.set_preview_handles(Some(preview_handles));
         Self {
             app,
             input: InputState::default(),
@@ -127,6 +131,7 @@ impl Harness {
             probe_rx,
             conflict_rx,
             edit_rx,
+            preview_rx,
             scratch,
         }
     }
@@ -146,6 +151,7 @@ impl Harness {
         self.app.receive_probe_results(&self.probe_rx);
         self.app.receive_conflict_probe_results(&self.conflict_rx);
         self.app.receive_edit_results(&self.edit_rx);
+        self.app.receive_preview_events(&self.preview_rx);
         self.app.start_pending_probe();
         self.app.maybe_open_conflict_dialog();
         let app = &mut self.app;

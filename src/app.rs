@@ -27,6 +27,7 @@ use crate::{
         video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
+    preview::{PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles},
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
@@ -1070,6 +1071,11 @@ pub struct App {
     /// Bumped for each page opening, so a worker result that arrives after the user has
     /// moved on can be recognised as stale and dropped.
     sync_generation: u64,
+    /// The preview worker, when one is running. `None` in tests and for library
+    /// consumers that never open the timing page, exactly like
+    /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
+    /// sites construct, so new workers arrive through a setter rather than a parameter.
+    preview: Option<PreviewHandles>,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1209,6 +1215,7 @@ impl App {
             subtitle_capabilities: ToolCapabilities::detect_cached(),
             subtitle_sync: None,
             sync_generation: 0,
+            preview: None,
             container_target: None,
             container_metadata: None,
             container_settings_popup: None,
@@ -1258,6 +1265,12 @@ impl App {
 
     pub fn set_completion_notification_sender(&mut self, sender: Option<Sender<PathBuf>>) {
         self.completion_notification_tx = sender;
+    }
+
+    /// Supplies the worker the subtitle timing page loads its cues through. Without it
+    /// the page still opens and still closes cleanly, it just never leaves its loader.
+    pub fn set_preview_handles(&mut self, handles: Option<PreviewHandles>) {
+        self.preview = handles;
     }
 
     /// Records the terminal's last reported focus state, driven by `main`'s
@@ -2244,13 +2257,23 @@ impl App {
 
         self.notice = None;
         self.sync_generation = self.sync_generation.wrapping_add(1);
-        self.subtitle_sync = Some(SubtitleSyncState::new(
-            self.sync_generation,
-            media,
-            source,
-            duration,
-            workspace,
-        ));
+        let state =
+            SubtitleSyncState::new(self.sync_generation, media, source, duration, workspace);
+        if let Some(preview) = self.preview.as_ref() {
+            // A sidecar is its own input and needs no extraction; an embedded track is
+            // read out of the media file by its absolute stream index.
+            let (input, stream_index) = match &state.source {
+                SubtitleSource::Embedded(index) => (state.media.clone(), Some(*index)),
+                SubtitleSource::Sidecar(path) => (path.clone(), None),
+            };
+            preview.request(PrepareRequest {
+                generation: state.generation,
+                input,
+                stream_index,
+                workspace: state.workspace().to_path_buf(),
+            });
+        }
+        self.subtitle_sync = Some(state);
         self.layer = Layer::SubtitleSync;
     }
 
@@ -2262,7 +2285,35 @@ impl App {
     fn close_subtitle_sync(&mut self) {
         if self.subtitle_sync.take().is_some() {
             self.sync_generation = self.sync_generation.wrapping_add(1);
+            // Tell the worker the page is gone as well as marking its answers stale: an
+            // extraction that has not finished is killed rather than left demuxing a
+            // whole container — seconds locally, and far longer over a network mount —
+            // for a page nobody is looking at.
+            if let Some(preview) = self.preview.as_ref() {
+                preview.abandon(self.sync_generation);
+            }
         }
+    }
+
+    /// Applies cues the preview worker parsed, ignoring anything belonging to a page
+    /// the user has already left. Returns whether an event was drained, so the main
+    /// loop can skip redrawing when none arrived.
+    pub fn receive_preview_events(&mut self, receiver: &Receiver<PreviewEvent>) -> bool {
+        let mut received = false;
+        while let Ok(event) = receiver.try_recv() {
+            received = true;
+            let Some(state) = self.subtitle_sync.as_mut() else {
+                continue;
+            };
+            if event.generation != state.generation {
+                continue;
+            }
+            match event.outcome {
+                PrepareOutcome::Ready(cues) => state.apply_prepared(cues),
+                PrepareOutcome::Failed(message) => state.fail(message),
+            }
+        }
+        received
     }
 
     /// The subtitle track under the cursor, if the cursor is on one at all.
@@ -19165,6 +19216,202 @@ mod tests {
             .unwrap()
             .apply_prepared(Vec::new());
         assert_that!(app.is_animating()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker knows nothing about selections or `SubtitleSource`, so the request has
+    /// to carry the media file, the **absolute** stream index, and the page's workspace.
+    /// A per-type `0:s:N` index here would extract whichever track happens to be Nth
+    /// among the subtitles, which is a different track on most real files.
+    #[test]
+    fn opening_the_sync_page_should_ask_the_worker_for_the_embedded_track() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let (handles, requests, _) = crate::preview::test_handles();
+        app.set_preview_handles(Some(handles));
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        let state = app.subtitle_sync.as_ref().expect("page should be open");
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(request.generation).is_equal_to(state.generation);
+        assert_that!(request.input.clone()).is_equal_to(state.media.clone());
+        assert_that!(request.stream_index).is_equal_to(Some(2));
+        assert_that!(request.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar is read straight off disk: the request has to point at the `.srt`
+    /// itself, not at the media, and ask for no extraction at all.
+    #[test]
+    fn opening_the_sync_page_should_ask_the_worker_for_a_sidecar_by_its_own_path() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let sidecar = test_sidecar(&app, "movie.en.srt", "eng");
+        let path = sidecar.path.clone();
+        app.sidecars.push(sidecar);
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| matches!(row, TrackRef::Sidecar(_)))
+            .expect("sidecar should have a track row");
+        let (handles, requests, _) = crate::preview::test_handles();
+        app.set_preview_handles(Some(handles));
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(request.input.clone()).is_equal_to(path);
+        assert_that!(request.stream_index).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page has to reach the worker, not just mark its answer stale: an
+    /// extraction demuxes the whole container, which over a network mount runs long
+    /// after the page it was for is gone.
+    #[test]
+    fn leaving_the_sync_page_should_tell_the_worker_to_stop() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let (handles, requests, live) = crate::preview::test_handles();
+        app.set_preview_handles(Some(handles));
+        app.open_subtitle_sync();
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Act
+        app.back();
+
+        // Assert: the generation the worker works for is no longer the one it was given.
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_fill_the_page_with_the_cues_the_worker_parsed() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act / Assert: an empty drain is not a redraw.
+        assert_that!(app.receive_preview_events(&receiver)).is_false();
+
+        // Act
+        sender
+            .send(PreviewEvent {
+                generation,
+                outcome: PrepareOutcome::Ready(vec![crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(2),
+                    text: "one".into(),
+                }]),
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(drained).is_true();
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.status.clone()).is_equal_to(crate::sync::SyncStatus::Ready);
+        assert_that!(state.cues.len()).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_show_a_failure_on_the_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent {
+                generation,
+                outcome: PrepareOutcome::Failed("ffmpeg said no".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_sync.as_ref().unwrap().status.clone()).is_equal_to(
+            crate::sync::SyncStatus::Failed("ffmpeg said no".to_string()),
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Cues extracted for a page the user has already left must never land on the page
+    /// they opened next — different track, possibly different file.
+    #[test]
+    fn receive_preview_events_should_drop_results_belonging_to_another_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        let stale = app.subtitle_sync.as_ref().unwrap().generation;
+        app.back();
+        app.open_subtitle_sync();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cues = || {
+            PrepareOutcome::Ready(vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "stale".into(),
+            }])
+        };
+
+        // Act
+        sender
+            .send(PreviewEvent {
+                generation: stale,
+                outcome: cues(),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert: the newly opened page is still waiting on its own extraction.
+        assert_that!(app.subtitle_sync.as_ref().unwrap().status.clone())
+            .is_equal_to(crate::sync::SyncStatus::Preparing);
+
+        // Act / Assert: and an answer arriving after the page is closed entirely is
+        // drained rather than panicking or reopening anything.
+        app.back();
+        sender
+            .send(PreviewEvent {
+                generation: stale,
+                outcome: cues(),
+            })
+            .unwrap();
+        assert_that!(app.receive_preview_events(&receiver)).is_true();
+        assert_that!(app.subtitle_sync.is_none()).is_true();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

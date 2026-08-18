@@ -17,6 +17,10 @@ pub struct SubtitleSpec {
     pub language: &'static str,
     pub codec: &'static str,
     pub default: bool,
+    /// SRT body to mux, or `None` for one cue spanning the whole clip. Scenarios that
+    /// look *inside* a track — cue counts, overlapping spans, per-cue selection — need
+    /// more than the default single cue can express.
+    pub cues: Option<&'static str>,
 }
 
 impl SubtitleSpec {
@@ -25,7 +29,13 @@ impl SubtitleSpec {
             language,
             codec,
             default: false,
+            cues: None,
         }
+    }
+
+    pub fn cues(mut self, cues: &'static str) -> Self {
+        self.cues = Some(cues);
+        self
     }
 }
 
@@ -165,7 +175,11 @@ pub fn write_media(path: &Path, spec: &MediaSpec) {
     );
     for (index, subtitle) in spec.subtitles.iter().enumerate() {
         let srt_path = parent.join(format!(".fixture-{stem}-{index}.srt"));
-        fs::write(&srt_path, srt_body(subtitle.language, spec.duration)).unwrap();
+        let body = subtitle
+            .cues
+            .map(str::to_string)
+            .unwrap_or_else(|| srt_body(subtitle.language, spec.duration));
+        fs::write(&srt_path, body).unwrap();
         srt_paths.push(srt_path);
     }
 

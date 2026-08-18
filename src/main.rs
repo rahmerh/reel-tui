@@ -13,6 +13,7 @@ use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
 use reel_tui::input::{InputOutcome, InputState, handle_key};
 use reel_tui::notification::completion_notification_sender;
+use reel_tui::preview::spawn_preview_worker;
 use reel_tui::probe::{spawn_conflict_probe_worker, spawn_probe_worker};
 use reel_tui::{config, mount, ui};
 
@@ -40,10 +41,12 @@ fn run(target_dir: PathBuf) -> Result<()> {
     let (transcode_workers, remux_workers) = app_config.effective_workers(is_network_mount);
     let (transcode_tx, remux_tx, edit_rx) =
         spawn_edit_worker_pools(transcode_workers, remux_workers);
+    let (preview_handles, preview_rx) = spawn_preview_worker();
     let mut app = App::new(target_dir, request_tx, conflict_tx, transcode_tx, remux_tx)?;
     app.set_completion_notification_sender(completion_notification_sender(
         app_config.notifications,
     ));
+    app.set_preview_handles(Some(preview_handles));
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {
@@ -64,6 +67,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
             dirty |= app.receive_probe_results(&result_rx);
             dirty |= app.receive_conflict_probe_results(&conflict_rx);
             dirty |= app.receive_edit_results(&edit_rx);
+            dirty |= app.receive_preview_events(&preview_rx);
             app.start_pending_probe();
             dirty |= app.maybe_open_conflict_dialog();
             if redraw.tick(std::mem::take(&mut dirty), app.is_animating()) {

@@ -3,8 +3,8 @@
 > **Delete this file before merging to `main`.** It is a working handoff for an
 > in-progress branch, not documentation of the finished feature.
 
-Handoff for the `subtitle-sync-preview` branch. Steps 0–3 are done and sitting in the
-working tree (uncommitted); steps 4–6 are not started. The full original design is at
+Handoff for the `subtitle-sync-preview` branch. Steps 0–4 are done; steps 5–6 are not
+started. The full original design is at
 `~/.claude/plans/okay-so-let-s-create-cryptic-ember.md`.
 
 ## What this feature is
@@ -84,9 +84,11 @@ already cover every path) and a `span.is_zero()` guard in `column()` (unreachabl
 are clean; `cargo install --path .` has been run.
 
 ### Known incomplete behavior right now
-Pressing `c` on an SRT track opens the page and it sits on **"Reading cues…" forever** —
-nothing populates the cues yet. That is Step 4. The page is otherwise correct: Esc/`q`
-leaves it, the workspace is created and deleted, and non-SRT tracks are refused properly.
+The preview pane shows the selected cue's **text**, not a video frame. That is Step 5, and
+the text pane is not scaffolding — it is the same fallback used when the terminal has no
+image protocol or FFmpeg lacks libass. Everything else works end to end: `c` opens the
+page, the cues load, `j`/`k` move the selection, the timeline stacks overlapping cues, and
+Esc releases the page with its workspace.
 
 ---
 
@@ -123,55 +125,43 @@ selection marker off `Cue::index` rather than row position, so nothing was ever 
 **15 deliberate breaks all proven.** `ui.rs` branch coverage 88.53% → 89.02%; every branch
 in the new page code is covered.
 
-## Step 4 — prepare worker (`src/preview.rs` new, `main.rs`, harness)
+## Step 4 — prepare worker — DONE
 
-First `cargo run`-verifiable milestone, and **shippable on its own** with a text-only
-preview pane if Step 5 has to be cut.
+`src/preview.rs` (new, ~730 lines with tests) plus the `main.rs` and harness wiring. The
+page now fills in for real; this is the first `cargo run`-verifiable milestone and is
+shippable on its own with the text preview pane.
 
-```rust
-pub struct PrepareRequest {
-    pub generation: u64,
-    pub input: PathBuf,             // media file, or the sidecar itself
-    pub stream_index: Option<u64>,  // Some => embedded; None => .srt sidecar, read directly
-    pub workspace: PathBuf,
-}
-pub enum PrepareOutcome { Ready(Vec<Cue>), Failed(String) }
-```
+- `PrepareRequest{generation,input,stream_index,workspace}` / `PrepareOutcome{Ready,Failed}`
+  / `PreviewEvent{generation,outcome}` as designed. A sidecar is `cue::read_srt` with **no
+  ffmpeg at all**; an embedded track is
+  `ffmpeg -v error -nostdin -y -i {media} -map 0:{index} -c:s copy {workspace}/cues.srt`,
+  the **absolute** ffprobe index, asserted against the full argument vector.
+- **`PreviewHandles` bundles the request channel with a shared `Arc<AtomicU64>`** instead of
+  handing `App` a bare `Sender`. Sending *is* what makes a generation live, and every other
+  write to the cell means "abandon". That is what lets the worker early-out before spawning
+  and kill a running extraction the moment the page closes — a full container demux nobody
+  is waiting for otherwise. Step 5's frame worker wants the same cell.
+- Worker is FIFO (`spawn_probe_worker`'s shape minus the coalescing, which has nothing to
+  collapse at one request per page opening), and shuts down when its results have nowhere
+  left to go.
+- `run_cancellable` is the pared-down `edit::run_cancellable_output`: same piped-reader
+  threads and 25 ms poll, no progress reporting, and **no `EditError`/seconv/OCR reach** —
+  a read-only preview must never write `~/.cache/reel-tui/edit_errors.log`.
+  Its `try_wait` error arm was folded into the give-up path rather than given an
+  untestable message of its own: `try_wait` fails only when something else reaped the
+  child, and nothing here installs a `SIGCHLD` handler.
+- `App::new`'s signature is unchanged: `set_preview_handles(Option<PreviewHandles>)`, in
+  the `set_completion_notification_sender` style. `main.rs` drains with
+  `dirty |= app.receive_preview_events(&preview_rx);`; the harness `pump` does the same —
+  and dropping that line from the harness was one of the proven breaks.
 
-Two cases only:
-| Source | Action |
-|---|---|
-| `.srt` sidecar | `cue::read_srt(path)` — **no ffmpeg at all** |
-| embedded `subrip` | `ffmpeg -v error -nostdin -y -i {media} -map 0:{index} -c:s copy {workspace}/cues.srt` |
+**Coverage: `preview.rs` 100% line + 100% branch on production code** (every remaining
+uncovered line and branch in the file is a `panic!` arm inside its own `#[cfg(test)]`
+module). All new `app.rs` branches covered both ways. **25 deliberate breaks all proven.**
+874 unit tests pass; fmt and clippy clean; `cargo install --path .` has been run.
 
-Note `-map 0:{index}` uses the **absolute** ffprobe stream index (`SubtitleSource::Embedded`
-carries that), matching `edit.rs`'s convention — never `0:s:N`.
-
-- **Must be async.** `-c:s copy` still demuxes to EOF: 1–3 s on a local 8 GB MKV, tens of
-  seconds over NFS. Blocking `handle_key` freezes the terminal with no way to cancel.
-- Worker shape: copy `spawn_probe_worker` (`src/probe.rs:254-279`). Prepare thread is FIFO.
-- **Do not reuse `edit.rs`'s private `extract_subtitle`/`convert_subtitle`** — they drag in
-  `SubtitleChange`/`ProgressReporter`/`EditError`/seconv/OCR, and routing a read-only
-  preview through the Save pipeline risks preview failures landing in
-  `~/.cache/reel-tui/edit_errors.log`, which AGENTS.md designates as the first place to
-  look for *edit* regressions. Write ~30 lines of dedicated command construction plus a
-  local `run_cancellable` mirroring `run_cancellable_output` (`edit.rs:4457`) minus
-  progress reporting (~45 lines). Bounded, deliberate duplication.
-- `App::receive_preview_events(&Receiver<PreviewEvent>) -> bool`, following
-  `receive_probe_results` (`app.rs:1777`). Drop events whose `generation` ≠ the live
-  state's.
-- **Do not change `App::new`'s signature** — 10+ test sites construct it positionally.
-  Make the sender `Option<Sender<_>>` defaulting to `None` plus a
-  `set_preview_senders(...)` setter, in the `set_completion_notification_sender` style
-  (`app.rs:1245`, used at `main.rs:37`).
-- `main.rs`: `dirty |= app.receive_preview_events(&preview_rx);` beside the other drains.
-  **The `dirty |=` trap**: omit it in either `main.rs` or `tests/e2e/harness.rs::pump` and
-  results arrive but never paint, and the e2e times out on a screen dump that looks fine.
-  Precedent regression test at `app.rs:9236`.
-- **Progress reporting**: AGENTS.md's Edit Progress Contract is scoped to Save workflows.
-  This is not one. Indeterminate loader only; **add no `EditPhase` variants**.
-
-Run e2e scenario 2 here (it needs no frame grabbing).
+Both e2e scenarios landed here rather than one, since Step 4 is what makes cue loading a
+user-visible behavior. Scenario 1 asserts everything except the frame; Step 5 extends it.
 
 ## Step 5 — frame preview (`ratatui-image`)
 
@@ -232,7 +222,7 @@ ffmpeg -v error -nostdin -y -ss {midpoint} -i {media}
   (n8.1.2, `--enable-libass`) and in CI (BtbN GPL static builds). The no-libass fallback
   shares its path with the no-`Picker` fallback, so it stays exercised.
 
-Run e2e scenario 1 here.
+Extend e2e scenario 1 with the frame assertions here; everything else in it already passes.
 
 ## Step 6 — final gate
 
@@ -251,30 +241,35 @@ Run e2e scenario 1 here.
   ```
 - `cargo install --path .`
 
-## E2E scenarios (Steps 4 and 5)
+## E2E scenarios — both written in Step 4
 
-Two fixture additions, both additive so no existing scenario changes:
-- `srt_body` (`tests/e2e/fixtures.rs:407`) writes exactly one cue spanning the whole
-  duration, so it cannot exercise lanes or `j`. Add an optional `SubtitleSpec.cues`
-  defaulting to today's single cue.
-- The builder deletes its temp `.srt` files after muxing (`fixtures.rs:262-263`); scenario
-  1 needs one *kept* as a persisted `{stem}.{lang}.srt` sidecar matching
-  `parse_sidecar_for_media`'s naming rules (`subtitle.rs:734`).
+Both live in `tests/e2e.rs` and pass. One fixture addition, additive:
+`SubtitleSpec::cues(&'static str)` overrides the builder's one-cue-per-track default
+(`fixtures.rs`). The sidecar is written by the scenario itself with `fs::write` rather than
+kept back from the builder — the scenario needs to control its cue text anyway, and that is
+less machinery than teaching `write_media` to persist one.
 
-1. **`subtitle_sync_page_previews_cue_timing_for_srt_tracks`** — one fixture, 3 cues with
-   one overlap, carrying both an embedded `subrip` track and a `.srt` sidecar so a single
-   build covers both prepare paths. Open → `c` → wait for Ready → assert cue count,
-   `lane_count == 2`, text + timestamp on screen → `j` → assert frame and highlight
-   followed → Esc → assert layer, state cleared, workspace gone → repeat `c` on the sidecar
-   row. Prove by: removing `close_subtitle_sync` from `back()`; making the frame worker
-   ignore `cue_index`; setting `MAX_LANES = 1`.
-2. **`subtitle_sync_page_refuses_formats_other_than_srt`** — press `c` on an `ass` track
-   and on the existing VobSub fixture (`fixtures.rs:293`); assert layer still `Streams`,
-   state `None`, notice names the format. Runs no ffmpeg, nearly free. Prove by dropping
-   the format guard.
+1. **`the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks`** —
+   one fixture, 3 cues with one overlap, carrying both an embedded `subrip` track and a
+   `clip.eng.srt` sidecar, so a single build covers both prepare paths. Open → `c` → wait
+   for cues → assert count, `lane_count == 2`, text + timestamp + `▸` marker on screen →
+   `j` → marker follows → Esc → layer, state cleared, workspace gone → `l` → `c` on the
+   sidecar. **Step 5 adds the frame assertions here.**
+   Note `l`, not `j`: with an embedded track *and* a sidecar the subtitle rows are drawn as
+   two columns, and `j` deliberately stays inside its column — walking with `j` spins
+   forever, which is what the first run of this scenario did.
+   Proven by: `MAX_LANES = 1`; removing `close_subtitle_sync` from `back()`; dropping
+   `receive_preview_events` from the harness `pump` (times out, exactly the trap the plan
+   called out).
+2. **`the_subtitle_timing_page_should_refuse_formats_other_than_srt`** — `c` on an `ass`
+   track and on the VobSub fixture; asserts layer still `Streams`, state `None`, and the
+   notice naming the format both in state and on screen. Files are visited in alphabetical
+   order with an Esc between them, because `Harness::open` only ever walks the file panel
+   downward. Proven by dropping the format guard.
 
-Harness: `pump` gains `receive_preview_events` + `start_pending_preview`; `Harness::start`
-calls `spawn_preview_workers(Some(Picker::halfblocks()), …)`.
+Harness: `pump` gained `receive_preview_events`; `Harness::start` calls
+`spawn_preview_worker()` and `set_preview_handles`. Step 5 adds `start_pending_preview` and
+`Picker::halfblocks()`.
 
 **What `TestBackend` cannot cover** — state this in the final change summary rather than
 papering over it: its `Buffer` stores symbol+style per cell and does not expose the backend
@@ -295,3 +290,6 @@ a solid fill), and that scaling preserves aspect.
    feature can *feel* broken.
 5. **`Layer` comparison semantics** — the two known landmines (`input.rs` `R`,
    `ui.rs:324`) are fixed. If another `layer != Layer::Files` gets added later, re-audit.
+6. **Subtitle column navigation in e2e** — `Harness::select_track_row` walks with `j`/`k`
+   and loops forever on a row `j` refuses to leave. With side-by-side subtitle columns that
+   is any subtitle row, so cross-column moves must use `l`/`h`.

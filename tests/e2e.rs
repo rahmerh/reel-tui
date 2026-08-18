@@ -370,9 +370,8 @@ fn editing_subtitle_metadata_should_persist_flags_and_preserve_its_neighbor() {
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv().audio(&["eng"]).subtitles(vec![
             SubtitleSpec {
-                language: "eng",
-                codec: "subrip",
                 default: true,
+                ..SubtitleSpec::new("eng", "subrip")
             },
             SubtitleSpec::new("nld", "subrip"),
         ]),
@@ -946,6 +945,182 @@ fn exporting_vobsub_as_srt_should_run_real_ocr_and_publish_valid_text() {
         stream_indices_of_type(&probe(&app.path("clip.mkv")), "subtitle").is_empty(),
         "the exported bitmap track should be removed from the media"
     );
+}
+
+/// Three cues with a deliberate overlap between the first two, so the timing page has
+/// to pack two lanes rather than one.
+const OVERLAPPING_CUES: &str = "1\n00:00:00,500 --> 00:00:02,000\nOverlapping opener\n\n\
+                                2\n00:00:01,500 --> 00:00:03,000\nOverlapping answer\n\n\
+                                3\n00:00:04,000 --> 00:00:05,000\nClosing line\n\n";
+
+const SIDECAR_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nSidecar first\n\n\
+                            2\n00:00:03,000 --> 00:00:04,000\nSidecar second\n\n";
+
+/// The subtitle timing page reads a track's cues in the background and draws them.
+///
+/// One fixture carries both source shapes — an embedded `subrip` stream, which the
+/// preview worker extracts with a real `ffmpeg`, and a `.srt` sidecar, which it reads
+/// straight off disk — so a single build covers both prepare paths. The page is opened,
+/// navigated and left through genuine keypresses, and leaving it has to take its scratch
+/// directory with it.
+#[test]
+fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks() {
+    let test = "the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().audio(&["eng"]).subtitles(vec![
+            SubtitleSpec::new("nld", "subrip").cues(OVERLAPPING_CUES),
+        ]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), SIDECAR_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    // The embedded track: extracted by the worker before anything can be drawn.
+    let subtitle_row = app.first_subtitle_row();
+    app.select_track_row(subtitle_row);
+    app.press(key(KeyCode::Char('c')));
+    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    let workspace = app
+        .app
+        .subtitle_sync
+        .as_ref()
+        .expect("the page should be open")
+        .workspace()
+        .to_path_buf();
+    app.wait_until("the embedded track's cues to be read", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 3, "every cue in the track should be read");
+    assert_eq!(
+        state.layout.lane_count, 2,
+        "the two overlapping cues need a lane each"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("Overlapping opener") && screen.contains("00:00:00.5 → 00:00:02.0"),
+        "the cue list should show cue text and timing:\n{screen}"
+    );
+    assert!(
+        screen.contains("▸ 00:00:00.5"),
+        "the first cue should start out selected:\n{screen}"
+    );
+
+    // Navigating the list moves the selection, and only the selection.
+    app.press(key(KeyCode::Char('j')));
+    app.pump();
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+    let screen = app.screen();
+    assert!(
+        screen.contains("▸ 00:00:01.5"),
+        "j should move the marker onto the second cue:\n{screen}"
+    );
+
+    // Leaving releases the page and its scratch directory.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert_eq!(app.app.layer, Layer::Streams);
+    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    assert!(
+        !workspace.exists(),
+        "closing the page should remove its workspace at {}",
+        workspace.display()
+    );
+
+    // The sidecar: read directly, with no ffmpeg involved at all. With both an embedded
+    // track and a sidecar present the subtitle rows are drawn as two columns, and `l` is
+    // how the cursor crosses to the external one — `j` deliberately stays in its column.
+    app.press(key(KeyCode::Char('l')));
+    app.pump();
+    assert_eq!(
+        app.app.selected_track(),
+        Some(TrackRef::Sidecar(0)),
+        "l should move onto the sidecar's column"
+    );
+    app.press(key(KeyCode::Char('c')));
+    app.wait_until("the sidecar's cues to be read", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 2, "the sidecar holds two cues");
+    assert_eq!(
+        state.layout.lane_count, 1,
+        "the sidecar's cues do not overlap"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("Sidecar first") && screen.contains("Sidecar second"),
+        "the sidecar's own cues should be on screen:\n{screen}"
+    );
+}
+
+/// The timing page reads a track exactly as it is stored and converts nothing, so every
+/// format that is not SubRip has to be turned away at the door rather than opening a
+/// page that can never fill in. Covers a text format and a bitmap one; runs no ffmpeg
+/// beyond building the fixtures.
+#[test]
+fn the_subtitle_timing_page_should_refuse_formats_other_than_srt() {
+    let test = "the_subtitle_timing_page_should_refuse_formats_other_than_srt";
+    require_tools(
+        test,
+        &["ffmpeg:libx264", "ffmpeg:aac", "seconv", "tesseract"],
+    );
+
+    let scratch = Scratch::new("subtitle-sync-refusal");
+    write_media(
+        &scratch.join("styled.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng"])
+            .subtitles(vec![SubtitleSpec::new("eng", "ass")]),
+    );
+    write_vobsub_media(&scratch.join("bitmap.mkv"), "eng");
+
+    let mut app = Harness::start(scratch);
+    // Alphabetical, because the file panel is walked downward from wherever the cursor
+    // already is.
+    for (file, format) in [("bitmap.mkv", "VobSub"), ("styled.mkv", "ASS")] {
+        app.open(file);
+        let subtitle_row = app.first_subtitle_row();
+        app.select_track_row(subtitle_row);
+        app.press(key(KeyCode::Char('c')));
+        app.pump();
+
+        assert_eq!(
+            app.app.layer,
+            Layer::Streams,
+            "{file} should not have opened the timing page"
+        );
+        assert!(
+            app.app.subtitle_sync.is_none(),
+            "{file} should not have left page state behind"
+        );
+        let notice = app
+            .app
+            .notice
+            .clone()
+            .unwrap_or_else(|| panic!("{file} should have been refused with a reason"));
+        assert!(
+            notice.contains(format) && notice.contains("Only SRT is supported"),
+            "the refusal should name the format it turned away: {notice:?}"
+        );
+        assert!(
+            app.screen().contains("Only SRT is supported"),
+            "the refusal should reach the screen:\n{}",
+            app.screen()
+        );
+        app.press(key(KeyCode::Esc));
+    }
 }
 
 /// Chapters and attachments are not editable track groups, but every ordinary remux
