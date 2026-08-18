@@ -215,6 +215,30 @@ pub fn format_timestamp(at: Duration) -> String {
     )
 }
 
+/// Renders a moment as a clock reading for the timeline axis: `1:23` or `1:02:03`.
+///
+/// The third and most compact of the three time formats here, because an axis reading is
+/// repeated across the track and pays for every character it spends. Whole seconds are
+/// enough: the axis is a reference to read cue positions *against*, and the exact times
+/// are in the cue list and the timeline's own title.
+///
+/// Whether hours appear is the caller's decision rather than derived per value, so one
+/// axis cannot mix `59:59` with `1:00:00` — readings of two different widths would make
+/// the spacing between them lie about the interval.
+pub fn format_clock(at: Duration, with_hours: bool) -> String {
+    let seconds = at.as_secs();
+    if with_hours {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
 /// Renders a cue time the way SubRip writes one, to the millisecond.
 ///
 /// The comma is not a stylistic choice: `ffmpeg`'s SubRip demuxer is what reads the file
@@ -756,6 +780,33 @@ mod tests {
             .is_equal_to("01:02:03,999");
         assert_that!(format_srt_timestamp(Duration::from_secs(600)).as_str())
             .is_equal_to("00:10:00,000");
+    }
+
+    /// Whether hours appear is the caller's, not the value's: an axis that decided per
+    /// reading would put `59:59` next to `1:00:00`, and the spacing between two readings
+    /// is the only thing telling you what interval the axis ticks at. A short reading with
+    /// hours on is therefore `0:00:59`, not `0:59`.
+    #[test]
+    fn format_clock_should_follow_the_callers_choice_of_hours_rather_than_the_value() {
+        // Act / Assert: without hours, minutes run past sixty rather than rolling over.
+        assert_that!(format_clock(Duration::ZERO, false).as_str()).is_equal_to("0:00");
+        assert_that!(format_clock(milliseconds(83_900), false).as_str()).is_equal_to("1:23");
+        assert_that!(format_clock(Duration::from_secs(3723), false).as_str()).is_equal_to("62:03");
+
+        // Act / Assert: with hours, every reading carries them.
+        assert_that!(format_clock(Duration::from_secs(59), true).as_str()).is_equal_to("0:00:59");
+        assert_that!(format_clock(Duration::from_secs(3723), true).as_str()).is_equal_to("1:02:03");
+        assert_that!(format_clock(Duration::from_secs(36_000), true).as_str())
+            .is_equal_to("10:00:00");
+    }
+
+    /// Sub-second remainders are dropped rather than rounded up, so a reading can never
+    /// name a moment later than the column it sits on.
+    #[test]
+    fn format_clock_should_truncate_toward_the_moment_it_marks() {
+        // Act / Assert
+        assert_that!(format_clock(milliseconds(1999), false).as_str()).is_equal_to("0:01");
+        assert_that!(format_clock(milliseconds(59_999), true).as_str()).is_equal_to("0:00:59");
     }
 
     #[test]

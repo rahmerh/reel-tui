@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use isolang::Language;
 use ratatui::{
@@ -21,7 +21,7 @@ use crate::{
         SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
         TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
-    cue::{Cue, LaneLayout, TimelineWindow, format_timestamp},
+    cue::{Cue, LaneLayout, TimelineWindow, format_clock, format_timestamp},
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
@@ -119,6 +119,15 @@ const SYNC_CUE_ROWS: u16 = 2;
 /// Its content is fixed-format, so it gets a floor rather than a share of the width.
 const SYNC_CUE_PANEL_WIDTH: u16 = 28;
 
+/// Rows the timeline track spends on everything that is not a lane: its two borders and
+/// the time axis beneath the lanes.
+const SYNC_TRACK_CHROME: u16 = 3;
+
+/// Seconds between the axis's ticks. Ten reads as a round number at a glance, and across
+/// the sixty-second window the track shows it lands six of them — enough to judge a cue's
+/// width against, few enough not to become a texture.
+const TICK: u64 = 10;
+
 /// Draws the subtitle timing page over the entire frame.
 ///
 /// Three panes: the frame at the selected cue on the left, the cue list on the right, and
@@ -153,10 +162,23 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // No minimum-size guard here: `render` already refuses anything under 50x10, and the
-    // deepest possible track (four lanes) needs only nine rows, so there is no reachable
-    // size this layout cannot draw. The cue panel's width is clamped rather than
-    // proportional so its fixed-format timestamps survive the narrowest of them.
-    let track_height = state.layout.lane_count as u16 + 2;
+    // deepest possible track (four lanes, plus its ruler) needs exactly ten rows, so there
+    // is no reachable size this layout cannot draw — but there is no room to spare either,
+    // which is why the axis is one row and not two. The cue panel's width is clamped rather
+    // than proportional so its fixed-format timestamps survive the narrowest of them.
+    //
+    // The axis is the first thing to go when the page cannot afford both it and a row of
+    // the cue list. The list is the only thing here you can move, and a page that cannot
+    // show which cue is selected is broken in a way a missing axis is not. Only the very
+    // deepest track at the very smallest size actually hits this. The ruler line is still
+    // built and simply clipped by the `Paragraph`, so the two shapes cannot drift apart.
+    let lanes = state.layout.lane_count as u16;
+    let cue_panel_floor = SYNC_CUE_ROWS + 2;
+    let track_height = if area.height.saturating_sub(lanes + SYNC_TRACK_CHROME) >= cue_panel_floor {
+        lanes + SYNC_TRACK_CHROME
+    } else {
+        lanes + SYNC_TRACK_CHROME - 1
+    };
     let cue_width = (area.width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48);
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(track_height)]).split(area);
     let columns =
@@ -267,16 +289,88 @@ fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect
 }
 
 fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect) {
-    let block = Block::bordered().title(" Timeline ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let Some(cue) = state.selected_cue() else {
+        // "Ready but holding nothing" is reachable state, since `cues` and `selected` are
+        // public — see `the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_\
+        // underneath_it`. The frame is still drawn, but with no span to name in its title
+        // and nothing to lay an axis against.
+        frame.render_widget(Block::bordered().title(" Timeline "), area);
         return;
     };
+    // The selected cue's exact times go in the title rather than onto the axis. At roughly
+    // a second per column there is nowhere on the track to put a ten-character timestamp
+    // without it covering the cues around it, and the title is otherwise empty space.
+    //
+    // Parenthetical rather than separated by " · ": that separator is the house style for
+    // inline control hints, which this page is forbidden from carrying, and
+    // `the_sync_page_should_not_carry_inline_control_hints` watches for it by name.
+    let block = Block::bordered().title(format!(
+        " Timeline ({} → {}) ",
+        format_timestamp(cue.start),
+        format_timestamp(cue.end)
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let window = TimelineWindow::centered(cue, state.duration, inner.width);
-    let lines = timeline_lines(&state.cues, &state.layout, &window, state.selected);
+    let mut lines = timeline_lines(&state.cues, &state.layout, &window, state.selected);
+    lines.push(timeline_ruler(&window, window.span(cue)));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The time axis drawn beneath the lanes: a reading every ten seconds, and the selected
+/// cue's two ends.
+///
+/// A reading's first character sits on the column its moment maps to, so the numbers mark
+/// the positions themselves and the axis needs no tick glyphs under them.
+///
+/// `selected` is the cue's column span, taken from `TimelineWindow::span` rather than
+/// re-derived here, so the marks land exactly under the bracket ends drawn above them even
+/// where the window has clamped a cue that runs past its edge.
+fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line<'static> {
+    // No width guard: `TimelineWindow::column` and `span` both answer `None` for a window
+    // with no columns, so a track drawn no cells wide places no readings and no marks and
+    // falls out as an empty line — the same contract `timeline_lines` indexes under.
+    let mut cells = vec![(' ', Style::default()); usize::from(window.width)];
+
+    // One decision for the whole axis: readings of two different widths would make the
+    // gaps between them lie about the interval they are spaced at.
+    let with_hours = window.end.as_secs() >= 3600;
+    // Reserved before anything is written. A reading with a mark painted through it leaves
+    // a plausible but wrong time on the axis, which is worse than no reading at all.
+    let marks: Vec<u16> = selected
+        .into_iter()
+        .flat_map(|(first, last)| [first, last])
+        .collect();
+
+    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(TICK) * TICK);
+    let mut written_to = None;
+    while at <= window.end {
+        let moment = at;
+        at += Duration::from_secs(TICK);
+        let Some(column) = window.column(moment) else {
+            continue;
+        };
+        let reading = format_clock(moment, with_hours);
+        let span = column..=column + reading.chars().count() as u16 - 1;
+        // Dropped whole rather than clipped or crowded: half a timestamp is a different,
+        // wrong moment, and two readings run together are unreadable as either.
+        let crowded = written_to.is_some_and(|last| column <= last + 1);
+        if *span.end() >= window.width || crowded || marks.iter().any(|mark| span.contains(mark)) {
+            continue;
+        }
+        for (offset, glyph) in reading.chars().enumerate() {
+            cells[usize::from(column) + offset] = (glyph, Style::default().fg(Color::DarkGray));
+        }
+        written_to = Some(*span.end());
+    }
+
+    // Painted last, the same way the selected cue's span is painted last onto a crowded
+    // lane. A triangle rather than a box-drawing glyph: the repo already ships `▸` and
+    // `▀`, so this is known to render, and it cannot be read as part of a reading.
+    for mark in marks {
+        cells[usize::from(mark)] = ('▲', Style::default().fg(Color::Cyan).bold());
+    }
+    Line::from(runs(cells))
 }
 
 /// Lays every cue out across the track, one line per lane.
@@ -11889,10 +11983,11 @@ mod tests {
         // Act
         drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert: 65% of 80 columns, less the pane's own borders.
+        // Assert: 65% of 80 columns, less the pane's own borders, and the rows left after
+        // the track takes its lane, its two borders and its time axis.
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
         assert_that!(cells.width).is_equal_to(50);
-        assert_that!(cells.height).is_equal_to(19);
+        assert_that!(cells.height).is_equal_to(18);
 
         // Cleanup
         drop(app);
@@ -11944,9 +12039,10 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The deepest possible track is four lanes, which needs nine of the ten rows
-    /// `render` already guarantees — so there is no reachable size the page has to refuse,
-    /// and the smallest one still has to be legible rather than merely not crash.
+    /// The deepest possible track is four lanes, which with its borders and its time axis
+    /// needs all ten of the rows `render` already guarantees — so there is no reachable
+    /// size the page has to refuse, but none to spare either, and the smallest one still
+    /// has to be legible rather than merely not crash.
     #[test]
     fn the_page_should_stay_usable_at_the_smallest_size_render_allows() {
         // Arrange: four mutually overlapping cues, so the track claims six rows.
@@ -11969,9 +12065,79 @@ mod tests {
         assert_that!(screen.contains("Preview")).is_true();
         assert_that!(screen.contains("Cues")).is_true();
         assert_that!(screen.contains("Timeline")).is_true();
-        assert_that!(screen.contains("00:00:00.0 → 00:00:09.0")).is_true();
+        // The cue-list row, marker and all, rather than the title's copy of the same span.
+        assert_that!(screen.contains("▸ 00:00:00.0 → 00:00:09.0")).is_true();
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
         assert_that!(cells.width > 0 && cells.height > 0).is_true();
+
+        // Act / Assert: four lanes plus an axis do not fit in ten rows alongside a row of
+        // the cue list, so the axis gives way — and one more row brings it back.
+        // Keyed on the selection marks, which nothing but the axis draws.
+        assert_that!(screen.contains('▲')).is_false();
+        let taller = drawn(50, 11, |frame| render(frame, &mut app));
+        assert_that!(taller.contains('▲')).is_true();
+        assert_that!(taller.contains("▸ 00:00:00.0 → 00:00:09.0")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue longer than the window it is centred in overflows both edges, so the marks
+    /// have to be clamped like the bracket above them rather than derived from moments the
+    /// window cannot map. Asserted through a rendered page, because it is the call site
+    /// that chooses between the two.
+    #[test]
+    fn the_axis_should_still_mark_a_cue_that_outruns_the_window() {
+        // Arrange: two minutes of dialogue in a window that shows one.
+        let (mut app, directory) =
+            sync_page_app("sync-long-cue", vec![sync_cue(0, 120_000, "a long one")]);
+
+        // Act
+        let painted = drawn_cells(100, 24, |frame| render(frame, &mut app));
+
+        // Assert: both ends are marked, and in the selection's own colour.
+        let marks: Vec<_> = painted.iter().filter(|(symbol, _)| symbol == "▲").collect();
+        assert_that!(marks.len()).is_equal_to(2);
+        for (_, style) in marks {
+            assert_that!(style.fg).is_equal_to(Some(Color::Cyan));
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The exact times live in the title because there is nowhere on a track drawn at a
+    /// second per column to put a ten-character timestamp without covering the cues
+    /// around it — and because the title is otherwise empty.
+    #[test]
+    fn the_timeline_title_should_carry_the_selected_cues_exact_span_and_follow_it() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-title",
+            vec![
+                sync_cue(1500, 3200, "first"),
+                sync_cue(9000, 11_500, "second"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert: the same format the cue list prints, so one cue reads identically in
+        // both places.
+        assert_that!(screen.contains("Timeline (00:00:01.5 → 00:00:03.2)")).is_true();
+
+        // Act: move to the next cue.
+        app.select_next();
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Timeline (00:00:09.0 → 00:00:11.5)")).is_true();
+        // Title-scoped: the first cue's times are still in the cue list beside it, which
+        // is the whole reason the title names only the selection.
+        assert_that!(screen.contains("Timeline (00:00:01.5")).is_false();
 
         // Cleanup
         drop(app);
@@ -12020,6 +12186,191 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// The text of a ruler drawn for `window`, marked for `cue`.
+    fn ruler_text(window: &TimelineWindow, cue: &crate::cue::Cue) -> String {
+        timeline_ruler(window, window.span(cue))
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn window_over(start: u64, end: u64, width: u16) -> TimelineWindow {
+        TimelineWindow {
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+            width,
+        }
+    }
+
+    /// The readings are the axis: one every ten seconds, each starting on the column its
+    /// moment falls on, so a cue's width can be read against them.
+    #[test]
+    fn the_axis_should_read_out_absolute_time_every_ten_seconds() {
+        // Arrange: a minute of a ten-minute file, starting somewhere untidy.
+        let window = window_over(52, 112, 76);
+        let cue = sync_cue(80_000, 84_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: absolute file time, not time relative to the window, which scrolls with
+        // the selection and would say nothing about where in the film a cue sits.
+        assert_that!(text.contains("1:00")).is_true();
+        assert_that!(text.contains("1:30")).is_true();
+        // Deliberately readings that only a ten-second interval produces: sixty and ninety
+        // seconds would still be marked by an axis ticking at fifteen.
+        assert_that!(text.contains("1:10")).is_true();
+        assert_that!(text.contains("1:40")).is_true();
+        assert_that!(text.contains("0:08")).is_false();
+
+        // Each reading begins on the column its moment maps to, using the same mapping the
+        // cue spans above it use — 1:30 must start where a cue starting at 1:30 would.
+        let column = window
+            .column(Duration::from_secs(90))
+            .expect("1:30 is inside the window");
+        let from_there: String = text.chars().skip(usize::from(column)).collect();
+        assert_that!(from_there.starts_with("1:30")).is_true();
+
+        // And nothing else is drawn: no tick glyphs under the numbers.
+        assert_that!(
+            text.chars()
+                .all(|glyph| glyph.is_ascii_digit() || matches!(glyph, ':' | '▲' | ' '))
+        )
+        .is_true();
+    }
+
+    /// An axis mixing `59:59` with `1:00:00` would carry readings of two widths, and the
+    /// gap between two readings is the only thing telling you the interval.
+    #[test]
+    fn an_axis_reaching_past_an_hour_should_carry_hours_on_every_reading() {
+        // Arrange: a window straddling the hour mark.
+        let window = window_over(3570, 3630, 90);
+        let cue = sync_cue(3_600_000, 3_602_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: the readings before the hour carry it too.
+        assert_that!(text.contains("0:59:40")).is_true();
+        assert_that!(text.contains("1:00:20")).is_true();
+        assert_that!(text.contains(" 59:40")).is_false();
+    }
+
+    /// Half a timestamp is a different, wrong time, and two run together are unreadable as
+    /// either. A reading that cannot be drawn clear of its neighbours, of the selection
+    /// marks, and of the track's end is dropped whole.
+    #[test]
+    fn a_reading_that_cannot_be_drawn_clear_should_not_be_drawn_at_all() {
+        // Arrange: the cue's ends fall right where 1:20's reading would go.
+        let window = window_over(60, 120, 76);
+        let cue = sync_cue(80_000, 84_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: that reading is gone rather than painted through, and so is the one at
+        // the right edge, which has a column but no room for its digits.
+        assert_that!(text.contains("1:20")).is_false();
+        assert_that!(text.contains("2:00")).is_false();
+
+        // Every reading that is drawn is a whole one: each run of digits is a real
+        // ten-second mark for this window, so none is the tail of a reading that was
+        // painted over or the head of one that ran off the end.
+        let printed: Vec<String> = text
+            .split(|glyph: char| !glyph.is_ascii_digit() && glyph != ':')
+            .filter(|run| !run.is_empty())
+            .map(str::to_string)
+            .collect();
+        let expected: Vec<String> = (60..=120)
+            .step_by(10)
+            .map(|second| format_clock(Duration::from_secs(second), false))
+            .collect();
+        assert_that!(printed.is_empty()).is_false();
+        for reading in &printed {
+            assert_that!(expected.contains(reading)).is_true();
+        }
+        assert_that!(printed.len() < expected.len()).is_true();
+        assert_that!(text.chars().count()).is_equal_to(76);
+    }
+
+    /// On the narrowest track an hour-long file can put two seven-character readings eight
+    /// columns apart, so they have to thin out rather than run into each other.
+    #[test]
+    fn readings_too_close_to_stand_apart_should_thin_out() {
+        // Arrange: the smallest track `render` allows, on a film past the hour mark.
+        let window = window_over(3600, 3660, 48);
+        let cue = sync_cue(3_610_000, 3_612_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: every unbroken run of characters is one whole reading. Two that had run
+        // together would show up here as a single run belonging to neither.
+        let expected: Vec<String> = (3600..=3660)
+            .step_by(10)
+            .map(|second| format_clock(Duration::from_secs(second), true))
+            .collect();
+        let printed: Vec<String> = text
+            .split([' ', '▲'])
+            .filter(|run| !run.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_that!(printed.is_empty()).is_false();
+        for reading in &printed {
+            assert_that!(expected.contains(reading)).is_true();
+        }
+        // And the track is too tight to hold them all, so at least one gave way.
+        assert_that!(printed.len() < expected.len()).is_true();
+    }
+
+    /// The marks have to line up with the bracket ends    /// The marks have to line up with the bracket ends drawn directly above them, which is
+    /// why they come from the same `span` the bracket does rather than being re-derived.
+    #[test]
+    fn the_axis_should_mark_the_selected_cue_under_its_bracket_ends() {
+        // Arrange
+        let window = window_over(60, 120, 76);
+        let cue = sync_cue(80_000, 84_000, "x");
+        let (first, last) = window.span(&cue).expect("the cue is inside the window");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert
+        let glyphs: Vec<char> = text.chars().collect();
+        assert_that!(glyphs[usize::from(first)]).is_equal_to('▲');
+        assert_that!(glyphs[usize::from(last)]).is_equal_to('▲');
+        assert_that!(glyphs.iter().filter(|glyph| **glyph == '▲').count()).is_equal_to(2);
+
+        // Arrange / Act: a cue longer than the window it is centred in, so both of its
+        // ends fall outside and the bracket above is drawn clamped to the track edges.
+        let overflowing = sync_cue(30_000, 150_000, "x");
+        let text = ruler_text(&window, &overflowing);
+
+        // Assert: the marks are clamped the same way, rather than disappearing with the
+        // moments they belong to.
+        let glyphs: Vec<char> = text.chars().collect();
+        assert_that!(window.column(overflowing.start)).is_none();
+        assert_that!(glyphs[0]).is_equal_to('▲');
+        assert_that!(glyphs[75]).is_equal_to('▲');
+    }
+
+    /// A track with no columns to draw on is a layout the renderer never asks for, but the
+    /// arithmetic below divides by the window's span and indexes by column, so it answers
+    /// with an empty line rather than panicking.
+    #[test]
+    fn an_axis_with_no_width_should_draw_nothing() {
+        // Arrange
+        let window = window_over(0, 60, 0);
+        let cue = sync_cue(0, 1000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert
+        assert_that!(text.as_str()).is_equal_to("");
     }
 
     #[test]
@@ -12149,9 +12500,12 @@ mod tests {
         // Act
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert: the panes are still framed, with no cue drawn inside them.
+        // Assert: the panes are still framed, with no cue drawn inside them — and the
+        // title names no span, because there is no cue to have one.
         assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains("Timeline (")).is_false();
         assert_that!(screen.contains('|')).is_false();
+        assert_that!(screen.contains('▲')).is_false();
 
         // Cleanup
         drop(app);

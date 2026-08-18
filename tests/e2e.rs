@@ -1019,6 +1019,22 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         screen.contains("▸ 00:00:00.5"),
         "the first cue should start out selected:\n{screen}"
     );
+    assert!(
+        screen.contains("Timeline (00:00:00.5 → 00:00:02.0)"),
+        "the timeline should name the selected cue's exact span:\n{screen}"
+    );
+    // The time axis: a ten-second reading to judge cue widths against, and the selected
+    // cue's two ends marked on it. Found by the marks, since nothing else on the page
+    // draws one — the cue list prints times of its own, so the whole screen cannot be
+    // asked whether a reading is present.
+    let axis = screen
+        .lines()
+        .find(|line| line.contains('▲'))
+        .unwrap_or_else(|| panic!("the timeline should mark the selected cue:\n{screen}"));
+    assert!(
+        axis.contains("0:00"),
+        "the axis should read out absolute time: {axis:?}"
+    );
 
     // The frame: a real `ffmpeg` seek with the cue burned in by libass, decoded and
     // encoded for the pane by the worker.
@@ -1049,6 +1065,10 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     assert!(
         screen.contains("▸ 00:00:01.5"),
         "j should move the marker onto the second cue:\n{screen}"
+    );
+    assert!(
+        screen.contains("Timeline (00:00:01.5 → 00:00:03.0)"),
+        "the timeline's title should follow the selection:\n{screen}"
     );
     app.wait_until("a frame for the second cue", |app| {
         app.subtitle_sync
