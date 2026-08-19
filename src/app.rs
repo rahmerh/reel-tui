@@ -1133,6 +1133,13 @@ pub struct App {
     /// moved, the pane resized — and this is what lets `advance_playback` notice that and
     /// tell the worker, rather than each of those points having to.
     playback_live: bool,
+    /// What the audio device wants a span's sound emitted as.
+    ///
+    /// Read once by `main` before the terminal is taken over — some hosts write to stderr
+    /// while enumerating devices, and on the alternate screen that lands in the middle of
+    /// the UI — and handed to `ffmpeg`, so the audio callback copies rather than resamples.
+    /// Tests and library consumers keep the fallback, which nothing plays anyway.
+    audio_format: crate::audio::OutputFormat,
     /// The preview worker, when one is running. `None` in tests and for library
     /// consumers that never open the timing page, exactly like
     /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
@@ -1283,6 +1290,7 @@ impl App {
             sync_generation: 0,
             playback_generation: 0,
             playback_live: false,
+            audio_format: crate::audio::OutputFormat::FALLBACK,
             preview_settings: PreviewSettings::default(),
             preview: None,
             container_target: None,
@@ -1346,6 +1354,15 @@ impl App {
     /// `config.toml` and the mount the directory is on.
     pub fn set_preview_settings(&mut self, settings: PreviewSettings) {
         self.preview_settings = settings;
+    }
+
+    /// Records what the audio device wants, so a span's sound is emitted as exactly that.
+    ///
+    /// A setter for the same reason the preview handles are one: `App::new` has a
+    /// positional signature a dozen test sites construct, and the query has to happen in
+    /// `main` before the terminal is taken over — see [`crate::audio::device_format`].
+    pub fn set_audio_format(&mut self, format: crate::audio::OutputFormat) {
+        self.audio_format = format;
     }
 
     /// Records the terminal's last reported focus state, driven by `main`'s
@@ -2477,8 +2494,13 @@ impl App {
                     && state.preparing_playback() == Some(cue_index) =>
                 {
                     match outcome {
-                        PlaybackOutcome::Ready(frames) => {
-                            state.begin_playback(cue_index, frames, crate::audio::open())
+                        PlaybackOutcome::Ready(mut frames) => {
+                            // The sound leaves the span here and is owned by the device for
+                            // as long as the stream lives, which is what makes dropping the
+                            // page the one thing that stops it.
+                            let sound = frames.take_samples();
+                            let output = crate::audio::open(self.audio_format, sound);
+                            state.begin_playback(cue_index, frames, output);
                         }
                         PlaybackOutcome::Failed(message) => {
                             state.fail_playback(cue_index, message);
@@ -2675,6 +2697,11 @@ impl App {
             return;
         }
         let settings = self.preview_settings;
+        // Asked of the probe rather than of `ffmpeg`: a `-map 0:a:0` on media with no audio
+        // fails the whole run, and the optional `0:a:0?` form leaves an output file with no
+        // streams in it, which fails just as hard. So the question is settled before the
+        // command is built, and a video with no sound plays as a silent slideshow.
+        let audio = self.has_audio_track().then_some(self.audio_format);
         let request = {
             let Some(state) = self.subtitle_sync.as_mut() else {
                 return;
@@ -2707,6 +2734,7 @@ impl App {
                 ),
                 pixels,
                 cells,
+                audio,
             }
         };
         self.playback_generation = request.generation;
@@ -2714,6 +2742,19 @@ impl App {
         if let Some(preview) = self.preview.as_ref() {
             preview.request_playback(request);
         }
+    }
+
+    /// Whether the media the page is previewing against has any sound in it.
+    ///
+    /// From the probe that opened the file, which is the same media a frame is grabbed
+    /// from — for a sidecar track that is the companion video, which is the file the page
+    /// was opened on either way.
+    fn has_audio_track(&self) -> bool {
+        self.media_info().is_some_and(|info| {
+            info.streams
+                .iter()
+                .any(|stream| stream_kind(stream) == Some("audio"))
+        })
     }
 
     /// Stops any playback and tells the worker to stop decoding for it.
@@ -20739,6 +20780,7 @@ mod tests {
             request.cells,
             request.fps,
             request.span_start,
+            Vec::new(),
         )
     }
 
@@ -20780,6 +20822,55 @@ mod tests {
         // Assert: the page says it is waiting, so `p` does not look like it did nothing.
         assert_that!(app.subtitle_sync.as_ref().unwrap().preparing_playback()).is_equal_to(Some(1));
         assert_that!(app.playback_active()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `-map 0:a:0` on media with no audio fails the whole run, and the optional `0:a:0?`
+    /// form leaves an output file with no streams in it, which fails just as hard. So the
+    /// question is settled from the probe before the command is built — and a video with no
+    /// sound plays as a silent slideshow rather than not at all.
+    #[test]
+    fn a_span_should_only_ask_for_sound_when_the_media_has_some() {
+        // Arrange: the ordinary case, which `app_with_subtitle_codec` gives an audio track.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_audio_format(crate::audio::OutputFormat {
+            sample_rate: 44_100,
+            channels: 1,
+        });
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert: the device's own format, so the callback copies rather than
+        // resamples.
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.audio).is_equal_to(Some(crate::audio::OutputFormat {
+            sample_rate: 44_100,
+            channels: 1,
+        }));
+
+        // Arrange: the same page against media with no audio track at all.
+        app.toggle_playback();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 1);
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.audio).is_none();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

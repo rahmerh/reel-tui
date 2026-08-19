@@ -39,6 +39,19 @@ runs:
         sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libicu-dev
         tesseract --version | head -1
 
+    - name: Install the ALSA headers cpal builds against
+      shell: bash
+      run: |
+        set -euo pipefail
+        # A build dependency, not a runtime one: `alsa-sys`'s build script is a
+        # bare `pkg_config::probe_library("alsa")`, so without these the crate
+        # fails to compile and nothing in the suite runs. The runner has no
+        # sound device and does not need one — the timing page's playback falls
+        # back to `audio::SilentOutput`, which is the same production path a
+        # user without a sound card takes.
+        sudo apt-get install -y pkg-config libasound2-dev
+        pkg-config --modversion alsa
+
     - name: Install seconv 5.1.0+
       shell: bash
       run: |
