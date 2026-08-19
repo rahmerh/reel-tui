@@ -5246,6 +5246,121 @@ mod tests {
         assert_that!(pixels.as_slice()).is_equal_to([1u8, 2, 3].as_slice());
     }
 
+    /// **The property the whole feature rests on: the picture and the sound describe the
+    /// same instant.**
+    ///
+    /// A *constant* offset between them is the one failure this page cannot have and the
+    /// one nothing else here would catch — every count, every size, every key and every
+    /// frame is right, and the playback simply reports every subtitle as late by the same
+    /// amount. Once the page can edit times, that reading gets written to the file.
+    ///
+    /// `-ss` before `-i` is where such an offset would come from: it resets output
+    /// timestamps to about zero, and it does so for both outputs of the pass. This measures
+    /// that rather than trusting it, with a fixture whose picture turns white at the exact
+    /// instant a tone starts — so the two streams carry the same event and the decoded span
+    /// can be asked where each of them put it.
+    ///
+    /// Measured at 0.1 ms on the machine this was written on. The tolerance is one frame
+    /// period, which is the finest the picture can resolve anyway.
+    #[test]
+    fn the_sound_and_the_picture_of_a_span_should_describe_the_same_instant() {
+        // Arrange: eight seconds that go from black-and-silent to white-and-audible at
+        // exactly three seconds in.
+        require_ffmpeg("the_sound_and_the_picture_of_a_span_should_describe_the_same_instant");
+        let directory = scratch("playback-sync");
+        let media = directory.join("clip.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x240:r=25:d=8",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc='0.5*sin(2*PI*440*t)*gte(t,3)':d=8:s=48000",
+                "-vf",
+                "drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='gte(t,3)'",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&media)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            built.status.success(),
+            "failed to build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Arrange: a span starting a second in, so the event lands two seconds into it —
+        // which is what makes a constant offset visible rather than hidden at zero.
+        let format = crate::audio::OutputFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let cells = Size::new(160, 60);
+        let mut request = playback_request(&media, &directory, cue(3000, 4000, "X"));
+        request.span_start = Duration::from_secs(1);
+        request.span_end = Duration::from_secs(6);
+        request.fps = 25;
+        request.cells = cells;
+        request.pixels = playback_pixels(cells);
+        request.audio = Some(format);
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let PlaybackOutcome::Ready(mut frames) = outcome else {
+            panic!("the fixture should decode");
+        };
+        let samples = frames.take_samples();
+
+        // Assert: where the picture turns white.
+        let brightened = (0..frames.count())
+            .find(|index| {
+                let frame = frames.frame(*index).expect("frame inside the span");
+                frame
+                    .iter()
+                    .take(3000)
+                    .map(|byte| u32::from(*byte))
+                    .sum::<u32>()
+                    / 3000
+                    > 128
+            })
+            .expect("the picture should turn white inside the span");
+        let picture_at = Duration::from_secs_f64(brightened as f64 / f64::from(request.fps));
+
+        // Assert: and where the tone starts. Stepped a frame at a time so the answer is in
+        // frames of sound rather than in interleaved samples.
+        let channels = usize::from(format.channels);
+        let onset = samples
+            .chunks_exact(channels)
+            .position(|frame| frame[0].abs() > 0.05)
+            .expect("the tone should start inside the span");
+        let sound_at = format.duration_of(onset * channels);
+
+        // Assert: both put the event two seconds into the span, and — the part that matters
+        // — they agree with each other to within a frame.
+        let frame_period = Duration::from_secs(1) / request.fps;
+        assert_that!(picture_at.abs_diff(Duration::from_secs(2)) <= frame_period).is_true();
+        assert_that!(sound_at.abs_diff(Duration::from_secs(2)) <= frame_period).is_true();
+        assert_that!(picture_at.abs_diff(sound_at) <= frame_period).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// A span the user has stopped waiting for is not reported at all — a span arriving
     /// after `p` was pressed again would start playing under a page that has gone back to
     /// its still frame.
