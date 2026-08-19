@@ -358,6 +358,24 @@ fn start(
     Some(stream)
 }
 
+/// Which part of the span a callback should copy: where to start, and how much there is.
+///
+/// **The start is clamped, and that is not defensive tidying.** `handed_over` counts whole
+/// buffers of device time rather than samples copied — it has to, or the clock walks
+/// backwards once the sound runs out — so it passes `samples.len()` and keeps going. In
+/// Rust `slice[n..n]` panics when `n` is past the end, empty range or not, so the obvious
+/// `&samples[handed_over..handed_over]` takes the audio thread down a buffer or two after
+/// the sound ends. A video span outlasting its audio is ordinary: a cue at the end of a
+/// file, or streams that do not finish together.
+///
+/// Split out from the callback because that is the one place a test cannot reach — it
+/// needs a real device, and it runs on a thread whose panic does not fail the test that
+/// caused it.
+fn span_slice(samples: usize, handed_over: usize, buffer: usize) -> (usize, usize) {
+    let from = handed_over.min(samples);
+    (from, (samples - from).min(buffer))
+}
+
 fn stream_of<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -389,11 +407,8 @@ where
                     .saturating_duration_since(timestamp.callback);
                 clock.anchor(Instant::now(), lead, format.duration_of(handed_over));
 
-                let taken = samples.len().saturating_sub(handed_over).min(buffer.len());
-                for (slot, sample) in buffer
-                    .iter_mut()
-                    .zip(&samples[handed_over..handed_over + taken])
-                {
+                let (from, taken) = span_slice(samples.len(), handed_over, buffer.len());
+                for (slot, sample) in buffer.iter_mut().zip(&samples[from..from + taken]) {
                     *slot = T::from_sample(*sample);
                 }
                 for slot in &mut buffer[taken..] {
@@ -623,6 +638,38 @@ mod tests {
             .is_equal_to(Duration::from_secs(1));
     }
 
+    /// **The regression test for a crash on the audio thread.** `handed_over` counts whole
+    /// buffers of device time rather than samples copied — it has to, or the clock walks
+    /// backwards once the sound runs out — so it passes the end of the span and keeps
+    /// going. Slicing at an index past the end panics in Rust even for an empty range, so
+    /// the obvious arithmetic took the audio thread down a buffer or two after the sound
+    /// finished, on any playback whose video outlasts its audio.
+    ///
+    /// Found by the e2e scenario, which noticed it only because a sabotaged run happened to
+    /// play long enough to reach the end of the sound.
+    #[test]
+    fn a_callback_past_the_end_of_the_sound_should_ask_for_nothing_rather_than_panic() {
+        // Arrange: a span of a thousand samples, handed over in buffers of four hundred.
+        let samples = 1_000;
+        let buffer = 400;
+
+        // Act / Assert: the first two buffers come straight out of the span.
+        assert_that!(span_slice(samples, 0, buffer)).is_equal_to((0, 400));
+        assert_that!(span_slice(samples, 400, buffer)).is_equal_to((400, 400));
+
+        // Act / Assert: the third runs out part-way, so it is padded with silence.
+        assert_that!(span_slice(samples, 800, buffer)).is_equal_to((800, 200));
+
+        // Act / Assert: and every one after it asks for nothing, from an index inside the
+        // span — `samples[1200..1200]` is a panic, not an empty slice.
+        assert_that!(span_slice(samples, 1_200, buffer)).is_equal_to((1_000, 0));
+        assert_that!(span_slice(samples, usize::MAX, buffer)).is_equal_to((1_000, 0));
+
+        // Act / Assert: media with no sound at all takes the same path rather than a
+        // special one.
+        assert_that!(span_slice(0, 0, buffer)).is_equal_to((0, 0));
+    }
+
     /// Media with no audio track produces no samples, and opening a device for them would
     /// be a device held open playing nothing. The slideshow still runs, at the right rate,
     /// because the clock does not depend on there being sound to hear.
@@ -703,7 +750,23 @@ mod tests {
         assert_that!(advanced >= waited.mul_f64(0.8)).is_true();
         assert_that!(advanced <= waited.mul_f64(1.5)).is_true();
 
+        // Assert: whichever it is, it describes itself — a `Box<dyn AudioOutput>` is printed
+        // whole in `SubtitleSyncState`'s `Debug`, which every test failure message carries.
+        let described = format!("{output:?}");
+        assert_that!(described.contains("CpalOutput") || described.contains("SilentOutput"))
+            .is_true();
+
         // Act / Assert: and dropping it is the single stop path, which must not hang.
         drop(output);
+    }
+
+    /// Both types expose a `new` with no arguments, so Clippy requires a `Default` beside
+    /// it — and that makes it public API a library consumer can reach, whether or not this
+    /// crate's own code happens to.
+    #[test]
+    fn the_defaults_should_build_the_same_thing_new_does() {
+        // Act / Assert
+        assert_that!(PlaybackClock::default().position(Instant::now())).is_none();
+        assert_that!(SilentOutput::default().position(Instant::now()).is_some()).is_true();
     }
 }
