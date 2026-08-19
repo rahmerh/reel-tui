@@ -19,7 +19,7 @@ mod fixtures;
 #[path = "e2e/harness.rs"]
 mod harness;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -2466,6 +2466,75 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
         app.app.subtitle_sync.as_ref().unwrap().warm,
         WarmState::Done,
         "the pass should run and find everything already there"
+    );
+}
+
+/// Nine cues, three per background worker, each with text of its own.
+const PARALLEL_CUES: &str = "1\n00:00:00,200 --> 00:00:00,600\nParallel alpha\n\n\
+                             2\n00:00:00,800 --> 00:00:01,200\nParallel bravo\n\n\
+                             3\n00:00:01,400 --> 00:00:01,800\nParallel charlie\n\n\
+                             4\n00:00:02,000 --> 00:00:02,400\nParallel delta\n\n\
+                             5\n00:00:02,600 --> 00:00:03,000\nParallel echo\n\n\
+                             6\n00:00:03,200 --> 00:00:03,600\nParallel foxtrot\n\n\
+                             7\n00:00:03,800 --> 00:00:04,200\nParallel golf\n\n\
+                             8\n00:00:04,400 --> 00:00:04,800\nParallel hotel\n\n\
+                             9\n00:00:05,000 --> 00:00:05,400\nParallel india\n\n";
+
+/// The background pass renders a track with three workers, and each burns in its own cue.
+///
+/// The workers share one scratch directory, so each has to stage its cue under a name of
+/// its own — two sharing one would overwrite each other between the write and the burn,
+/// and a frame would come back carrying a *different cue's* line, stored under the right
+/// key in the right directory and counted correctly. Nothing about keys, counts or files
+/// could tell.
+///
+/// What tells is that the fixture is a solid black clip: the burned-in line is the only
+/// thing that can make one frame differ from another, so nine cues with nine different
+/// lines have to produce nine different files. A collision makes two of them identical.
+#[test]
+fn the_background_pass_should_render_every_cue_with_its_own_line_burned_in() {
+    let test = "the_background_pass_should_render_every_cue_with_its_own_line_burned_in";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-frame-parallel");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), PARALLEL_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    wait_for_frames(&mut app);
+
+    // Every cue rendered, by whichever worker's slice it fell in.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 9, "the sidecar holds nine cues");
+    let frames: Vec<Vec<u8>> = state
+        .cues
+        .iter()
+        .map(|cue| {
+            let path = frame_path(&state.frames.key(cue));
+            fs::read(&path).unwrap_or_else(|error| {
+                panic!("the pass should have cached {:?}: {error}", cue.text)
+            })
+        })
+        .collect();
+    for (cue, frame) in state.cues.iter().zip(&frames) {
+        assert!(!frame.is_empty(), "{:?} cached an empty frame", cue.text);
+    }
+
+    // And no two of them are the same picture. On a solid black clip that can only mean
+    // two cues were burned with the same line, which is what a shared staging file does.
+    let distinct: BTreeSet<&Vec<u8>> = frames.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        frames.len(),
+        "two cues cached the same picture, so a worker burned in another's line"
     );
 }
 

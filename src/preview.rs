@@ -30,9 +30,9 @@
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Size;
@@ -55,13 +55,33 @@ pub const CUES_FILE: &str = "cues.srt";
 /// `'`), which is a class of bug this feature simply does not have to have.
 pub const CUE_FILE: &str = "cue.srt";
 
-/// The same, for the background pass.
+/// The same, for the background pass — one per worker.
 ///
-/// A *second* constant rather than the same one: the two workers run at the same time in
-/// the same workspace, and sharing the staging file would let the background pass
-/// overwrite the cue the interactive grab is about to burn in — a frame showing the wrong
-/// line, which is precisely what this page exists to let you judge.
-pub const WARM_CUE_FILE: &str = "warm.srt";
+/// A *function* rather than a constant, and that is the whole point. The pass runs
+/// [`WARM_WORKERS`] threads in one workspace; two of them sharing a staged `.srt` would
+/// each overwrite the other's cue between the write and the burn, so a frame would come
+/// back with the wrong line on it — and stored under the *right* cache key, where nothing
+/// downstream could ever tell. Distinct from [`CUE_FILE`] for the same reason: the
+/// interactive grab runs at the same time as all of them.
+fn warm_cue_file(worker: usize) -> String {
+    format!("warm-{worker}.srt")
+}
+
+/// How many threads walk a track's cues.
+///
+/// Each frame is an accurate seek plus a libass burn plus a JPEG encode, which is mostly
+/// CPU and parallelises about as well as the machine has cores to give it. Three rather
+/// than "all of them": the interactive grab the user is actually waiting on runs beside
+/// these and is not prioritised, so leaving headroom is what keeps a background pass from
+/// making the foreground slower.
+pub const WARM_WORKERS: usize = 3;
+
+/// "Has the page this was for gone?", as every stage of a grab asks it.
+///
+/// `Sync`, because the background pass hands one of these to all [`WARM_WORKERS`] threads
+/// rather than giving each its own — there is one page, and it closes for all of them at
+/// the same instant.
+type Abandoned<'a> = &'a (dyn Fn() -> bool + Sync);
 
 /// How often a running `ffmpeg` is checked on, matching `edit.rs`'s runner.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -552,7 +572,7 @@ fn frame(
 fn frame_window(
     request: &FrameRequest,
     picker: &Picker,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
     events: &Sender<PreviewEvent>,
 ) -> bool {
     if abandoned() {
@@ -594,7 +614,7 @@ fn frame_window(
 fn nearby(
     request: &FrameRequest,
     picker: &Picker,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
     events: &Sender<PreviewEvent>,
 ) -> bool {
     for target in &request.nearby {
@@ -670,7 +690,7 @@ fn png(
     cue: &Cue,
     seek: Duration,
     staged: &str,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
 ) -> PngOutcome {
     let key = source.key(cue);
     if let Some(bytes) = framecache::read(&key.0, &key.1) {
@@ -702,7 +722,7 @@ fn cache_frame(
     cue: &Cue,
     seek: Duration,
     staged: &str,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
 ) -> CacheOutcome {
     let key = source.key(cue);
     if framecache::is_cached(&key.0, &key.1) {
@@ -723,7 +743,7 @@ fn render(
     staged: &str,
     media_key: &str,
     cue_key: &str,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
 ) -> PngOutcome {
     let path = source.workspace.join(staged);
     if let Err(error) = std::fs::write(&path, one_cue_srt(&cue.text)) {
@@ -832,9 +852,19 @@ fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<Prev
 /// up — between cues, and part-way through rendering one — are a race against a real
 /// `ffmpeg` otherwise, and they are what stops a thousand-cue track running on for a page
 /// nobody is looking at.
+///
+/// The track is walked by [`WARM_WORKERS`] threads over contiguous slices of it. Scoped
+/// threads rather than a pool: they are joined before this returns, so the worker's
+/// `newest()` coalescing and its "stop once nobody is listening" contract are untouched,
+/// and a pass that runs for minutes does not care what a thread cost to spawn.
+///
+/// Contiguous slices rather than interleaved, because each `ffmpeg` is an accurate seek
+/// and neighbouring cues are near each other in the container — three workers reading three
+/// regions is three sequential walks, where interleaving would make all three seek across
+/// the whole file.
 fn warm_track(
     request: &WarmRequest,
-    abandoned: &dyn Fn() -> bool,
+    abandoned: Abandoned<'_>,
     events: &Sender<PreviewEvent>,
 ) -> bool {
     if abandoned() {
@@ -852,17 +882,73 @@ fn warm_track(
     framecache::prune(request.cache_tracks, Some(&media_key));
 
     let total = request.cues.len();
-    let mut progress = WarmProgress::new(request.generation, total);
-    if !progress.publish(events, 0) {
+    let progress = Mutex::new(WarmProgress::new(request.generation, total));
+    if !progress
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .publish(events, 0)
+    {
         return false;
     }
 
+    // Shared rather than per-worker, because the status line counts the track and not the
+    // slice. `done` is therefore no longer an index into the cue list — three workers
+    // finish cues out of order — which is why nothing may infer *which* cues are done
+    // from it.
+    let done = AtomicUsize::new(0);
+    // `div_ceil`, so the last slice is the short one and no worker is handed an empty
+    // slice while cues are left over.
+    let per_worker = total.div_ceil(WARM_WORKERS).max(1);
+    std::thread::scope(|scope| {
+        for (worker, cues) in request.cues.chunks(per_worker).enumerate() {
+            let progress = &progress;
+            let done = &done;
+            scope.spawn(move || {
+                warm_slice(request, cues, worker, abandoned, events, progress, done);
+            });
+        }
+    });
+
+    if abandoned() {
+        // No final event: the page this counted for is gone, and a `Warming` for it would
+        // be dropped by `App` anyway.
+        return true;
+    }
+    // The last count is published here rather than by whichever worker happens to finish
+    // last: only this point knows every slice is done, and the status line has to stop
+    // counting however the pass ended — including a slice that gave up part-way.
+    //
+    // Its result is also what tells the worker loop that nobody is listening any more,
+    // which is why the slices themselves do not track that: a closed event channel means
+    // the application is exiting, so stopping a slice a few frames earlier buys nothing
+    // that process teardown is not about to do anyway — and a flag for it would be a
+    // path across three threads that no test can reach.
+    progress
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .publish(events, total)
+}
+
+/// One worker's contiguous slice of the track.
+///
+/// `staged` is [`warm_cue_file`] for this worker and nothing else. Two workers sharing one
+/// staged `.srt` would each overwrite the other's cue between the write and the burn, and
+/// the frame that came out would carry the wrong line — stored under the *right* key, so
+/// nothing downstream could ever notice. It is the single most important thing here.
+fn warm_slice(
+    request: &WarmRequest,
+    cues: &[Cue],
+    worker: usize,
+    abandoned: Abandoned<'_>,
+    events: &Sender<PreviewEvent>,
+    progress: &Mutex<WarmProgress>,
+    done: &AtomicUsize,
+) {
+    let staged = warm_cue_file(worker);
     let mut failures = 0;
-    for (done, cue) in request.cues.iter().enumerate() {
+    for cue in cues {
         if abandoned() {
-            // No final event: the page this counted for is gone, and a `Warming` for it
-            // would be dropped by `App` anyway.
-            return true;
+            return;
         }
         // Checked per cue as the pass reaches it, rather than filtered up front, because
         // the interactive worker may have rendered this very cue since the pass started.
@@ -870,26 +956,31 @@ fn warm_track(
             &request.source,
             cue,
             seek_for(cue, request.duration),
-            WARM_CUE_FILE,
+            &staged,
             abandoned,
         ) {
             CacheOutcome::Cached | CacheOutcome::Rendered => failures = 0,
-            CacheOutcome::Abandoned => return true,
+            CacheOutcome::Abandoned => return,
             CacheOutcome::Failed => {
                 failures += 1;
                 if failures >= WARM_FAILURE_TOLERANCE {
-                    // Everything left is abandoned at once, so the status line finishes
-                    // rather than freezing part-way up a track that cannot produce frames
-                    // at all.
-                    return progress.publish(events, total);
+                    // Per slice rather than shared across the pass. A flag telling the
+                    // other workers to stop early was tried and removed: each already
+                    // bounds its own waste at this same handful of subprocesses, so the
+                    // flag bought a fraction of one worker's tolerance in exchange for a
+                    // mechanism no test could pin down.
+                    return;
                 }
             }
         }
-        if !progress.publish(events, done + 1) {
-            return false;
+        let counted = done.fetch_add(1, Ordering::Relaxed) + 1;
+        // `try_lock`, not `lock`: the count is already recorded, and a worker blocking to
+        // publish a number another worker is publishing a larger version of would be
+        // waiting to say something already out of date.
+        if let Ok(mut progress) = progress.try_lock() {
+            progress.publish(events, counted);
         }
     }
-    true
 }
 
 /// The background pass's rate-limited progress reporting.
@@ -1053,7 +1144,7 @@ enum RunOutcome {
 ///
 /// Both streams are piped rather than inherited. `ffmpeg` writing a single line to the
 /// inherited stderr would land on the alternate screen, corrupting the TUI.
-fn run_cancellable(command: &mut Command, abandoned: &dyn Fn() -> bool) -> RunOutcome {
+fn run_cancellable(command: &mut Command, abandoned: Abandoned<'_>) -> RunOutcome {
     let program = command.get_program().to_string_lossy().to_string();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
@@ -2297,12 +2388,11 @@ mod tests {
         };
         forget(&request.source, wanted(&request));
         let (events_tx, events) = mpsc::channel();
-        let checks = std::cell::Cell::new(0);
+        let checks = AtomicUsize::new(0);
         let closes_during_the_grab = || {
-            checks.set(checks.get() + 1);
             // The worker's own check is the first; everything after it is `ffmpeg` being
             // polled, and by then the page has gone.
-            checks.get() > 1
+            checks.fetch_add(1, Ordering::Relaxed) >= 1
         };
 
         // Act
@@ -2352,12 +2442,9 @@ mod tests {
             cells: Size::new(20, 10),
         };
         let (events_tx, events) = mpsc::channel();
-        let checks = std::cell::Cell::new(0);
+        let checks = AtomicUsize::new(0);
         // The worker's check, then the first neighbour's; the page goes before the second.
-        let closes_after_the_first = || {
-            checks.set(checks.get() + 1);
-            checks.get() > 2
-        };
+        let closes_after_the_first = || checks.fetch_add(1, Ordering::Relaxed) >= 2;
 
         // Act
         let alive = frame_window(
@@ -2783,7 +2870,7 @@ mod tests {
         // Assert: it got all the way to the end without staging a cue, which is the first
         // thing any real grab does.
         assert_that!(warmed(&events).last().copied()).is_equal_to(Some((2, 2)));
-        assert_that!(directory.join(WARM_CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(warm_cue_file(0)).exists()).is_false();
 
         // Cleanup
         for cue in &cues {
@@ -2811,23 +2898,143 @@ mod tests {
 
         // Assert: not a single event, and nothing staged or spawned.
         assert_that!(warmed(&events).as_slice()).is_empty();
-        assert_that!(directory.join(WARM_CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(warm_cue_file(0)).exists()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Every worker stages its cue somewhere no other worker can reach.
+    ///
+    /// The one thing in this module that fails *silently* if it is wrong: two workers
+    /// sharing a staged `.srt` would each overwrite the other's cue between the write and
+    /// the burn, and the frame that came back would carry the wrong line — stored under
+    /// the right cache key, so no assertion about keys, counts or files could ever notice.
+    /// See `the_background_pass_should_burn_each_workers_own_cue` for the end-to-end half.
+    #[test]
+    fn every_warm_worker_should_stage_its_cue_under_its_own_name() {
+        // Act
+        let names: std::collections::BTreeSet<String> =
+            (0..WARM_WORKERS).map(warm_cue_file).collect();
+
+        // Assert: one per worker, and none of them the interactive path's — which runs at
+        // the same time as all of them.
+        assert_that!(names.len()).is_equal_to(WARM_WORKERS);
+        assert_that!(names.contains(CUE_FILE)).is_false();
+        // Bare relative names, so `ffmpeg` takes them as literals inside its working
+        // directory and nothing has to be escaped through the filtergraph syntax.
+        for name in &names {
+            assert_that!(name.contains('/')).is_false();
+            assert_that!(name.ends_with(".srt")).is_true();
+        }
+    }
+
+    /// The frame each worker cached is the one its own cue would have produced alone.
+    ///
+    /// The end-to-end half of the staging rule, and the only assertion that can catch it
+    /// breaking. Two workers sharing a staged `.srt` overwrite each other between the
+    /// write and the burn, so a frame comes back carrying a *different cue's* line —
+    /// stored under the right key, in the right directory, counted correctly. Every other
+    /// test in this file would pass.
+    ///
+    /// So each cue is rendered again afterwards on its own, through the interactive path
+    /// and its own staging file, and the bytes are compared. `mjpeg` is deterministic for
+    /// one input at one seek, so the two runs agree exactly unless the picture differs —
+    /// and against a solid-colour fixture the burned-in line is the only thing that can
+    /// make it differ.
+    #[test]
+    fn the_background_pass_should_burn_each_workers_own_cue() {
+        // Arrange: three cues per worker, each with text of its own.
+        let _guard = cache_guard();
+        require_ffmpeg("the_background_pass_should_burn_each_workers_own_cue");
+        let directory = scratch("warm-staging");
+        let media = video(&directory);
+        let cues: Vec<Cue> = (0..WARM_WORKERS as u64 * 3)
+            .map(|index| {
+                cue(
+                    index * 400,
+                    index * 400 + 300,
+                    &format!("worker line {index}"),
+                )
+            })
+            .collect();
+        let request = warm_request(&media, &directory, cues.clone());
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+
+        // Act: the parallel pass.
+        let (events_tx, events) = mpsc::channel();
+        assert_that!(warm_track(&request, &|| false, &events_tx)).is_true();
+        drop(events_tx);
+        drop(events);
+        let in_parallel: Vec<Vec<u8>> = cues
+            .iter()
+            .map(|cue| {
+                let (media_key, cue_key) = request.source.key(cue);
+                framecache::read(&media_key, &cue_key)
+                    .unwrap_or_else(|| panic!("the pass should have cached {:?}", cue.text))
+            })
+            .collect();
+
+        // Act: the same cues again, one at a time, with nothing to race.
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        let alone: Vec<Vec<u8>> = cues
+            .iter()
+            .map(|cue| {
+                match png(
+                    &request.source,
+                    cue,
+                    seek_for(cue, request.duration),
+                    CUE_FILE,
+                    &|| false,
+                ) {
+                    PngOutcome::Ready(bytes) => bytes,
+                    PngOutcome::Abandoned => panic!("nothing abandoned {:?}", cue.text),
+                    PngOutcome::Failed(why) => {
+                        panic!("rendering {:?} alone should work: {why}", cue.text)
+                    }
+                }
+            })
+            .collect();
+
+        // Assert
+        for ((cue, parallel), serial) in cues.iter().zip(&in_parallel).zip(&alone) {
+            assert_that!(parallel.as_slice() == serial.as_slice()).is_true();
+            assert_that!(parallel.is_empty()).is_false();
+            // Named in the failure message, since the bytes themselves say nothing.
+            assert!(
+                parallel == serial,
+                "the pass cached a different picture for {:?} than rendering it alone \
+                 produces, which is what a shared staging file looks like",
+                cue.text
+            );
+        }
+
+        // Cleanup
+        for cue in &cues {
+            forget(&request.source, cue);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// A media file that cannot produce frames at all must not cost one doomed subprocess
-    /// per cue. The pass steps over a failure or two and then gives up on the track,
-    /// finishing its count so the status line does not freeze part-way.
+    /// per cue. Each worker steps over a failure or two and then gives up on its slice,
+    /// and the pass still finishes its count so the status line does not freeze part-way.
+    ///
+    /// Twelve cues, so every worker's slice is longer than the tolerance — with fewer, a
+    /// slice runs out before the third consecutive failure and the tolerance is never
+    /// reached at all, which is a property of the split rather than of the media.
     #[test]
     fn the_background_pass_should_give_up_on_a_track_that_keeps_failing() {
-        // Arrange: five cues, each named so the staged file says which one was last tried.
+        // Arrange: each cue named so the staged file says which one that worker last tried.
         let _guard = cache_guard();
         require_ffmpeg("the_background_pass_should_give_up_on_a_track_that_keeps_failing");
         let directory = scratch("warm-failing");
-        let cues: Vec<Cue> = (0..5)
-            .map(|index| cue(index * 1000, index * 1000 + 500, &format!("cue-{index}")))
+        let cues: Vec<Cue> = (0..12)
+            .map(|index| cue(index * 1000, index * 1000 + 500, &format!("cue-{index:02}")))
             .collect();
         let request = warm_request(&directory.join("never-existed.mkv"), &directory, cues);
         let (events_tx, events) = mpsc::channel();
@@ -2837,10 +3044,15 @@ mod tests {
 
         // Assert: the count finishes, so the status line clears...
         assert_that!(alive).is_true();
-        assert_that!(warmed(&events).last().copied()).is_equal_to(Some((5, 5)));
-        // ...but it stopped at the third cue rather than trying all five.
-        let staged = std::fs::read_to_string(directory.join(WARM_CUE_FILE)).unwrap();
-        assert_that!(staged.as_str()).contains("cue-2");
+        assert_that!(warmed(&events).last().copied()).is_equal_to(Some((12, 12)));
+        // ...and every worker stopped at the third cue of its own slice rather than
+        // walking all four. Which is also the proof that the slices are the contiguous
+        // quarters they are meant to be, and that each worker staged its cue somewhere no
+        // other worker could overwrite.
+        for (worker, expected) in [(0, "cue-02"), (1, "cue-06"), (2, "cue-10")] {
+            let staged = std::fs::read_to_string(directory.join(warm_cue_file(worker))).unwrap();
+            assert_that!(staged.as_str()).contains(expected);
+        }
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2962,9 +3174,15 @@ mod tests {
         forget(&source, &second);
 
         // Act
-        let cached = cache_frame(&source, &first, Duration::ZERO, WARM_CUE_FILE, &|| false);
-        let missing = cache_frame(&source, &second, Duration::ZERO, WARM_CUE_FILE, &|| false);
-        let abandoned = cache_frame(&source, &second, Duration::ZERO, WARM_CUE_FILE, &|| true);
+        let cached = cache_frame(&source, &first, Duration::ZERO, &warm_cue_file(0), &|| {
+            false
+        });
+        let missing = cache_frame(&source, &second, Duration::ZERO, &warm_cue_file(0), &|| {
+            false
+        });
+        let abandoned = cache_frame(&source, &second, Duration::ZERO, &warm_cue_file(0), &|| {
+            true
+        });
 
         // Assert
         assert_that!(cached).is_equal_to(CacheOutcome::Cached);
@@ -3053,6 +3271,32 @@ mod tests {
         assert_that!(matches!(ready, Some(FrameOutcome::Ready(_)))).is_true();
     }
 
+    /// An application that has exited takes its event receiver with it. The pass has to
+    /// report that rather than walk a whole track for nobody, and reporting it is what
+    /// stops the worker thread — see
+    /// `the_background_worker_should_answer_the_live_page_and_stop_when_nobody_is_listening`.
+    #[test]
+    fn a_pass_with_nobody_listening_should_report_it_before_rendering_anything() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("warm-deaf");
+        let cues = vec![cue(1000, 2000, "first"), cue(3000, 4000, "second")];
+        let request = warm_request(&directory.join("never-existed.mkv"), &directory, cues);
+        let (events_tx, events) = mpsc::channel();
+        drop(events);
+
+        // Act
+        let alive = warm_track(&request, &|| false, &events_tx);
+
+        // Assert: reported, and nothing staged — it gave up before the first grab rather
+        // than after the last.
+        assert_that!(alive).is_false();
+        assert_that!(directory.join(warm_cue_file(0)).exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Leaving the page part-way through the pass stops it where it stands: no further
     /// cue is rendered, and no count is published for a page that is gone.
     #[test]
@@ -3065,20 +3309,21 @@ mod tests {
             .collect();
         let request = warm_request(&directory.join("never-existed.mkv"), &directory, cues);
         let (events_tx, events) = mpsc::channel();
-        let checks = std::cell::Cell::new(0);
-        let closes_after_the_first = || {
-            checks.set(checks.get() + 1);
-            checks.get() > 2
-        };
+        // The pass's own check comes first and finds the page open; every check after it
+        // is a worker starting its slice, and by then it has gone. Which worker asks
+        // first does not matter — they all get the same answer.
+        let checks = AtomicUsize::new(0);
+        let closes_after_the_first = || checks.fetch_add(1, Ordering::Relaxed) >= 1;
 
         // Act
         let alive = warm_track(&request, &closes_after_the_first, &events_tx);
 
         // Assert: the pass ends without a final count, since the page it counted for is
-        // gone — and it ended early, rather than walking the remaining cues.
+        // gone — and it ended early, rather than walking the remaining cues. Asserted on
+        // the events rather than on how many times the closure was asked, which three
+        // workers make a race.
         assert_that!(alive).is_true();
         assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 5)]);
-        assert_that!(checks.get()).is_equal_to(3);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -3087,37 +3332,43 @@ mod tests {
     /// Closing the page during a cue's own render is the other half of the same rule:
     /// the running `ffmpeg` is killed and the pass stops, rather than the killed grab
     /// counting as a failure and the next cue starting another one.
+    ///
+    /// One cue, so the split hands the whole track to one worker and the order the
+    /// closure is asked in is fixed. With three workers running it is a race, and the
+    /// first draft of this test lost it silently — every worker gave up at the top of its
+    /// slice, so nothing was ever rendered and the mid-render path this is named for was
+    /// not reached at all.
     #[test]
     fn the_background_pass_should_stop_when_a_cue_is_abandoned_mid_render() {
-        // Arrange: the page is open when the loop checks, and gone once the grab is
-        // running — which is exactly the order a real closure arrives in.
+        // Arrange
         let _guard = cache_guard();
         require_ffmpeg("the_background_pass_should_stop_when_a_cue_is_abandoned_mid_render");
         let directory = scratch("warm-mid-render");
         let media = video(&directory);
-        let cues = vec![cue(1000, 2000, "first"), cue(3000, 4000, "second")];
+        let cues = vec![cue(1000, 2000, "only")];
         let request = warm_request(&media, &directory, cues.clone());
         for cue in &cues {
             forget(&request.source, cue);
         }
         let (events_tx, events) = mpsc::channel();
-        let checks = std::cell::Cell::new(0);
-        let closes_during_the_grab = || {
-            checks.set(checks.get() + 1);
-            // The loop's own check is the first; everything after it is `ffmpeg` being
-            // polled, and by then the page has gone.
-            checks.get() > 1
-        };
+        // Check one is the pass's own and check two the worker's, both finding the page
+        // open. Everything after is `ffmpeg` being polled, and by then it has gone — so a
+        // grab already running is killed rather than left to finish.
+        let checks = AtomicUsize::new(0);
+        let closes_during_the_grab = || checks.fetch_add(1, Ordering::Relaxed) >= 2;
 
         // Act
         let alive = warm_track(&request, &closes_during_the_grab, &events_tx);
 
         // Assert: stopped with nothing cached and nothing counted past the start.
         assert_that!(alive).is_true();
-        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 2)]);
+        assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 1)]);
         for cue in &cues {
             assert_that!(cached(&request.source, cue)).is_false();
         }
+        // And the grab really did start, rather than the worker giving up before it: the
+        // cue was staged, which is the step every render begins with.
+        assert_that!(directory.join(warm_cue_file(0)).exists()).is_true();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
