@@ -2508,27 +2508,41 @@ impl App {
         // Only a request that named the selection asks for the selected cue. A refill
         // triggered by the background pass asks for the neighbours alone — see
         // `SubtitleSyncState::refill_nearby`.
-        let wanted = if state.frame_requested() && !state.has_frame(state.selected) {
+        let selected = if state.frame_requested() && !state.has_frame(state.selected) {
             state.frame_target(state.selected)
         } else {
             None
         };
+        // The debounce exists to stop one `ffmpeg` per keystroke, so it only applies to a
+        // cue that would have to be rendered — one already in the cache costs a file read.
+        // Held back rather than dropped: the neighbours in the same dispatch are cache-only
+        // by construction, and returning here would strand them behind the expensive one,
+        // which is exactly the round trip the ready window exists to remove.
+        let held_back = selected.as_ref().is_some_and(|target| {
+            let (media, cue) = state.frames.key(&target.cue);
+            !framecache::is_cached(&media, &cue) && !state.frame_request_due()
+        });
+        let wanted = if held_back { None } else { selected };
         let nearby = state.nearby_frame_targets();
         // Everything in the window is already encoded, which is the steady state while the
         // cursor sits still. Forgetting the request here is what stops the same window
-        // being re-examined on every one of the twenty loop iterations a second.
+        // being re-examined on every one of the twenty loop iterations a second — unless
+        // the selected cue is being held back, which is a request still owed an answer.
         if wanted.is_none() && nearby.is_empty() {
+            if !held_back {
+                state.clear_frame_request();
+            }
+            return;
+        }
+        // A dispatch that carries only the neighbours leaves the held-back request
+        // standing, so the grab still goes out once the debounce expires. Re-sending the
+        // same nearby list on the two or three iterations inside that window is harmless:
+        // the frame worker coalesces its queue down to the newest request.
+        if held_back {
+            state.clear_nearby_request();
+        } else {
             state.clear_frame_request();
-            return;
         }
-        let renders = wanted.as_ref().is_some_and(|target| {
-            let (media, cue) = state.frames.key(&target.cue);
-            !framecache::is_cached(&media, &cue)
-        });
-        if renders && !state.frame_request_due() {
-            return;
-        }
-        state.clear_frame_request();
         preview.request_frame(FrameRequest {
             generation: state.generation,
             source: state.frames.clone(),
@@ -19821,10 +19835,24 @@ mod tests {
         app.subtitle_sync.as_mut().unwrap().select(1);
         app.start_pending_preview();
 
-        // Assert: nothing yet.
-        assert_that!(frames.try_recv().is_err()).is_true();
+        // Assert: the selected cue is held back, but the neighbours ride out anyway —
+        // they come from the cache, so there is no `ffmpeg` for the debounce to protect
+        // against and nothing gained by stranding them behind one.
+        let refill = frames
+            .try_recv()
+            .expect("the neighbours should not wait on the debounce");
+        assert_that!(refill.wanted.is_none()).is_true();
+        assert_that!(
+            refill
+                .nearby
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![0]);
 
-        // Act / Assert: and it is asked for once the movement settles.
+        // Act / Assert: and the held-back request is still owed, so the grab goes out
+        // once the movement settles rather than being forgotten with the refill.
         std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
         app.start_pending_preview();
         let request = frames
@@ -19837,6 +19865,50 @@ mod tests {
                 .unwrap_or_default()
         )
         .is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Holding the selected cue back has to leave the request standing even when there is
+    /// nothing else to send with it. A track of one cue has no neighbours at all, so the
+    /// dispatch is empty and the "nothing to ask for" branch runs — and forgetting the
+    /// request there would strand the cursor on a permanently blank pane, since nothing
+    /// asks again until the selection moves.
+    #[test]
+    fn a_held_back_frame_should_survive_a_dispatch_with_nothing_to_carry() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(vec![crate::cue::Cue {
+            index: 0,
+            start: Duration::from_secs(1),
+            end: Duration::from_secs(3),
+            text: "alone".into(),
+        }]);
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+
+        // Act: inside the debounce, with an uncached cue and no neighbours.
+        app.start_pending_preview();
+
+        // Assert: nothing was sent, and the request was not thrown away with it.
+        assert_that!(frames.try_recv().is_err()).is_true();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().frame_requested()).is_true();
+
+        // Act / Assert: so the grab still goes out when the debounce expires.
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        let request = frames
+            .try_recv()
+            .expect("the held-back cue should be asked for once the debounce expires");
+        assert_that!(request.wanted.map(|target| target.cue_index)).is_equal_to(Some(0));
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

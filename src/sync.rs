@@ -292,7 +292,17 @@ impl SubtitleSyncState {
         // asked for. Without this the neighbours are only ever refilled by the cursor
         // moving, so the first step in a freshly opened page waits on the worker — the
         // round trip this whole window exists to remove.
-        self.refill_nearby = true;
+        //
+        // Only when something is actually missing, though: the pass reports ten times a
+        // second for as long as it runs, and a full window has nothing to refill, so the
+        // steady state of a settled cursor would otherwise be ten requests a second that
+        // exist only to be found empty and dropped.
+        //
+        // Deliberately *not* gated on the pass having reached the window. The workers
+        // render contiguous slices in parallel, so `done` counts frames rather than
+        // describing a prefix of the track: a cue near the cursor may well be cached
+        // while the count is still low.
+        self.refill_nearby |= self.has_missing_nearby();
     }
 
     /// Takes the cues a worker parsed and makes the page ready.
@@ -437,6 +447,15 @@ impl SubtitleSyncState {
         self.refill_nearby = false;
     }
 
+    /// Forgets the refill alone, leaving the selected cue's request outstanding.
+    ///
+    /// For the dispatch that carries the neighbours while the selected cue is still
+    /// waiting out [`FRAME_DEBOUNCE`]: that request has been deferred, not answered, and
+    /// clearing it here would lose the frame the cursor is actually sitting on.
+    pub fn clear_nearby_request(&mut self) {
+        self.refill_nearby = false;
+    }
+
     /// What the frame worker needs in order to draw the cue at `cue_index`.
     pub fn frame_target(&self, cue_index: usize) -> Option<FrameTarget> {
         let cue = self.cues.get(cue_index)?;
@@ -471,6 +490,23 @@ impl SubtitleSyncState {
             }
         }
         targets
+    }
+
+    /// Whether any cue inside the window is still short of a frame.
+    ///
+    /// The same question [`Self::nearby_frame_targets`] answers, without building the
+    /// list to answer it — this runs on every progress report the background pass sends,
+    /// which is ten a second for as long as a track takes to render.
+    fn has_missing_nearby(&self) -> bool {
+        (1..=NEARBY_FRAMES).any(|distance| {
+            [
+                self.selected.checked_sub(distance),
+                self.selected.checked_add(distance),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|cue_index| cue_index < self.cues.len() && !self.has_frame(cue_index))
+        })
     }
 
     /// Records the pane size the renderer measured, dropping every frame on hand and
@@ -1195,6 +1231,57 @@ mod tests {
         // An empty track has nothing to count and is over before it starts.
         state.apply_warming(0, 0);
         assert_that!(state.warm).is_equal_to(WarmState::Done);
+    }
+
+    /// The background pass reports ten times a second for as long as a track takes, and a
+    /// window with nothing missing has nothing to refill — so the steady state of a
+    /// settled cursor has to be silence rather than ten dispatches a second that exist
+    /// only to be found empty and dropped.
+    #[test]
+    fn warming_should_only_ask_for_a_refill_when_the_window_is_short_of_one() {
+        // Arrange: a three-cue track with the cursor at the start, so cues 1 and 2 are the
+        // window and cue 0 is the selection.
+        let mut state = ready(3);
+        state.clear_frame_request();
+
+        // Act / Assert: a missing neighbour is worth going back to the cache for.
+        state.apply_warming(1, 3);
+        assert_that!(state.any_frame_requested()).is_true();
+
+        // Arrange: fill the window, and the selection with it.
+        state.clear_frame_request();
+        for cue_index in 0..3 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+        state.clear_frame_request();
+
+        // Act
+        state.apply_warming(2, 3);
+
+        // Assert: nothing to fetch, so nothing is asked for.
+        assert_that!(state.any_frame_requested()).is_false();
+
+        // Act / Assert: and a window that loses a frame starts asking again.
+        state.fail_frame(2, "ffmpeg exploded".to_string());
+        state.apply_warming(3, 3);
+        assert_that!(state.any_frame_requested()).is_true();
+    }
+
+    /// The window stops at the ends of the track, so a cursor with fewer than
+    /// [`NEARBY_FRAMES`] cues beside it must not count the cues that do not exist as
+    /// missing — that would put the page right back to asking on every progress report.
+    #[test]
+    fn a_window_running_off_the_end_of_the_track_should_not_count_as_short() {
+        // Arrange: one cue, so there are no neighbours at any distance.
+        let mut state = ready(1);
+        state.apply_frame(0, protocol(10, 5));
+        state.clear_frame_request();
+
+        // Act
+        state.apply_warming(1, 1);
+
+        // Assert
+        assert_that!(state.any_frame_requested()).is_false();
     }
 
     /// A track that could not be read has no cues to render, so a count left on screen
