@@ -17,9 +17,9 @@ pub struct Config {
     pub remux_workers: usize,
     pub network_transcode_workers: usize,
     pub network_remux_workers: usize,
-    /// How large the subtitle timing page's frame cache may get, in megabytes, before its
-    /// oldest frames are dropped.
-    pub preview_cache_mb: u64,
+    /// How many media files' preview frames the timing page's cache may hold before the
+    /// least recently used one is dropped.
+    pub preview_cache_tracks: usize,
     /// Whether opening the timing page renders every cue's frame in the background.
     pub preview_prefetch: bool,
     /// The same, for media on a network mount. Off by default: a feature-length track is
@@ -36,7 +36,7 @@ impl Default for Config {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
-            preview_cache_mb: DEFAULT_PREVIEW_CACHE_MB,
+            preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
             preview_prefetch: true,
             network_preview_prefetch: false,
         }
@@ -47,19 +47,20 @@ impl Default for Config {
 /// number of threads.
 const MAX_WORKERS: usize = 16;
 
-/// Frames are under a hundred kilobytes each — see `framecache::FRAME_EXTENSION` for why
-/// that is JPEG's doing — and a feature-length subtitle track has a thousand or two cues,
-/// so this holds several whole films at once.
+/// Whole media files rather than megabytes, because a track is what gets used and half a
+/// track is nearly worthless — see `framecache`'s module docs for why the unit of eviction
+/// has to be the unit of use.
 ///
-/// The margin matters rather than being slack: a limit that cannot hold one track's frames
-/// makes the background pass evict its own earliest work as it writes, so every opening of
-/// that track renders it again from the beginning. That is what this was doing at two
-/// megabytes a frame.
-const DEFAULT_PREVIEW_CACHE_MB: u64 = 512;
+/// Ten is the last ten films you opened the timing page on. Disk follows from the content
+/// rather than from a number: a feature-length track is a thousand or two cues at under a
+/// hundred kilobytes a frame, so ten of them is on the order of a gigabyte, and a set of
+/// unusually long and densely subtitled ones perhaps three.
+const DEFAULT_PREVIEW_CACHE_TRACKS: usize = 10;
 
-/// A cache large enough to matter, and a ceiling a mistyped value cannot cross. Zero is
-/// allowed and means "keep nothing", which is a real answer for a machine short on disk.
-const MAX_PREVIEW_CACHE_MB: u64 = 64 * 1024;
+/// A ceiling a mistyped value cannot cross. Zero is allowed and means the cache keeps
+/// nothing beyond the page that is open, which is a real answer for a machine short on
+/// disk — the open track is never evicted, since the pass is about to render into it.
+const MAX_PREVIEW_CACHE_TRACKS: usize = 1024;
 
 #[derive(Deserialize, Default)]
 struct RawConfig {
@@ -82,7 +83,7 @@ struct RawWorkers {
 
 #[derive(Deserialize, Default)]
 struct RawPreview {
-    cache_mb: Option<u64>,
+    cache_tracks: Option<usize>,
     prefetch: Option<RawPrefetch>,
 }
 
@@ -162,10 +163,10 @@ impl Config {
                     .unwrap_or(defaults.network_transcode_workers),
             ),
             network_remux_workers: clamp(network.remux.unwrap_or(defaults.network_remux_workers)),
-            preview_cache_mb: preview
-                .cache_mb
-                .unwrap_or(defaults.preview_cache_mb)
-                .min(MAX_PREVIEW_CACHE_MB),
+            preview_cache_tracks: preview
+                .cache_tracks
+                .unwrap_or(defaults.preview_cache_tracks)
+                .min(MAX_PREVIEW_CACHE_TRACKS),
             preview_prefetch: prefetch.enabled.unwrap_or(defaults.preview_prefetch),
             network_preview_prefetch: prefetch
                 .network
@@ -181,12 +182,6 @@ impl Config {
         } else {
             self.preview_prefetch
         }
-    }
-
-    /// The frame cache's ceiling in bytes, which is the unit everything below the config
-    /// file works in.
-    pub fn preview_cache_bytes(&self) -> u64 {
-        self.preview_cache_mb * 1024 * 1024
     }
 
     /// The worker counts to actually pass to `spawn_edit_worker_pools`, given whether
@@ -247,7 +242,7 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_mb = 128\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n",
+            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_tracks = 4\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n",
         )
         .unwrap();
         let config = Config::load_from(&path);
@@ -259,7 +254,7 @@ mod tests {
                 remux_workers: 8,
                 network_transcode_workers: 3,
                 network_remux_workers: 4,
-                preview_cache_mb: 128,
+                preview_cache_tracks: 4,
                 preview_prefetch: false,
                 network_preview_prefetch: true,
             }
@@ -415,7 +410,7 @@ mod tests {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
-            preview_cache_mb: DEFAULT_PREVIEW_CACHE_MB,
+            preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
             preview_prefetch: true,
             network_preview_prefetch: false,
         };
@@ -461,20 +456,21 @@ mod tests {
         assert!(configured.effective_prefetch(true));
     }
 
-    /// The config file talks in megabytes because that is what a person thinks in;
-    /// everything below it works in bytes.
+    /// The cache is counted in whole media files rather than megabytes, because a track
+    /// is what gets used and half a track is nearly worthless — see `framecache`.
     #[test]
-    fn the_frame_cache_limit_should_be_offered_in_bytes() {
+    fn the_frame_cache_limit_should_be_counted_in_tracks() {
         assert_eq!(
-            Config::default().preview_cache_bytes(),
-            DEFAULT_PREVIEW_CACHE_MB * 1024 * 1024
+            Config::default().preview_cache_tracks,
+            DEFAULT_PREVIEW_CACHE_TRACKS
         );
-        // Zero is a real answer — "cache nothing" — for a machine short on disk.
+        // Zero is a real answer for a machine short on disk: nothing is kept beyond the
+        // page that is open, which the pass is rendering into and so never evicts.
         let none = Config {
-            preview_cache_mb: 0,
+            preview_cache_tracks: 0,
             ..Config::default()
         };
-        assert_eq!(none.preview_cache_bytes(), 0);
+        assert_eq!(none.preview_cache_tracks, 0);
     }
 
     /// A mistyped cache size must not let the frame cache eat the disk, the same way a
@@ -483,11 +479,11 @@ mod tests {
     fn an_absurd_cache_size_should_be_capped() {
         let directory = scratch("cache-size");
         let path = directory.join("config.toml");
-        fs::write(&path, b"[preview]\ncache_mb = 99999999\n").unwrap();
+        fs::write(&path, b"[preview]\ncache_tracks = 99999999\n").unwrap();
 
         let config = Config::load_from(&path);
 
-        assert_eq!(config.preview_cache_mb, MAX_PREVIEW_CACHE_MB);
+        assert_eq!(config.preview_cache_tracks, MAX_PREVIEW_CACHE_TRACKS);
         fs::remove_dir_all(directory).unwrap();
     }
 

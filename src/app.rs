@@ -55,8 +55,9 @@ pub struct PreviewSettings {
     /// Whether the media is on a network mount. Only used to explain a *disabled* pass:
     /// it is the one reason the page says out loud, because it is not the user's doing.
     pub network: bool,
-    /// How large the frame cache may get before its oldest frames are dropped.
-    pub cache_limit: u64,
+    /// How many media files' frames the cache may hold before the least recently used is
+    /// dropped whole.
+    pub cache_tracks: usize,
 }
 
 impl Default for PreviewSettings {
@@ -64,7 +65,7 @@ impl Default for PreviewSettings {
         Self {
             prefetch: true,
             network: false,
-            cache_limit: crate::config::Config::default().preview_cache_bytes(),
+            cache_tracks: crate::config::Config::default().preview_cache_tracks,
         }
     }
 }
@@ -2441,7 +2442,7 @@ impl App {
                     source: state.frames.clone(),
                     cues: state.cues.clone(),
                     duration: state.duration,
-                    cache_limit: settings.cache_limit,
+                    cache_tracks: settings.cache_tracks,
                 })
             }
         };
@@ -2499,9 +2500,10 @@ impl App {
             state.clear_frame_request();
             return;
         }
-        let renders = wanted
-            .as_ref()
-            .is_some_and(|target| !framecache::is_cached(&state.frames.key(&target.cue)));
+        let renders = wanted.as_ref().is_some_and(|target| {
+            let (media, cue) = state.frames.key(&target.cue);
+            !framecache::is_cached(&media, &cue)
+        });
         if renders && !state.frame_request_due() {
             return;
         }
@@ -19747,7 +19749,7 @@ mod tests {
         // had walked past it.
         let state = app.subtitle_sync.as_ref().unwrap();
         let key = state.frames.key(&state.cues[1]);
-        crate::framecache::store(&key, b"stand-in for a rendered frame");
+        crate::framecache::store(&key.0, &key.1, b"stand-in for a rendered frame");
 
         // Act: the selection moves and the dispatch runs immediately, with none of the
         // debounce waited out.
@@ -19764,7 +19766,7 @@ mod tests {
         assert_that!(wanted.cue_index).is_equal_to(1);
 
         // Cleanup
-        if let Some(path) = crate::framecache::path(&key) {
+        if let Some(path) = crate::framecache::path(&key.0, &key.1) {
             let _ = std::fs::remove_file(path);
         }
         std::fs::remove_dir_all(directory).unwrap();
@@ -20102,8 +20104,8 @@ mod tests {
         assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
         assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
         assert_that!(request.duration).is_equal_to(state.duration);
-        assert_that!(request.cache_limit)
-            .is_equal_to(crate::config::Config::default().preview_cache_bytes());
+        assert_that!(request.cache_tracks)
+            .is_equal_to(crate::config::Config::default().preview_cache_tracks);
         // And the page starts counting, so the status line appears with the first frame
         // rather than after it.
         assert_that!(state.warm).is_equal_to(WarmState::Working { done: 0, total: 2 });

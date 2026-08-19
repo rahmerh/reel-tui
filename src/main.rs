@@ -57,7 +57,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
     app.set_preview_settings(PreviewSettings {
         prefetch: app_config.effective_prefetch(is_network_mount),
         network: is_network_mount,
-        cache_limit: app_config.preview_cache_bytes(),
+        cache_tracks: app_config.preview_cache_tracks,
     });
     let mut input = InputState::default();
 

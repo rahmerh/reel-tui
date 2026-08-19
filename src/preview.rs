@@ -27,7 +27,6 @@
 //! per round trip: by the time the cursor reaches a cue, the page is already holding it
 //! encoded (see `SubtitleSyncState::nearby_frame_targets`).
 
-use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -142,18 +141,23 @@ pub struct FrameSource {
 }
 
 impl FrameSource {
-    /// The cache key one cue's frame is stored under. Public because the e2e suite has
-    /// to look inside the frame cache to assert what a page did or did not render.
-    pub fn key(&self, cue: &Cue) -> String {
-        framecache::key(
-            FrameKeyParts {
-                media: &self.media,
-                media_length: self.media_length,
-                media_modified: self.media_modified,
-                pixels: self.pixels,
-            },
-            cue,
-        )
+    /// The directory this media's frames are cached under. Public because the e2e suite
+    /// has to look inside the frame cache to assert what a page did or did not render.
+    ///
+    /// Depends on nothing per-cue, so it is the same for every frame of a track — which is
+    /// what lets the cache evict a track as one thing. See [`crate::framecache`].
+    pub fn media_key(&self) -> String {
+        framecache::media_key(FrameKeyParts {
+            media: &self.media,
+            media_length: self.media_length,
+            media_modified: self.media_modified,
+            pixels: self.pixels,
+        })
+    }
+
+    /// Both halves of one cue's cache path, for the callers that need them together.
+    pub fn key(&self, cue: &Cue) -> (String, String) {
+        (self.media_key(), framecache::cue_key(cue))
     }
 }
 
@@ -203,8 +207,8 @@ pub struct WarmRequest {
     /// The media's duration, for holding a seek back from the very end. Zero means it
     /// could not be parsed, and no clamping is applied — see [`seek_for`].
     pub duration: Duration,
-    /// How large the frame cache is allowed to get, pruned to before the pass starts.
-    pub cache_limit: u64,
+    /// How many media files' frames the cache may hold, pruned to before the pass starts.
+    pub cache_tracks: usize,
 }
 
 /// A frame ready to draw, or why there is none.
@@ -597,7 +601,8 @@ fn nearby(
         if abandoned() {
             return true;
         }
-        let Some(bytes) = framecache::read(&request.source.key(&target.cue)) else {
+        let (media, cue) = request.source.key(&target.cue);
+        let Some(bytes) = framecache::read(&media, &cue) else {
             continue;
         };
         let FrameOutcome::Ready(protocol) = encode(&bytes, picker, request.cells) else {
@@ -668,10 +673,10 @@ fn png(
     abandoned: &dyn Fn() -> bool,
 ) -> PngOutcome {
     let key = source.key(cue);
-    if let Some(bytes) = framecache::read(&key) {
+    if let Some(bytes) = framecache::read(&key.0, &key.1) {
         return PngOutcome::Ready(bytes);
     }
-    render(source, cue, seek, staged, &key, abandoned)
+    render(source, cue, seek, staged, &key.0, &key.1, abandoned)
 }
 
 /// What the background pass made of one cue.
@@ -700,10 +705,10 @@ fn cache_frame(
     abandoned: &dyn Fn() -> bool,
 ) -> CacheOutcome {
     let key = source.key(cue);
-    if framecache::is_cached(&key) {
+    if framecache::is_cached(&key.0, &key.1) {
         return CacheOutcome::Cached;
     }
-    match render(source, cue, seek, staged, &key, abandoned) {
+    match render(source, cue, seek, staged, &key.0, &key.1, abandoned) {
         PngOutcome::Ready(_) => CacheOutcome::Rendered,
         PngOutcome::Abandoned => CacheOutcome::Abandoned,
         PngOutcome::Failed(_) => CacheOutcome::Failed,
@@ -716,7 +721,8 @@ fn render(
     cue: &Cue,
     seek: Duration,
     staged: &str,
-    key: &str,
+    media_key: &str,
+    cue_key: &str,
     abandoned: &dyn Fn() -> bool,
 ) -> PngOutcome {
     let path = source.workspace.join(staged);
@@ -730,7 +736,7 @@ fn render(
         &source.workspace,
         staged,
     );
-    grabbed(run_cancellable(&mut command, abandoned), key)
+    grabbed(run_cancellable(&mut command, abandoned), media_key, cue_key)
 }
 
 /// What a finished grab means, and the point the result is cached at.
@@ -738,7 +744,7 @@ fn render(
 /// Separated from `png` for the same reason `extracted` is separated from `prepare`:
 /// giving up part-way and failing to start are endings a test cannot reliably steer a
 /// real `ffmpeg` into, and they are the two that must not be mistaken for a blank frame.
-fn grabbed(run: RunOutcome, key: &str) -> PngOutcome {
+fn grabbed(run: RunOutcome, media_key: &str, cue_key: &str) -> PngOutcome {
     let output = match run {
         RunOutcome::Abandoned => return PngOutcome::Abandoned,
         RunOutcome::Failed(message) => return PngOutcome::Failed(message),
@@ -755,7 +761,7 @@ fn grabbed(run: RunOutcome, key: &str) -> PngOutcome {
     // one bad grab into a permanently blank cue — but still passed on, so the decoder
     // reports it as the unreadable frame it is.
     if !output.stdout.is_empty() {
-        framecache::store(key, &output.stdout);
+        framecache::store(media_key, cue_key, &output.stdout);
     }
     PngOutcome::Ready(output.stdout)
 }
@@ -826,20 +832,6 @@ fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<Prev
 /// up — between cues, and part-way through rendering one — are a race against a real
 /// `ffmpeg` otherwise, and they are what stops a thousand-cue track running on for a page
 /// nobody is looking at.
-/// The cache keys of every cue in a track, for the frames a prune should take last.
-///
-/// Recomputed here rather than carried on the request: it is a short hash per cue, which
-/// for even a feature-length track is microseconds on a thread that is about to spend
-/// minutes in `ffmpeg`, and the alternative is a second copy of the track's keys that
-/// could disagree with the ones the pass then renders under.
-fn track_keys(request: &WarmRequest) -> HashSet<String> {
-    request
-        .cues
-        .iter()
-        .map(|cue| request.source.key(cue))
-        .collect()
-}
-
 fn warm_track(
     request: &WarmRequest,
     abandoned: &dyn Fn() -> bool,
@@ -848,14 +840,16 @@ fn warm_track(
     if abandoned() {
         return true;
     }
+    // Marked used before anything else, and pruned immediately after. The order is the
+    // point: the marker is what ranks this track as the most recent, so a prune that runs
+    // a moment later cannot pick it — and the track is named to `prune` as the open one
+    // besides, which is what makes evicting the frames this pass was opened to show
+    // impossible rather than merely unlikely.
+    let media_key = request.source.media_key();
+    framecache::touch(&media_key);
     // Before rendering, not after: the pass is about to add a frame per cue, and pruning
     // first is what keeps the cache inside its limit rather than over it until next time.
-    //
-    // This track's own keys are handed over so that they are the last thing evicted. A
-    // track that has not been opened for a while is the *oldest* thing in the cache, so
-    // plain oldest-first eviction would throw away exactly the frames this pass exists to
-    // avoid rendering, in favour of frames belonging to tracks nobody is looking at.
-    framecache::prune(request.cache_limit, &track_keys(request));
+    framecache::prune(request.cache_tracks, Some(&media_key));
 
     let total = request.cues.len();
     let mut progress = WarmProgress::new(request.generation, total);
@@ -1309,9 +1303,22 @@ mod tests {
     }
 
     fn forget(source: &FrameSource, cue: &Cue) {
-        if let Some(path) = framecache::path(&source.key(cue)) {
+        let (media, cue_key) = source.key(cue);
+        if let Some(path) = framecache::path(&media, &cue_key) {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// `framecache::store` for a source and cue, which is how every test seeds the cache.
+    fn seed(source: &FrameSource, cue: &Cue, bytes: &[u8]) -> bool {
+        let (media, cue_key) = source.key(cue);
+        framecache::store(&media, &cue_key, bytes)
+    }
+
+    /// `framecache::is_cached` for a source and cue.
+    fn cached(source: &FrameSource, cue: &Cue) -> bool {
+        let (media, cue_key) = source.key(cue);
+        framecache::is_cached(&media, &cue_key)
     }
 
     fn live(generation: u64) -> AtomicU64 {
@@ -1602,7 +1609,7 @@ mod tests {
             source: source(&sidecar, &directory),
             cues: vec![cue(0, 1000, "unused")],
             duration: Duration::from_secs(6),
-            cache_limit: u64::MAX,
+            cache_tracks: usize::MAX,
         });
         let request = |generation| PrepareRequest {
             generation,
@@ -1801,7 +1808,8 @@ mod tests {
     fn a_grab_that_produced_no_image_should_not_be_reported_as_a_frame() {
         // Arrange
         let _guard = cache_guard();
-        let key = format!("preview-endings-{}", std::process::id());
+        let media = format!("preview-endings-{}", std::process::id());
+        let key = "cue";
         let succeeded = Command::new("sh").args(["-c", "exit 0"]).output().unwrap();
         let refused = Command::new("sh")
             .args(["-c", "echo 'Invalid stream specifier' >&2; exit 1"])
@@ -1809,13 +1817,14 @@ mod tests {
             .unwrap();
 
         // Act
-        let abandoned = grabbed(RunOutcome::Abandoned, &key);
+        let abandoned = grabbed(RunOutcome::Abandoned, &media, key);
         let unstartable = grabbed(
             RunOutcome::Failed("ffmpeg was not found in PATH.".to_string()),
-            &key,
+            &media,
+            key,
         );
-        let empty = grabbed(RunOutcome::Finished(succeeded), &key);
-        let rejected = grabbed(RunOutcome::Finished(refused), &key);
+        let empty = grabbed(RunOutcome::Finished(succeeded), &media, key);
+        let rejected = grabbed(RunOutcome::Finished(refused), &media, key);
 
         // Assert
         assert_that!(matches!(abandoned, PngOutcome::Abandoned)).is_true();
@@ -1838,7 +1847,7 @@ mod tests {
         assert_that!(rejected.as_str()).contains("Invalid stream specifier");
         // And nothing empty or failed was ever written to the cache: a blank file there
         // would make one bad grab a permanently blank cue.
-        assert_that!(framecache::is_cached(&key)).is_false();
+        assert_that!(framecache::is_cached(&media, key)).is_false();
     }
 
     /// The worker loop itself: the coalescing receive, the picker it owns, and the event
@@ -2079,7 +2088,7 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let cues = [cue(0, 1000, "here"), cue(2000, 3000, "next")];
         for one in &cues {
-            framecache::store(&source.key(one), &frame_bytes(64, 48));
+            seed(&source, one, &frame_bytes(64, 48));
         }
         let request = FrameRequest {
             generation: 1,
@@ -2158,7 +2167,7 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .is_equal_to(vec![0]);
-        assert_that!(framecache::is_cached(&request.source.key(&uncached))).is_false();
+        assert_that!(cached(&request.source, &uncached)).is_false();
 
         // Cleanup
         forget(&request.source, wanted(&request));
@@ -2176,8 +2185,8 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let selected = cue(0, 1000, "here");
         let corrupt = cue(2000, 3000, "next");
-        framecache::store(&source.key(&selected), &frame_bytes(64, 48));
-        framecache::store(&source.key(&corrupt), b"not a PNG at all");
+        seed(&source, &selected, &frame_bytes(64, 48));
+        seed(&source, &corrupt, b"not a PNG at all");
         let request = FrameRequest {
             generation: 1,
             source: source.clone(),
@@ -2222,7 +2231,7 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let cues = [cue(0, 1000, "here"), cue(2000, 3000, "next")];
         for one in &cues {
-            framecache::store(&source.key(one), &frame_bytes(64, 48));
+            seed(&source, one, &frame_bytes(64, 48));
         }
         let request = FrameRequest {
             generation: 1,
@@ -2277,10 +2286,7 @@ mod tests {
         let directory = scratch("frame-mid-grab");
         let media = video(&directory);
         let ahead = cue(4000, 5000, "the cue behind it");
-        framecache::store(
-            &source(&media, &directory).key(&ahead),
-            &frame_bytes(64, 48),
-        );
+        seed(&source(&media, &directory), &ahead, &frame_bytes(64, 48));
         let request = FrameRequest {
             nearby: vec![FrameTarget {
                 cue_index: 1,
@@ -2328,7 +2334,7 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let cues = [cue(0, 1000, "first"), cue(2000, 3000, "second")];
         for one in &cues {
-            framecache::store(&source.key(one), &frame_bytes(64, 48));
+            seed(&source, one, &frame_bytes(64, 48));
         }
         let request = FrameRequest {
             generation: 1,
@@ -2383,7 +2389,7 @@ mod tests {
         let directory = scratch("frame-prefetch-deaf");
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let ahead = cue(2000, 3000, "second");
-        framecache::store(&source.key(&ahead), &frame_bytes(64, 48));
+        seed(&source, &ahead, &frame_bytes(64, 48));
         let request = FrameRequest {
             generation: 1,
             source: source.clone(),
@@ -2419,7 +2425,7 @@ mod tests {
         let directory = scratch("frame-nearby-only");
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let ahead = cue(2000, 3000, "next");
-        framecache::store(&source.key(&ahead), &frame_bytes(64, 48));
+        seed(&source, &ahead, &frame_bytes(64, 48));
         let request = FrameRequest {
             generation: 1,
             source: source.clone(),
@@ -2462,7 +2468,7 @@ mod tests {
                 Duration::ZERO,
             )
         };
-        framecache::store(&request.source.key(wanted(&request)), &frame_bytes(64, 48));
+        seed(&request.source, wanted(&request), &frame_bytes(64, 48));
 
         // Act
         let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
@@ -2510,7 +2516,7 @@ mod tests {
 
         // Assert: drawn, and kept under a name that says what it holds.
         assert_that!(frames.len()).is_equal_to(1);
-        let path = framecache::path(&key).expect("the test binary has a cache directory");
+        let path = framecache::path(&key.0, &key.1).expect("the test binary has a cache directory");
         assert_that!(
             path.extension()
                 .and_then(|extension| extension.to_str())
@@ -2545,7 +2551,7 @@ mod tests {
 
         // Assert
         assert_that!(matches!(outcome, Some(FrameOutcome::Ready(_)))).is_true();
-        assert_that!(framecache::is_cached(&request.source.key(wanted(&request)))).is_true();
+        assert_that!(cached(&request.source, wanted(&request))).is_true();
 
         // Act / Assert: and with the media deleted and the staged cue removed, the same
         // request still draws — from the cache, since there is nothing left to grab.
@@ -2562,18 +2568,24 @@ mod tests {
 
     /// A cache key covers one cue's text and timing, so a track whose cues differ cannot
     /// share a frame between them — which is what would show the wrong line burned in.
+    ///
+    /// And they differ in the *cue* half only: every cue of one media shares its directory,
+    /// which is what lets the cache evict that media's frames as one thing.
     #[test]
     fn two_cues_should_not_share_a_frame() {
         // Arrange
         let _guard = cache_guard();
         let directory = scratch("frame-per-cue");
         let source = source(&directory.join("clip.mkv"), &directory);
+        let first = source.key(&cue(0, 1000, "first"));
 
         // Act / Assert
-        assert_that!(source.key(&cue(0, 1000, "first")).as_str())
-            .is_not_equal_to(source.key(&cue(0, 1000, "second")).as_str());
-        assert_that!(source.key(&cue(0, 1000, "first")).as_str())
-            .is_not_equal_to(source.key(&cue(500, 1000, "first")).as_str());
+        assert_that!(first.1.as_str())
+            .is_not_equal_to(source.key(&cue(0, 1000, "second")).1.as_str());
+        assert_that!(first.1.as_str())
+            .is_not_equal_to(source.key(&cue(500, 1000, "first")).1.as_str());
+        // The same directory for all three, whatever the cue says.
+        assert_that!(first.0.as_str()).is_equal_to(source.key(&cue(500, 1000, "first")).0.as_str());
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2631,7 +2643,7 @@ mod tests {
             duration: Duration::from_secs(6),
             // Deliberately unbounded: `warm` prunes the cache it shares with every other
             // test in this binary, and a real limit here would delete their frames.
-            cache_limit: u64::MAX,
+            cache_tracks: usize::MAX,
         }
     }
 
@@ -2643,18 +2655,17 @@ mod tests {
         progress
     }
 
-    /// The pass hands the prune the track it is about to render, so those frames are the
-    /// last thing evicted rather than the first.
+    /// The pass marks its track used and names it to the prune as the open one, so the
+    /// frames it was opened to show cannot be the ones it evicts.
     ///
-    /// A track that has not been opened for a while is the *oldest* thing in the cache, so
-    /// plain oldest-first eviction would throw it away in favour of frames belonging to
-    /// tracks nobody is looking at — and the pass would then render the whole thing again,
-    /// which is precisely what the cache is for avoiding.
+    /// Both halves matter and are asserted together: the marker is what ranks this track
+    /// as the most recently used, and naming it excludes it outright even at a limit that
+    /// leaves room for nothing else.
     ///
     /// Takes the exclusive guard and empties the shared directory, because a real limit is
     /// the point here and every other test's frames would otherwise be counted towards it.
     #[test]
-    fn the_background_pass_should_prune_around_the_track_it_is_about_to_render() {
+    fn the_background_pass_should_mark_its_track_used_and_prune_around_it() {
         // Arrange
         let _guard = crate::framecache::testing::whole_directory();
         let cache = framecache::directory().expect("the test binary has a cache directory");
@@ -2667,26 +2678,27 @@ mod tests {
             cue(3000, 4000, "open second"),
         ];
         let request = WarmRequest {
-            // Room for two frames of a hundred bytes, against the three that are there.
-            cache_limit: 250,
+            // Room for one track only, so the prune has to choose between the open track
+            // and the other one.
+            cache_tracks: 1,
             ..warm_request(
                 &directory.join("never-existed.mkv"),
                 &directory,
                 cues.clone(),
             )
         };
-        let aged = |key: &str, hours: u64| {
-            assert_that!(framecache::store(key, &[0u8; 100])).is_true();
-            let path = framecache::path(key).expect("the frame was just stored");
-            std::fs::File::open(path)
-                .unwrap()
-                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
-                .expect("the test filesystem should allow setting an mtime");
-        };
-        // The open track's frames are the oldest; some other track's is the newest.
-        aged(&request.source.key(&cues[0]), 100);
-        aged(&request.source.key(&cues[1]), 99);
-        aged("some-other-tracks-frame", 1);
+        for cue in &cues {
+            assert_that!(seed(&request.source, cue, &[0u8; 100])).is_true();
+        }
+        // The open track was used long ago; the other one moments ago. Plain
+        // least-recently-used would take the open one, which is the bug.
+        assert_that!(framecache::touch(&request.source.media_key())).is_true();
+        std::fs::File::open(cache.join(request.source.media_key()).join(".used"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600 * 100))
+            .expect("the test filesystem should allow setting an mtime");
+        assert_that!(framecache::store("some-other-track", "frame", &[0u8; 100])).is_true();
+        assert_that!(framecache::touch("some-other-track")).is_true();
 
         // Act
         let (events, published) = mpsc::channel();
@@ -2694,40 +2706,21 @@ mod tests {
         drop(events);
         drop(published);
 
-        // Assert: the other track's frame went despite being newer, and both of the open
-        // track's stayed despite being older.
+        // Assert: the other track went whole, and every frame of the open one survived
+        // despite its being the least recently used thing in the cache.
         assert_that!(alive).is_true();
-        assert_that!(framecache::is_cached("some-other-tracks-frame")).is_false();
+        assert_that!(cache.join("some-other-track").exists()).is_false();
         for cue in &cues {
-            assert_that!(framecache::is_cached(&request.source.key(cue))).is_true();
+            assert_that!(cached(&request.source, cue)).is_true();
         }
+        // And the pass left the marker fresh, so the *next* prune ranks it first too.
+        let used = std::fs::metadata(cache.join(request.source.media_key()).join(".used"))
+            .and_then(|marker| marker.modified())
+            .expect("the pass should have marked its track used");
+        assert_that!(used.elapsed().unwrap() < Duration::from_secs(60)).is_true();
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&cache);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// The keys the pass protects are exactly the ones it is about to render under, so a
-    /// disagreement between the two cannot spare the wrong frames.
-    #[test]
-    fn a_tracks_keys_should_be_the_ones_its_own_frames_are_stored_under() {
-        // Arrange
-        let directory = scratch("warm-keys");
-        let cues = vec![cue(0, 1000, "first"), cue(2000, 3000, "second")];
-        let request = warm_request(&directory.join("clip.mkv"), &directory, cues.clone());
-
-        // Act
-        let keys = track_keys(&request);
-
-        // Assert
-        assert_that!(keys.len()).is_equal_to(2);
-        for cue in &cues {
-            assert_that!(keys.contains(&request.source.key(cue))).is_true();
-        }
-        // And a cue the track does not hold is not protected by it.
-        assert_that!(keys.contains(&request.source.key(&cue(9000, 9500, "absent")))).is_false();
-
-        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2753,7 +2746,7 @@ mod tests {
         // Assert
         assert_that!(alive).is_true();
         for cue in &cues {
-            assert_that!(framecache::is_cached(&request.source.key(cue))).is_true();
+            assert_that!(cached(&request.source, cue)).is_true();
         }
         let progress = warmed(&events);
         assert_that!(progress.first().copied()).is_equal_to(Some((0, 2)));
@@ -2780,7 +2773,7 @@ mod tests {
             cues.clone(),
         );
         for cue in &cues {
-            framecache::store(&request.source.key(cue), &frame_bytes(8, 8));
+            seed(&request.source, cue, &frame_bytes(8, 8));
         }
         let (events_tx, events) = mpsc::channel();
 
@@ -2965,7 +2958,7 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let first = cue(1000, 2000, "cached");
         let second = cue(3000, 4000, "missing");
-        framecache::store(&source.key(&first), &frame_bytes(8, 8));
+        seed(&source, &first, &frame_bytes(8, 8));
         forget(&source, &second);
 
         // Act
@@ -3123,7 +3116,7 @@ mod tests {
         assert_that!(alive).is_true();
         assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 2)]);
         for cue in &cues {
-            assert_that!(framecache::is_cached(&request.source.key(cue))).is_false();
+            assert_that!(cached(&request.source, cue)).is_false();
         }
 
         // Cleanup

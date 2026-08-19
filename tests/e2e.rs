@@ -860,7 +860,7 @@ fn an_external_track_change_should_revert_only_the_conflicting_edits() {
         state.dialog == Some(reel_tui::app::Dialog::ResolveConflicts)
     });
     let path = app.path("clip.mkv");
-    assert_eq!(app.app.conflicting_paths(), [path.clone()]);
+    assert_eq!(app.app.conflicting_paths(), [path.clone()][..]);
     assert!(
         app.app
             .conflicting_change_summary(&path)
@@ -1429,9 +1429,8 @@ fn converting_subrip_subtitles_to_mp4_should_be_refused_with_an_actionable_messa
         !error.contains("Could not find tag for codec"),
         "the raw MP4 muxer error leaked to the user: {error}"
     );
-    assert_eq!(
+    assert!(
         app.app.active_batch.is_none(),
-        true,
         "nothing should have been dispatched"
     );
     assert_eq!(
@@ -2474,20 +2473,19 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
 const SHORT_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nShort first\n\n\
                           2\n00:00:03,000 --> 00:00:04,000\nShort second\n\n";
 
-/// A cache too small for two tracks evicts the one that is *not* open, not the one that
-/// is — even though the open one is older and plain oldest-first eviction would take it.
+/// A cache with room for fewer tracks than exist evicts whole tracks, least recently used
+/// first, and never the one that is open.
 ///
-/// This is the residual of the frame-cache fix. Opening a track prunes the cache and then
-/// renders the track, so a track not looked at for a while is the oldest thing there and
-/// was the first thing thrown away — by the very pass that had just been opened to show
-/// it, which then rendered the whole track again. `framecache::prune` now takes the open
-/// track's keys and considers them last.
-///
-/// The limit is derived from what the short track actually occupies rather than guessed:
-/// exactly enough for it and not for both, so eviction has to choose between them.
+/// Two properties in one scenario, because they are the same design decision. **Whole
+/// tracks**: a track missing some of its frames is re-rendered on every visit, so evicting
+/// a fraction of one buys disk at the cost of the work the cache exists to avoid — a
+/// surviving track has to be complete, and an evicted one has to be gone entirely. **Never
+/// the open one**: the pass is about to render into it, so evicting it guarantees the
+/// re-render, and it is the least recently used track here precisely to prove the
+/// exclusion is doing the work rather than the ranking happening to agree.
 #[test]
-fn a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open() {
-    let test = "a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open";
+fn a_full_cache_should_evict_whole_tracks_and_never_the_open_one() {
+    let test = "a_full_cache_should_evict_whole_tracks_and_never_the_open_one";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-frame-eviction");
@@ -2504,43 +2502,38 @@ fn a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open() {
 
     let mut app = Harness::start(scratch);
 
-    // The short track first, so it is the older of the two in the cache.
+    // The short track first, so it is the *least* recently used of the two.
     let short = render_sidecar_track(&mut app, "short.mkv");
     assert_eq!(short.len(), 2, "the short sidecar holds two cues");
-    let rendered: Vec<SystemTime> = short.iter().map(|path| modified(path)).collect();
-    let short_bytes: u64 = short
-        .iter()
-        .map(|path| fs::metadata(path).unwrap().len())
-        .sum();
+    let rendered: Vec<SystemTime> = short.iter().map(modified).collect();
 
-    // Then the long one, which is larger and newer.
+    // Then the long one, which is larger and more recently used.
     let long = render_sidecar_track(&mut app, "long.mkv");
     assert_eq!(long.len(), 4, "the long sidecar holds four cues");
-    let long_bytes: u64 = long
-        .iter()
-        .map(|path| fs::metadata(path).unwrap().len())
-        .sum();
+    let long_track = long[0]
+        .parent()
+        .expect("a frame lives inside its media's directory")
+        .to_path_buf();
     assert!(
-        long_bytes > short_bytes,
-        "the long track has to outweigh the short one for eviction to have to choose: \
-         {long_bytes} vs {short_bytes}"
+        long_track.is_dir(),
+        "the long track should have a directory"
     );
 
-    // Room for the short track and nothing else.
+    // Room for one track, which the open one takes.
     app.app.set_preview_settings(PreviewSettings {
         prefetch: true,
         network: false,
-        cache_limit: short_bytes,
+        cache_tracks: 1,
     });
     // The filesystem's mtime granularity can be coarse enough that a rewrite within the
     // same tick is indistinguishable from no rewrite at all.
     std::thread::sleep(Duration::from_millis(1100));
 
-    // Act: back to the short track, whose pass has to prune before it can render.
+    // Act: back to the short track, whose pass prunes before it renders.
     let reopened = render_sidecar_track(&mut app, "short.mkv");
 
-    // Assert: not one of its frames was touched, despite every one of them being older
-    // than everything else in the cache.
+    // Assert: every one of its frames survived untouched, despite its being the least
+    // recently used track in the cache.
     assert_eq!(
         reopened, short,
         "the same track should hash to the same frames"
@@ -2553,15 +2546,14 @@ fn a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open() {
             path.display()
         );
     }
-    // And the pruning really happened, rather than the limit turning out to be generous:
-    // the track that was not open is the one that went.
-    for path in &long {
-        assert!(
-            !path.exists(),
-            "the track that was not open should have been evicted first, but {} survived",
-            path.display()
-        );
-    }
+    // And the track that was not open went as a unit — the directory itself, not some of
+    // the frames in it. A cache that could bisect a track would leave this standing with
+    // part of its contents, and the next visit would re-render the difference.
+    assert!(
+        !long_track.exists(),
+        "the track that was not open should have been evicted whole, but {} survived",
+        long_track.display()
+    );
 }
 
 /// Opens a file's sidecar timing page, renders the whole track, and answers where each
@@ -2706,12 +2698,26 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
     }
 }
 
-/// Where a cached frame lives, under the `XDG_CACHE_HOME` the harness redirects.
-fn frame_path(key: &str) -> PathBuf {
+/// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
+fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
         .join("reel-tui")
         .join("preview_frames")
-        .join(format!("{key}.{}", reel_tui::framecache::FRAME_EXTENSION))
+}
+
+/// Where one media's frames live: a directory of its own, which is the unit the cache
+/// keeps or evicts.
+fn track_dir(media_key: &str) -> PathBuf {
+    frames_root().join(media_key)
+}
+
+/// Where a cached frame lives.
+fn frame_path(key: &(String, String)) -> PathBuf {
+    track_dir(&key.0).join(format!(
+        "{}.{}",
+        key.1,
+        reel_tui::framecache::FRAME_EXTENSION
+    ))
 }
 
 /// Opens the timing page on the sidecar track and waits for its cues.

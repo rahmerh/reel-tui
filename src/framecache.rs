@@ -5,11 +5,26 @@
 //! the timing page paid that cost again for every cue the cursor came back to, and again
 //! for every cue when the page was re-opened.
 //!
-//! Content-addressed: the filename *is* the hash of everything the frame depends on, so
-//! there is no index to keep consistent, no lock to take, and nothing a crash mid-write or
-//! two pages warming at once can corrupt. A cue whose text or timing changed hashes
-//! differently and simply misses, which is what makes "the line changed, re-render it"
-//! fall out for free rather than needing invalidation logic.
+//! Content-addressed: the path *is* the hash of everything the frame depends on, so there
+//! is no index to keep consistent, no lock to take, and nothing a crash mid-write or two
+//! pages warming at once can corrupt. A cue whose text or timing changed hashes differently
+//! and simply misses, which is what makes "the line changed, re-render it" fall out for
+//! free rather than needing invalidation logic.
+//!
+//! # Why frames are grouped by media
+//!
+//! The path has two halves — `{media_key}/{cue_key}.jpg` — and the split is the whole
+//! shape of the eviction policy. What the user opens is a *track*, and half a track is
+//! nearly worthless: the missing half is re-rendered on every visit. A cache that evicts
+//! individual frames against a byte budget can always bisect one, and every cache bug this
+//! module has had came from that — a whole track re-rendering on every open, a pass
+//! evicting the frames it had just been opened to show, a guard against that guarding the
+//! wrong files.
+//!
+//! So the unit of eviction is the unit of use: a whole media directory, or nothing. The
+//! directory *is* the index, which is what keeps the grouping without giving up the
+//! properties above — no side file to keep consistent, no lock, and a crash leaves at worst
+//! one stray temporary.
 //!
 //! Pure filesystem and hashing. No `ffmpeg`, no `App`, no `ratatui`.
 //!
@@ -19,7 +34,6 @@
 //! test binary shares — and the first is then a line long, with only the "this machine
 //! has no cache directory at all" arm the test binary cannot reach.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,13 +55,33 @@ const FRAMES_DIR: &str = "preview_frames";
 /// other as they are written.
 pub const FRAME_EXTENSION: &str = "jpg";
 
-/// Everything a cached frame depends on, hashed into its filename.
+/// Bumped whenever a stored frame stops meaning what it used to.
+///
+/// Hashed into [`media_key`], so a change orphans whole directories that then age out as
+/// units. Without it a change of format or encoder leaves files whose names still collide
+/// with live keys — the PNG-to-JPEG switch did exactly that, because a key does not encode
+/// the format, and the leftovers had to be swept by hand. Bump this instead.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Records when a media directory was last *used*, by its own mtime.
+///
+/// Written on every page opening, whether or not a frame is rendered. Ranking directories
+/// by their own mtime would rank by last *write*, so a track that is fully cached — the
+/// ideal case, where the pass renders nothing — would never refresh its position and would
+/// age out under tracks rendered once and never opened again.
+///
+/// Leading dot and no [`FRAME_EXTENSION`], so it can never be mistaken for a frame.
+const USED_MARKER: &str = ".used";
+
+/// Everything about the media a cached frame depends on, hashed into its directory name.
 ///
 /// The media's length and mtime are in here as well as its path: re-encoding a file in
 /// place leaves the path identical while every frame in it moves, and serving the old
 /// file's pictures for the new one is exactly the kind of silent wrongness a preview must
-/// not have. `pixels` is in here because the stored PNG is rendered at that size, so
+/// not have. `pixels` is in here because the stored frame is rendered at that size, so
 /// changing the cap must miss rather than hand back mis-sized images.
+///
+/// All of it is per-media rather than per-cue, which is what lets it name a directory.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameKeyParts<'a> {
     pub media: &'a Path,
@@ -56,7 +90,7 @@ pub struct FrameKeyParts<'a> {
     pub pixels: (u32, u32),
 }
 
-/// The cache key for one cue's frame, as hex.
+/// The directory every frame of one media file is stored under, as hex.
 ///
 /// FNV-1a, 128-bit, written out here rather than taken from a crate or from
 /// `DefaultHasher`. `DefaultHasher`'s output is explicitly not stable across Rust
@@ -64,15 +98,13 @@ pub struct FrameKeyParts<'a> {
 /// toolchain bump would silently orphan the whole cache. Sixteen bytes puts a collision
 /// among the few thousand frames a film's subtitle track produces far below the odds of
 /// the disk lying about the bytes.
-pub fn key(parts: FrameKeyParts<'_>, cue: &Cue) -> String {
-    // The two variable-length fields — which file, which line — go in first and next to
-    // each other, which is what the separator between them is for: without it a path
-    // ending where the next cue's text begins would hash the same as the pair the other
-    // way round. Everything after them is fixed width and so delimits itself.
+pub fn media_key(parts: FrameKeyParts<'_>) -> String {
+    // The path is variable-length and goes in first, followed by the separator: without it
+    // a path ending where the next field begins would hash the same as a different pair.
+    // Everything after is fixed width and so delimits itself.
     let mut hash = Hasher::new();
     hash.bytes(parts.media.as_os_str().as_encoded_bytes());
     hash.separator();
-    hash.bytes(cue.text.as_bytes());
     hash.number(u128::from(parts.media_length));
     hash.number(u128::from(
         parts
@@ -82,6 +114,18 @@ pub fn key(parts: FrameKeyParts<'_>, cue: &Cue) -> String {
     ));
     hash.number(u128::from(parts.pixels.0));
     hash.number(u128::from(parts.pixels.1));
+    hash.number(u128::from(CACHE_FORMAT_VERSION));
+    hash.finish()
+}
+
+/// The filename one cue's frame is stored under inside its media's directory, as hex.
+///
+/// Only the cue, so two subtitle tracks of the same film that happen to carry an identical
+/// line at an identical time share the one frame — they would render the same picture.
+pub fn cue_key(cue: &Cue) -> String {
+    let mut hash = Hasher::new();
+    hash.bytes(cue.text.as_bytes());
+    hash.separator();
     // Millis rather than the whole `Duration`: it is what the SubRip format itself
     // stores, so two cues that are equal on disk cannot hash apart on a rounding.
     hash.number(u128::from(cue.start.as_millis() as u64));
@@ -89,43 +133,63 @@ pub fn key(parts: FrameKeyParts<'_>, cue: &Cue) -> String {
     hash.finish()
 }
 
-/// Where the frame for `key` lives, or `None` when there is no cache directory at all.
+/// Where one cue's frame lives, or `None` when there is no cache directory at all.
 ///
 /// Resolved through [`DiskCache::cache_dir`] rather than from the environment directly:
 /// that one function is what redirects the unit-test binary to throwaway storage, and the
 /// e2e harness redirects `XDG_CACHE_HOME` around it. Going straight to the environment
 /// here would put a second door on the user's real cache directory that no test closes.
-pub fn path(key: &str) -> Option<PathBuf> {
-    Some(path_in(&directory()?, key))
+pub fn path(media: &str, cue: &str) -> Option<PathBuf> {
+    Some(path_in(&directory()?, media, cue))
 }
 
 pub fn directory() -> Option<PathBuf> {
     Some(DiskCache::cache_dir()?.join(FRAMES_DIR))
 }
 
-fn path_in(directory: &Path, key: &str) -> PathBuf {
-    directory.join(format!("{key}.{FRAME_EXTENSION}"))
+fn path_in(directory: &Path, media: &str, cue: &str) -> PathBuf {
+    directory
+        .join(media)
+        .join(format!("{cue}.{FRAME_EXTENSION}"))
 }
 
-/// The cached frame for `key`, if one was ever stored and still is.
-pub fn read(key: &str) -> Option<Vec<u8>> {
-    read_in(&directory()?, key)
+/// The cached frame for one cue, if one was ever stored and still is.
+pub fn read(media: &str, cue: &str) -> Option<Vec<u8>> {
+    read_in(&directory()?, media, cue)
 }
 
-pub fn read_in(directory: &Path, key: &str) -> Option<Vec<u8>> {
-    let bytes = fs::read(path_in(directory, key)).ok()?;
+pub fn read_in(directory: &Path, media: &str, cue: &str) -> Option<Vec<u8>> {
+    let bytes = fs::read(path_in(directory, media, cue)).ok()?;
     // A zero-byte file is what a half-finished write outside `store` would leave, and
     // handing it to the decoder produces "Unreadable frame" for something that is really
     // just a miss. Treated as absent so the next grab replaces it.
     (!bytes.is_empty()).then_some(bytes)
 }
 
-pub fn is_cached(key: &str) -> bool {
-    directory().is_some_and(|directory| is_cached_in(&directory, key))
+pub fn is_cached(media: &str, cue: &str) -> bool {
+    directory().is_some_and(|directory| is_cached_in(&directory, media, cue))
 }
 
-pub fn is_cached_in(directory: &Path, key: &str) -> bool {
-    fs::metadata(path_in(directory, key)).is_ok_and(|frame| frame.len() > 0)
+pub fn is_cached_in(directory: &Path, media: &str, cue: &str) -> bool {
+    fs::metadata(path_in(directory, media, cue)).is_ok_and(|frame| frame.len() > 0)
+}
+
+/// Records that a media's frames are being used now, for [`prune`]'s ranking.
+///
+/// Best-effort and cheap: one small write per page opening. Creates the directory, so a
+/// track whose frames all turn out to be cached still has somewhere for its marker.
+pub fn touch(media: &str) -> bool {
+    directory().is_some_and(|directory| touch_in(&directory, media))
+}
+
+pub fn touch_in(directory: &Path, media: &str) -> bool {
+    let media_directory = directory.join(media);
+    if fs::create_dir_all(&media_directory).is_err() {
+        return false;
+    }
+    // Rewritten rather than opened for append: the content is irrelevant, the mtime is the
+    // whole point, and a write is the one portable way to move it.
+    fs::write(media_directory.join(USED_MARKER), b"").is_ok()
 }
 
 /// Stores one frame, reporting only whether it landed.
@@ -136,24 +200,29 @@ pub fn is_cached_in(directory: &Path, key: &str) -> bool {
 ///
 /// Best-effort throughout: a cache that cannot be written is a slow page, not a broken
 /// one, so every failure here is swallowed by the caller.
-pub fn store(key: &str, bytes: &[u8]) -> bool {
-    directory().is_some_and(|directory| store_in(&directory, key, bytes))
+pub fn store(media: &str, cue: &str, bytes: &[u8]) -> bool {
+    directory().is_some_and(|directory| store_in(&directory, media, cue, bytes))
 }
 
-pub fn store_in(directory: &Path, key: &str, bytes: &[u8]) -> bool {
-    if fs::create_dir_all(directory).is_err() {
+pub fn store_in(directory: &Path, media: &str, cue: &str, bytes: &[u8]) -> bool {
+    let media_directory = directory.join(media);
+    if fs::create_dir_all(&media_directory).is_err() {
         return false;
     }
-    let path = path_in(directory, key);
+    let path = path_in(directory, media, cue);
+    // Beside the frame, inside the media's own directory, so the rename is within one
+    // directory and one filesystem — and so `prune_in`'s sweep of the cache root, which
+    // deletes anything that is not a media directory, can never catch a write in flight.
+    //
     // The temporary is unique per *write*, not per key: the process id keeps two `reel`s
     // apart, and the counter keeps this process's own writers apart. Sharing a name would
     // let one writer rename another's half-written file into place — the very tearing the
-    // temporary exists to prevent — and the two frame workers do render the same cue at
-    // the same moment, since the interactive one answers the selection the background
-    // pass is walking towards.
+    // temporary exists to prevent — and the frame workers do render the same cue at the
+    // same moment, since the interactive one answers the selection the background pass is
+    // walking towards.
     static WRITES: AtomicU64 = AtomicU64::new(0);
-    let temporary = directory.join(format!(
-        ".{key}.{}.{}.tmp",
+    let temporary = media_directory.join(format!(
+        ".{cue}.{}.{}.tmp",
         std::process::id(),
         WRITES.fetch_add(1, Ordering::Relaxed)
     ));
@@ -168,97 +237,72 @@ pub fn store_in(directory: &Path, key: &str, bytes: &[u8]) -> bool {
     true
 }
 
-/// Deletes the least recently modified frames until the directory fits inside `limit`,
-/// taking the keys in `spare` last.
+/// Deletes least-recently-used media directories until at most `tracks` remain, never the
+/// one named by `open`.
 ///
-/// Called once per page opening, from the background worker rather than the event loop:
-/// it stats every file in the directory, which on a full cache is thousands of them.
+/// Called once per page opening, from the background worker rather than the event loop: it
+/// stats every entry in the cache root.
 ///
-/// Oldest-first by mtime, which for a content-addressed cache is also "least recently
-/// generated" — a frame that is still being looked at is re-read, not rewritten, so this
-/// is an approximation of least-recently-used that costs no bookkeeping. The worst case
-/// of getting it wrong is regenerating a frame.
+/// **Whole directories, never part of one.** That is the policy, not an implementation
+/// detail: what the user opens is a track, and a track missing some of its frames is
+/// re-rendered on every visit, so evicting a fraction of one buys disk at the cost of the
+/// work the cache exists to avoid. Counting tracks rather than bytes is what makes that
+/// expressible — a byte budget has no way to stop at a track boundary.
 ///
-/// `spare` is the track that is about to be rendered, and it is a *priority*, not an
-/// exemption: those frames still go if evicting everything else was not enough. Without it
-/// the pass could evict exactly the frames it was opened to show — a track not looked at
-/// for a while is the oldest thing in the cache, so plain oldest-first eviction throws it
-/// away in favour of frames from tracks nobody is looking at, and then renders it all
-/// again. Ordering costs nothing and makes the common case impossible.
+/// Ranked by the [`USED_MARKER`]'s mtime, falling back to the directory's own for one
+/// written before the marker existed, so this is genuine least-recently-*used* rather than
+/// least-recently-written.
 ///
-/// What it deliberately does *not* do is let the cache exceed `limit`. A track whose own
-/// frames do not fit still evicts itself as it writes, because the alternative is ignoring
-/// a limit the user set — `cache_mb = 0` has to keep nothing, whatever is open.
-pub fn prune(limit: u64, spare: &HashSet<String>) {
+/// `open` is excluded outright rather than merely ranked last. It cannot be the right
+/// answer: the pass is about to render into it, so evicting it guarantees the re-render
+/// this whole module exists to prevent. With `tracks = 0` that means the open track's
+/// frames survive until the page closes and something else prunes.
+///
+/// Also sweeps anything in the root that is *not* a media directory. That is where the old
+/// flat `{key}.jpg` layout's files sit, so the first prune after this change clears them;
+/// it is also the only rule needed for any other stray. In-flight temporaries live inside a
+/// media directory, so the sweep cannot race a write.
+pub fn prune(tracks: usize, open: Option<&str>) {
     if let Some(directory) = directory() {
-        prune_in(&directory, limit, spare);
+        prune_in(&directory, tracks, open);
     }
 }
 
-pub fn prune_in(directory: &Path, limit: u64, spare: &HashSet<String>) {
+pub fn prune_in(directory: &Path, tracks: usize, open: Option<&str>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut frames: Vec<Candidate> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            let path = entry.path();
-            Some(Candidate {
-                spared: is_spared(&path, spare),
-                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-                length: metadata.len(),
-                path,
-            })
-        })
-        .collect();
+    let mut cached: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            // Not a media directory, so nothing here can ever be read again.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == open {
+            continue;
+        }
+        cached.push((used_at(&path, &metadata), path));
+    }
 
-    let mut total: u64 = frames.iter().map(|frame| frame.length).sum();
-    // `false` sorts before `true`, so everything that is not the open track is offered up
-    // first, and each group is still oldest-first within itself.
-    frames.sort_by_key(|frame| (frame.spared, frame.modified));
-    for frame in frames {
-        if total <= limit {
-            break;
-        }
-        if fs::remove_file(&frame.path).is_ok() {
-            total = total.saturating_sub(frame.length);
-        }
+    // The open track was skipped above, but it still occupies one of the `tracks` slots.
+    let keep = tracks.saturating_sub(usize::from(open.is_some()));
+    cached.sort_by_key(|(used, _)| *used);
+    for (_, path) in cached.iter().take(cached.len().saturating_sub(keep)) {
+        let _ = fs::remove_dir_all(path);
     }
 }
 
-/// One file prune is considering, in the order it considers them.
-struct Candidate {
-    spared: bool,
-    modified: SystemTime,
-    length: u64,
-    path: PathBuf,
-}
-
-/// Whether a file in the cache directory is one of `spare`'s frames.
-///
-/// By stem *and* extension, and both halves earn their place. The stem is the key. The
-/// extension is what keeps a file the cache can no longer read from being protected as
-/// though it were the frame it once was: a key does not encode the format, so a frame left
-/// behind by an older build — `{key}.png`, from before frames were JPEG — hashes to the
-/// same name as the one that replaced it whenever the media's size is unchanged. Sparing
-/// that would give the *least* useful file in the directory the highest priority.
-///
-/// The in-flight temporaries `store_in` writes are `.{key}.{pid}.{n}.tmp`, which fail both
-/// halves, so a torn write is never protected as the frame it is on its way to becoming.
-fn is_spared(path: &Path, spare: &HashSet<String>) -> bool {
-    let is_frame = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension == FRAME_EXTENSION);
-    is_frame
-        && path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| spare.contains(stem))
+/// When a media directory was last used: its marker's mtime, or its own if it has none.
+fn used_at(path: &Path, metadata: &fs::Metadata) -> SystemTime {
+    fs::metadata(path.join(USED_MARKER))
+        .and_then(|marker| marker.modified())
+        .or_else(|_| metadata.modified())
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// FNV-1a over 128 bits, fed one field at a time.
@@ -338,6 +382,9 @@ mod tests {
         }
     }
 
+    /// A stand-in media directory, for the storage tests that are not about hashing.
+    const MEDIA: &str = "media-key";
+
     fn parts(media: &Path) -> FrameKeyParts<'_> {
         FrameKeyParts {
             media,
@@ -362,6 +409,11 @@ mod tests {
         directory
     }
 
+    /// Both halves of the path, together, for the tests that care about the whole thing.
+    fn key(parts: FrameKeyParts<'_>, cue: &Cue) -> String {
+        format!("{}/{}", media_key(parts), cue_key(cue))
+    }
+
     #[test]
     fn the_same_media_and_cue_should_always_hash_the_same() {
         // Arrange
@@ -370,8 +422,35 @@ mod tests {
         // Act / Assert
         assert_that!(key(parts(&media), &cue(1000, 2000, "hello")).as_str())
             .is_equal_to(key(parts(&media), &cue(1000, 2000, "hello")).as_str());
-        // Sixteen bytes of hex, so a filename that is always the same length.
-        assert_that!(key(parts(&media), &cue(1000, 2000, "hello")).len()).is_equal_to(32);
+        // Sixteen bytes of hex either side, so a path whose parts are always one length.
+        assert_that!(media_key(parts(&media)).len()).is_equal_to(32);
+        assert_that!(cue_key(&cue(1000, 2000, "hello")).len()).is_equal_to(32);
+    }
+
+    /// The split is the eviction policy: everything about the *media* has to land in the
+    /// directory name, and everything about the *cue* in the filename. A media-level field
+    /// that leaked into the cue key would scatter one track across directories, and a
+    /// cue-level one that leaked into the media key would give every cue its own.
+    #[test]
+    fn the_media_half_and_the_cue_half_should_each_hold_only_their_own_fields() {
+        // Arrange
+        let media = PathBuf::from("/media/show.mkv");
+        let other = PathBuf::from("/media/other.mkv");
+        let base = media_key(parts(&media));
+
+        // Act / Assert: every cue of one media shares one directory.
+        assert_that!(cue_key(&cue(1000, 2000, "hello")).as_str())
+            .is_not_equal_to(cue_key(&cue(3000, 4000, "goodbye")).as_str());
+        assert_that!(media_key(parts(&media)).as_str()).is_equal_to(base.as_str());
+
+        // Act / Assert: and every media-level difference moves the directory.
+        assert_that!(media_key(parts(&other)).as_str()).is_not_equal_to(base.as_str());
+        let mut relength = parts(&media);
+        relength.media_length = 1_001;
+        assert_that!(media_key(relength).as_str()).is_not_equal_to(base.as_str());
+        let mut smaller = parts(&media);
+        smaller.pixels = (640, 360);
+        assert_that!(media_key(smaller).as_str()).is_not_equal_to(base.as_str());
     }
 
     /// The whole point of the key: change what the frame would look like, and the cache
@@ -419,6 +498,39 @@ mod tests {
             .is_not_equal_to(base.as_str());
     }
 
+    /// The version is what makes a change to what a stored frame *means* — its format, its
+    /// encoder — orphan whole directories that then age out as units. Without it such a
+    /// change leaves files whose names still collide with live keys, which is exactly the
+    /// bug the PNG-to-JPEG switch left behind and had to be swept by hand.
+    ///
+    /// Asserted by rebuilding the hash by hand, both with the version and with the next
+    /// one. Only the *matching* half catches the failure that matters: a version simply
+    /// left out of `media_key` still differs from `version + 1`, so a test that checked
+    /// nothing but the difference would pass against exactly the bug it is here for.
+    #[test]
+    fn the_format_version_should_be_part_of_every_media_directory() {
+        // Arrange
+        let media = PathBuf::from("/media/show.mkv");
+        let composed = |version: u32| {
+            let mut hash = Hasher::new();
+            hash.bytes(media.as_os_str().as_encoded_bytes());
+            hash.separator();
+            hash.number(u128::from(1_000u64));
+            hash.number(u128::from(1_700_000_000_000_000_000u64));
+            hash.number(u128::from(960u32));
+            hash.number(u128::from(540u32));
+            hash.number(u128::from(version));
+            hash.finish()
+        };
+
+        // Act / Assert: the version is in there…
+        assert_that!(media_key(parts(&media)).as_str())
+            .is_equal_to(composed(CACHE_FORMAT_VERSION).as_str());
+        // …and moves the whole directory when it changes.
+        assert_that!(composed(CACHE_FORMAT_VERSION).as_str())
+            .is_not_equal_to(composed(CACHE_FORMAT_VERSION + 1).as_str());
+    }
+
     /// The two variable-length fields are separated rather than run together, so a path
     /// that ends where the next cue's text begins cannot collide with the pair the other
     /// way round.
@@ -439,15 +551,15 @@ mod tests {
         let directory = scratch("round-trip");
 
         // Act
-        let stored = store_in(&directory, "frame", b"\xff\xd8\xff frame bytes");
+        let stored = store_in(&directory, MEDIA, "frame", b"\xff\xd8\xff frame bytes");
 
         // Assert
         assert_that!(stored).is_true();
-        assert_that!(is_cached_in(&directory, "frame")).is_true();
-        assert_that!(read_in(&directory, "frame"))
+        assert_that!(is_cached_in(&directory, MEDIA, "frame")).is_true();
+        assert_that!(read_in(&directory, MEDIA, "frame"))
             .is_equal_to(Some(b"\xff\xd8\xff frame bytes".to_vec()));
         // No temporary left behind by a write that succeeded.
-        let leftovers = fs::read_dir(&directory)
+        let leftovers = fs::read_dir(directory.join(MEDIA))
             .unwrap()
             .flatten()
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
@@ -464,8 +576,8 @@ mod tests {
         let directory = scratch("absent");
 
         // Act / Assert
-        assert_that!(read_in(&directory, "never-stored")).is_none();
-        assert_that!(is_cached_in(&directory, "never-stored")).is_false();
+        assert_that!(read_in(&directory, MEDIA, "never-stored")).is_none();
+        assert_that!(is_cached_in(&directory, MEDIA, "never-stored")).is_false();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -478,11 +590,12 @@ mod tests {
     fn an_empty_frame_file_should_read_as_absent() {
         // Arrange
         let directory = scratch("empty");
-        fs::write(path_in(&directory, "empty"), b"").unwrap();
+        fs::create_dir_all(directory.join(MEDIA)).unwrap();
+        fs::write(path_in(&directory, MEDIA, "empty"), b"").unwrap();
 
         // Act / Assert
-        assert_that!(read_in(&directory, "empty")).is_none();
-        assert_that!(is_cached_in(&directory, "empty")).is_false();
+        assert_that!(read_in(&directory, MEDIA, "empty")).is_none();
+        assert_that!(is_cached_in(&directory, MEDIA, "empty")).is_false();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -497,11 +610,11 @@ mod tests {
         let directory = parent.join("preview_frames");
 
         // Act
-        let stored = store_in(&directory, "frame", b"frame");
+        let stored = store_in(&directory, MEDIA, "frame", b"frame");
 
         // Assert
         assert_that!(stored).is_true();
-        assert_that!(is_cached_in(&directory, "frame")).is_true();
+        assert_that!(is_cached_in(&directory, MEDIA, "frame")).is_true();
 
         // Cleanup
         fs::remove_dir_all(parent).unwrap();
@@ -515,26 +628,30 @@ mod tests {
         // Arrange
         let parent = scratch("unwritable");
 
-        // Act / Assert: a file sitting where the directory belongs.
+        // Act / Assert: a file sitting where the cache root belongs.
         let blocked = parent.join("in-the-way");
         fs::write(&blocked, b"not a directory").unwrap();
-        assert_that!(store_in(&blocked, "frame", b"frame")).is_false();
+        assert_that!(store_in(&blocked, MEDIA, "frame", b"frame")).is_false();
 
         // Act / Assert: a directory sitting where the frame belongs.
         let directory = parent.join("frames");
-        fs::create_dir_all(path_in(&directory, "occupied")).unwrap();
-        assert_that!(store_in(&directory, "occupied", b"frame")).is_false();
-        assert_that!(read_in(&directory, "occupied")).is_none();
+        fs::create_dir_all(path_in(&directory, MEDIA, "occupied")).unwrap();
+        assert_that!(store_in(&directory, MEDIA, "occupied", b"frame")).is_false();
+        assert_that!(read_in(&directory, MEDIA, "occupied")).is_none();
 
         // Act / Assert: and a temporary that cannot be written at all, which is the write
-        // failing rather than the rename. A key naming a directory that does not exist
+        // failing rather than the rename. A cue key naming a directory that does not exist
         // does it without depending on file permissions, which a test running as root
         // would not get to observe.
-        assert_that!(store_in(&directory, "missing/taken", b"frame")).is_false();
-        assert_that!(is_cached_in(&directory, "missing/taken")).is_false();
+        assert_that!(store_in(&directory, MEDIA, "missing/taken", b"frame")).is_false();
+        assert_that!(is_cached_in(&directory, MEDIA, "missing/taken")).is_false();
+
+        // Act / Assert: and a marker that cannot be written is a track that simply loses
+        // its place in the ranking, not a failure that reaches the page.
+        assert_that!(touch_in(&blocked, MEDIA)).is_false();
 
         // Assert: nothing was left lying beside them.
-        let leftovers = fs::read_dir(&directory)
+        let leftovers = fs::read_dir(directory.join(MEDIA))
             .unwrap()
             .flatten()
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
@@ -546,187 +663,151 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
-    /// No track open, which is what every prune that is not the background pass's does.
-    fn nothing() -> HashSet<String> {
-        HashSet::new()
+    /// Puts `frames` frames in a media directory and dates its use marker `hours` ago.
+    fn track(directory: &Path, media: &str, frames: usize, hours: u64) {
+        for index in 0..frames {
+            assert_that!(store_in(
+                directory,
+                media,
+                &format!("cue-{index}"),
+                &[0u8; 100]
+            ))
+            .is_true();
+        }
+        assert_that!(touch_in(directory, media)).is_true();
+        fs::File::open(directory.join(media).join(USED_MARKER))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
+            .expect("the test filesystem should allow setting an mtime");
     }
 
-    /// Frames are hundreds of kilobytes each and a film's subtitle track has thousands of
-    /// cues, so the directory has to have a ceiling — and the frames that go are the ones
-    /// least recently written.
+    fn holds(directory: &Path, media: &str, frames: usize) -> bool {
+        (0..frames).all(|index| is_cached_in(directory, media, &format!("cue-{index}")))
+    }
+
+    /// The cache has to have a ceiling, and the track that goes is the least recently used
+    /// one — whole, never in part.
     #[test]
-    fn pruning_should_delete_the_oldest_frames_until_the_cache_fits() {
-        // Arrange: three frames of 100 bytes, aged oldest-first.
+    fn pruning_should_delete_whole_tracks_least_recently_used_first() {
+        // Arrange: three tracks of differing size, used oldest-first.
         let directory = scratch("prune");
-        for index in 0..3u64 {
-            assert_that!(store_in(&directory, &format!("frame-{index}"), &[0u8; 100])).is_true();
-            let age = SystemTime::now() - Duration::from_secs(3600 * (3 - index));
-            fs::File::open(path_in(&directory, &format!("frame-{index}")))
-                .unwrap()
-                .set_modified(age)
-                .expect("the test filesystem should allow setting an mtime");
-        }
+        track(&directory, "oldest", 4, 3);
+        track(&directory, "middle", 2, 2);
+        track(&directory, "newest", 3, 1);
 
         // Act: room for two of the three.
-        prune_in(&directory, 250, &nothing());
+        prune_in(&directory, 2, None);
 
-        // Assert: the oldest went, the two newer stayed.
-        assert_that!(is_cached_in(&directory, "frame-0")).is_false();
-        assert_that!(is_cached_in(&directory, "frame-1")).is_true();
-        assert_that!(is_cached_in(&directory, "frame-2")).is_true();
+        // Assert: the least recently used one went entirely, and the others are intact —
+        // *every* frame of them, which is the property a byte budget could not offer.
+        assert_that!(directory.join("oldest").exists()).is_false();
+        assert_that!(holds(&directory, "middle", 2)).is_true();
+        assert_that!(holds(&directory, "newest", 3)).is_true();
 
         // Act / Assert: and a cache already inside its limit is left entirely alone.
-        prune_in(&directory, 250, &nothing());
-        assert_that!(is_cached_in(&directory, "frame-1")).is_true();
-        assert_that!(is_cached_in(&directory, "frame-2")).is_true();
+        prune_in(&directory, 2, None);
+        assert_that!(holds(&directory, "middle", 2)).is_true();
+        assert_that!(holds(&directory, "newest", 3)).is_true();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The open track's frames go last, whatever their age.
-    ///
-    /// Without this the background pass could evict exactly what it was opened to show: a
-    /// track not looked at for a while is the *oldest* thing in the cache, so plain
-    /// oldest-first eviction throws it away in favour of frames belonging to tracks nobody
-    /// is looking at — and then renders the whole thing again.
+    /// Ranked by last *use*, not last write. A track that is fully cached is the ideal
+    /// case — the pass renders nothing — so ranking by write would let the tracks actually
+    /// being watched age out under ones rendered once and never opened again.
     #[test]
-    fn pruning_should_take_the_open_tracks_frames_last() {
-        // Arrange: the open track's two frames are the oldest in the cache, and two
-        // frames of some other track are the newest.
-        let directory = scratch("prune-spared");
-        let aged = |key: &str, hours: u64| {
-            assert_that!(store_in(&directory, key, &[0u8; 100])).is_true();
-            fs::File::open(path_in(&directory, key))
-                .unwrap()
-                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
-                .expect("the test filesystem should allow setting an mtime");
-        };
-        aged("open-0", 100);
-        aged("open-1", 99);
-        aged("other-0", 2);
-        aged("other-1", 1);
-        let spare = HashSet::from(["open-0".to_string(), "open-1".to_string()]);
+    fn pruning_should_rank_by_last_use_rather_than_last_write() {
+        // Arrange: `stale` was written most recently, `watched` used most recently.
+        let directory = scratch("prune-lru");
+        track(&directory, "watched", 2, 10);
+        track(&directory, "stale", 2, 1);
+        // The watched track is opened again, rendering nothing — only the marker moves.
+        assert_that!(touch_in(&directory, "watched")).is_true();
 
-        // Act: room for two of the four.
-        prune_in(&directory, 250, &spare);
-
-        // Assert: the other track went despite being newer, and the open one stayed
-        // despite being older.
-        assert_that!(is_cached_in(&directory, "open-0")).is_true();
-        assert_that!(is_cached_in(&directory, "open-1")).is_true();
-        assert_that!(is_cached_in(&directory, "other-0")).is_false();
-        assert_that!(is_cached_in(&directory, "other-1")).is_false();
-
-        // Cleanup
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// A frame left behind by an older build must not be spared as though it were the one
-    /// that replaced it.
-    ///
-    /// A key does not encode the format, so `{key}.png` from before frames were JPEG hashes
-    /// to the same name as `{key}.jpg` whenever the media's size is unchanged. Protecting
-    /// it would hand the highest priority in the directory to the one file the cache can
-    /// never read — and evict the frame that would actually have been used.
-    #[test]
-    fn a_frame_in_a_format_the_cache_no_longer_reads_should_not_be_spared() {
-        // Arrange: the readable frame first, so it is the *older* of the two — without the
-        // extension check it is the one oldest-first eviction would take.
-        let directory = scratch("prune-spared-stale-format");
-        assert_that!(store_in(&directory, "frame", &[0u8; 100])).is_true();
-        fs::File::open(path_in(&directory, "frame"))
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .expect("the test filesystem should allow setting an mtime");
-        let stale = directory.join("frame.png");
-        fs::write(&stale, [0u8; 100]).unwrap();
-        let spare = HashSet::from(["frame".to_string()]);
-
-        // Act: room for one of the two.
-        prune_in(&directory, 150, &spare);
-
-        // Assert: the unreadable leftover went, the frame the cache would actually serve
-        // stayed — despite being the older of the two.
-        assert_that!(stale.exists()).is_false();
-        assert_that!(is_cached_in(&directory, "frame")).is_true();
-
-        // Cleanup
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// A priority, not an exemption. Sparing the open track must not let the cache run
-    /// past the limit the user set — `cache_mb = 0` has to keep nothing, whatever is
-    /// open — so once everything else is gone the open track goes too, oldest first.
-    #[test]
-    fn a_spared_track_should_still_go_when_evicting_everything_else_was_not_enough() {
-        // Arrange
-        let directory = scratch("prune-spared-overflow");
-        let aged = |key: &str, hours: u64| {
-            assert_that!(store_in(&directory, key, &[0u8; 100])).is_true();
-            fs::File::open(path_in(&directory, key))
-                .unwrap()
-                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
-                .expect("the test filesystem should allow setting an mtime");
-        };
-        aged("open-old", 10);
-        aged("open-new", 1);
-        aged("other", 5);
-        let spare = HashSet::from(["open-old".to_string(), "open-new".to_string()]);
-
-        // Act: room for one of the three, so sparing cannot save both.
-        prune_in(&directory, 150, &spare);
-
-        // Assert: the other track first, then the older of the spared pair.
-        assert_that!(is_cached_in(&directory, "other")).is_false();
-        assert_that!(is_cached_in(&directory, "open-old")).is_false();
-        assert_that!(is_cached_in(&directory, "open-new")).is_true();
-
-        // Act / Assert: and a limit of zero still keeps nothing at all.
-        prune_in(&directory, 0, &spare);
-        assert_that!(is_cached_in(&directory, "open-new")).is_false();
-
-        // Cleanup
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// A half-written frame is named `.{key}.{pid}.{n}.tmp`, which must not be protected
-    /// as though it were the frame it is on its way to becoming — sparing a torn write
-    /// would keep bytes no reader will ever accept in place of ones it would.
-    #[test]
-    fn an_in_flight_temporary_should_not_be_spared_by_its_keys_name() {
-        // Arrange
-        let directory = scratch("prune-spared-temporary");
-        fs::create_dir_all(&directory).unwrap();
-        let temporary = directory.join(".frame.999.0.tmp");
-        fs::write(&temporary, [0u8; 100]).unwrap();
-        let spare = HashSet::from(["frame".to_string()]);
-
-        // Act
-        prune_in(&directory, 0, &spare);
+        // Act: room for one.
+        prune_in(&directory, 1, None);
 
         // Assert
-        assert_that!(temporary.exists()).is_false();
+        assert_that!(holds(&directory, "watched", 2)).is_true();
+        assert_that!(directory.join("stale").exists()).is_false();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Pruning walks whatever it finds, and a cache directory holds nothing but frames —
-    /// a subdirectory is not one, and its size is not the cache's.
+    /// The open track is excluded outright rather than merely ranked last. Evicting it
+    /// guarantees the re-render the cache exists to prevent, because the pass is about to
+    /// render into it — so it survives even at a limit that leaves room for nothing else,
+    /// and even when it is the least recently used thing there.
     #[test]
-    fn pruning_should_ignore_anything_that_is_not_a_frame() {
+    fn pruning_should_never_evict_the_track_that_is_open() {
+        // Arrange: the open track is the oldest of the three.
+        let directory = scratch("prune-open");
+        track(&directory, "open", 2, 100);
+        track(&directory, "other", 2, 2);
+        track(&directory, "another", 2, 1);
+
+        // Act: room for two, one of which the open track takes.
+        prune_in(&directory, 2, Some("open"));
+
+        // Assert: the open track stayed despite being oldest, and only one other survived.
+        assert_that!(holds(&directory, "open", 2)).is_true();
+        assert_that!(directory.join("other").exists()).is_false();
+        assert_that!(holds(&directory, "another", 2)).is_true();
+
+        // Act / Assert: and at zero it is still the one thing kept, since the pass is
+        // rendering into it — everything else goes.
+        prune_in(&directory, 0, Some("open"));
+        assert_that!(holds(&directory, "open", 2)).is_true();
+        assert_that!(directory.join("another").exists()).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Anything in the cache root that is not a media directory can never be read again:
+    /// the flat `{key}.jpg` files the previous layout left behind, and any other stray.
+    /// Sweeping them is one rule rather than a migration.
+    #[test]
+    fn pruning_should_sweep_files_left_in_the_cache_root() {
         // Arrange
-        let directory = scratch("prune-directories");
-        fs::create_dir_all(directory.join("not-a-frame")).unwrap();
-        assert_that!(store_in(&directory, "frame", &[0u8; 100])).is_true();
+        let directory = scratch("prune-root");
+        track(&directory, "kept", 2, 1);
+        let flat = directory.join(format!("0123456789abcdef.{FRAME_EXTENSION}"));
+        fs::write(&flat, [0u8; 100]).unwrap();
+        let stray = directory.join("something-else");
+        fs::write(&stray, b"?").unwrap();
+
+        // Act: a limit generous enough that no track is at risk.
+        prune_in(&directory, 10, None);
+
+        // Assert: the leftovers went and the track did not.
+        assert_that!(flat.exists()).is_false();
+        assert_that!(stray.exists()).is_false();
+        assert_that!(holds(&directory, "kept", 2)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The sweep runs over the cache *root*, and a write in flight is
+    /// `{media}/.{cue}.{pid}.{n}.tmp` — inside a media directory, never beside one. That
+    /// is what keeps a prune from deleting a frame another `reel` is halfway through
+    /// writing.
+    #[test]
+    fn the_root_sweep_should_not_reach_a_write_in_flight() {
+        // Arrange
+        let directory = scratch("prune-inflight");
+        track(&directory, "busy", 1, 1);
+        let temporary = directory.join("busy").join(".cue-9.999.0.tmp");
+        fs::write(&temporary, [0u8; 100]).unwrap();
 
         // Act
-        prune_in(&directory, 50, &nothing());
+        prune_in(&directory, 10, Some("busy"));
 
-        // Assert: the frame went, the directory stayed.
-        assert_that!(is_cached_in(&directory, "frame")).is_false();
-        assert_that!(directory.join("not-a-frame").is_dir()).is_true();
+        // Assert
+        assert_that!(temporary.exists()).is_true();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -741,7 +822,7 @@ mod tests {
         let directory = parent.join("never-created");
 
         // Act / Assert: no panic, and nothing created.
-        prune_in(&directory, 0, &nothing());
+        prune_in(&directory, 0, None);
         assert_that!(directory.exists()).is_false();
 
         // Cleanup
@@ -762,12 +843,15 @@ mod tests {
         // Act / Assert
         assert_that!(directory.parent().map(Path::to_path_buf))
             .is_equal_to(crate::cache::DiskCache::cache_dir());
-        assert_that!(path("frame")).is_equal_to(Some(directory.join("frame.jpg")));
-        assert_that!(store("frame", &[0u8; 100])).is_true();
-        assert_that!(is_cached("frame")).is_true();
-        assert_that!(read("frame")).is_equal_to(Some(vec![0u8; 100]));
-        prune(0, &nothing());
-        assert_that!(is_cached("frame")).is_false();
+        assert_that!(path(MEDIA, "frame"))
+            .is_equal_to(Some(directory.join(MEDIA).join("frame.jpg")));
+        assert_that!(store(MEDIA, "frame", &[0u8; 100])).is_true();
+        assert_that!(is_cached(MEDIA, "frame")).is_true();
+        assert_that!(read(MEDIA, "frame")).is_equal_to(Some(vec![0u8; 100]));
+        assert_that!(touch(MEDIA)).is_true();
+        // Nothing open, so the one track there is goes.
+        prune(0, None);
+        assert_that!(is_cached(MEDIA, "frame")).is_false();
 
         // Cleanup
         let _ = fs::remove_dir_all(&directory);
@@ -785,13 +869,13 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
-                    assert!(store_in(&directory, "frame", &[7u8; 4096]));
+                    assert!(store_in(&directory, MEDIA, "frame", &[7u8; 4096]));
                 });
             }
         });
 
         // Assert
-        assert_that!(read_in(&directory, "frame")).is_equal_to(Some(vec![7u8; 4096]));
+        assert_that!(read_in(&directory, MEDIA, "frame")).is_equal_to(Some(vec![7u8; 4096]));
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
