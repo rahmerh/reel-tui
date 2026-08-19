@@ -449,7 +449,13 @@ fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let window = TimelineWindow::centered(cue, state.duration, inner.width);
-    let mut lines = timeline_lines(&state.cues, &state.layout, &window, state.selected);
+    let mut lines = timeline_lines(
+        &state.cues,
+        &state.layout,
+        &window,
+        state.selected,
+        state.playback_position(),
+    );
     lines.push(timeline_ruler(&window, window.span(cue)));
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -519,6 +525,7 @@ fn timeline_lines(
     layout: &LaneLayout,
     window: &TimelineWindow,
     selected: usize,
+    playhead: Option<Duration>,
 ) -> Vec<Line<'static>> {
     let width = window.width as usize;
     // `pack_lanes` already guarantees at least one lane, including for an empty track, so
@@ -558,6 +565,23 @@ fn timeline_lines(
         let span_width = usize::from(last - first) + 1;
         for (offset, glyph) in cue_glyphs(span_width).chars().enumerate() {
             grid[lane][usize::from(first) + offset] = (glyph, style);
+        }
+    }
+
+    // Painted last and through every lane, for the same reason the ruler's `▲` marks are:
+    // it has to stay readable over whatever it crosses, and what it crosses is exactly the
+    // cue it is being read against.
+    //
+    // Yellow because cyan is the selected cue's, and the whole judgement being made is
+    // where this sits relative to that — two things in one colour would be one thing.
+    if let Some(column) = playhead.and_then(|at| window.column(at)) {
+        for lane in &mut grid {
+            // Bounds-checked rather than indexed, unlike the cues above: `column` answers
+            // for any moment inside the window, and the playhead's moment comes from the
+            // audio device rather than from the cue list this grid was sized against.
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('│', Style::default().fg(Color::Yellow).bold());
+            }
         }
     }
 
@@ -12818,7 +12842,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None);
         let text = timeline_text(&lines);
 
         // Assert
@@ -12844,7 +12868,7 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0));
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
 
         // Assert
         assert_that!(text[0].contains('|')).is_true();
@@ -12866,7 +12890,7 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0));
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
 
         // Assert: one cue drawn, and nothing wrapped around from the other.
         assert_that!(text.len()).is_equal_to(1);
@@ -12887,7 +12911,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None);
 
         // Assert: the overflowed cue is the only one painted magenta.
         let magenta = lines
@@ -12958,7 +12982,7 @@ mod tests {
         };
 
         // Act: an empty track, with the cursor still sitting on cue zero.
-        let lines = timeline_lines(&[], &layout, &window, 0);
+        let lines = timeline_lines(&[], &layout, &window, 0, None);
 
         // Assert: one blank lane rather than an index panic.
         assert_that!(lines.len()).is_equal_to(1);
@@ -13148,6 +13172,123 @@ mod tests {
         // Act / Assert: and when the playback ends, the still frame is back.
         app.subtitle_sync.as_mut().unwrap().stop_playback();
         assert_that!(drawn(80, 24, |frame| render(frame, &mut app))).is_equal_to(still);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The playhead is the only thing on the timeline that says *where in the span* the
+    /// sound has got to, which is the whole judgement the page exists for: is the bracket
+    /// where the speech is. So it has to be readable over the cue it is being read against
+    /// rather than hidden underneath it.
+    #[test]
+    fn the_playhead_should_mark_where_the_sound_is_across_every_lane() {
+        // Arrange: two overlapping cues, so the track has two lanes to cross.
+        let cues = [sync_cue(10_000, 20_000, "a"), sync_cue(15_000, 25_000, "b")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act: eighteen seconds in, which is inside both cues.
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            0,
+            Some(std::time::Duration::from_secs(18)),
+        );
+
+        // Assert: on both lanes, at the column that moment maps to — over the cue rather
+        // than under it.
+        let text = timeline_text(&lines);
+        assert_that!(text.len()).is_equal_to(2);
+        for lane in &text {
+            assert_that!(lane.chars().nth(18)).is_equal_to(Some('│'));
+        }
+
+        // Act / Assert: and no playback means no mark, rather than one parked at zero.
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
+        for lane in &text {
+            assert_that!(lane.contains('│')).is_false();
+        }
+    }
+
+    /// The playhead's moment comes from the audio device, not from the cue list the track
+    /// was laid out against — so a span reaching past the visible window must leave the
+    /// timeline unmarked rather than painting its edge.
+    #[test]
+    fn a_playhead_outside_the_visible_window_should_not_be_drawn() {
+        // Arrange
+        let cues = [sync_cue(10_000, 20_000, "a")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::from_secs(10),
+            end: std::time::Duration::from_secs(70),
+            width: 61,
+        };
+
+        // Act / Assert: before the window, and after it.
+        for at in [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(90),
+        ] {
+            let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, Some(at)));
+            for lane in &text {
+                assert_that!(lane.contains('│')).is_false();
+            }
+        }
+    }
+
+    /// End to end through the real page: a playback running puts the mark on the timeline,
+    /// and stopping it takes the mark away.
+    #[test]
+    fn the_page_should_draw_a_playhead_while_a_span_is_playing() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-playhead", vec![sync_cue(10_000, 20_000, "a")]);
+        // Counted rather than searched for: `│` is also ratatui's vertical border glyph, so
+        // the page is full of them before anything plays. The layout does not change here —
+        // a playing page shows no status row, the same as an idle one — so any increase is
+        // the playhead.
+        let before = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+
+        // Act: a span starting where the cue does, stepped onto its first frame.
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        let playback_cells = crate::preview::playback_cells(cells, (1920, 1080));
+        let pixels = crate::preview::playback_pixels(playback_cells);
+        let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
+        app.subtitle_sync.as_mut().unwrap().begin_playback(
+            0,
+            crate::preview::PlaybackFrames::new(
+                vec![40; stride * 20],
+                pixels,
+                playback_cells,
+                10,
+                std::time::Duration::from_secs(8),
+                Vec::new(),
+            ),
+            Box::new(crate::audio::SilentOutput::new()),
+        );
+        app.advance_playback();
+        let playing = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+
+        // Assert: one mark per lane, and this track has one lane.
+        assert_that!(playing).is_equal_to(before + 1);
+
+        // Act / Assert: and it goes when the playback does.
+        app.subtitle_sync.as_mut().unwrap().stop_playback();
+        let stopped = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+        assert_that!(stopped).is_equal_to(before);
 
         // Cleanup
         drop(app);
