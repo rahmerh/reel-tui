@@ -24,7 +24,21 @@ pub struct Cue {
     pub index: usize,
     pub start: Duration,
     pub end: Duration,
+    /// What to show in the cue list: plain text, with ASS override tags stripped and its
+    /// `\N` breaks turned into real ones.
     pub text: String,
+    /// The cue's original `Dialogue:` line, for an ASS track only.
+    ///
+    /// [`text`](Self::text) is what the *reader* needs and this is what the *renderer*
+    /// needs, and for ASS they are not the same string. A cue's line carries its style
+    /// name, its layer, its margins, and any `{\pos}`-style overrides — which for a sign
+    /// or a piece of typesetting is most of what the cue is. Burning the stripped text
+    /// instead would draw it in the default style at the bottom of the frame, so the page
+    /// would be showing something the user will never see, on the one page whose entire
+    /// job is comparing subtitles against the picture.
+    ///
+    /// `None` for every other format, where the text is the whole cue.
+    pub dialogue: Option<String>,
 }
 
 impl Cue {
@@ -95,6 +109,7 @@ pub fn parse_srt(source: &str) -> Vec<Cue> {
             // entire reason this view exists.
             end: end.max(start),
             text: text_lines.join("\n"),
+            dialogue: None,
         });
     }
 
@@ -113,6 +128,214 @@ pub fn parse_srt(source: &str) -> Vec<Cue> {
 pub fn read_srt(path: &Path) -> std::io::Result<Vec<Cue>> {
     let bytes = std::fs::read(path)?;
     Ok(parse_srt(&String::from_utf8_lossy(&bytes)))
+}
+
+/// An ASS script split into the parts the timing page needs.
+///
+/// The cues alone are not enough to draw one. An ASS cue names a *style* rather than
+/// carrying one, and positions itself against the script's declared `PlayResX`/`PlayResY`
+/// rather than against the video — so a `Dialogue:` line lifted out on its own renders in
+/// libass's defaults at the wrong scale. What the header holds is the other half of every
+/// cue in the file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AssScript {
+    /// Everything before `[Events]`, verbatim: `[Script Info]`, `[V4+ Styles]`, and any
+    /// other section the file carries. Kept as text rather than parsed, because the page
+    /// only ever hands it back to libass — anything understood here is something that
+    /// could be understood *wrongly*.
+    pub header: String,
+    /// The `[Events]` section's own `Format:` line, verbatim.
+    ///
+    /// Field order is declared per file rather than fixed by the format. Almost every
+    /// file uses the same order and the one that does not would have its cues staged with
+    /// their columns shuffled, which libass reads as a different cue entirely.
+    pub events_format: String,
+    pub cues: Vec<Cue>,
+}
+
+/// Parses an ASS or SSA script.
+///
+/// Lenient in the same way [`parse_srt`] is and for the same reason: what cannot be read
+/// is skipped rather than failing the track. A file with no `[Events]` section yields no
+/// cues, which the page already reports as an empty track.
+pub fn parse_ass(source: &str) -> AssScript {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut header = String::new();
+    let mut events_format = String::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut cues: Vec<Cue> = Vec::new();
+    let mut in_events = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Case-insensitively, because `[Events]` is spelled every way in the wild and
+            // a missed section header silently costs the whole track its cues.
+            in_events = trimmed.eq_ignore_ascii_case("[events]");
+            if !in_events {
+                header.push_str(line);
+                header.push('\n');
+            }
+            continue;
+        }
+        if !in_events {
+            header.push_str(line);
+            header.push('\n');
+            continue;
+        }
+        if let Some(rest) = strip_ass_key(trimmed, "Format:") {
+            events_format = line.to_string();
+            columns = rest
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .collect();
+            continue;
+        }
+        let Some(rest) = strip_ass_key(trimmed, "Dialogue:") else {
+            continue;
+        };
+        // A `Dialogue:` before the `Format:` that describes it cannot be read at all, and
+        // guessing the standard order would put a cue on screen at a time nothing in the
+        // file says.
+        let (Some(start_at), Some(end_at)) =
+            (column_of(&columns, "Start"), column_of(&columns, "End"))
+        else {
+            continue;
+        };
+        // `columns.len()` splits, not more: the last column is Text and is the one field
+        // allowed to contain commas.
+        let fields: Vec<&str> = rest.splitn(columns.len(), ',').collect();
+        if fields.len() < columns.len() {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            parse_timestamp(fields[start_at]),
+            parse_timestamp(fields[end_at]),
+        ) else {
+            continue;
+        };
+        let text = column_of(&columns, "Text")
+            .and_then(|at| fields.get(at))
+            .map(|field| plain_ass_text(field))
+            .unwrap_or_default();
+        cues.push(Cue {
+            index: 0,
+            start,
+            end: end.max(start),
+            text,
+            dialogue: Some(line.to_string()),
+        });
+    }
+
+    cues.sort_by_key(|cue| (cue.start, cue.end));
+    for (index, cue) in cues.iter_mut().enumerate() {
+        cue.index = index;
+    }
+    AssScript {
+        header: header.trim_end().to_string(),
+        events_format,
+        cues,
+    }
+}
+
+/// Reads and parses an `.ass` file, lossily for the same reason [`read_srt`] is.
+pub fn read_ass(path: &Path) -> std::io::Result<AssScript> {
+    let bytes = std::fs::read(path)?;
+    Ok(parse_ass(&String::from_utf8_lossy(&bytes)))
+}
+
+/// The value after an ASS `Key:` prefix, matched without regard to case.
+fn strip_ass_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.get(..key.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(key))
+        .map(|_| line[key.len()..].trim_start())
+}
+
+fn column_of(columns: &[String], name: &str) -> Option<usize> {
+    columns
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case(name))
+}
+
+/// An ASS text field as something worth putting in a list.
+///
+/// Override blocks (`{\pos(320,10)}`, `{\an8}`, karaoke timings) are markup, not words,
+/// and a cue list full of them is unreadable. `\N` and `\n` are the format's line breaks
+/// and become real ones. The *rendered* cue keeps all of it — see [`Cue::dialogue`].
+fn plain_ass_text(field: &str) -> String {
+    let mut text = String::with_capacity(field.len());
+    let mut depth = 0usize;
+    let mut characters = field.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '{' => depth += 1,
+            // Saturating, so a stray `}` with no opening brace does not swallow the rest
+            // of the line by wrapping the depth around.
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            '\\' if matches!(characters.peek(), Some('N' | 'n')) => {
+                characters.next();
+                text.push('\n');
+            }
+            // `\h` is a non-breaking space, which reads as an ordinary one in a list.
+            '\\' if characters.peek() == Some(&'h') => {
+                characters.next();
+                text.push(' ');
+            }
+            _ => text.push(character),
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Renders a cue time the way an ASS `Dialogue:` line spells it: `H:MM:SS.cc`.
+///
+/// Centiseconds, and exactly one hour digit — libass parses more leniently than that, but
+/// a staged line that does not look like the ones around it is a difference waiting to
+/// matter.
+pub fn format_ass_timestamp(at: Duration) -> String {
+    let centiseconds = (at.as_millis() / 10) as u64;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        centiseconds / 360_000,
+        (centiseconds / 6_000) % 60,
+        (centiseconds / 100) % 60,
+        centiseconds % 100
+    )
+}
+
+/// Rewrites a `Dialogue:` line's Start and End columns, leaving every other column alone.
+///
+/// The preview burns one cue onto a frame grabbed from the middle of that cue, so the
+/// staged line has to be on screen at whatever moment the grab lands on — the same job
+/// `one_cue_srt` does for SubRip. Rewriting rather than rebuilding, because every other
+/// column is the cue's styling and this code has no business understanding it.
+///
+/// Returns `None` when the line cannot be read as a `Dialogue:` with the columns
+/// `events_format` declares, which is the same condition that stops it becoming a cue.
+pub fn retimed_dialogue(
+    events_format: &str,
+    dialogue: &str,
+    start: Duration,
+    end: Duration,
+) -> Option<String> {
+    let columns: Vec<String> = strip_ass_key(events_format.trim(), "Format:")?
+        .split(',')
+        .map(|name| name.trim().to_string())
+        .collect();
+    let start_at = column_of(&columns, "Start")?;
+    let end_at = column_of(&columns, "End")?;
+    let rest = strip_ass_key(dialogue.trim(), "Dialogue:")?;
+    let mut fields: Vec<String> = rest
+        .splitn(columns.len(), ',')
+        .map(str::to_string)
+        .collect();
+    if fields.len() < columns.len() {
+        return None;
+    }
+    fields[start_at] = format_ass_timestamp(start);
+    fields[end_at] = format_ass_timestamp(end);
+    Some(format!("Dialogue: {}", fields.join(",")))
 }
 
 fn is_index_line(line: &str) -> bool {
@@ -415,11 +638,239 @@ mod tests {
             start: milliseconds(start),
             end: milliseconds(end),
             text: String::new(),
+            dialogue: None,
         }
     }
 
     fn texts(cues: &[Cue]) -> Vec<&str> {
         cues.iter().map(|cue| cue.text.as_str()).collect()
+    }
+
+    /// The shape `ffmpeg`'s own ASS muxer writes, which is what an extracted track looks
+    /// like in practice.
+    const ASS: &str = "[Script Info]\n\
+                       ScriptType: v4.00+\n\
+                       PlayResX: 384\n\
+                       PlayResY: 288\n\
+                       \n\
+                       [V4+ Styles]\n\
+                       Format: Name, Fontname, Fontsize, PrimaryColour, Alignment\n\
+                       Style: Default,Arial,16,&Hffffff,2\n\
+                       Style: Sign,Impact,40,&H00ffff,8\n\
+                       \n\
+                       [Events]\n\
+                       Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                       Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,first line\n\
+                       Dialogue: 0,0:00:03.00,0:00:04.50,Sign,,0,0,0,,{\\pos(320,10)}a sign, with a comma\n";
+
+    #[test]
+    fn parse_ass_should_read_cues_and_keep_the_header_that_styles_them() {
+        // Act
+        let script = parse_ass(ASS);
+
+        // Assert: the header is everything before `[Events]`, kept verbatim — the styles
+        // the cues name and the `PlayRes` they position against.
+        assert_that!(script.header.as_str()).contains("[Script Info]");
+        assert_that!(script.header.as_str()).contains("PlayResX: 384");
+        assert_that!(script.header.as_str()).contains("[V4+ Styles]");
+        assert_that!(script.header.as_str()).contains("Style: Sign,Impact,40,&H00ffff,8");
+        assert_that!(script.header.contains("[Events]")).is_false();
+        assert_that!(script.header.contains("Dialogue:")).is_false();
+        assert_that!(script.events_format.as_str()).is_equal_to(
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        );
+
+        // Assert: the cues themselves.
+        assert_that!(script.cues.len()).is_equal_to(2);
+        assert_that!(script.cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(script.cues[0].end).is_equal_to(Duration::from_secs(2));
+        assert_that!(script.cues[1].end).is_equal_to(Duration::from_millis(4500));
+        assert_that!(script.cues[1].index).is_equal_to(1);
+
+        // Assert: the list text is readable, and the line the renderer needs is verbatim.
+        // The second cue is the whole point — its override block is markup rather than
+        // words, and its text contains the comma that a naive split would cut it at.
+        assert_that!(texts(&script.cues)).is_equal_to(vec!["first line", "a sign, with a comma"]);
+        assert_that!(script.cues[1].dialogue.as_deref().unwrap()).is_equal_to(
+            "Dialogue: 0,0:00:03.00,0:00:04.50,Sign,,0,0,0,,{\\pos(320,10)}a sign, with a comma",
+        );
+    }
+
+    /// Field order is declared per file rather than fixed by the format. A parser that
+    /// assumed the usual order would read this file's cues at the wrong times and stage
+    /// them with their columns shuffled, which libass renders as something else entirely.
+    #[test]
+    fn parse_ass_should_take_its_column_order_from_the_files_own_format_line() {
+        // Arrange: Start and End after Style rather than before it.
+        let source = "[Events]\n\
+                      Format: Layer, Style, Start, End, Text\n\
+                      Dialogue: 0,Sign,0:00:05.00,0:00:06.25,shuffled\n";
+
+        // Act
+        let script = parse_ass(source);
+
+        // Assert
+        assert_that!(script.cues.len()).is_equal_to(1);
+        assert_that!(script.cues[0].start).is_equal_to(Duration::from_secs(5));
+        assert_that!(script.cues[0].end).is_equal_to(Duration::from_millis(6250));
+        assert_that!(script.cues[0].text.as_str()).is_equal_to("shuffled");
+    }
+
+    /// Everything malformed is skipped rather than failing the track, the way SubRip
+    /// parsing is — a file with one bad line should show the rest.
+    #[test]
+    fn parse_ass_should_skip_what_it_cannot_read_and_keep_what_it_can() {
+        // Arrange
+        let source = "[Events]\n\
+                      Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,before any format line\n\
+                      Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                      Dialogue: 0,not a time,0:00:02.00,Default,,0,0,0,,unparseable start\n\
+                      Dialogue: 0,0:00:07.00\n\
+                      Comment: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,a comment is not a cue\n\
+                      [Truncated\n\
+                      Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,good\n";
+
+        // Act
+        let script = parse_ass(source);
+
+        // Assert
+        assert_that!(texts(&script.cues)).is_equal_to(vec!["good"]);
+    }
+
+    /// A script with no `[Events]` at all is an empty track, not a failure — the same
+    /// answer an empty SubRip file gives.
+    #[test]
+    fn parse_ass_should_report_a_script_with_no_events_as_empty() {
+        // Act
+        let script = parse_ass("[Script Info]\nPlayResX: 1920\n");
+
+        // Assert
+        assert_that!(script.cues.as_slice()).is_empty();
+        assert_that!(script.header.as_str()).contains("PlayResX: 1920");
+        assert_that!(script.events_format.as_str()).is_empty();
+    }
+
+    /// Override blocks are markup rather than words, so a cue list full of them is
+    /// unreadable — but the rendered cue keeps every one of them, which is what
+    /// `Cue::dialogue` is for.
+    #[test]
+    fn ass_list_text_should_drop_the_markup_and_keep_the_words() {
+        // Act / Assert
+        assert_that!(plain_ass_text("{\\an8}{\\fad(200,200)}up top").as_str())
+            .is_equal_to("up top");
+        assert_that!(plain_ass_text("two\\Nlines").as_str()).is_equal_to("two\nlines");
+        assert_that!(plain_ass_text("lower\\ncase break").as_str())
+            .is_equal_to("lower\ncase break");
+        assert_that!(plain_ass_text("wide\\hspace").as_str()).is_equal_to("wide space");
+        // Any other backslash is a literal one — only `\N`, `\n` and `\h` mean something
+        // outside an override block, and swallowing the rest would eat real characters.
+        assert_that!(plain_ass_text("a\\bc").as_str()).is_equal_to("a\\bc");
+        assert_that!(plain_ass_text("  padded  ").as_str()).is_equal_to("padded");
+        // A stray closing brace must not swallow the line: saturating the depth is what
+        // keeps an unbalanced tag from hiding every word after it.
+        assert_that!(plain_ass_text("}still here").as_str()).is_equal_to("still here");
+        // And an unclosed one genuinely does run to the end, which is what libass does
+        // with it too.
+        assert_that!(plain_ass_text("visible{\\b1 and not").as_str()).is_equal_to("visible");
+    }
+
+    #[test]
+    fn ass_timestamps_should_be_written_the_way_a_dialogue_line_spells_them() {
+        // Act / Assert
+        assert_that!(format_ass_timestamp(Duration::ZERO).as_str()).is_equal_to("0:00:00.00");
+        assert_that!(format_ass_timestamp(Duration::from_millis(4500)).as_str())
+            .is_equal_to("0:00:04.50");
+        assert_that!(format_ass_timestamp(Duration::from_secs(3725)).as_str())
+            .is_equal_to("1:02:05.00");
+        // Truncated to centiseconds, which is all the format carries.
+        assert_that!(format_ass_timestamp(Duration::from_millis(1239)).as_str())
+            .is_equal_to("0:00:01.23");
+    }
+
+    /// The preview burns one cue onto a frame from the middle of it, so the staged line
+    /// has to be on screen whenever the grab lands — and every other column has to survive
+    /// untouched, since those columns are the styling the whole feature exists to show.
+    #[test]
+    fn retiming_a_dialogue_line_should_move_only_its_two_time_columns() {
+        // Arrange
+        let script = parse_ass(ASS);
+        let sign = script.cues[1].dialogue.clone().unwrap();
+
+        // Act
+        let retimed = retimed_dialogue(
+            &script.events_format,
+            &sign,
+            Duration::ZERO,
+            Duration::from_secs(600),
+        )
+        .expect("a line that parsed as a cue should retime");
+
+        // Assert
+        assert_that!(retimed.as_str()).is_equal_to(
+            "Dialogue: 0,0:00:00.00,0:10:00.00,Sign,,0,0,0,,{\\pos(320,10)}a sign, with a comma",
+        );
+    }
+
+    /// Retiming reads the same `Format:` line the parse did, so a shuffled file has its
+    /// times written back into the columns that file declares rather than the usual ones.
+    #[test]
+    fn retiming_should_follow_the_files_column_order_rather_than_the_usual_one() {
+        // Arrange
+        let events_format = "Format: Layer, Style, Start, End, Text";
+
+        // Act
+        let retimed = retimed_dialogue(
+            events_format,
+            "Dialogue: 0,Sign,0:00:05.00,0:00:06.25,shuffled",
+            Duration::ZERO,
+            Duration::from_secs(600),
+        )
+        .unwrap();
+
+        // Assert
+        assert_that!(retimed.as_str())
+            .is_equal_to("Dialogue: 0,Sign,0:00:00.00,0:10:00.00,shuffled");
+    }
+
+    /// A line that cannot be retimed must say so rather than be staged half-rewritten:
+    /// libass would draw whatever it made of it, under a cache key claiming it was right.
+    #[test]
+    fn retiming_should_refuse_a_line_or_a_format_it_cannot_read() {
+        // Act / Assert: no usable `Format:` line.
+        assert_that!(retimed_dialogue(
+            "",
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,text",
+            Duration::ZERO,
+            Duration::from_secs(1),
+        ))
+        .is_none();
+
+        // Act / Assert: a format line naming no Start column.
+        assert_that!(retimed_dialogue(
+            "Format: Layer, Style, Text",
+            "Dialogue: 0,Default,text",
+            Duration::ZERO,
+            Duration::from_secs(1),
+        ))
+        .is_none();
+
+        // Act / Assert: not a `Dialogue:` line at all.
+        assert_that!(retimed_dialogue(
+            "Format: Layer, Start, End, Text",
+            "Comment: 0,0:00:01.00,0:00:02.00,text",
+            Duration::ZERO,
+            Duration::from_secs(1),
+        ))
+        .is_none();
+
+        // Act / Assert: a line with fewer columns than the format declares.
+        assert_that!(retimed_dialogue(
+            "Format: Layer, Start, End, Text",
+            "Dialogue: 0,0:00:01.00",
+            Duration::ZERO,
+            Duration::from_secs(1),
+        ))
+        .is_none();
     }
 
     #[test]

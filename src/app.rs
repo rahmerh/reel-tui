@@ -29,8 +29,8 @@ use crate::{
     files::{DirectorySnapshot, FileEntry, scan_directory},
     framecache,
     preview::{
-        FrameOutcome, FrameRequest, FrameSource, PrepareOutcome, PrepareRequest, PreviewEvent,
-        PreviewHandles, WarmRequest,
+        CueStyle, FrameOutcome, FrameRequest, FrameSource, PrepareOutcome, PrepareRequest,
+        PreviewEvent, PreviewHandles, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -2319,6 +2319,9 @@ impl App {
                         Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
                     }),
             ),
+            // Replaced when the cues arrive, since an ASS script's styles are read out of
+            // the file with them. Nothing is staged before then.
+            style: std::sync::Arc::new(CueStyle::SubRip),
             workspace: workspace.path().to_path_buf(),
         };
 
@@ -2404,8 +2407,8 @@ impl App {
                     generation,
                     outcome,
                 } if generation == state.generation => match outcome {
-                    PrepareOutcome::Ready(cues) => {
-                        state.apply_prepared(cues);
+                    PrepareOutcome::Ready { cues, style } => {
+                        state.apply_prepared(cues, style);
                         prepared = true;
                     }
                     PrepareOutcome::Failed(message) => state.fail(message),
@@ -19197,7 +19200,6 @@ mod tests {
     #[test]
     fn open_subtitle_sync_should_refuse_a_format_it_cannot_reach_cues_through() {
         for (codec, expected) in [
-            ("ass", "ASS"),
             ("ttml", "TTML"),
             ("hdmv_pgs_subtitle", "PGS"),
             ("dvd_subtitle", "VobSub"),
@@ -19455,20 +19457,25 @@ mod tests {
         );
         select_embedded_row(&mut app, 2);
         app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(vec![
-            crate::cue::Cue {
-                index: 0,
-                start: Duration::from_secs(1),
-                end: Duration::from_secs(2),
-                text: "one".into(),
-            },
-            crate::cue::Cue {
-                index: 1,
-                start: Duration::from_secs(3),
-                end: Duration::from_secs(4),
-                text: "two".into(),
-            },
-        ]);
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![
+                crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(2),
+                    text: "one".into(),
+                    dialogue: None,
+                },
+                crate::cue::Cue {
+                    index: 1,
+                    start: Duration::from_secs(3),
+                    end: Duration::from_secs(4),
+                    text: "two".into(),
+                    dialogue: None,
+                },
+            ],
+            CueStyle::SubRip,
+        );
         let file_before = app.list_state.selected();
 
         // Act
@@ -19499,9 +19506,13 @@ mod tests {
                 start: Duration::from_secs(index as u64),
                 end: Duration::from_secs(index as u64 + 1),
                 text: format!("line {index}"),
+                dialogue: None,
             })
             .collect();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(cues);
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(cues, CueStyle::SubRip);
 
         // Act / Assert
         app.scroll_down();
@@ -19532,7 +19543,7 @@ mod tests {
         app.subtitle_sync
             .as_mut()
             .unwrap()
-            .apply_prepared(Vec::new());
+            .apply_prepared(Vec::new(), CueStyle::SubRip);
         assert_that!(app.is_animating()).is_false();
 
         // Cleanup
@@ -19641,12 +19652,16 @@ mod tests {
         sender
             .send(PreviewEvent::Prepared {
                 generation,
-                outcome: PrepareOutcome::Ready(vec![crate::cue::Cue {
-                    index: 0,
-                    start: Duration::from_secs(1),
-                    end: Duration::from_secs(2),
-                    text: "one".into(),
-                }]),
+                outcome: PrepareOutcome::Ready {
+                    style: CueStyle::SubRip,
+                    cues: vec![crate::cue::Cue {
+                        index: 0,
+                        start: Duration::from_secs(1),
+                        end: Duration::from_secs(2),
+                        text: "one".into(),
+                        dialogue: None,
+                    }],
+                },
             })
             .unwrap();
         let drained = app.receive_preview_events(&receiver);
@@ -19700,13 +19715,15 @@ mod tests {
         app.back();
         app.open_subtitle_sync();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let cues = || {
-            PrepareOutcome::Ready(vec![crate::cue::Cue {
+        let cues = || PrepareOutcome::Ready {
+            style: CueStyle::SubRip,
+            cues: vec![crate::cue::Cue {
                 index: 0,
                 start: Duration::from_secs(1),
                 end: Duration::from_secs(2),
                 text: "stale".into(),
-            }])
+                dialogue: None,
+            }],
         };
 
         // Act
@@ -19743,20 +19760,25 @@ mod tests {
     fn app_ready_for_a_frame(app: &mut App) {
         app.open_subtitle_sync();
         let state = app.subtitle_sync.as_mut().unwrap();
-        state.apply_prepared(vec![
-            crate::cue::Cue {
-                index: 0,
-                start: Duration::from_secs(1),
-                end: Duration::from_secs(3),
-                text: "one".into(),
-            },
-            crate::cue::Cue {
-                index: 1,
-                start: Duration::from_secs(5),
-                end: Duration::from_secs(7),
-                text: "two".into(),
-            },
-        ]);
+        state.apply_prepared(
+            vec![
+                crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(3),
+                    text: "one".into(),
+                    dialogue: None,
+                },
+                crate::cue::Cue {
+                    index: 1,
+                    start: Duration::from_secs(5),
+                    end: Duration::from_secs(7),
+                    text: "two".into(),
+                    dialogue: None,
+                },
+            ],
+            CueStyle::SubRip,
+        );
         state.set_preview_cells(ratatui::layout::Size::new(40, 20));
         std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
     }
@@ -19820,12 +19842,16 @@ mod tests {
         app.open_subtitle_sync();
         let state = app.subtitle_sync.as_mut().unwrap();
         state.duration = Duration::from_secs(10);
-        state.apply_prepared(vec![crate::cue::Cue {
-            index: 0,
-            start: Duration::from_secs(8),
-            end: Duration::from_secs(12),
-            text: "past the end".into(),
-        }]);
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(8),
+                end: Duration::from_secs(12),
+                text: "past the end".into(),
+                dialogue: None,
+            }],
+            CueStyle::SubRip,
+        );
         state.set_preview_cells(ratatui::layout::Size::new(40, 20));
         std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
 
@@ -19961,12 +19987,16 @@ mod tests {
         app.set_preview_handles(Some(preview.handles));
         app.open_subtitle_sync();
         let state = app.subtitle_sync.as_mut().unwrap();
-        state.apply_prepared(vec![crate::cue::Cue {
-            index: 0,
-            start: Duration::from_secs(1),
-            end: Duration::from_secs(3),
-            text: "alone".into(),
-        }]);
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "alone".into(),
+                dialogue: None,
+            }],
+            CueStyle::SubRip,
+        );
         state.set_preview_cells(ratatui::layout::Size::new(40, 20));
 
         // Act: inside the debounce, with an uncached cue and no neighbours.
@@ -20092,15 +20122,16 @@ mod tests {
         let frames = preview.frame_rx;
         app.set_preview_handles(Some(preview.handles));
         app.open_subtitle_sync();
-        app.subtitle_sync
-            .as_mut()
-            .unwrap()
-            .apply_prepared(vec![crate::cue::Cue {
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
                 index: 0,
                 start: Duration::from_secs(1),
                 end: Duration::from_secs(2),
                 text: "one".into(),
-            }]);
+                dialogue: None,
+            }],
+            CueStyle::SubRip,
+        );
         std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
 
         // Act
@@ -20251,12 +20282,14 @@ mod tests {
                 start: Duration::from_secs(1),
                 end: Duration::from_secs(3),
                 text: "one".into(),
+                dialogue: None,
             },
             crate::cue::Cue {
                 index: 1,
                 start: Duration::from_secs(5),
                 end: Duration::from_secs(7),
                 text: "two".into(),
+                dialogue: None,
             },
         ];
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -20265,7 +20298,10 @@ mod tests {
         sender
             .send(PreviewEvent::Prepared {
                 generation,
-                outcome: PrepareOutcome::Ready(cues.clone()),
+                outcome: PrepareOutcome::Ready {
+                    cues: cues.clone(),
+                    style: CueStyle::SubRip,
+                },
             })
             .unwrap();
         app.receive_preview_events(&receiver);
@@ -20402,7 +20438,10 @@ mod tests {
         sender
             .send(PreviewEvent::Prepared {
                 generation,
-                outcome: PrepareOutcome::Ready(Vec::new()),
+                outcome: PrepareOutcome::Ready {
+                    cues: Vec::new(),
+                    style: CueStyle::SubRip,
+                },
             })
             .unwrap();
         app.receive_preview_events(&receiver);
@@ -20422,20 +20461,25 @@ mod tests {
         sender
             .send(PreviewEvent::Prepared {
                 generation,
-                outcome: PrepareOutcome::Ready(vec![
-                    crate::cue::Cue {
-                        index: 0,
-                        start: Duration::from_secs(1),
-                        end: Duration::from_secs(3),
-                        text: "one".into(),
-                    },
-                    crate::cue::Cue {
-                        index: 1,
-                        start: Duration::from_secs(5),
-                        end: Duration::from_secs(7),
-                        text: "two".into(),
-                    },
-                ]),
+                outcome: PrepareOutcome::Ready {
+                    style: CueStyle::SubRip,
+                    cues: vec![
+                        crate::cue::Cue {
+                            index: 0,
+                            start: Duration::from_secs(1),
+                            end: Duration::from_secs(3),
+                            text: "one".into(),
+                            dialogue: None,
+                        },
+                        crate::cue::Cue {
+                            index: 1,
+                            start: Duration::from_secs(5),
+                            end: Duration::from_secs(7),
+                            text: "two".into(),
+                            dialogue: None,
+                        },
+                    ],
+                },
             })
             .unwrap();
         app.receive_preview_events(&receiver);

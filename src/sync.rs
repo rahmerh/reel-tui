@@ -7,6 +7,7 @@
 //! including its temp directory, without each exit path having to remember to.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
-use crate::preview::{FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, seek_for};
+use crate::preview::{CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, seek_for};
 use crate::subtitle::SubtitleSource;
 
 /// How long the selection has to stop moving before a frame is asked for.
@@ -320,7 +321,11 @@ impl SubtitleSyncState {
     /// Lanes are packed once, here, rather than per frame: the packing is over the whole
     /// track, so doing it while rendering would both repeat the work every draw and let
     /// the track's height change as the user scrolls through denser regions.
-    pub fn apply_prepared(&mut self, cues: Vec<Cue>) {
+    pub fn apply_prepared(&mut self, cues: Vec<Cue>, style: CueStyle) {
+        // Onto the frame source, because that is what every renderer is handed and the
+        // style is as much a part of drawing a cue as the cue is. It arrives only now:
+        // an ASS script's styles come out of the file in the same pass as its cues.
+        self.frames.style = Arc::new(style);
         self.layout = pack_lanes(&cues, MAX_LANES);
         self.status = if cues.is_empty() {
             SyncStatus::Empty
@@ -644,6 +649,7 @@ mod tests {
             start: Duration::from_millis(start),
             end: Duration::from_millis(end),
             text: text.to_string(),
+            dialogue: None,
         }
     }
 
@@ -663,6 +669,7 @@ mod tests {
                 media_length: 4096,
                 media_modified: None,
                 pixels: (960, 540),
+                style: Arc::new(CueStyle::SubRip),
                 workspace: PathBuf::from("/tmp/reel-tui-preview/state"),
             },
             SubtitleSource::Embedded(2),
@@ -703,7 +710,7 @@ mod tests {
                 cue(start, start + 1000, &format!("line {index}"))
             })
             .collect();
-        state.apply_prepared(cues);
+        state.apply_prepared(cues, CueStyle::SubRip);
         state
     }
 
@@ -726,11 +733,14 @@ mod tests {
         state.selected = 5;
 
         // Act
-        state.apply_prepared(vec![
-            cue(0, 3000, "a"),
-            cue(1000, 4000, "b"),
-            cue(5000, 6000, "c"),
-        ]);
+        state.apply_prepared(
+            vec![
+                cue(0, 3000, "a"),
+                cue(1000, 4000, "b"),
+                cue(5000, 6000, "c"),
+            ],
+            CueStyle::SubRip,
+        );
 
         // Assert
         assert_that!(state.status.clone()).is_equal_to(SyncStatus::Ready);
@@ -749,7 +759,7 @@ mod tests {
         let mut state = state();
 
         // Act
-        state.apply_prepared(Vec::new());
+        state.apply_prepared(Vec::new(), CueStyle::SubRip);
 
         // Assert
         assert_that!(state.status.clone()).is_equal_to(SyncStatus::Empty);
@@ -1219,7 +1229,10 @@ mod tests {
         };
 
         // Act / Assert: the cues arriving.
-        state.apply_prepared(vec![cue(0, 1000, "a"), cue(2000, 3000, "b")]);
+        state.apply_prepared(
+            vec![cue(0, 1000, "a"), cue(2000, 3000, "b")],
+            CueStyle::SubRip,
+        );
         assert_that!(due(&mut state)).is_true();
 
         // Act / Assert: the pane being measured, and then resized.
@@ -1352,6 +1365,7 @@ mod tests {
                     cue(start, start + 1000, &format!("line {index}"))
                 })
                 .collect(),
+            CueStyle::SubRip,
         );
         state.set_preview_cells(Size::new(200, 60));
         state.select(2);
@@ -1396,6 +1410,7 @@ mod tests {
                     cue(start, start + 1000, &format!("line {index}"))
                 })
                 .collect(),
+            CueStyle::SubRip,
         );
         state.set_preview_cells(Size::new(400, 120));
         state.select(1);
@@ -1435,6 +1450,7 @@ mod tests {
                     cue(start, start + 1000, &format!("line {index}"))
                 })
                 .collect(),
+            CueStyle::SubRip,
         );
         state.set_preview_cells(Size::new(400, 120));
         state.select(2);

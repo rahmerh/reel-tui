@@ -472,8 +472,8 @@ impl ToolCapabilities {
     /// Each format reaches the cue list by a different road, and it is the road that
     /// decides what has to be installed:
     ///
-    /// - **SubRip** is parsed by [`crate::cue`] straight off a `-c:s copy` extraction, so
-    ///   no codec is involved and nothing can be missing.
+    /// - **SubRip and ASS** are parsed by [`crate::cue`] straight off a `-c:s copy`
+    ///   extraction, so no codec is involved and nothing can be missing.
     /// - **WebVTT and MOV Text** are transcoded to SubRip on the way out, which needs a
     ///   build that can *decode* them — a different question from the encoder list the
     ///   rest of the program asks about.
@@ -481,7 +481,7 @@ impl ToolCapabilities {
     ///   of this to read.
     pub fn preview_blocked(&self, format: SubtitleFormat) -> Option<String> {
         match format {
-            SubtitleFormat::SubRip => None,
+            SubtitleFormat::SubRip | SubtitleFormat::Ass => None,
             SubtitleFormat::WebVtt | SubtitleFormat::MovText => {
                 (!self.ffmpeg_decoders.contains(format.ffmpeg_codec())).then(|| {
                     format!(
@@ -490,10 +490,7 @@ impl ToolCapabilities {
                     )
                 })
             }
-            SubtitleFormat::Ass
-            | SubtitleFormat::Ttml
-            | SubtitleFormat::Pgs
-            | SubtitleFormat::VobSub => Some(format!(
+            SubtitleFormat::Ttml | SubtitleFormat::Pgs | SubtitleFormat::VobSub => Some(format!(
                 "{} subtitle previewing is not implemented yet.",
                 format.overview_label()
             )),
@@ -1954,6 +1951,10 @@ mod tests {
 
         // Act / Assert
         assert_that!(capabilities.preview_blocked(SubtitleFormat::SubRip)).is_none();
+        // ASS too: this crate parses it, off a `-c:s copy` that decodes nothing. A build
+        // with no `ass` decoder still previews one, which is the point of asking per
+        // format rather than asking once.
+        assert_that!(capabilities.preview_blocked(SubtitleFormat::Ass)).is_none();
         let vtt = capabilities
             .preview_blocked(SubtitleFormat::WebVtt)
             .expect("a build that cannot read WebVTT should refuse it");
@@ -2001,7 +2002,6 @@ mod tests {
 
         // Act / Assert
         for format in [
-            SubtitleFormat::Ass,
             SubtitleFormat::Ttml,
             SubtitleFormat::Pgs,
             SubtitleFormat::VobSub,

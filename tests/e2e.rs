@@ -1199,9 +1199,7 @@ fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
             .size(320, 240)
             .duration(6.0)
             .audio(&["eng"])
-            .subtitles(vec![
-                SubtitleSpec::new("eng", "webvtt").cues(WALKED_CUES),
-            ]),
+            .subtitles(vec![SubtitleSpec::new("eng", "webvtt").cues(WALKED_CUES)]),
     );
 
     let mut app = Harness::start(scratch);
@@ -2913,6 +2911,120 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
              screen:\n{screen}"
         );
     }
+}
+
+/// An ASS script whose two cues read identically and draw completely differently.
+///
+/// That is the whole fixture. One cue is the file's `Default` style at the bottom of the
+/// frame; the other names a `Sign` style and pins itself to the top with `{\pos}`. Nothing
+/// about the difference is in the text, so a preview that staged the text — or that
+/// transcoded the track to SubRip on the way in — would draw the two cues the same.
+const STYLED_ASS: &str = "[Script Info]\n\
+     ScriptType: v4.00+\n\
+     PlayResX: 320\n\
+     PlayResY: 240\n\
+     \n\
+     [V4+ Styles]\n\
+     Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+     Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\
+     Style: Sign,Arial,48,&H0000CCFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,10,10,10,1\n\
+     \n\
+     [Events]\n\
+     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+     Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,IDENTICAL WORDS\n\
+     Dialogue: 0,0:00:03.00,0:00:04.00,Sign,,0,0,0,,{\\pos(160,20)}IDENTICAL WORDS\n";
+
+/// An ASS track previews with its own styling, not with libass's defaults.
+///
+/// The reason ASS is copied out of its container rather than transcoded to SubRip like
+/// WebVTT is. An ASS cue names a style rather than carrying one and positions itself
+/// against the script's declared `PlayRes`, so a `Dialogue:` line lifted out on its own
+/// draws in the wrong font at the wrong place — a picture the user will never see, on the
+/// one page whose whole job is comparing subtitles against the picture.
+///
+/// **Asserted on rendered bytes, because nothing else would notice.** The two cues carry
+/// the same words at different times, so a preview that lost the styling would stage them
+/// byte-for-byte alike and render two identical pictures. Counting cues, counting cache
+/// files, or reading the screen all pass in that world. Comparing the frames does not.
+#[test]
+fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults() {
+    let test = "an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-ass");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.ass"), STYLED_ASS).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // The cue list shows words, not markup: `{\pos(160,20)}` is how the cue draws, not
+    // what it says, and a list full of override blocks is unreadable.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(
+        state.cues.len(),
+        2,
+        "both cues should parse: {:?}",
+        state.cues
+    );
+    assert_eq!(state.cues[0].text, "IDENTICAL WORDS");
+    assert_eq!(state.cues[1].text, "IDENTICAL WORDS");
+    let screen = app.screen();
+    assert!(
+        !screen.contains("\\pos") && !screen.contains("{"),
+        "override markup should not reach the cue list:\n{screen}"
+    );
+
+    // Each cue keeps the line that draws it, which is where the styling lives.
+    assert!(
+        state.cues[1]
+            .dialogue
+            .as_deref()
+            .is_some_and(|line| line.contains("Sign") && line.contains("\\pos(160,20)")),
+        "the styled cue should keep its own Dialogue line: {:?}",
+        state.cues[1].dialogue
+    );
+
+    // Render the whole track, then compare the two cues' frames.
+    wait_for_frames(&mut app);
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let first = frame_path(&state.frames.key(&state.cues[0]));
+    let second = frame_path(&state.frames.key(&state.cues[1]));
+    assert_ne!(
+        first, second,
+        "two cues that draw differently must not share a cache entry"
+    );
+    let first_bytes = fs::read(&first)
+        .unwrap_or_else(|error| panic!("the first cue should have rendered: {error}"));
+    let second_bytes = fs::read(&second)
+        .unwrap_or_else(|error| panic!("the styled cue should have rendered: {error}"));
+    // `assert!` rather than `assert_ne!`, which would print two whole JPEGs.
+    assert!(
+        first_bytes != second_bytes,
+        "the same words in a different style, font size and position must not produce the \
+         same picture — the styling is being dropped somewhere between the file and libass; \
+         both frames are {} bytes",
+        first_bytes.len()
+    );
+
+    // And the page draws, so the styled path works end to end rather than only caching.
+    app.wait_until("a frame for the selected cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    assert!(
+        app.preview_shades().len() > 1,
+        "the preview should hold a decoded image:\n{}",
+        app.screen()
+    );
 }
 
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.

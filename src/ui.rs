@@ -11834,15 +11834,16 @@ mod tests {
         };
         app.set_preview_handles(Some(crate::preview::test_handles().handles));
         app.open_subtitle_sync();
-        app.subtitle_sync
-            .as_mut()
-            .unwrap()
-            .apply_prepared(vec![crate::cue::Cue {
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
                 index: 0,
                 start: std::time::Duration::from_millis(62_300),
                 end: std::time::Duration::from_millis(64_000),
                 text: "Hello there".to_string(),
-            }]);
+                dialogue: None,
+            }],
+            crate::preview::CueStyle::SubRip,
+        );
 
         // Act
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
@@ -11904,7 +11905,7 @@ mod tests {
         app.subtitle_sync
             .as_mut()
             .unwrap()
-            .apply_prepared(Vec::new());
+            .apply_prepared(Vec::new(), crate::preview::CueStyle::SubRip);
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
         assert_that!(screen.contains("no cues")).is_true();
 
@@ -11927,6 +11928,7 @@ mod tests {
             start: std::time::Duration::from_millis(start),
             end: std::time::Duration::from_millis(end),
             text: text.to_string(),
+            dialogue: None,
         }
     }
 
@@ -11963,7 +11965,10 @@ mod tests {
         };
         app.set_preview_handles(Some(crate::preview::test_handles().handles));
         app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(cues);
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_prepared(cues, crate::preview::CueStyle::SubRip);
         (app, directory)
     }
 

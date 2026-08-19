@@ -61,7 +61,7 @@ pub const FRAME_EXTENSION: &str = "jpg";
 /// units. Without it a change of format or encoder leaves files whose names still collide
 /// with live keys — the PNG-to-JPEG switch did exactly that, because a key does not encode
 /// the format, and the leftovers had to be swept by hand. Bump this instead.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Records when a media directory was last *used*, by its own mtime.
 ///
@@ -120,14 +120,28 @@ pub fn media_key(parts: FrameKeyParts<'_>) -> String {
 
 /// The filename one cue's frame is stored under inside its media's directory, as hex.
 ///
-/// Only the cue, so two subtitle tracks of the same film that happen to carry an identical
-/// line at an identical time share the one frame — they would render the same picture.
-pub fn cue_key(cue: &Cue) -> String {
+/// **Hashes the staged subtitle file rather than the cue's text**, and that is what makes
+/// the key provably complete: the picture is a pure function of the media, the moment
+/// seeked to, and the file handed to libass. [`media_key`] covers the first, the cue's
+/// timing here covers the second, and `staged` is the third exactly as written to disk.
+///
+/// Reading the cue's text instead was right while SubRip was the only format, where text
+/// *is* the staged file. It stops being right the moment a format carries how it draws:
+/// two ASS cues can read the same words in different styles, at different positions, and
+/// under different `PlayRes` — the same key for two different pictures.
+///
+/// Still only the cue and its staging, so two subtitle tracks of one film that carry an
+/// identical line at an identical time in an identical style share the one frame. They
+/// would render the same picture.
+pub fn cue_key(cue: &Cue, staged: &str) -> String {
     let mut hash = Hasher::new();
-    hash.bytes(cue.text.as_bytes());
+    hash.bytes(staged.as_bytes());
     hash.separator();
-    // Millis rather than the whole `Duration`: it is what the SubRip format itself
-    // stores, so two cues that are equal on disk cannot hash apart on a rounding.
+    // Millis rather than the whole `Duration`: it is what the subtitle formats themselves
+    // store, so two cues that are equal on disk cannot hash apart on a rounding. Needed
+    // separately from `staged` because the staged file is *retimed* — the cue's own
+    // timing is what decides where the grab seeks to, and two cues with identical text at
+    // different moments stage byte-for-byte identically.
     hash.number(u128::from(cue.start.as_millis() as u64));
     hash.number(u128::from(cue.end.as_millis() as u64));
     hash.finish()
@@ -379,6 +393,7 @@ mod tests {
             start: Duration::from_millis(start),
             end: Duration::from_millis(end),
             text: text.to_string(),
+            dialogue: None,
         }
     }
 
@@ -409,9 +424,17 @@ mod tests {
         directory
     }
 
+    /// Roughly what `preview` stages a SubRip cue as, which is what the key covers.
+    ///
+    /// Derived from the text rather than being the text, so a test cannot pass by hashing
+    /// the cue where it should be hashing the file.
+    fn staged(cue: &Cue) -> String {
+        format!("1\n00:00:00,000 --> 00:10:00,000\n{}\n\n", cue.text)
+    }
+
     /// Both halves of the path, together, for the tests that care about the whole thing.
     fn key(parts: FrameKeyParts<'_>, cue: &Cue) -> String {
-        format!("{}/{}", media_key(parts), cue_key(cue))
+        format!("{}/{}", media_key(parts), cue_key(cue, &staged(cue)))
     }
 
     #[test]
@@ -424,7 +447,8 @@ mod tests {
             .is_equal_to(key(parts(&media), &cue(1000, 2000, "hello")).as_str());
         // Sixteen bytes of hex either side, so a path whose parts are always one length.
         assert_that!(media_key(parts(&media)).len()).is_equal_to(32);
-        assert_that!(cue_key(&cue(1000, 2000, "hello")).len()).is_equal_to(32);
+        let one = cue(1000, 2000, "hello");
+        assert_that!(cue_key(&one, &staged(&one)).len()).is_equal_to(32);
     }
 
     /// The split is the eviction policy: everything about the *media* has to land in the
@@ -439,8 +463,10 @@ mod tests {
         let base = media_key(parts(&media));
 
         // Act / Assert: every cue of one media shares one directory.
-        assert_that!(cue_key(&cue(1000, 2000, "hello")).as_str())
-            .is_not_equal_to(cue_key(&cue(3000, 4000, "goodbye")).as_str());
+        let hello = cue(1000, 2000, "hello");
+        let goodbye = cue(3000, 4000, "goodbye");
+        assert_that!(cue_key(&hello, &staged(&hello)).as_str())
+            .is_not_equal_to(cue_key(&goodbye, &staged(&goodbye)).as_str());
         assert_that!(media_key(parts(&media)).as_str()).is_equal_to(base.as_str());
 
         // Act / Assert: and every media-level difference moves the directory.
@@ -451,6 +477,40 @@ mod tests {
         let mut smaller = parts(&media);
         smaller.pixels = (640, 360);
         assert_that!(media_key(smaller).as_str()).is_not_equal_to(base.as_str());
+    }
+
+    /// Two cues can read the same words and still draw differently — an ASS cue names a
+    /// style, a position and a layer, and none of that is in its text. Keying on the text
+    /// would file both pictures under one name and hand back whichever was rendered first.
+    ///
+    /// Keying on the *staged file* is what makes this impossible: it is byte-for-byte what
+    /// libass is given, so two frames that would differ cannot key alike.
+    #[test]
+    fn cues_that_read_alike_but_draw_differently_should_not_share_a_key() {
+        // Arrange: identical text and timing, different staging.
+        let cue = cue(1000, 2000, "look out");
+        let plain = "Dialogue: 0,0:00:00.00,0:10:00.00,Default,,0,0,0,,look out";
+        let sign = "Dialogue: 0,0:00:00.00,0:10:00.00,Sign,,0,0,0,,{\\pos(320,10)}look out";
+
+        // Act / Assert
+        assert_that!(cue_key(&cue, plain).as_str()).is_not_equal_to(cue_key(&cue, sign).as_str());
+
+        // Act / Assert: and the same staging keys the same, or nothing would ever hit.
+        assert_that!(cue_key(&cue, plain).as_str()).is_equal_to(cue_key(&cue, plain).as_str());
+    }
+
+    /// The staged file is retimed to cover the whole grab, so two cues carrying the same
+    /// line at different moments stage byte-for-byte identically — and would collide on a
+    /// key made of the staging alone, despite the grab seeking somewhere else entirely.
+    #[test]
+    fn cues_staged_alike_at_different_times_should_not_share_a_key() {
+        // Arrange
+        let early = cue(1000, 2000, "same words");
+        let late = cue(60_000, 61_000, "same words");
+        let file = "1\n00:00:00,000 --> 00:10:00,000\nsame words\n\n";
+
+        // Act / Assert
+        assert_that!(cue_key(&early, file).as_str()).is_not_equal_to(cue_key(&late, file).as_str());
     }
 
     /// The whole point of the key: change what the frame would look like, and the cache

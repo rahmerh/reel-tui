@@ -41,33 +41,48 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
-use crate::cue::{Cue, format_srt_timestamp, read_srt};
+use crate::cue::{Cue, format_srt_timestamp, read_ass, read_srt, retimed_dialogue};
 use crate::framecache::{self, FrameKeyParts};
 use crate::subtitle::SubtitleFormat;
 
 /// Filename an embedded track is staged under inside the page's workspace.
 pub const CUES_FILE: &str = "cues.srt";
 
-/// Filename the one retimed cue being previewed is staged under.
+/// Which renderer owns a staging file, and so which name it writes its cue under.
 ///
-/// Deliberately short and constant. `ffmpeg` runs with the workspace as its working
-/// directory and is handed this bare relative name, so the value inside the `subtitles=`
-/// filter is a literal that needs no escaping at all — the alternative is quoting a user's
-/// path through three layers (filtergraph `[],;`, filter-arg `:`, option-parser `\` and
-/// `'`), which is a class of bug this feature simply does not have to have.
-pub const CUE_FILE: &str = "cue.srt";
-
-/// The same, for the background pass — one per worker.
-///
-/// A *function* rather than a constant, and that is the whole point. The pass runs
-/// [`WARM_WORKERS`] threads in one workspace; two of them sharing a staged `.srt` would
-/// each overwrite the other's cue between the write and the burn, so a frame would come
-/// back with the wrong line on it — and stored under the *right* cache key, where nothing
-/// downstream could ever tell. Distinct from [`CUE_FILE`] for the same reason: the
-/// interactive grab runs at the same time as all of them.
-fn warm_cue_file(worker: usize) -> String {
-    format!("warm-{worker}.srt")
+/// **Every renderer that can run at once needs its own name**, and that is the whole
+/// point of this existing. The background pass runs several threads in one workspace, and
+/// two sharing a staged file would each overwrite the other's cue between the write and
+/// the burn — so a frame would come back with the wrong line on it, stored under the
+/// *right* cache key, where nothing downstream could ever tell. The interactive grab runs
+/// alongside all of them and needs a name of its own for the same reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CueSlot {
+    /// The grab the user is waiting on.
+    Interactive,
+    /// One worker of the background pass.
+    Warm(usize),
 }
+
+impl CueSlot {
+    /// The staged file's name, which the format decides the extension of.
+    ///
+    /// Deliberately short and relative. `ffmpeg` runs with the workspace as its working
+    /// directory and is handed this bare name, so the value inside the `subtitles=` filter
+    /// is a literal that needs no escaping at all — the alternative is quoting a user's
+    /// path through three layers (filtergraph `[],;`, filter-arg `:`, option-parser `\`
+    /// and `'`), which is a class of bug this feature simply does not have to have.
+    fn file(self, style: &CueStyle) -> String {
+        let extension = style.extension();
+        match self {
+            Self::Interactive => format!("cue.{extension}"),
+            Self::Warm(worker) => format!("warm-{worker}.{extension}"),
+        }
+    }
+}
+
+/// How long the staged cue is made to cover, so the grab cannot land outside it.
+const BURN_WINDOW: Duration = Duration::from_secs(600);
 
 /// The most threads that will ever walk a track's cues at once.
 ///
@@ -173,7 +188,13 @@ pub struct PrepareRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrepareOutcome {
-    Ready(Vec<Cue>),
+    Ready {
+        cues: Vec<Cue>,
+        /// How this track's cues have to be staged to be drawn, which comes out of the
+        /// file with them: an ASS script's styles and `PlayRes` are read in the same pass
+        /// as its `Dialogue:` lines and are useless apart from them.
+        style: CueStyle,
+    },
     Failed(String),
 }
 
@@ -192,7 +213,74 @@ pub struct FrameSource {
     pub media_modified: Option<SystemTime>,
     /// The size every frame for this media is rendered at, from [`target_pixels`].
     pub pixels: (u32, u32),
+    /// How this track's cues are written back out for libass, which for ASS is most of
+    /// what a cue is. Set when the cues arrive, since it comes out of the file with them.
+    pub style: Arc<CueStyle>,
     pub workspace: PathBuf,
+}
+
+/// How one cue is staged as a subtitle file for libass to burn in.
+///
+/// A cue on its own is not enough to draw for every format. An ASS cue names a style
+/// rather than carrying one and positions itself against the script's declared
+/// `PlayResX`/`PlayResY`, so the track's header has to be staged with it or libass draws
+/// the line in its own defaults at its own scale — a picture the user will never see, on
+/// the one page whose whole job is comparing subtitles against the picture.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CueStyle {
+    /// Everything the cue needs is its text.
+    #[default]
+    SubRip,
+    /// The track's own `[Script Info]` and `[V4+ Styles]`, verbatim, and the `[Events]`
+    /// `Format:` line its cues' columns are declared by.
+    Ass {
+        header: String,
+        events_format: String,
+    },
+}
+
+impl CueStyle {
+    /// The extension the staged file must carry.
+    ///
+    /// Not decoration: libass picks its reader from the name, so a staged ASS script
+    /// called `.srt` is read as SubRip and every override tag in it becomes literal text
+    /// on the frame.
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::SubRip => "srt",
+            Self::Ass { .. } => "ass",
+        }
+    }
+
+    /// The whole subtitle file to hand libass, holding this one cue and nothing else.
+    ///
+    /// Retimed to cover the entire grab in both formats, for the reason [`one_cue_srt`]
+    /// explains: `-ss` before `-i` resets output timestamps to about zero, so a cue left
+    /// at its original time is a coin toss on exactly the boundary frames this page exists
+    /// to inspect.
+    fn stage(&self, cue: &Cue) -> String {
+        match self {
+            Self::SubRip => one_cue_srt(&cue.text),
+            Self::Ass {
+                header,
+                events_format,
+            } => {
+                let events = cue
+                    .dialogue
+                    .as_deref()
+                    .and_then(|line| {
+                        retimed_dialogue(events_format, line, Duration::ZERO, BURN_WINDOW)
+                    })
+                    .unwrap_or_default();
+                // No `Dialogue:` line at all when the cue arrived without one — a state
+                // `parse_ass` cannot produce, since it emits a cue only for a line it
+                // could read and `retimed_dialogue` re-reads it by the same rules. Staging
+                // SubRip text under an `.ass` name instead would fail the grab on a good
+                // track to guard a case that does not occur.
+                format!("{header}\n\n[Events]\n{events_format}\n{events}\n")
+            }
+        }
+    }
 }
 
 impl FrameSource {
@@ -210,9 +298,24 @@ impl FrameSource {
         })
     }
 
+    /// The subtitle file this cue is burned from, for this track's format and styling.
+    pub fn stage(&self, cue: &Cue) -> String {
+        self.style.stage(cue)
+    }
+
+    /// The filename the staged cue must be written under, distinct per renderer.
+    pub fn staged_name(&self, slot: CueSlot) -> String {
+        slot.file(&self.style)
+    }
+
     /// Both halves of one cue's cache path, for the callers that need them together.
+    ///
+    /// Stages the cue to key it, because the staged file is what the key covers — see
+    /// [`framecache::cue_key`]. That builds a short string per lookup even when the answer
+    /// is a cache hit, which is a few kilobytes of transient allocation against an
+    /// `ffmpeg` seek, and buys a key that cannot describe a picture it did not produce.
     pub fn key(&self, cue: &Cue) -> (String, String) {
-        (self.media_key(), framecache::cue_key(cue))
+        (self.media_key(), framecache::cue_key(cue, &self.stage(cue)))
     }
 }
 
@@ -597,10 +700,13 @@ pub(crate) fn test_handles() -> TestHandles {
 
 /// Reads one track's cues, or `None` if the page it was for closed on the way.
 ///
-/// Every format ends at the same place — a SubRip file this crate's own parser can read —
-/// and differs only in how it gets there:
+/// Every format ends at the same place — a file this crate's own parsers read — and
+/// differs only in how it gets there:
 ///
-/// - **SubRip** is copied out of the container bit for bit, or read where it already lies.
+/// - **SubRip and ASS** are copied out of the container bit for bit, or read where they
+///   already lie. For ASS that is not a preference: a transcode to SubRip discards the
+///   styles, the `PlayRes`, and every positioning override, which is most of what an ASS
+///   track is and all of what makes previewing one worth doing.
 /// - **WebVTT and MOV Text** are transcoded to SubRip: on the way out of the container for
 ///   an embedded track, in a second pass for a sidecar. Neither carries styling that
 ///   survives anywhere, so there is nothing to lose by it.
@@ -619,11 +725,13 @@ fn prepare(request: &PrepareRequest, live_generation: &AtomicU64) -> Option<Prep
     // no conversion at all, and one fewer file written is one fewer thing to fail.
     let source = match request.stream_index {
         Some(index) => {
-            // Always SubRip, whatever went in: the format either copies out as SubRip or
-            // is transcoded into it. `ffmpeg` picks its muxer from the extension, so this
-            // name and `extract_command`'s `-c:s` have to agree or the muxer refuses the
-            // codec — a disagreement neither half shows on its own.
-            let staged = request.workspace.join(CUES_FILE);
+            // What comes *out*, which is not always what went in. `ffmpeg` picks its muxer
+            // from the extension, so this name and `extract_command`'s `-c:s` have to
+            // agree or the muxer refuses the codec — a disagreement neither half shows on
+            // its own.
+            let staged = request
+                .workspace
+                .join(cues_file(extracted_format(request.format)));
             let mut command = extract_command(&request.input, index, request.format, &staged);
             match run_cancellable(&mut command, &abandoned) {
                 RunOutcome::Abandoned => return None,
@@ -645,6 +753,23 @@ fn prepare(request: &PrepareRequest, live_generation: &AtomicU64) -> Option<Prep
     converted(&source, request, &abandoned)
 }
 
+/// What a track's format becomes once it has been pulled out of its container.
+///
+/// One answer shared by the staged filename and the extraction's `-c:s`, so the two cannot
+/// disagree about what is being written.
+fn extracted_format(format: SubtitleFormat) -> SubtitleFormat {
+    match format {
+        // Copied unchanged, because this crate reads them itself.
+        SubtitleFormat::SubRip | SubtitleFormat::Ass => format,
+        _ => SubtitleFormat::SubRip,
+    }
+}
+
+/// The name a track is staged under inside the page's workspace.
+fn cues_file(format: SubtitleFormat) -> String {
+    format!("cues.{}", format.extension())
+}
+
 /// Turns the extracted or sidecar file into cues, converting it first when it is not
 /// already something this crate can read.
 fn converted(
@@ -654,6 +779,7 @@ fn converted(
 ) -> Option<PrepareOutcome> {
     match request.format {
         SubtitleFormat::SubRip => Some(read_cues(source)),
+        SubtitleFormat::Ass => Some(read_ass_cues(source)),
         // An embedded track was transcoded on the way out already; a sidecar has had
         // nothing done to it and still needs the pass.
         SubtitleFormat::WebVtt | SubtitleFormat::MovText => {
@@ -729,7 +855,7 @@ fn frame_window(
                 &request.source,
                 &target.cue,
                 target.seek,
-                CUE_FILE,
+                CueSlot::Interactive,
                 abandoned,
             ),
             picker,
@@ -827,21 +953,21 @@ enum PngOutcome {
 /// The cache lookup comes first and is the whole point of the module: a hit costs a file
 /// read where a miss costs an accurate seek into the container plus a libass burn.
 ///
-/// `staged` names the file the cue is written to inside the workspace, so the interactive
-/// path and the background pass can run at the same time without overwriting each other's
-/// subtitle — see [`CUE_FILE`] and [`WARM_CUE_FILE`].
+/// `slot` decides the file the cue is written to inside the workspace, so the interactive
+/// path and every worker of the background pass can run at the same time without
+/// overwriting each other's subtitle — see [`CueSlot`].
 fn png(
     source: &FrameSource,
     cue: &Cue,
     seek: Duration,
-    staged: &str,
+    slot: CueSlot,
     abandoned: Abandoned<'_>,
 ) -> PngOutcome {
     let key = source.key(cue);
     if let Some(bytes) = framecache::read(&key.0, &key.1) {
         return PngOutcome::Ready(bytes);
     }
-    render(source, cue, seek, staged, &key.0, &key.1, abandoned)
+    render(source, cue, seek, slot, &key.0, &key.1, abandoned)
 }
 
 /// What the background pass made of one cue.
@@ -866,14 +992,14 @@ fn cache_frame(
     source: &FrameSource,
     cue: &Cue,
     seek: Duration,
-    staged: &str,
+    slot: CueSlot,
     abandoned: Abandoned<'_>,
 ) -> CacheOutcome {
     let key = source.key(cue);
     if framecache::is_cached(&key.0, &key.1) {
         return CacheOutcome::Cached;
     }
-    match render(source, cue, seek, staged, &key.0, &key.1, abandoned) {
+    match render(source, cue, seek, slot, &key.0, &key.1, abandoned) {
         PngOutcome::Ready(_) => CacheOutcome::Rendered,
         PngOutcome::Abandoned => CacheOutcome::Abandoned,
         PngOutcome::Failed(_) => CacheOutcome::Failed,
@@ -881,17 +1007,22 @@ fn cache_frame(
 }
 
 /// Stages the cue and grabs its frame, caching whatever comes back.
+///
+/// The staged file is the track's own format and styling, not always a bare `.srt` — see
+/// [`CueStyle::stage`]. Its *name* comes from the same place, because libass picks its
+/// reader from the extension.
 fn render(
     source: &FrameSource,
     cue: &Cue,
     seek: Duration,
-    staged: &str,
+    slot: CueSlot,
     media_key: &str,
     cue_key: &str,
     abandoned: Abandoned<'_>,
 ) -> PngOutcome {
-    let path = source.workspace.join(staged);
-    if let Err(error) = std::fs::write(&path, one_cue_srt(&cue.text)) {
+    let staged = source.staged_name(slot);
+    let path = source.workspace.join(&staged);
+    if let Err(error) = std::fs::write(&path, source.stage(cue)) {
         return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
     }
     let mut command = frame_command(
@@ -899,7 +1030,7 @@ fn render(
         seek,
         source.pixels,
         &source.workspace,
-        staged,
+        &staged,
     );
     grabbed(run_cancellable(&mut command, abandoned), media_key, cue_key)
 }
@@ -1081,8 +1212,8 @@ fn warm_track(
 
 /// One worker's contiguous slice of the track.
 ///
-/// `staged` is [`warm_cue_file`] for this worker and nothing else. Two workers sharing one
-/// staged `.srt` would each overwrite the other's cue between the write and the burn, and
+/// The slot is [`CueSlot::Warm`] for this worker and nothing else. Two workers sharing one
+/// staged file would each overwrite the other's cue between the write and the burn, and
 /// the frame that came out would carry the wrong line — stored under the *right* key, so
 /// nothing downstream could ever notice. It is the single most important thing here.
 fn warm_slice(
@@ -1094,7 +1225,7 @@ fn warm_slice(
     progress: &Mutex<WarmProgress>,
     done: &AtomicUsize,
 ) {
-    let staged = warm_cue_file(worker);
+    let slot = CueSlot::Warm(worker);
     let mut failures = 0;
     for cue in cues {
         if abandoned() {
@@ -1106,7 +1237,7 @@ fn warm_slice(
             &request.source,
             cue,
             seek_for(cue, request.duration),
-            &staged,
+            slot,
             abandoned,
         ) {
             CacheOutcome::Cached | CacheOutcome::Rendered => failures = 0,
@@ -1180,7 +1311,7 @@ fn one_cue_srt(text: &str) -> String {
     format!(
         "1\n{} --> {}\n{}\n\n",
         format_srt_timestamp(Duration::ZERO),
-        format_srt_timestamp(Duration::from_secs(600)),
+        format_srt_timestamp(BURN_WINDOW),
         text.trim_end()
     )
 }
@@ -1242,9 +1373,10 @@ fn frame_command(
 /// The rest transcode to SubRip on the way out, since nothing here can read them and they
 /// carry no styling that would survive the trip anyway.
 fn extract_command(media: &Path, index: u64, format: SubtitleFormat, output: &Path) -> Command {
-    let codec = match format {
-        SubtitleFormat::SubRip | SubtitleFormat::Ass => "copy",
-        _ => "subrip",
+    let codec = if extracted_format(format) == format {
+        "copy"
+    } else {
+        "subrip"
     };
     let mut command = Command::new("ffmpeg");
     command
@@ -1271,7 +1403,24 @@ fn transcode_command(source: &Path, output: &Path) -> Command {
 
 fn read_cues(path: &Path) -> PrepareOutcome {
     match read_srt(path) {
-        Ok(cues) => PrepareOutcome::Ready(cues),
+        Ok(cues) => PrepareOutcome::Ready {
+            cues,
+            style: CueStyle::SubRip,
+        },
+        Err(error) => PrepareOutcome::Failed(format!("Could not read {}: {error}", label(path))),
+    }
+}
+
+/// Reads an ASS script, keeping the header its cues are drawn by alongside them.
+fn read_ass_cues(path: &Path) -> PrepareOutcome {
+    match read_ass(path) {
+        Ok(script) => PrepareOutcome::Ready {
+            cues: script.cues,
+            style: CueStyle::Ass {
+                header: script.header,
+                events_format: script.events_format,
+            },
+        },
         Err(error) => PrepareOutcome::Failed(format!("Could not read {}: {error}", label(path))),
     }
 }
@@ -1394,6 +1543,118 @@ mod tests {
 
     const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n\
                        2\n00:00:03,000 --> 00:00:04,500\nsecond\n\n";
+
+    /// What the interactive grab stages a SubRip cue under, which is what these fixtures
+    /// are. Resolved through [`CueSlot`] rather than spelled out, so a test asserting on
+    /// the staged file cannot drift from the name the renderer actually writes.
+    fn cue_file() -> String {
+        CueSlot::Interactive.file(&CueStyle::SubRip)
+    }
+
+    fn warm_cue_file(worker: usize) -> String {
+        CueSlot::Warm(worker).file(&CueStyle::SubRip)
+    }
+
+    const ASS: &str = "[Script Info]\n\
+                       ScriptType: v4.00+\n\
+                       PlayResX: 384\n\
+                       PlayResY: 288\n\
+                       \n\
+                       [V4+ Styles]\n\
+                       Format: Name, Fontname, Fontsize, Alignment\n\
+                       Style: Default,Arial,16,2\n\
+                       Style: Sign,Impact,40,8\n\
+                       \n\
+                       [Events]\n\
+                       Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                       Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\pos(320,10)}a sign\n";
+
+    fn ass_style() -> CueStyle {
+        let script = crate::cue::parse_ass(ASS);
+        CueStyle::Ass {
+            header: script.header,
+            events_format: script.events_format,
+        }
+    }
+
+    /// The whole reason ASS is not simply transcoded to SubRip. A `Dialogue:` line lifted
+    /// out on its own renders in libass's defaults at libass's scale — so the staged file
+    /// has to carry the styles it names and the `PlayRes` it positions against, or the
+    /// page draws a picture the user will never see.
+    #[test]
+    fn staging_an_ass_cue_should_carry_the_styles_and_resolution_that_draw_it() {
+        // Arrange
+        let script = crate::cue::parse_ass(ASS);
+        let style = ass_style();
+
+        // Act
+        let staged = style.stage(&script.cues[0]);
+
+        // Assert: a whole script, not a line.
+        assert_that!(staged.as_str()).contains("[Script Info]");
+        assert_that!(staged.as_str()).contains("PlayResX: 384");
+        assert_that!(staged.as_str()).contains("[V4+ Styles]");
+        assert_that!(staged.as_str()).contains("Style: Sign,Impact,40,8");
+        assert_that!(staged.as_str()).contains("[Events]");
+        assert_that!(staged.as_str()).contains(
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        );
+
+        // Assert: the cue's own line, retimed to cover the grab and otherwise untouched —
+        // its style name and its position override are what the preview exists to show.
+        assert_that!(staged.as_str())
+            .contains("Dialogue: 0,0:00:00.00,0:10:00.00,Sign,,0,0,0,,{\\pos(320,10)}a sign");
+        assert_that!(staged.contains("0:00:01.00")).is_false();
+
+        // Assert: and exactly one cue, so nothing else in the track can draw over it.
+        assert_that!(staged.matches("Dialogue:").count()).is_equal_to(1);
+    }
+
+    /// libass picks its reader from the name, so a staged ASS script called `.srt` is read
+    /// as SubRip and every override tag in it lands on the frame as literal text.
+    #[test]
+    fn the_staged_file_should_be_named_for_the_format_it_holds() {
+        // Act / Assert
+        assert_that!(CueSlot::Interactive.file(&CueStyle::SubRip).as_str()).is_equal_to("cue.srt");
+        assert_that!(CueSlot::Interactive.file(&ass_style()).as_str()).is_equal_to("cue.ass");
+        assert_that!(CueSlot::Warm(2).file(&CueStyle::SubRip).as_str()).is_equal_to("warm-2.srt");
+        assert_that!(CueSlot::Warm(2).file(&ass_style()).as_str()).is_equal_to("warm-2.ass");
+    }
+
+    /// Two ASS cues reading the same words in different styles draw differently, so they
+    /// must not share a cache key — and the SubRip path must be unaffected by the style
+    /// having entered the key at all.
+    #[test]
+    fn the_cache_key_should_follow_the_style_a_cue_is_drawn_in() {
+        // Arrange: one script's cue, and the same words under the other style.
+        let directory = scratch("ass-key");
+        let source = source(&directory.join("clip.mkv"), &directory);
+        let script = crate::cue::parse_ass(ASS);
+        let styled = FrameSource {
+            style: Arc::new(ass_style()),
+            ..source.clone()
+        };
+        let restyled = FrameSource {
+            style: Arc::new(CueStyle::Ass {
+                header: script.header.replace("PlayResX: 384", "PlayResX: 1920"),
+                events_format: script.events_format.clone(),
+            }),
+            ..source.clone()
+        };
+
+        // Act / Assert: the same media, so the same directory — but not the same frame.
+        let sign = &script.cues[0];
+        assert_that!(styled.key(sign).0.as_str()).is_equal_to(restyled.key(sign).0.as_str());
+        assert_that!(styled.key(sign).1.as_str()).is_not_equal_to(restyled.key(sign).1.as_str());
+
+        // Act / Assert: and a SubRip source of the same words keys apart from both, since
+        // it stages an entirely different file.
+        let plain = cue(1000, 2000, "a sign");
+        assert_that!(source.key(&plain).1.as_str()).is_not_equal_to(styled.key(sign).1.as_str());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// The spread across protocols is three orders of magnitude, which is the whole reason
     /// the window's budget consults the picker rather than assuming a figure: halfblocks
@@ -1533,6 +1794,7 @@ mod tests {
             start: Duration::from_millis(start),
             end: Duration::from_millis(end),
             text: text.to_string(),
+            dialogue: None,
         }
     }
 
@@ -1544,6 +1806,7 @@ mod tests {
             media_length: 4096,
             media_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             pixels: (64, 48),
+            style: Arc::new(CueStyle::SubRip),
             workspace: workspace.to_path_buf(),
         }
     }
@@ -1651,7 +1914,7 @@ mod tests {
         let outcome = prepare(&request, &live(7));
 
         // Assert
-        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+        let PrepareOutcome::Ready { cues, .. } = outcome.expect("the page is still open") else {
             panic!("a readable sidecar should be ready");
         };
         assert_that!(cues.len()).is_equal_to(2);
@@ -1689,7 +1952,7 @@ mod tests {
         let outcome = prepare(&request, &live(5));
 
         // Assert
-        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+        let PrepareOutcome::Ready { cues, .. } = outcome.expect("the page is still open") else {
             panic!("a readable WebVTT sidecar should be ready");
         };
         assert_that!(cues.len()).is_equal_to(2);
@@ -1750,7 +2013,7 @@ mod tests {
         let outcome = prepare(&request, &live(2));
 
         // Assert
-        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+        let PrepareOutcome::Ready { cues, .. } = outcome.expect("the page is still open") else {
             panic!("an embedded WebVTT track should be ready");
         };
         assert_that!(cues.len()).is_equal_to(2);
@@ -1761,6 +2024,81 @@ mod tests {
         let staged = std::fs::read_to_string(workspace.join(CUES_FILE)).unwrap();
         assert_that!(staged.as_str()).contains("00:00:01,000 --> 00:00:02,000");
         assert_that!(staged.contains("WEBVTT")).is_false();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An embedded ASS track is copied out bit for bit, so the styles and `PlayRes` its
+    /// cues are drawn by arrive with them. A transcode to SubRip would leave the cues
+    /// readable and the track unrenderable as itself.
+    #[test]
+    fn preparing_an_embedded_ass_track_should_keep_the_header_that_styles_it() {
+        // Arrange
+        require_ffmpeg("preparing_an_embedded_ass_track_should_keep_the_header_that_styles_it");
+        let directory = scratch("ass-embedded");
+        let script = directory.join("source.ass");
+        std::fs::write(&script, ASS).unwrap();
+        let media = directory.join("clip.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=32x24:r=5:d=5",
+                "-i",
+            ])
+            .arg(&script)
+            .args([
+                "-map", "0:v:0", "-map", "1:s:0", "-c:v", "ffv1", "-c:s", "copy",
+            ])
+            .arg(&media)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            built.status.success(),
+            "failed to build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let request = PrepareRequest {
+            generation: 4,
+            input: media,
+            stream_index: Some(1),
+            format: SubtitleFormat::Ass,
+            workspace: workspace.clone(),
+        };
+
+        // Act
+        let outcome = prepare(&request, &live(4));
+
+        // Assert: the cue, with its markup stripped for the list.
+        let PrepareOutcome::Ready { cues, style } = outcome.expect("the page is still open") else {
+            panic!("an embedded ASS track should be ready");
+        };
+        assert_that!(cues.len()).is_equal_to(1);
+        assert_that!(cues[0].text.as_str()).is_equal_to("a sign");
+
+        // Assert: and the line the renderer needs, alongside the header that draws it.
+        assert_that!(cues[0].dialogue.as_deref().unwrap()).contains("{\\pos(320,10)}");
+        assert_that!(cues[0].dialogue.as_deref().unwrap()).contains("Sign");
+        let CueStyle::Ass {
+            header,
+            events_format,
+        } = &style
+        else {
+            panic!("an ASS track should carry an ASS style, got {style:?}");
+        };
+        assert_that!(header.as_str()).contains("PlayResX: 384");
+        assert_that!(header.as_str()).contains("Style: Sign,");
+        assert_that!(events_format.as_str()).contains("Start, End");
+
+        // Assert: staged as ASS, not SubRip — the name is what libass reads it by.
+        assert_that!(workspace.join("cues.ass").exists()).is_true();
+        assert_that!(workspace.join(CUES_FILE).exists()).is_false();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1840,7 +2178,7 @@ mod tests {
         let outcome = prepare(&request, &live(3));
 
         // Assert
-        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+        let PrepareOutcome::Ready { cues, .. } = outcome.expect("the page is still open") else {
             panic!("an embedded subrip track should be ready");
         };
         assert_that!(cues.len()).is_equal_to(2);
@@ -2105,7 +2443,7 @@ mod tests {
             Duration::from_millis(2500),
             (640, 480),
             Path::new("/tmp/reel-tui-preview/7-1"),
-            CUE_FILE,
+            &cue_file(),
         );
 
         // Assert
@@ -2165,7 +2503,7 @@ mod tests {
         assert_that!(protocol.size().width > 0 && protocol.size().height > 0).is_true();
         // The cue is staged where the filter expects to find it: beside the command's
         // working directory, under the bare name it was given.
-        let staged = std::fs::read_to_string(directory.join(CUE_FILE)).unwrap();
+        let staged = std::fs::read_to_string(directory.join(cue_file())).unwrap();
         assert_that!(staged.as_str()).contains("BURNED IN");
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2246,7 +2584,7 @@ mod tests {
 
         // Assert: nothing was even staged, let alone spawned.
         assert_that!(outcome).is_none();
-        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(cue_file()).exists()).is_false();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2503,7 +2841,7 @@ mod tests {
             panic!("a prepare request should answer with cues, not a frame");
         };
         assert_that!(generation).is_equal_to(3);
-        assert_that!(matches!(outcome, PrepareOutcome::Ready(ref cues) if cues.len() == 2))
+        assert_that!(matches!(outcome, PrepareOutcome::Ready { ref cues, .. } if cues.len() == 2))
             .is_true();
         assert_that!(events.try_recv().is_err()).is_true();
 
@@ -2573,7 +2911,7 @@ mod tests {
                 .all(|(_, outcome)| matches!(outcome, FrameOutcome::Ready(_)))
         )
         .is_true();
-        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(cue_file()).exists()).is_false();
 
         // Cleanup
         for one in &cues {
@@ -2890,7 +3228,7 @@ mod tests {
         assert_that!(frames.len()).is_equal_to(1);
         assert_that!(frames[0].0).is_equal_to(4);
         assert_that!(matches!(frames[0].1, FrameOutcome::Ready(_))).is_true();
-        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(cue_file()).exists()).is_false();
 
         // Cleanup
         forget(&source, &ahead);
@@ -2924,7 +3262,7 @@ mod tests {
         };
         assert_that!(protocol.size().width > 0).is_true();
         // Nothing was staged, which is the step every real grab starts with.
-        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(cue_file()).exists()).is_false();
 
         // Cleanup
         forget(&request.source, wanted(&request));
@@ -3001,10 +3339,10 @@ mod tests {
         // Act / Assert: and with the media deleted and the staged cue removed, the same
         // request still draws — from the cache, since there is nothing left to grab.
         std::fs::remove_file(&media).unwrap();
-        std::fs::remove_file(directory.join(CUE_FILE)).unwrap();
+        std::fs::remove_file(directory.join(cue_file())).unwrap();
         let again = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
         assert_that!(matches!(again, Some(FrameOutcome::Ready(_)))).is_true();
-        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+        assert_that!(directory.join(cue_file()).exists()).is_false();
 
         // Cleanup
         forget(&request.source, wanted(&request));
@@ -3302,7 +3640,7 @@ mod tests {
         // Assert: one per worker, and none of them the interactive path's — which runs at
         // the same time as all of them.
         assert_that!(names.len()).is_equal_to(MAX_WARM_WORKERS);
-        assert_that!(names.contains(CUE_FILE)).is_false();
+        assert_that!(names.contains(&cue_file())).is_false();
         // Bare relative names, so `ffmpeg` takes them as literals inside its working
         // directory and nothing has to be escaped through the filtergraph syntax.
         for name in &names {
@@ -3370,7 +3708,7 @@ mod tests {
                     &request.source,
                     cue,
                     seek_for(cue, request.duration),
-                    CUE_FILE,
+                    CueSlot::Interactive,
                     &|| false,
                 ) {
                     PngOutcome::Ready(bytes) => bytes,
@@ -3556,15 +3894,11 @@ mod tests {
         forget(&source, &second);
 
         // Act
-        let cached = cache_frame(&source, &first, Duration::ZERO, &warm_cue_file(0), &|| {
+        let cached = cache_frame(&source, &first, Duration::ZERO, CueSlot::Warm(0), &|| false);
+        let missing = cache_frame(&source, &second, Duration::ZERO, CueSlot::Warm(0), &|| {
             false
         });
-        let missing = cache_frame(&source, &second, Duration::ZERO, &warm_cue_file(0), &|| {
-            false
-        });
-        let abandoned = cache_frame(&source, &second, Duration::ZERO, &warm_cue_file(0), &|| {
-            true
-        });
+        let abandoned = cache_frame(&source, &second, Duration::ZERO, CueSlot::Warm(0), &|| true);
 
         // Assert
         assert_that!(cached).is_equal_to(CacheOutcome::Cached);
