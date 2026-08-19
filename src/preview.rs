@@ -36,7 +36,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Size;
-use ratatui_image::picker::Picker;
+use ratatui_image::FontSize;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
@@ -121,6 +122,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// [`crate::framecache::FRAME_EXTENSION`]. At 1080p a frame is around ninety kilobytes,
 /// against two megabytes for a *smaller* PNG.
 const MAX_FRAME_PIXELS: (u32, u32) = (1920, 1080);
+
+/// How much memory the whole ready window is allowed to hold at once.
+///
+/// [`MAX_FRAME_PIXELS`] bounds what is *rendered*; this bounds what is kept *encoded*, and
+/// the two are unrelated numbers. A `Protocol` does not hold the picture — it holds the
+/// bytes the terminal is going to be sent, and for kitty that is the frame's pixels as
+/// base64 RGBA, so a full window on a large pane can run to tens of megabytes for five
+/// pictures the user is looking at one of. Forty-eight megabytes buys the full window on
+/// any ordinary pane and gives up the outer neighbours on the panes where it would not.
+pub const FRAME_WINDOW_BUDGET: u64 = 48 * 1024 * 1024;
 
 /// How often the background pass reports where it has got to.
 ///
@@ -322,6 +333,9 @@ pub struct PreviewHandles {
     /// a worker has — "is this request still wanted" and "should I stop now" — with one
     /// comparison, and because the value is already unique per page opening.
     live_generation: Arc<AtomicU64>,
+    /// Roughly what one encoded frame costs per cell, from the picker's protocol and font
+    /// size. See [`frame_bytes_per_cell`].
+    frame_cost: u64,
 }
 
 impl PreviewHandles {
@@ -354,6 +368,16 @@ impl PreviewHandles {
         self.frame_tx.is_some()
     }
 
+    /// Roughly how many bytes one encoded frame costs per cell of the pane it was drawn
+    /// for.
+    ///
+    /// Read off the picker when the workers were spawned, since the picker itself moves
+    /// into the frame worker and cannot be consulted afterwards. Zero without one: nothing
+    /// is encoded, so nothing is held.
+    pub fn frame_bytes_per_cell(&self) -> u64 {
+        self.frame_cost
+    }
+
     /// Tells the workers that the page they were working for is gone, so a running
     /// `ffmpeg` is killed rather than left demuxing a file nobody is looking at.
     pub fn abandon(&self, generation: u64) {
@@ -368,10 +392,40 @@ impl PreviewHandles {
 /// Three threads rather than one because they are asked for different things at different
 /// rates. A single thread would make a held-down `j` queue behind an extraction that is
 /// demuxing a container, or behind a thousand-cue background pass.
+/// Roughly what one encoded frame costs per cell of the pane it was drawn for.
+///
+/// Read out of `ratatui-image`'s protocol implementations rather than guessed, because the
+/// spread between them is three orders of magnitude and a single figure would be wrong at
+/// one end or the other:
+///
+/// - **Halfblocks** keeps a `Vec<HalfBlock>`, one per cell: two `Color`s and a `char`,
+///   twelve bytes. Independent of the font size — the picture *is* the cell grid.
+/// - **Kitty** keeps the transmit string, which is the frame's pixels as RGBA base64:
+///   four bytes a pixel and a third again for the encoding. That is where the megabytes
+///   are, and the font size is what turns cells into pixels.
+/// - **iTerm2** keeps base64 PNG, so the same bound with compression on top of it; taken
+///   uncompressed because how well a video frame packs is not knowable here and a budget
+///   that under-counts is not a budget.
+/// - **Sixel** keeps its own encoding, around a byte a pixel and no alpha.
+fn frame_bytes_per_cell(protocol: ProtocolType, font: FontSize) -> u64 {
+    let pixels = u64::from(font.width) * u64::from(font.height);
+    match protocol {
+        ProtocolType::Halfblocks => 12,
+        ProtocolType::Kitty | ProtocolType::Iterm2 => pixels * 4 * 4 / 3,
+        ProtocolType::Sixel => pixels,
+    }
+}
+
 pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receiver<PreviewEvent>) {
     let (prepare_tx, prepare_rx) = mpsc::channel::<PrepareRequest>();
     let (event_tx, event_rx) = mpsc::channel();
     let live_generation = Arc::new(AtomicU64::new(0));
+    // Taken before the picker moves into the frame worker below, which is the last chance
+    // to ask it anything. Both are `Copy` and neither changes for the run.
+    let frame_cost = picker
+        .as_ref()
+        .map(|picker| frame_bytes_per_cell(picker.protocol_type(), picker.font_size()))
+        .unwrap_or_default();
     let prepare_generation = Arc::clone(&live_generation);
     let prepare_events = event_tx.clone();
 
@@ -434,6 +488,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             frame_tx,
             warm_tx,
             live_generation,
+            frame_cost,
         },
         event_rx,
     )
@@ -522,6 +577,9 @@ pub(crate) fn test_handles() -> TestHandles {
             frame_tx: Some(frame_tx),
             warm_tx: Some(warm_tx),
             live_generation: Arc::clone(&live_generation),
+            // What `Picker::halfblocks()` would report, which is what the tests that
+            // actually encode a protocol use.
+            frame_cost: frame_bytes_per_cell(ProtocolType::Halfblocks, FontSize::new(10, 20)),
         },
         prepare_rx,
         frame_rx,
@@ -1242,6 +1300,49 @@ mod tests {
 
     const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n\
                        2\n00:00:03,000 --> 00:00:04,500\nsecond\n\n";
+
+    /// The spread across protocols is three orders of magnitude, which is the whole reason
+    /// the window's budget consults the picker rather than assuming a figure: halfblocks
+    /// could not reach the budget on any pane a terminal can draw, and kitty reaches it on
+    /// a pane people actually have.
+    #[test]
+    fn a_frame_should_cost_what_its_protocol_actually_holds() {
+        // Arrange: a 10x20 font, so a cell is two hundred pixels.
+        let font = FontSize::new(10, 20);
+
+        // Act / Assert: halfblocks holds one `HalfBlock` per cell — two `Color`s and a
+        // `char` — and the font size does not enter into it, since the picture *is* the
+        // cell grid.
+        assert_that!(frame_bytes_per_cell(ProtocolType::Halfblocks, font)).is_equal_to(12);
+        assert_that!(frame_bytes_per_cell(
+            ProtocolType::Halfblocks,
+            FontSize::new(30, 60)
+        ))
+        .is_equal_to(12);
+
+        // Act / Assert: kitty holds the pixels as RGBA base64, four bytes each and a third
+        // again for the encoding. iTerm2 holds base64 PNG, taken uncompressed because how
+        // well a video frame packs is not knowable here.
+        assert_that!(frame_bytes_per_cell(ProtocolType::Kitty, font)).is_equal_to(200 * 4 * 4 / 3);
+        assert_that!(frame_bytes_per_cell(ProtocolType::Iterm2, font)).is_equal_to(200 * 4 * 4 / 3);
+
+        // Act / Assert: sixel carries no alpha and no base64.
+        assert_that!(frame_bytes_per_cell(ProtocolType::Sixel, font)).is_equal_to(200);
+    }
+
+    /// The picker moves into the frame worker, so anything the rest of the program needs
+    /// from it has to be read off before the workers are spawned — and a build with no
+    /// picker encodes nothing, so it holds nothing.
+    #[test]
+    fn spawning_the_workers_should_carry_the_pickers_frame_cost_out_with_them() {
+        // Act / Assert
+        let (handles, _events) = spawn_preview_workers(Some(Picker::halfblocks()));
+        assert_that!(handles.frame_bytes_per_cell()).is_equal_to(12);
+
+        // Act / Assert
+        let (handles, _events) = spawn_preview_workers(None);
+        assert_that!(handles.frame_bytes_per_cell()).is_equal_to(0);
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(

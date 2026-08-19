@@ -2340,6 +2340,10 @@ impl App {
             source,
             duration,
             support,
+            self.preview
+                .as_ref()
+                .map(PreviewHandles::frame_bytes_per_cell)
+                .unwrap_or_default(),
             workspace,
         );
         if let Some(preview) = self.preview.as_ref() {

@@ -14,7 +14,7 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
-use crate::preview::{FrameSource, FrameTarget, seek_for};
+use crate::preview::{FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, seek_for};
 use crate::subtitle::SubtitleSource;
 
 /// How long the selection has to stop moving before a frame is asked for.
@@ -235,6 +235,14 @@ pub struct SubtitleSyncState {
     /// help. Getting the neighbours ready is always safe: they only ever come from the
     /// cache.
     refill_nearby: bool,
+    /// Roughly what one encoded frame costs per cell of the preview pane, from the
+    /// terminal's image protocol and font size — see
+    /// [`PreviewHandles::frame_bytes_per_cell`]. Multiplied by the pane the renderer
+    /// measured, this is what sizes the window; zero means nothing is being encoded, so
+    /// there is nothing to bound.
+    ///
+    /// [`PreviewHandles::frame_bytes_per_cell`]: crate::preview::PreviewHandles::frame_bytes_per_cell
+    frame_cost: u64,
     workspace: PreviewWorkspace,
 }
 
@@ -245,9 +253,11 @@ impl SubtitleSyncState {
         source: SubtitleSource,
         duration: Duration,
         support: PreviewSupport,
+        frame_cost: u64,
         workspace: PreviewWorkspace,
     ) -> Self {
         Self {
+            frame_cost,
             generation,
             frames,
             source,
@@ -402,11 +412,37 @@ impl SubtitleSyncState {
             .map(|(_, message)| message.as_str())
     }
 
-    /// Drops every frame further from the selection than [`NEARBY_FRAMES`].
+    /// How many cues either side of the selection this pane can afford to keep encoded.
+    ///
+    /// [`NEARBY_FRAMES`] is the ceiling, not the answer. A `Protocol` holds the bytes the
+    /// terminal is going to be sent rather than the picture, and under kitty that is the
+    /// frame's pixels as base64 RGBA — so five of them on a pane filling a large display
+    /// is tens of megabytes held to save a round trip on two cues the cursor may never
+    /// reach. [`FRAME_WINDOW_BUDGET`] is what the whole window may hold; the selected
+    /// cue's own frame is not optional, so it is paid for first and the neighbours divide
+    /// what is left.
+    ///
+    /// Floored at one either side rather than zero: a window of nothing puts the worker
+    /// round trip back on every cursor move, which is the thing the window exists to
+    /// remove, and one frame over the budget is the better of those two outcomes.
+    fn window_radius(&self) -> usize {
+        let cells = u64::from(self.preview_cells.width) * u64::from(self.preview_cells.height);
+        let per_frame = cells.saturating_mul(self.frame_cost);
+        if per_frame == 0 {
+            return NEARBY_FRAMES;
+        }
+        let affordable = FRAME_WINDOW_BUDGET / per_frame;
+        usize::try_from(affordable.saturating_sub(1) / 2)
+            .unwrap_or(NEARBY_FRAMES)
+            .clamp(1, NEARBY_FRAMES)
+    }
+
+    /// Drops every frame further from the selection than [`Self::window_radius`].
     fn prune_frames(&mut self) {
         let selected = self.selected;
+        let radius = self.window_radius();
         self.encoded
-            .retain(|frame| frame.cue_index.abs_diff(selected) <= NEARBY_FRAMES);
+            .retain(|frame| frame.cue_index.abs_diff(selected) <= radius);
     }
 
     /// Marks the frames on hand as no longer the right ones for where the cursor is.
@@ -474,9 +510,13 @@ impl SubtitleSyncState {
     ///
     /// Both directions at each distance, because which way the cursor is about to move is
     /// not knowable and getting the wrong one ready costs a cache read.
+    ///
+    /// Reaches exactly as far as [`Self::window_radius`] can afford to keep. Asking wider
+    /// than that would render frames the next `prune_frames` throws away, and then ask for
+    /// them again on the following report.
     pub fn nearby_frame_targets(&self) -> Vec<FrameTarget> {
         let mut targets = Vec::new();
-        for distance in 1..=NEARBY_FRAMES {
+        for distance in 1..=self.window_radius() {
             let candidates = [
                 self.selected.checked_sub(distance),
                 self.selected.checked_add(distance),
@@ -498,7 +538,7 @@ impl SubtitleSyncState {
     /// list to answer it — this runs on every progress report the background pass sends,
     /// which is ten a second for as long as a track takes to render.
     fn has_missing_nearby(&self) -> bool {
-        (1..=NEARBY_FRAMES).any(|distance| {
+        (1..=self.window_radius()).any(|distance| {
             [
                 self.selected.checked_sub(distance),
                 self.selected.checked_add(distance),
@@ -608,6 +648,14 @@ mod tests {
     }
 
     fn state() -> SubtitleSyncState {
+        costed_state(HALFBLOCKS_BYTES_PER_CELL)
+    }
+
+    /// What halfblocks costs: two `Color`s and a `char` per cell, and no dependence on the
+    /// font size. The protocol the tests here actually encode with, via `protocol`.
+    const HALFBLOCKS_BYTES_PER_CELL: u64 = 12;
+
+    fn costed_state(frame_cost: u64) -> SubtitleSyncState {
         SubtitleSyncState::new(
             1,
             FrameSource {
@@ -620,6 +668,7 @@ mod tests {
             SubtitleSource::Embedded(2),
             Duration::from_secs(600),
             PreviewSupport::Available,
+            frame_cost,
             PreviewWorkspace::new().unwrap(),
         )
     }
@@ -1282,6 +1331,118 @@ mod tests {
 
         // Assert
         assert_that!(state.any_frame_requested()).is_false();
+    }
+
+    /// What kitty costs on a 10x20 font: the frame's pixels as base64 RGBA, so the pane
+    /// size is what turns this into megabytes.
+    const KITTY_BYTES_PER_CELL: u64 = 200 * 4 * 4 / 3;
+
+    /// A `Protocol` holds the bytes the terminal is going to be sent rather than the
+    /// picture, so a full window on a pane filling a large display runs to tens of
+    /// megabytes held to save a round trip on cues the cursor may never reach.
+    #[test]
+    fn the_ready_window_should_shrink_on_a_pane_it_cannot_afford() {
+        // Arrange: a pane of 12,000 cells, which under kitty is about 12 MB a frame —
+        // three of them fit the budget where five do not.
+        let mut state = costed_state(KITTY_BYTES_PER_CELL);
+        state.apply_prepared(
+            (0..5)
+                .map(|index| {
+                    let start = index as u64 * 2000;
+                    cue(start, start + 1000, &format!("line {index}"))
+                })
+                .collect(),
+        );
+        state.set_preview_cells(Size::new(200, 60));
+        state.select(2);
+
+        // Act: offer the full window anyway, as the worker would.
+        for cue_index in 0..5 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+
+        // Assert: the selected cue and one either side, not two.
+        assert_that!(state.has_frame(2)).is_true();
+        assert_that!(state.has_frame(1)).is_true();
+        assert_that!(state.has_frame(3)).is_true();
+        assert_that!(state.has_frame(0)).is_false();
+        assert_that!(state.has_frame(4)).is_false();
+
+        // Assert: and the page stops asking for what it would only throw away — cue 0 and
+        // cue 4 are outside the window, so an empty list is the steady state rather than a
+        // render on every progress report.
+        assert_that!(state.nearby_frame_targets().is_empty()).is_true();
+
+        // Act / Assert: the same page on a pane it can afford keeps the full window.
+        state.set_preview_cells(Size::new(80, 24));
+        for cue_index in 0..5 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(4)).is_true();
+    }
+
+    /// A window of nothing puts the worker round trip back on every cursor move, which is
+    /// the thing the window exists to remove — so however large the pane, one neighbour
+    /// either side is kept and the budget is the one that gives.
+    #[test]
+    fn the_ready_window_should_keep_a_neighbour_however_large_the_pane() {
+        // Arrange: a pane where a single frame alone is over budget.
+        let mut state = costed_state(KITTY_BYTES_PER_CELL);
+        state.apply_prepared(
+            (0..3)
+                .map(|index| {
+                    let start = index as u64 * 2000;
+                    cue(start, start + 1000, &format!("line {index}"))
+                })
+                .collect(),
+        );
+        state.set_preview_cells(Size::new(400, 120));
+        state.select(1);
+
+        // Act
+        for cue_index in 0..3 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+
+        // Assert
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(1)).is_true();
+        assert_that!(state.has_frame(2)).is_true();
+    }
+
+    /// Halfblocks is twelve bytes a cell whatever the pane, and a build with no picker
+    /// encodes nothing at all — neither can ever reach the budget, so neither should be
+    /// made to pay for it with a shortened window.
+    #[test]
+    fn a_window_that_costs_nothing_should_never_be_shortened() {
+        // Arrange / Act / Assert: halfblocks, on a pane far past what kitty could afford.
+        let mut state = ready(5);
+        state.set_preview_cells(Size::new(400, 120));
+        state.select(2);
+        for cue_index in 0..5 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(4)).is_true();
+
+        // Arrange / Act / Assert: and a page with no image protocol behind it at all.
+        let mut state = costed_state(0);
+        state.apply_prepared(
+            (0..5)
+                .map(|index| {
+                    let start = index as u64 * 2000;
+                    cue(start, start + 1000, &format!("line {index}"))
+                })
+                .collect(),
+        );
+        state.set_preview_cells(Size::new(400, 120));
+        state.select(2);
+        for cue_index in 0..5 {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(4)).is_true();
     }
 
     /// A track that could not be read has no cues to render, so a count left on screen
