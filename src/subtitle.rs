@@ -444,9 +444,9 @@ impl ToolCapabilities {
     /// Whether `ffmpeg` can draw a subtitle onto a video frame.
     ///
     /// `subtitles` is the libass one, present only in a build configured with it;
-    /// `scale` is what fits the result to the preview pane. Without both, the timing
-    /// page falls back to showing the cue's text, which is also what a terminal with no
-    /// image protocol gets.
+    /// `scale` is what fits the result to the preview pane. Without both, the timing page
+    /// asks for no frames at all and leaves its preview pane empty, which is also what a
+    /// terminal with no image protocol gets.
     pub fn can_burn_subtitles(&self) -> bool {
         self.ffmpeg_filters.contains("subtitles") && self.ffmpeg_filters.contains("scale")
     }

@@ -245,9 +245,12 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
 
 /// The frame at the selected cue, with that cue burned into it.
 ///
-/// Falls back to drawing the cue's text when there is no frame: while one is being
-/// rendered, when the terminal has no image protocol, and when FFmpeg was built without
-/// libass. All three land here, so the fallback is a real path rather than scaffolding.
+/// An empty pane when there is no frame for the cue under the cursor. The cue's text used
+/// to fill that gap, and it read as a flicker rather than as a fallback: the picture is
+/// what the pane is for, so every cursor move flashed the line as plain text for a moment
+/// before the real frame replaced it. With the cues either side of the selection kept
+/// encoded and ready (`SubtitleSyncState::nearby_frame_targets`) there is usually no gap
+/// left to fill, and the cue's text is on screen in the list beside this anyway.
 fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
     let block = Block::bordered().title(" Preview ");
     let inner = block.inner(area);
@@ -258,34 +261,15 @@ fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: R
 
     // `Image` draws nothing at all — not even clipped — when the protocol is larger than
     // the area it is given, so a frame encoded for a pane that has since shrunk is left
-    // for the text fallback rather than rendered into an empty box.
+    // out rather than rendered into an empty box. Only in-flight frames can be that stale:
+    // a measured resize drops every frame on hand.
     if let Some(protocol) = state
         .frame()
         .filter(|protocol| protocol.size().width <= inner.width)
         .filter(|protocol| protocol.size().height <= inner.height)
     {
         frame.render_widget(Image::new(protocol), inner);
-        return;
     }
-
-    let text = state
-        .selected_cue()
-        .map(|cue| cue.text.clone())
-        .unwrap_or_default();
-    // Vertically centred the way a burned-in subtitle sits low in frame, so the text does
-    // not jump when the real image arrives behind it.
-    let padding = usize::from(inner.height).saturating_sub(1) / 2;
-    let mut lines = vec![Line::from(""); padding];
-    lines.extend(text.lines().map(|line| {
-        Line::styled(
-            line.to_string(),
-            Style::default().fg(Color::White).bold().bg(Color::Black),
-        )
-    }));
-    frame.render_widget(
-        Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
-        inner,
-    );
 }
 
 fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
@@ -11967,6 +11951,22 @@ mod tests {
     /// derives the cell size from the image's own proportions — asking for a cell size
     /// with an image of some other shape silently produces a smaller protocol than asked
     /// for, which is exactly how an "oversized" fixture ends up fitting after all.
+    /// The distinct image colours a drawn screen carries.
+    ///
+    /// Halfblocks paints a plain space wherever a cell's two halves came out the same
+    /// colour, so the colour is what says a picture was drawn, rather than the `▀` glyph.
+    fn image_shades(
+        painted: &[(String, ratatui::style::Style)],
+    ) -> std::collections::BTreeSet<(u8, u8, u8)> {
+        painted
+            .iter()
+            .filter_map(|(_, style)| match style.bg {
+                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn striped_protocol(width: u16, height: u16) -> Box<ratatui_image::protocol::Protocol> {
         let font = ratatui_image::picker::Picker::halfblocks().font_size();
         let mut image = image::RgbImage::new(
@@ -12035,16 +12035,8 @@ mod tests {
         let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
 
         // Assert: cells carrying real image colour, in more than one shade — a blank
-        // pane has none, and a solid fill would have exactly one. Halfblocks paints a
-        // plain space wherever a cell's two halves came out the same colour, so the
-        // colour is the signal here rather than the `▀` glyph.
-        let shades: std::collections::BTreeSet<_> = painted
-            .iter()
-            .filter_map(|(_, style)| match style.bg {
-                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
-                _ => None,
-            })
-            .collect();
+        // pane has none, and a solid fill would have exactly one.
+        let shades = image_shades(&painted);
         assert_that!(shades.is_empty()).is_false();
         assert_that!(shades.len() > 1).is_true();
 
@@ -12053,11 +12045,11 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// `Image` renders nothing at all — not even clipped — when the protocol is bigger
-    /// than the area, so a frame encoded before the pane shrank would blank the preview
-    /// entirely rather than fall back.
+    /// A frame encoded for a pane that has since shrunk is left out rather than handed to
+    /// `Image`, which renders nothing at all — not even clipped — when the protocol is
+    /// bigger than the area, and would leave the pane's own border painted over.
     #[test]
-    fn a_frame_too_big_for_the_pane_should_fall_back_to_the_cue_text() {
+    fn a_frame_too_big_for_the_pane_should_be_left_out_rather_than_drawn() {
         // Arrange
         let (mut app, directory) =
             sync_page_app("sync-frame-big", vec![sync_cue(0, 1000, "spoken")]);
@@ -12069,12 +12061,34 @@ mod tests {
             .apply_frame(0, striped_protocol(cells.width + 10, cells.height + 10));
 
         // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: no image colour anywhere — an oversized protocol contributes nothing,
+        // and the pane is left empty rather than half-painted.
+        let shades = image_shades(&painted);
+        assert_that!(shades.is_empty()).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The pane used to draw the cue's text whenever it had no frame, which meant every
+    /// move of the cursor flashed the line as plain text for a moment before the picture
+    /// replaced it — the preview reading as broken on every keypress. The text belongs to
+    /// the cue list beside it, and the pane is now simply empty until its frame arrives.
+    #[test]
+    fn a_pane_with_no_frame_should_stay_empty_rather_than_flash_the_cue_text() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-frame-gap", vec![sync_cue(0, 1000, "spoken")]);
+
+        // Act: drawn before any frame has been rendered, which is the gap in question.
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
-        // Assert: twice — once in the cue list, once as the preview pane's fallback.
-        // Counting is the point: the cue list draws the text either way, so a preview
-        // left blank by an image `Image` silently refused to draw still "contains" it.
-        assert_that!(screen.matches("spoken").count()).is_equal_to(2);
+        // Assert: once, in the cue list — counting is the point, since an empty preview
+        // still leaves a screen that "contains" the line.
+        assert_that!(screen.matches("spoken").count()).is_equal_to(1);
 
         // Cleanup
         drop(app);

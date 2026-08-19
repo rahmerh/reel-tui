@@ -47,8 +47,14 @@ impl Default for Config {
 /// number of threads.
 const MAX_WORKERS: usize = 16;
 
-/// Frames are a few hundred kilobytes each and a feature-length subtitle track has a
-/// thousand or two cues, so this holds a handful of whole films at once.
+/// Frames are under a hundred kilobytes each — see `framecache::FRAME_EXTENSION` for why
+/// that is JPEG's doing — and a feature-length subtitle track has a thousand or two cues,
+/// so this holds several whole films at once.
+///
+/// The margin matters rather than being slack: a limit that cannot hold one track's frames
+/// makes the background pass evict its own earliest work as it writes, so every opening of
+/// that track renders it again from the beginning. That is what this was doing at two
+/// megabytes a frame.
 const DEFAULT_PREVIEW_CACHE_MB: u64 = 512;
 
 /// A cache large enough to matter, and a ceiling a mistyped value cannot cross. Zero is

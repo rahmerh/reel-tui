@@ -432,16 +432,20 @@ fn srt_body(language: &str, duration: f32) -> String {
     format!("1\n00:00:00,000 --> 00:00:{whole:02},{millis:03}\n{language} subtitle line\n\n")
 }
 
-/// Writes a single solid-colour PNG, for planting in the preview frame cache.
+/// Writes a single solid-colour frame in the format the preview cache stores, for
+/// planting in it.
 ///
 /// A cached frame the application could not possibly have rendered from the fixture
 /// video, so a page that draws it is a page that read the cache rather than running
 /// `ffmpeg` again.
-pub fn write_solid_png(path: &Path, color: &str, width: u32, height: u32) {
+///
+/// `-pix_fmt yuvj420p` for the same reason `preview::frame_command` passes it: the mjpeg
+/// encoder refuses the limited-range YUV that `color` produces.
+pub fn write_solid_frame(path: &Path, color: &str, width: u32, height: u32) {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
         .arg(format!("color=c={color}:s={width}x{height}"))
-        .args(["-frames:v", "1"])
+        .args(["-frames:v", "1", "-vcodec", "mjpeg", "-pix_fmt", "yuvj420p"])
         .arg(path)
         .output()
         .expect("ffmpeg should be runnable");

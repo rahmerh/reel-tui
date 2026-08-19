@@ -13,7 +13,7 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
-use crate::preview::FrameSource;
+use crate::preview::{FrameSource, FrameTarget, seek_for};
 use crate::subtitle::SubtitleSource;
 
 /// How long the selection has to stop moving before a frame is asked for.
@@ -21,7 +21,21 @@ use crate::subtitle::SubtitleSource;
 /// Matches the file list's probe debounce (`App::start_pending_probe`). Walking a cue list
 /// with `j` held down would otherwise start an `ffmpeg` per repeat, each one an accurate
 /// seek that on a network mount reads from the preceding keyframe.
+///
+/// Only frames that would have to be rendered wait it out. One already in the frame cache
+/// costs a file read and an encode — a few milliseconds — so `App::start_pending_preview`
+/// asks for it straight away, which is what makes walking an already-rendered track feel
+/// like scrolling rather than like loading.
 pub const FRAME_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// How many cues either side of the selection are kept encoded and ready to draw.
+///
+/// The point of the window is that moving the cursor draws a picture in the *same* frame
+/// the keypress is handled in, with no worker round trip at all. Two rather than one so a
+/// cursor moving faster than the worker answers still lands inside it; small because a
+/// `Protocol` holds the picture encoded for the pane, and a full-screen preview is several
+/// megabytes each.
+pub const NEARBY_FRAMES: usize = 2;
 
 /// How far the background pass has got in rendering the track's frames.
 ///
@@ -148,14 +162,29 @@ pub struct SubtitleSyncState {
     /// renderer knows, and because a change to it is what tells the worker the frame it
     /// already produced is the wrong size now.
     pub preview_cells: Size,
-    /// The frame on screen, once one has been drawn.
-    frame: Option<Frame>,
-    /// Why the last frame request produced nothing, shown under the text preview.
+    /// The frames encoded and ready to draw: the selected cue's, and up to
+    /// [`NEARBY_FRAMES`] either side of it.
+    ///
+    /// A window rather than the single frame on screen, because a round trip to the worker
+    /// — even one that only reads the cache — is a visible gap on every cursor move. Kept
+    /// pruned to the window by [`Self::prune_frames`], so it is bounded by how far the
+    /// cursor is from what has been drawn rather than by how long the page has been open.
+    encoded: Vec<Frame>,
+    /// Why the last frame request produced nothing.
     pub frame_error: Option<String>,
-    /// Set when something invalidated the frame — the selection moved, the cues arrived,
-    /// the pane resized — and cleared when the request is actually sent, one debounce
-    /// later.
+    /// Set when something invalidated the frames on hand — the selection moved, the cues
+    /// arrived, the pane resized — and cleared when the request is actually sent.
     frame_pending_since: Option<Instant>,
+    /// Set when the frame cache has gained something the window is still missing, and
+    /// cleared when the request is sent.
+    ///
+    /// Separate from `frame_pending_since` because it asks for strictly less. The
+    /// background pass reports progress ten times a second, and letting that re-ask for
+    /// the *selected* cue would put an `ffmpeg` per report behind a cue that failed to
+    /// draw — the one case where the selected frame is missing and asking again cannot
+    /// help. Getting the neighbours ready is always safe: they only ever come from the
+    /// cache.
+    refill_nearby: bool,
     workspace: PreviewWorkspace,
 }
 
@@ -180,9 +209,10 @@ impl SubtitleSyncState {
             list_scroll: 0,
             list_rows: 0,
             preview_cells: Size::new(0, 0),
-            frame: None,
+            encoded: Vec::new(),
             frame_error: None,
             frame_pending_since: None,
+            refill_nearby: false,
             workspace,
         }
     }
@@ -206,6 +236,11 @@ impl SubtitleSyncState {
         } else {
             WarmState::Working { done, total }
         };
+        // The pass has cached frames the window may have been missing when it was last
+        // asked for. Without this the neighbours are only ever refilled by the cursor
+        // moving, so the first step in a freshly opened page waits on the worker — the
+        // round trip this whole window exists to remove.
+        self.refill_nearby = true;
     }
 
     /// Takes the cues a worker parsed and makes the page ready.
@@ -233,66 +268,152 @@ impl SubtitleSyncState {
         self.warm = WarmState::Off;
         self.cues.clear();
         self.layout = LaneLayout::default();
-        self.drop_frame();
+        self.encoded.clear();
         self.frame_pending_since = None;
+        self.refill_nearby = false;
     }
 
-    /// The frame to draw, if there is one for the cue currently selected.
+    /// The frame to draw, if the cue currently selected has one ready.
     ///
-    /// Keyed on the selection rather than handed out unconditionally, so the moment the
-    /// cursor moves the pane shows the new cue's text instead of the previous cue's
-    /// picture — a stale frame under a fresh cue reads as the burn-in being wrong.
+    /// Keyed on the selection rather than handed out unconditionally, so a frame is never
+    /// drawn under a cue it does not belong to — a stale picture under a fresh cue reads
+    /// as the burn-in being wrong.
     pub fn frame(&self) -> Option<&Protocol> {
-        self.frame
-            .as_ref()
-            .filter(|frame| frame.cue_index == self.selected)
+        self.frame_for(self.selected)
+    }
+
+    fn frame_for(&self, cue_index: usize) -> Option<&Protocol> {
+        self.encoded
+            .iter()
+            .find(|frame| frame.cue_index == cue_index)
             .map(|frame| frame.protocol.as_ref())
     }
 
-    /// Takes a rendered frame, ignoring one for a cue that is no longer selected.
-    pub fn apply_frame(&mut self, cue_index: usize, protocol: Box<Protocol>) {
-        self.frame_error = None;
-        self.frame = Some(Frame {
-            cue_index,
-            protocol,
-        });
+    /// Whether the cue at `cue_index` is already encoded and ready to draw.
+    pub fn has_frame(&self, cue_index: usize) -> bool {
+        self.frame_for(cue_index).is_some()
     }
 
-    pub fn fail_frame(&mut self, message: String) {
-        self.drop_frame();
+    /// Takes a rendered frame, for the selection or for a cue near it.
+    pub fn apply_frame(&mut self, cue_index: usize, protocol: Box<Protocol>) {
+        self.frame_error = None;
+        let frame = Frame {
+            cue_index,
+            protocol,
+        };
+        match self
+            .encoded
+            .iter_mut()
+            .find(|held| held.cue_index == cue_index)
+        {
+            Some(held) => *held = frame,
+            None => self.encoded.push(frame),
+        }
+        // A frame for a cue the cursor has since left is worth keeping only while it is
+        // still inside the window; pruning here is what bounds the list when the answer
+        // arrives after the selection has moved on.
+        self.prune_frames();
+        // And look again at what is left. The frame worker coalesces its queue down to the
+        // newest request, so a refill that was still waiting when the next one arrived was
+        // dropped on the floor; without this the window would stay short of that one cue
+        // until the cursor happened to move again.
+        self.refill_nearby = true;
+    }
+
+    /// Records why one cue could not be drawn, dropping any frame held for it.
+    pub fn fail_frame(&mut self, cue_index: usize, message: String) {
+        self.encoded.retain(|frame| frame.cue_index != cue_index);
         self.frame_error = Some(message);
     }
 
-    fn drop_frame(&mut self) {
-        self.frame = None;
+    /// Drops every frame further from the selection than [`NEARBY_FRAMES`].
+    fn prune_frames(&mut self) {
+        let selected = self.selected;
+        self.encoded
+            .retain(|frame| frame.cue_index.abs_diff(selected) <= NEARBY_FRAMES);
     }
 
-    /// Marks the frame on screen as no longer the right one, starting the debounce.
+    /// Marks the frames on hand as no longer the right ones for where the cursor is.
+    ///
+    /// Asked for even when the selected cue is already encoded: the window has moved, so
+    /// there is a new cue at its far edge to get ready before the cursor reaches it.
     pub fn request_frame(&mut self) {
+        self.prune_frames();
         self.frame_pending_since = Some(Instant::now());
     }
 
-    /// Whether a frame request has waited out its debounce, consuming it if so.
-    ///
-    /// Consuming here rather than in the caller keeps "asked for" and "waiting to ask"
-    /// from ever both being true, which is what would let one settled selection start two
-    /// `ffmpeg` processes.
-    pub fn take_due_frame_request(&mut self) -> bool {
-        let due = self
-            .frame_pending_since
-            .is_some_and(|since| since.elapsed() >= FRAME_DEBOUNCE);
-        if due {
-            self.frame_pending_since = None;
-        }
-        due
+    /// Whether the selected cue's own frame has been asked for since the last request was
+    /// sent — as opposed to only the neighbours around it.
+    pub fn frame_requested(&self) -> bool {
+        self.frame_pending_since.is_some()
     }
 
-    /// Records the pane size the renderer measured, asking for a new frame when it
-    /// changed — the frame already drawn was encoded for the old size, and `Image` draws
-    /// nothing at all rather than clipping when it no longer fits.
+    /// Whether anything at all has been asked for, of either kind.
+    pub fn any_frame_requested(&self) -> bool {
+        self.frame_pending_since.is_some() || self.refill_nearby
+    }
+
+    /// Whether the outstanding request has waited out [`FRAME_DEBOUNCE`].
+    ///
+    /// Only consulted for a frame that would have to be rendered. One already in the
+    /// cache is dispatched without asking, since there is no `ffmpeg` for the debounce to
+    /// be protecting against.
+    pub fn frame_request_due(&self) -> bool {
+        self.frame_pending_since
+            .is_some_and(|since| since.elapsed() >= FRAME_DEBOUNCE)
+    }
+
+    /// Forgets the outstanding request, once it has been sent or found to be asking for
+    /// nothing. Keeps "asked for" and "waiting to ask" from ever both being true, which
+    /// is what would let one settled selection start two `ffmpeg` processes.
+    pub fn clear_frame_request(&mut self) {
+        self.frame_pending_since = None;
+        self.refill_nearby = false;
+    }
+
+    /// What the frame worker needs in order to draw the cue at `cue_index`.
+    pub fn frame_target(&self, cue_index: usize) -> Option<FrameTarget> {
+        let cue = self.cues.get(cue_index)?;
+        Some(FrameTarget {
+            cue_index,
+            cue: cue.clone(),
+            // `seek_for` rather than the midpoint outright: a cue running to the end of
+            // the media has to be held back from the very last instant, and the background
+            // pass has to make exactly the same decision — a disagreement would have the
+            // two writing different pictures under one cache key.
+            seek: seek_for(cue, self.duration),
+        })
+    }
+
+    /// The cues either side of the selection that are not encoded yet, nearest first.
+    ///
+    /// Both directions at each distance, because which way the cursor is about to move is
+    /// not knowable and getting the wrong one ready costs a cache read.
+    pub fn nearby_frame_targets(&self) -> Vec<FrameTarget> {
+        let mut targets = Vec::new();
+        for distance in 1..=NEARBY_FRAMES {
+            let candidates = [
+                self.selected.checked_sub(distance),
+                self.selected.checked_add(distance),
+            ];
+            for cue_index in candidates.into_iter().flatten() {
+                if !self.has_frame(cue_index)
+                    && let Some(target) = self.frame_target(cue_index)
+                {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Records the pane size the renderer measured, dropping every frame on hand and
+    /// asking again when it changed: each one was encoded for the old size, and `Image`
+    /// draws nothing at all rather than clipping when it no longer fits.
     pub fn set_preview_cells(&mut self, cells: Size) {
         if self.preview_cells != cells {
             self.preview_cells = cells;
+            self.encoded.clear();
             self.request_frame();
         }
     }
@@ -610,6 +731,16 @@ mod tests {
         assert_that!(state.list_scroll).is_equal_to(0);
     }
 
+    /// The take-if-due the state used to expose, which `App::start_pending_preview` now
+    /// spells out itself so that a frame already in the cache can skip the wait.
+    fn take_due(state: &mut SubtitleSyncState) -> bool {
+        let due = state.frame_request_due();
+        if due {
+            state.clear_frame_request();
+        }
+        due
+    }
+
     #[test]
     fn selected_cue_should_return_the_cue_under_the_cursor() {
         // Arrange
@@ -656,7 +787,7 @@ mod tests {
         state.apply_frame(1, protocol(10, 5));
 
         // Act
-        let described = format!("{:?}", state.frame);
+        let described = format!("{:?}", state.encoded);
 
         // Assert
         assert_that!(described.as_str()).contains("cue_index: 1");
@@ -683,6 +814,207 @@ mod tests {
         assert_that!(state.frame().is_some()).is_true();
     }
 
+    /// The point of holding more than one frame: moving the cursor onto a cue whose frame
+    /// is already encoded draws it in the same pass that handled the keypress, with no
+    /// round trip to the worker and so no empty pane in between.
+    #[test]
+    fn a_frame_already_encoded_should_be_drawn_the_moment_the_cursor_reaches_it() {
+        // Arrange
+        let mut state = ready(6);
+        state.apply_frame(0, protocol(10, 5));
+        state.apply_frame(1, protocol(10, 5));
+        state.apply_frame(2, protocol(10, 5));
+
+        // Act / Assert: every step forward lands on a frame that is already there.
+        for _ in 0..2 {
+            assert_that!(state.select(1)).is_true();
+            assert_that!(state.frame().is_some()).is_true();
+        }
+
+        // Act / Assert: and the step past the window does not, which is what the request
+        // it leaves pending is for.
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.frame().is_some()).is_false();
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// A `Protocol` holds the picture encoded for the pane, so the window has to be a
+    /// window rather than a growing pile — walking a thousand-cue track would otherwise
+    /// keep every frame it passed.
+    #[test]
+    fn frames_further_than_the_window_should_be_dropped_as_the_cursor_moves() {
+        // Arrange
+        let mut state = ready(10);
+        for cue_index in 0..=NEARBY_FRAMES {
+            state.apply_frame(cue_index, protocol(10, 5));
+        }
+        assert_that!(state.encoded.len()).is_equal_to(NEARBY_FRAMES + 1);
+
+        // Act: far enough that nothing held is still near the cursor.
+        assert_that!(state.select(9)).is_true();
+
+        // Assert
+        assert_that!(state.encoded.is_empty()).is_true();
+        // And a frame that arrives for a cue the cursor has already left is not kept
+        // either — the answer to a request the selection outran.
+        state.apply_frame(0, protocol(10, 5));
+        assert_that!(state.encoded.is_empty()).is_true();
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// One cue re-rendered — after a resize, or after the pane changed — replaces the
+    /// frame held for it rather than stacking a second entry under the same index.
+    #[test]
+    fn a_second_frame_for_one_cue_should_replace_the_first() {
+        // Arrange
+        let mut state = ready(3);
+        state.apply_frame(0, protocol(10, 5));
+
+        // Act
+        state.apply_frame(0, protocol(6, 3));
+
+        // Assert
+        assert_that!(state.encoded.len()).is_equal_to(1);
+        assert_that!(state.frame().map(|protocol| protocol.size().width)).is_equal_to(Some(6));
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// Every frame on hand was encoded for the pane it was asked for, and `Image` draws
+    /// nothing at all rather than clipping when one no longer fits.
+    #[test]
+    fn resizing_the_pane_should_drop_every_frame_on_hand() {
+        // Arrange
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        state.apply_frame(0, protocol(10, 5));
+        state.apply_frame(1, protocol(10, 5));
+
+        // Act
+        state.set_preview_cells(Size::new(30, 20));
+
+        // Assert
+        assert_that!(state.encoded.is_empty()).is_true();
+        assert_that!(state.frame_requested()).is_true();
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// The worker is told what is missing, not what the window is: a cue already encoded
+    /// would otherwise be read out of the cache and re-encoded on every cursor move.
+    #[test]
+    fn nearby_targets_should_name_the_cues_around_the_cursor_that_have_no_frame_yet() {
+        // Arrange
+        let mut state = ready(9);
+        assert_that!(state.select(4)).is_true();
+
+        // Act
+        let targets = state.nearby_frame_targets();
+
+        // Assert: both directions, nearest first, and never the selection itself.
+        assert_that!(
+            targets
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![3, 5, 2, 6]);
+        assert_that!(targets[0].cue.text.as_str()).is_equal_to("line 3");
+        // The seek is the cue's midpoint, the same one the background pass renders under,
+        // or the two would write different pictures for one cache key.
+        assert_that!(targets[0].seek).is_equal_to(seek_for(&state.cues[3], state.duration));
+
+        // Act / Assert: the ones already encoded drop out.
+        state.apply_frame(3, protocol(10, 5));
+        state.apply_frame(6, protocol(10, 5));
+        assert_that!(
+            state
+                .nearby_frame_targets()
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![5, 2]);
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// The window runs off both ends of a short track, and an index that does not exist
+    /// must not become a request for a cue the page does not have.
+    #[test]
+    fn nearby_targets_should_stop_at_the_ends_of_the_track() {
+        // Arrange
+        let mut state = ready(2);
+
+        // Act / Assert: nothing before the first cue.
+        assert_that!(
+            state
+                .nearby_frame_targets()
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![1]);
+
+        // Act / Assert: nothing after the last.
+        assert_that!(state.select_last()).is_true();
+        assert_that!(
+            state
+                .nearby_frame_targets()
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![0]);
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// A page whose track has not arrived yet is drawn and navigable, so the dispatch
+    /// runs against it — and must find nothing to ask for rather than a cue at index 0.
+    #[test]
+    fn a_page_with_no_cues_should_have_no_frame_to_ask_for() {
+        // Arrange
+        let state = state();
+
+        // Act / Assert
+        assert_that!(state.nearby_frame_targets().is_empty()).is_true();
+        assert_that!(state.frame_target(0).is_none()).is_true();
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// A frame that could not be drawn belongs to one cue. Dropping the whole window with
+    /// it would blank the neighbours the cursor is about to reach, for a failure that
+    /// says nothing about them.
+    #[test]
+    fn a_failed_frame_should_drop_only_the_cue_it_failed_for() {
+        // Arrange
+        let mut state = ready(4);
+        state.apply_frame(0, protocol(10, 5));
+        state.apply_frame(1, protocol(10, 5));
+
+        // Act
+        state.fail_frame(1, "libass is missing".to_string());
+
+        // Assert
+        assert_that!(state.frame().is_some()).is_true();
+        assert_that!(state.has_frame(1)).is_false();
+        assert_that!(state.frame_error.clone()).is_equal_to(Some("libass is missing".to_string()));
+
+        // Cleanup
+        drop(state);
+    }
+
     #[test]
     fn a_frame_that_could_not_be_drawn_should_replace_the_one_on_screen_with_its_reason() {
         // Arrange
@@ -690,7 +1022,7 @@ mod tests {
         state.apply_frame(0, protocol(10, 5));
 
         // Act
-        state.fail_frame("libass is missing".to_string());
+        state.fail_frame(0, "libass is missing".to_string());
 
         // Assert
         assert_that!(state.frame().is_some()).is_false();
@@ -701,23 +1033,24 @@ mod tests {
         assert_that!(state.frame_error.clone()).is_none();
     }
 
-    /// Everything that invalidates the frame has to go through the same debounce, or a
-    /// held-down `j` starts an ffmpeg per key repeat.
+    /// A frame that has to be rendered waits out the debounce, or a held-down `j` starts
+    /// an ffmpeg per key repeat. (One already in the cache does not — that decision is
+    /// `App::start_pending_preview`'s, and is asserted there.)
     #[test]
     fn moving_the_selection_should_ask_for_a_frame_only_once_the_movement_settles() {
         // Arrange
         let mut state = ready(5);
-        state.take_due_frame_request();
+        take_due(&mut state);
 
         // Act
         state.select(1);
 
         // Assert: pending, but not yet due.
-        assert_that!(state.take_due_frame_request()).is_false();
+        assert_that!(take_due(&mut state)).is_false();
         std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
-        assert_that!(state.take_due_frame_request()).is_true();
+        assert_that!(take_due(&mut state)).is_true();
         // And consumed: one settled selection is one request.
-        assert_that!(state.take_due_frame_request()).is_false();
+        assert_that!(take_due(&mut state)).is_false();
     }
 
     #[test]
@@ -726,7 +1059,7 @@ mod tests {
         let mut state = state();
         let due = |state: &mut SubtitleSyncState| {
             std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
-            state.take_due_frame_request()
+            take_due(state)
         };
 
         // Act / Assert: the cues arriving.
@@ -766,7 +1099,7 @@ mod tests {
         // Assert
         assert_that!(state.frame().is_some()).is_false();
         std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
-        assert_that!(state.take_due_frame_request()).is_false();
+        assert_that!(take_due(&mut state)).is_false();
     }
 
     /// The status line counts cues the pass is finished with, and stops counting when the

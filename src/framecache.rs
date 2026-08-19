@@ -30,6 +30,16 @@ use crate::cue::Cue;
 /// Directory the frames live in, under the same cache directory as `probe_cache.json`.
 const FRAMES_DIR: &str = "preview_frames";
 
+/// What a stored frame is, which is also what `preview::frame_command` asks `ffmpeg` for.
+///
+/// JPEG rather than PNG, and the difference is not a detail. PNG is lossless, and a frame
+/// of live-action video has nothing lossless to preserve — it came out of a lossy codec to
+/// begin with — so the encoder spends two megabytes storing grain. The same frame at twice
+/// the resolution is under a hundred kilobytes as JPEG, which is the whole reason a
+/// feature-length track's frames now fit in the cache at once rather than evicting each
+/// other as they are written.
+pub const FRAME_EXTENSION: &str = "jpg";
+
 /// Everything a cached frame depends on, hashed into its filename.
 ///
 /// The media's length and mtime are in here as well as its path: re-encoding a file in
@@ -93,7 +103,7 @@ pub fn directory() -> Option<PathBuf> {
 }
 
 fn path_in(directory: &Path, key: &str) -> PathBuf {
-    directory.join(format!("{key}.png"))
+    directory.join(format!("{key}.{FRAME_EXTENSION}"))
 }
 
 /// The cached frame for `key`, if one was ever stored and still is.
@@ -349,7 +359,7 @@ mod tests {
         undated.media_modified = None;
         assert_that!(key(undated, &cue(1000, 2000, "hello")).as_str())
             .is_not_equal_to(base.as_str());
-        // And the size the PNG was rendered at.
+        // And the size the frame was rendered at.
         let mut smaller = parts(&media);
         smaller.pixels = (640, 360);
         assert_that!(key(smaller, &cue(1000, 2000, "hello")).as_str())
@@ -380,13 +390,13 @@ mod tests {
         let directory = scratch("round-trip");
 
         // Act
-        let stored = store_in(&directory, "frame", b"\x89PNG frame bytes");
+        let stored = store_in(&directory, "frame", b"\xff\xd8\xff frame bytes");
 
         // Assert
         assert_that!(stored).is_true();
         assert_that!(is_cached_in(&directory, "frame")).is_true();
         assert_that!(read_in(&directory, "frame"))
-            .is_equal_to(Some(b"\x89PNG frame bytes".to_vec()));
+            .is_equal_to(Some(b"\xff\xd8\xff frame bytes".to_vec()));
         // No temporary left behind by a write that succeeded.
         let leftovers = fs::read_dir(&directory)
             .unwrap()
@@ -570,7 +580,7 @@ mod tests {
         // Act / Assert
         assert_that!(directory.parent().map(Path::to_path_buf))
             .is_equal_to(crate::cache::DiskCache::cache_dir());
-        assert_that!(path("frame")).is_equal_to(Some(directory.join("frame.png")));
+        assert_that!(path("frame")).is_equal_to(Some(directory.join("frame.jpg")));
         assert_that!(store("frame", &[0u8; 100])).is_true();
         assert_that!(is_cached("frame")).is_true();
         assert_that!(read("frame")).is_equal_to(Some(vec![0u8; 100]));

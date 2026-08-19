@@ -27,6 +27,7 @@ use crate::{
         video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
+    framecache,
     preview::{
         FrameOutcome, FrameRequest, FrameSource, PrepareOutcome, PrepareRequest, PreviewEvent,
         PreviewHandles, WarmRequest,
@@ -2388,7 +2389,7 @@ impl App {
                     outcome,
                 } if generation == state.generation => match outcome {
                     FrameOutcome::Ready(protocol) => state.apply_frame(cue_index, protocol),
-                    FrameOutcome::Failed(message) => state.fail_frame(message),
+                    FrameOutcome::Failed(message) => state.fail_frame(cue_index, message),
                 },
                 _ => {}
             }
@@ -2451,24 +2452,30 @@ impl App {
         }
     }
 
-    /// Asks for the frame at the selected cue, once the selection has settled.
+    /// Asks for the frame at the selected cue, and for the ones around it.
     ///
-    /// Called every loop iteration beside `start_pending_probe`, and debounced for the
-    /// same reason: a held-down `j` would otherwise start an accurate seek per key repeat.
+    /// Called every loop iteration beside `start_pending_probe`. The debounce it used to
+    /// apply unconditionally now applies only when the selected cue would have to be
+    /// rendered: that is what a held-down `j` must not start an accurate seek per repeat
+    /// of, whereas a frame already in the cache costs a read and an encode, and making the
+    /// user wait `FRAME_DEBOUNCE` for it is a tenth of a second of empty pane for nothing.
     pub fn start_pending_preview(&mut self) {
         let Some(preview) = self.preview.as_ref() else {
             return;
         };
         // Asking for a frame that can only fail is worse than not asking: it is one
-        // `ffmpeg` per settled selection producing the same message the page already
-        // shows. Both fallbacks — a terminal with no image protocol, a build without
-        // libass — land on the cue's text instead.
+        // `ffmpeg` per settled selection producing a message that goes under the cue the
+        // cursor has since left. A terminal with no image protocol and a build without
+        // libass both land here.
         if !preview.draws_frames() || !self.subtitle_capabilities.can_burn_subtitles() {
             return;
         }
         let Some(state) = self.subtitle_sync.as_mut() else {
             return;
         };
+        if !state.any_frame_requested() {
+            return;
+        }
         // A pane with no cells has nothing to scale to, and the renderer has not measured
         // one yet on the first frame after the page opens. Not merely wasteful: encoding
         // an image for a zero-cell area trips a `debug_assert!` inside `ratatui-image`
@@ -2476,22 +2483,34 @@ impl App {
         if state.preview_cells.width == 0 || state.preview_cells.height == 0 {
             return;
         }
-        if !state.take_due_frame_request() {
+        // Only a request that named the selection asks for the selected cue. A refill
+        // triggered by the background pass asks for the neighbours alone — see
+        // `SubtitleSyncState::refill_nearby`.
+        let wanted = if state.frame_requested() && !state.has_frame(state.selected) {
+            state.frame_target(state.selected)
+        } else {
+            None
+        };
+        let nearby = state.nearby_frame_targets();
+        // Everything in the window is already encoded, which is the steady state while the
+        // cursor sits still. Forgetting the request here is what stops the same window
+        // being re-examined on every one of the twenty loop iterations a second.
+        if wanted.is_none() && nearby.is_empty() {
+            state.clear_frame_request();
             return;
         }
-        let Some(cue) = state.selected_cue() else {
+        let renders = wanted
+            .as_ref()
+            .is_some_and(|target| !framecache::is_cached(&state.frames.key(&target.cue)));
+        if renders && !state.frame_request_due() {
             return;
-        };
-        // `seek_for` rather than the midpoint outright: a cue running to the end of the
-        // media has to be held back from the very last instant, and the background pass
-        // has to make exactly the same decision — a disagreement would have the two
-        // writing different pictures under one cache key.
+        }
+        state.clear_frame_request();
         preview.request_frame(FrameRequest {
             generation: state.generation,
-            cue_index: state.selected,
             source: state.frames.clone(),
-            cue: cue.clone(),
-            seek: crate::preview::seek_for(cue, state.duration),
+            wanted,
+            nearby,
             cells: state.preview_cells,
         });
     }
@@ -19645,15 +19664,19 @@ mod tests {
         let state = app.subtitle_sync.as_ref().unwrap();
         let request = frames.try_recv().expect("a frame should be asked for");
         assert_that!(request.generation).is_equal_to(state.generation);
-        assert_that!(request.cue_index).is_equal_to(0);
         assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
         assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
-        assert_that!(request.cue.text.as_str()).is_equal_to("one");
+        let wanted = request
+            .wanted
+            .clone()
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.cue_index).is_equal_to(0);
+        assert_that!(wanted.cue.text.as_str()).is_equal_to("one");
         // The midpoint of the cue, not its start: a cue's first frame is often the last
         // frame of the previous shot. This file's duration would not parse, so there is
         // nothing to hold the seek back from — clamping against the resulting zero would
         // preview the first frame of the media for every cue in the track.
-        assert_that!(request.seek).is_equal_to(Duration::from_secs(2));
+        assert_that!(wanted.seek).is_equal_to(Duration::from_secs(2));
         assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 20));
 
         // Act / Assert: and one settled selection asks exactly once.
@@ -19693,14 +19716,170 @@ mod tests {
 
         // Assert: the midpoint would be 10s, which is the whole duration.
         let request = frames.try_recv().expect("a frame should be asked for");
-        assert_that!(request.seek).is_equal_to(Duration::from_millis(9800));
+        let wanted = request
+            .wanted
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.seek).is_equal_to(Duration::from_millis(9800));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The debounce is there to stop a held-down `j` starting an accurate seek per key
+    /// repeat. A frame already in the frame cache starts no seek at all — it costs a file
+    /// read and an encode — so waiting `FRAME_DEBOUNCE` out for it is a tenth of a second
+    /// of empty pane bought for nothing, on every single cursor move through a track that
+    /// has already been rendered.
+    #[test]
+    fn a_cached_frame_should_be_asked_for_without_waiting_out_the_debounce() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+        // The second cue's picture is on disk, as it would be once the background pass
+        // had walked past it.
+        let state = app.subtitle_sync.as_ref().unwrap();
+        let key = state.frames.key(&state.cues[1]);
+        crate::framecache::store(&key, b"stand-in for a rendered frame");
+
+        // Act: the selection moves and the dispatch runs immediately, with none of the
+        // debounce waited out.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.start_pending_preview();
+
+        // Assert
+        let request = frames
+            .try_recv()
+            .expect("a cached frame should be asked for straight away");
+        let wanted = request
+            .wanted
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.cue_index).is_equal_to(1);
+
+        // Cleanup
+        if let Some(path) = crate::framecache::path(&key) {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The other half of the same decision: a cue the cache has never seen is an accurate
+    /// seek into the container, which is exactly what the debounce exists to keep a held
+    /// key from starting one of per repeat.
+    #[test]
+    fn an_uncached_frame_should_still_wait_out_the_debounce() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+
+        // Act
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.start_pending_preview();
+
+        // Assert: nothing yet.
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Act / Assert: and it is asked for once the movement settles.
+        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        let request = frames
+            .try_recv()
+            .expect("a settled selection should be asked for");
+        assert_that!(
+            request
+                .wanted
+                .map(|target| target.cue_index)
+                .unwrap_or_default()
+        )
+        .is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cues either side of the cursor are asked for alongside it, so that moving onto
+    /// one draws it in the same pass that handled the keypress rather than after a round
+    /// trip to the worker — which is the gap the pane used to fill with the cue's text.
+    #[test]
+    fn a_frame_request_should_carry_the_cues_around_the_selection() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert: the page holds two cues, so the one after the selection is the only
+        // neighbour there is.
+        let request = frames.try_recv().expect("a frame should be asked for");
+        assert_that!(
+            request
+                .nearby
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![1]);
+        assert_that!(request.nearby[0].cue.text.as_str()).is_equal_to("two");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The steady state while the cursor sits still. Re-examining the window on every one
+    /// of the twenty loop iterations a second would be a `stat` per cue per tick for a
+    /// page that is not going to change until a key is pressed.
+    #[test]
+    fn a_window_that_is_already_encoded_should_ask_for_nothing_further() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act: both cues answered, which is the whole window for this two-cue track.
+        for cue_index in 0..2 {
+            app.subtitle_sync
+                .as_mut()
+                .unwrap()
+                .apply_frame(cue_index, test_protocol());
+        }
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().frame_requested()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// An FFmpeg without libass cannot burn a cue in, so asking would be one doomed
-    /// subprocess per settled selection producing a message the page already shows.
+    /// subprocess per settled selection, producing a reason nothing is drawn under a cue
+    /// the cursor has since left.
     #[test]
     fn start_pending_preview_should_ask_for_nothing_without_the_tools_to_draw_it() {
         // Arrange

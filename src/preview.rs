@@ -17,10 +17,15 @@
 //! command construction instead.
 //!
 //! Three threads, because they are asked for different things at different rates: cues
-//! once per page opening, the selected cue's frame once per settled selection, and every
-//! *other* cue's frame in the background from the moment the cues land. Frames from all
-//! three paths go through [`crate::framecache`], so the second visit to a cue — and every
-//! visit after the page is re-opened — costs a decode rather than an `ffmpeg` seek.
+//! once per page opening, the cue under the cursor and its immediate neighbours once per
+//! cursor movement, and every *other* cue's frame in the background from the moment the
+//! cues land. Frames from all three paths go through [`crate::framecache`], so the second
+//! visit to a cue — and every visit after the page is re-opened — costs a decode rather
+//! than an `ffmpeg` seek.
+//!
+//! The neighbours are why walking the cue list draws a picture per keypress rather than
+//! per round trip: by the time the cursor reaches a cue, the page is already holding it
+//! encoded (see `SubtitleSyncState::nearby_frame_targets`).
 
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -63,12 +68,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The largest a frame is rendered before it is cached.
 ///
-/// Fixed rather than the pane's own pixel size, which is what it used to be. A cached
-/// frame has to serve whatever size the pane happens to be later — otherwise resizing the
-/// terminal invalidates every frame on disk — and this is small enough that a whole film's
-/// cues fit in a cache measured in hundreds of megabytes while still holding more detail
-/// than any terminal can draw.
-const MAX_FRAME_PIXELS: (u32, u32) = (960, 540);
+/// Fixed rather than the pane's own pixel size, which is what it used to be. A cached frame
+/// has to serve whatever size the pane happens to be later — otherwise resizing the
+/// terminal invalidates every frame on disk — so this has to be a bound on every pane the
+/// frame might be drawn into rather than on any one of them.
+///
+/// 1080p is that bound in practice: the preview pane is a fraction of the terminal, and a
+/// terminal filling a 4K display is around 3840 pixels wide, so a pane wider than this
+/// takes a display most people do not have and a font most people do not use. Above it the
+/// picture is detail no terminal draws, paid for in cache and in the resize every draw
+/// performs.
+///
+/// It was 960×540, which was visibly soft on a large pane. What made the larger size
+/// affordable was storing frames as JPEG rather than PNG — see
+/// [`crate::framecache::FRAME_EXTENSION`]. At 1080p a frame is around ninety kilobytes,
+/// against two megabytes for a *smaller* PNG.
+const MAX_FRAME_PIXELS: (u32, u32) = (1920, 1080);
 
 /// How often the background pass reports where it has got to.
 ///
@@ -147,15 +162,31 @@ impl FrameSource {
 /// writes it back out as a one-cue subtitle file and hashes it into the cache key, and
 /// cannot reach `App` to look either up.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrameRequest {
-    pub generation: u64,
-    /// Which cue in the page's list this is for, so a frame that arrives after the
-    /// selection has moved on can be recognised as stale.
+pub struct FrameTarget {
+    /// Which cue in the page's list this is, so a frame that arrives after the selection
+    /// has moved on can be filed against the cue it actually belongs to.
     pub cue_index: usize,
-    pub source: FrameSource,
     pub cue: Cue,
     /// Where to grab the frame, already clamped inside the media by the caller.
     pub seek: Duration,
+}
+
+/// What to have ready to draw: the cue under the cursor, and the ones around it.
+///
+/// Two lists rather than one because they are allowed to cost different amounts. The
+/// selected cue is what the user is waiting to see, so it is rendered with `ffmpeg` when
+/// the cache does not have it; the ones around it are only being got ready in advance, so
+/// they are taken from the cache or skipped. Rendering those too would put a second
+/// `ffmpeg` per cursor move behind the one the user is actually waiting for — the
+/// background pass already renders the whole track, and this only has to encode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameRequest {
+    pub generation: u64,
+    pub source: FrameSource,
+    /// The cue under the cursor, unless its frame is already encoded and on hand.
+    pub wanted: Option<FrameTarget>,
+    /// Cues either side of the cursor, encoded only from the cache.
+    pub nearby: Vec<FrameTarget>,
     /// The preview pane, in terminal cells, as the renderer measured it. Only the encode
     /// to a terminal protocol uses this — the picture itself is rendered at
     /// `source.pixels` so that one cached frame serves every pane size.
@@ -177,8 +208,8 @@ pub struct WarmRequest {
 
 /// A frame ready to draw, or why there is none.
 ///
-/// `Failed` is not an error dialog: the page keeps showing the cue's text, and this is
-/// what it can say underneath.
+/// `Failed` is not an error dialog: the page leaves the preview pane empty and records the
+/// reason on the state, for the cue it was reported against.
 pub enum FrameOutcome {
     Ready(Box<Protocol>),
     Failed(String),
@@ -289,8 +320,8 @@ impl PreviewHandles {
 }
 
 /// Starts the page's background workers: one that reads a track's cues, and — when the
-/// terminal can draw images at all — one that renders the frame at the selected cue and
-/// one that renders the rest of the track behind it.
+/// terminal can draw images at all — one that renders the frame at the selected cue along
+/// with the cues around it, and one that renders the rest of the track behind them.
 ///
 /// Three threads rather than one because they are asked for different things at different
 /// rates. A single thread would make a held-down `j` queue behind an extraction that is
@@ -332,17 +363,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             std::thread::spawn(move || {
                 while let Ok(request) = frame_rx.recv() {
                     let request = newest(request, &frame_rx);
-                    let Some(outcome) = frame(&request, &picker, &frame_generation) else {
-                        continue;
-                    };
-                    if frame_events
-                        .send(PreviewEvent::Frame {
-                            generation: request.generation,
-                            cue_index: request.cue_index,
-                            outcome,
-                        })
-                        .is_err()
-                    {
+                    if !frame(&request, &picker, &frame_generation, &frame_events) {
                         break;
                     }
                 }
@@ -498,28 +519,115 @@ fn extracted(run: RunOutcome, staged: &Path) -> Option<PrepareOutcome> {
     }
 }
 
-/// Renders the frame at one cue with that cue burned into it, or `None` if the page it
-/// was for closed on the way.
+/// Answers one request: the cue under the cursor first, then the ones around it.
+///
+/// Returns whether the worker should keep serving requests — `false` only when nobody is
+/// listening for events any more, which means the application has gone.
+///
+/// The selected cue is always sent first, even though the nearby ones are cheaper. They
+/// are being got ready for a cursor that has not arrived yet; sending one of them first
+/// would put a cache read and an encode in front of the picture the user is looking at an
+/// empty pane waiting for.
 fn frame(
     request: &FrameRequest,
     picker: &Picker,
     live_generation: &AtomicU64,
-) -> Option<FrameOutcome> {
+    events: &Sender<PreviewEvent>,
+) -> bool {
     let abandoned = || live_generation.load(Ordering::Relaxed) != request.generation;
+    frame_window(request, picker, &abandoned, events)
+}
+
+/// The window itself, with "has the page gone" handed in.
+///
+/// Split from `frame` for the same reason `warm_track` is split from `warm`: the two
+/// places this gives up part-way — during the grab the user is waiting on, and between the
+/// neighbours behind it — are a race against a real `ffmpeg` otherwise, and they are what
+/// stops a page nobody is looking at any more from finishing its window.
+fn frame_window(
+    request: &FrameRequest,
+    picker: &Picker,
+    abandoned: &dyn Fn() -> bool,
+    events: &Sender<PreviewEvent>,
+) -> bool {
     if abandoned() {
-        return None;
+        return true;
     }
-    drawn(
-        png(
-            &request.source,
-            &request.cue,
-            request.seek,
-            CUE_FILE,
-            &abandoned,
-        ),
-        picker,
-        request.cells,
-    )
+    if let Some(target) = request.wanted.as_ref() {
+        let outcome = drawn(
+            png(
+                &request.source,
+                &target.cue,
+                target.seek,
+                CUE_FILE,
+                abandoned,
+            ),
+            picker,
+            request.cells,
+        );
+        // `None` is the page having closed mid-grab: nothing to report, and nothing left
+        // to get ready either, since the window it was around is gone.
+        let Some(outcome) = outcome else {
+            return true;
+        };
+        if !publish(events, request.generation, target.cue_index, outcome) {
+            return false;
+        }
+    }
+    nearby(request, picker, abandoned, events)
+}
+
+/// Encodes the cues around the cursor, from the frame cache only.
+///
+/// A cue the cache does not have is skipped rather than rendered: the background pass is
+/// already walking the whole track, so it will be there shortly, and spawning `ffmpeg`
+/// here would compete with the grab the user is actually waiting for.
+///
+/// Failures are skipped too, rather than reported. Nobody is looking at these cues, and a
+/// message from one of them would appear under the cue that *is* selected, blaming the
+/// wrong line.
+fn nearby(
+    request: &FrameRequest,
+    picker: &Picker,
+    abandoned: &dyn Fn() -> bool,
+    events: &Sender<PreviewEvent>,
+) -> bool {
+    for target in &request.nearby {
+        if abandoned() {
+            return true;
+        }
+        let Some(bytes) = framecache::read(&request.source.key(&target.cue)) else {
+            continue;
+        };
+        let FrameOutcome::Ready(protocol) = encode(&bytes, picker, request.cells) else {
+            continue;
+        };
+        if !publish(
+            events,
+            request.generation,
+            target.cue_index,
+            FrameOutcome::Ready(protocol),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sends one frame back to the page, reporting whether anyone was still listening.
+fn publish(
+    events: &Sender<PreviewEvent>,
+    generation: u64,
+    cue_index: usize,
+    outcome: FrameOutcome,
+) -> bool {
+    events
+        .send(PreviewEvent::Frame {
+            generation,
+            cue_index,
+            outcome,
+        })
+        .is_ok()
 }
 
 /// What one cue's PNG — cached or freshly grabbed — means for the page.
@@ -657,7 +765,7 @@ fn grabbed(run: RunOutcome, key: &str) -> PngOutcome {
 /// thread — a kitty protocol is base64 over the whole image, which is milliseconds the
 /// event loop would otherwise spend not answering keys.
 fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
-    let image = match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+    let image = match image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg) {
         Ok(image) => image,
         Err(error) => return FrameOutcome::Failed(format!("Unreadable frame: {error}")),
     };
@@ -823,7 +931,25 @@ fn frame_command(
         .arg(format!(
             "subtitles={staged},scale={width}:{height}:force_original_aspect_ratio=decrease"
         ))
-        .args(["-f", "image2pipe", "-vcodec", "png", "-"]);
+        // `-q:v 2` is mjpeg's near-lossless end. The frame is judged by eye against a
+        // burned-in subtitle, so visible compression artefacts would be read as the
+        // rendering being wrong; anything looser is not worth the kilobytes it saves.
+        //
+        // `-pix_fmt yuvj420p` is not optional: the mjpeg encoder refuses limited-range YUV
+        // outright ("Non full-range YUV is non-standard"), which is what most video
+        // actually is, and the filter graph only negotiates its way to a full-range format
+        // on its own some of the time. Stating it makes every source encode the same way.
+        .args([
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-pix_fmt",
+            "yuvj420p",
+            "-q:v",
+            "2",
+            "-",
+        ]);
     command
 }
 
@@ -1080,12 +1206,56 @@ mod tests {
     fn frame_request(media: &Path, workspace: &Path, seek: Duration) -> FrameRequest {
         FrameRequest {
             generation: 1,
-            cue_index: 0,
             source: source(media, workspace),
-            cue: cue(0, 1000, "BURNED IN"),
-            seek,
+            wanted: Some(FrameTarget {
+                cue_index: 0,
+                cue: cue(0, 1000, "BURNED IN"),
+                seek,
+            }),
+            nearby: Vec::new(),
             cells: Size::new(20, 10),
         }
+    }
+
+    /// The cue `frame_request` asks for, for the tests that have to look it up in the
+    /// cache or forget it again.
+    fn wanted(request: &FrameRequest) -> &Cue {
+        &request
+            .wanted
+            .as_ref()
+            .expect("frame_request always asks for a cue")
+            .cue
+    }
+
+    /// Runs the frame worker over a channel of its own and collects what it published.
+    ///
+    /// One request now answers for several cues, so the worker reports through the event
+    /// channel rather than by return value; this is the shape the tests below assert on.
+    /// Panics unless the worker reported that it can keep serving, which is only false
+    /// when the results channel has gone — and here it has not.
+    fn frames_of(
+        request: &FrameRequest,
+        picker: &Picker,
+        live_generation: &AtomicU64,
+    ) -> Vec<(usize, FrameOutcome)> {
+        let (events, published) = mpsc::channel();
+        assert_that!(frame(request, picker, live_generation, &events)).is_true();
+        drop(events);
+        published
+            .into_iter()
+            .map(|event| match event {
+                PreviewEvent::Frame {
+                    cue_index, outcome, ..
+                } => (cue_index, outcome),
+                other => panic!("the frame worker should only publish frames, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The single frame `frames_of` published, for the tests that ask for one cue.
+    fn only_frame(frames: Vec<(usize, FrameOutcome)>) -> Option<FrameOutcome> {
+        assert_that!(frames.len() <= 1).is_true();
+        frames.into_iter().next().map(|(_, outcome)| outcome)
     }
 
     /// Frames land in the test binary's shared cache directory, so anything that reads or
@@ -1381,7 +1551,7 @@ mod tests {
         let (handles, events) = spawn_preview_workers(None);
         // No picker means no frame worker and no background pass either — there would be
         // nothing to draw their output with — and asking anyway is a no-op rather than a
-        // panic: the page falls back to the cue's text.
+        // panic: the page simply leaves its preview pane empty.
         assert_that!(handles.draws_frames()).is_false();
         handles.request_frame(frame_request(&sidecar, &directory, Duration::ZERO));
         handles.request_warm(WarmRequest {
@@ -1466,7 +1636,11 @@ mod tests {
                 "-f",
                 "image2pipe",
                 "-vcodec",
-                "png",
+                "mjpeg",
+                "-pix_fmt",
+                "yuvj420p",
+                "-q:v",
+                "2",
                 "-",
             ]
             .map(str::to_string)
@@ -1483,7 +1657,7 @@ mod tests {
         let request = frame_request(&media, &directory, Duration::from_millis(2500));
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         let Some(FrameOutcome::Ready(protocol)) = outcome else {
@@ -1510,7 +1684,7 @@ mod tests {
         let request = frame_request(&media, &directory, Duration::from_secs(60));
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         let Some(FrameOutcome::Failed(message)) = outcome else {
@@ -1532,7 +1706,7 @@ mod tests {
         );
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         let Some(FrameOutcome::Failed(message)) = outcome else {
@@ -1553,7 +1727,7 @@ mod tests {
         let request = frame_request(&directory.join("clip.mkv"), &workspace, Duration::ZERO);
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         let Some(FrameOutcome::Failed(message)) = outcome else {
@@ -1570,7 +1744,7 @@ mod tests {
         let request = frame_request(&directory.join("clip.mkv"), &directory, Duration::ZERO);
 
         // Act: the live page has moved on past this request's generation.
-        let outcome = frame(&request, &Picker::halfblocks(), &live(9));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(9)));
 
         // Assert: nothing was even staged, let alone spawned.
         assert_that!(outcome).is_none();
@@ -1641,7 +1815,11 @@ mod tests {
         // directly in `a_queue_of_frame_requests_should_collapse_to_the_newest`.
         handles.abandon(1);
         handles.request_frame(FrameRequest {
-            cue_index: 3,
+            wanted: Some(FrameTarget {
+                cue_index: 3,
+                cue: cue(0, 1000, "BURNED IN"),
+                seek: Duration::from_millis(2500),
+            }),
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         });
 
@@ -1833,17 +2011,396 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// A PNG the decoder will accept, for seeding the cache with something a real grab
-    /// could not have produced from the media the request names.
-    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+    /// A frame the decoder will accept, in the format the cache actually stores, for
+    /// seeding it with something a real grab could not have produced from the media the
+    /// request names.
+    fn frame_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         image::DynamicImage::new_rgb8(width, height)
             .write_to(
                 &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
+                image::ImageFormat::Jpeg,
             )
-            .expect("an in-memory PNG should encode");
+            .expect("an in-memory JPEG should encode");
         bytes
+    }
+
+    /// The cues around the cursor are encoded and published alongside it, so that moving
+    /// onto one draws it in the same pass that handled the keypress. Proven with a media
+    /// file that does not exist: every frame here comes from the cache or not at all.
+    #[test]
+    fn the_cues_around_the_cursor_should_be_encoded_from_the_cache_and_published_too() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-nearby");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let cues = [cue(0, 1000, "here"), cue(2000, 3000, "next")];
+        for one in &cues {
+            framecache::store(&source.key(one), &frame_bytes(64, 48));
+        }
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: Some(FrameTarget {
+                cue_index: 7,
+                cue: cues[0].clone(),
+                seek: Duration::ZERO,
+            }),
+            nearby: vec![FrameTarget {
+                cue_index: 8,
+                cue: cues[1].clone(),
+                seek: Duration::from_millis(2500),
+            }],
+            cells: Size::new(20, 10),
+        };
+
+        // Act
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert: the selected cue first — a nearby one ahead of it would put a cache read
+        // in front of the picture the user is sitting in front of an empty pane for.
+        assert_that!(
+            frames
+                .iter()
+                .map(|(cue_index, _)| *cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![7, 8]);
+        assert_that!(
+            frames
+                .iter()
+                .all(|(_, outcome)| matches!(outcome, FrameOutcome::Ready(_)))
+        )
+        .is_true();
+        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        for one in &cues {
+            forget(&source, one);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A nearby cue the cache does not hold is skipped rather than rendered: the
+    /// background pass is already walking the whole track, and an `ffmpeg` here would
+    /// compete with the grab the user is actually waiting for.
+    #[test]
+    fn a_nearby_cue_with_no_cached_frame_should_be_skipped_rather_than_rendered() {
+        // Arrange
+        require_ffmpeg("a_nearby_cue_with_no_cached_frame_should_be_skipped_rather_than_rendered");
+        let _guard = cache_guard();
+        let directory = scratch("frame-nearby-uncached");
+        let media = video(&directory);
+        let uncached = cue(4000, 5000, "not rendered yet");
+        let request = FrameRequest {
+            nearby: vec![FrameTarget {
+                cue_index: 1,
+                cue: uncached.clone(),
+                seek: Duration::from_millis(4500),
+            }],
+            ..frame_request(&media, &directory, Duration::from_millis(2500))
+        };
+        forget(&request.source, wanted(&request));
+        forget(&request.source, &uncached);
+
+        // Act
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert: the selected cue was rendered, and the nearby one was left for the
+        // background pass rather than grabbed here.
+        assert_that!(
+            frames
+                .iter()
+                .map(|(cue_index, _)| *cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![0]);
+        assert_that!(framecache::is_cached(&request.source.key(&uncached))).is_false();
+
+        // Cleanup
+        forget(&request.source, wanted(&request));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Nobody is looking at a nearby cue, so a frame of its that will not decode is
+    /// dropped rather than reported — the message would appear under the cue that *is*
+    /// selected, blaming a line that drew perfectly well.
+    #[test]
+    fn a_nearby_frame_that_will_not_decode_should_be_dropped_rather_than_reported() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-nearby-corrupt");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let selected = cue(0, 1000, "here");
+        let corrupt = cue(2000, 3000, "next");
+        framecache::store(&source.key(&selected), &frame_bytes(64, 48));
+        framecache::store(&source.key(&corrupt), b"not a PNG at all");
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: Some(FrameTarget {
+                cue_index: 0,
+                cue: selected.clone(),
+                seek: Duration::ZERO,
+            }),
+            nearby: vec![FrameTarget {
+                cue_index: 1,
+                cue: corrupt.clone(),
+                seek: Duration::from_millis(2500),
+            }],
+            cells: Size::new(20, 10),
+        };
+
+        // Act
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert
+        assert_that!(
+            frames
+                .iter()
+                .map(|(cue_index, _)| *cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![0]);
+
+        // Cleanup
+        forget(&source, &selected);
+        forget(&source, &corrupt);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The window a prefetch is around belongs to a page that can close part-way through
+    /// it, and the cues left are for a cursor that is no longer anywhere near them.
+    #[test]
+    fn a_page_that_closes_should_stop_the_prefetch_where_it_stands() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-nearby-abandoned");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let cues = [cue(0, 1000, "here"), cue(2000, 3000, "next")];
+        for one in &cues {
+            framecache::store(&source.key(one), &frame_bytes(64, 48));
+        }
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: None,
+            nearby: cues
+                .iter()
+                .enumerate()
+                .map(|(cue_index, one)| FrameTarget {
+                    cue_index,
+                    cue: one.clone(),
+                    seek: Duration::ZERO,
+                })
+                .collect(),
+            cells: Size::new(20, 10),
+        };
+
+        // Act: the live page has moved on past this request's generation.
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(9));
+
+        // Assert: not one of them, cached and cheap though they were.
+        assert_that!(frames.is_empty()).is_true();
+
+        // Cleanup
+        for one in &cues {
+            forget(&source, one);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Collects the frames a `frame_window` run published, for the tests that hand their
+    /// own "has the page gone" in.
+    fn published(events: Receiver<PreviewEvent>) -> Vec<usize> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                PreviewEvent::Frame { cue_index, .. } => cue_index,
+                other => panic!("the frame worker should only publish frames, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The page is open when the worker checks and gone once the grab is running, which is
+    /// exactly the order a real closure arrives in. Nothing is published for it, and the
+    /// window it was the middle of is dropped with it — the cues around a cursor that no
+    /// longer exists are not worth encoding.
+    #[test]
+    fn a_page_that_closes_mid_grab_should_publish_nothing_and_drop_its_window() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_page_that_closes_mid_grab_should_publish_nothing_and_drop_its_window");
+        let directory = scratch("frame-mid-grab");
+        let media = video(&directory);
+        let ahead = cue(4000, 5000, "the cue behind it");
+        framecache::store(
+            &source(&media, &directory).key(&ahead),
+            &frame_bytes(64, 48),
+        );
+        let request = FrameRequest {
+            nearby: vec![FrameTarget {
+                cue_index: 1,
+                cue: ahead.clone(),
+                seek: Duration::from_millis(4500),
+            }],
+            ..frame_request(&media, &directory, Duration::from_millis(2500))
+        };
+        forget(&request.source, wanted(&request));
+        let (events_tx, events) = mpsc::channel();
+        let checks = std::cell::Cell::new(0);
+        let closes_during_the_grab = || {
+            checks.set(checks.get() + 1);
+            // The worker's own check is the first; everything after it is `ffmpeg` being
+            // polled, and by then the page has gone.
+            checks.get() > 1
+        };
+
+        // Act
+        let alive = frame_window(
+            &request,
+            &Picker::halfblocks(),
+            &closes_during_the_grab,
+            &events_tx,
+        );
+        drop(events_tx);
+
+        // Assert: still serving, but nothing published — not the grab it gave up on, and
+        // not the cached neighbour it would otherwise have gone on to encode.
+        assert_that!(alive).is_true();
+        assert_that!(published(events).is_empty()).is_true();
+
+        // Cleanup
+        forget(&request.source, &ahead);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A page can close between one neighbour and the next, and the rest of the window is
+    /// then being got ready for a cursor that is not there any more.
+    #[test]
+    fn a_page_that_closes_mid_prefetch_should_stop_at_the_cue_it_reached() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-mid-prefetch");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let cues = [cue(0, 1000, "first"), cue(2000, 3000, "second")];
+        for one in &cues {
+            framecache::store(&source.key(one), &frame_bytes(64, 48));
+        }
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: None,
+            nearby: cues
+                .iter()
+                .enumerate()
+                .map(|(cue_index, one)| FrameTarget {
+                    cue_index,
+                    cue: one.clone(),
+                    seek: Duration::ZERO,
+                })
+                .collect(),
+            cells: Size::new(20, 10),
+        };
+        let (events_tx, events) = mpsc::channel();
+        let checks = std::cell::Cell::new(0);
+        // The worker's check, then the first neighbour's; the page goes before the second.
+        let closes_after_the_first = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        };
+
+        // Act
+        let alive = frame_window(
+            &request,
+            &Picker::halfblocks(),
+            &closes_after_the_first,
+            &events_tx,
+        );
+        drop(events_tx);
+
+        // Assert
+        assert_that!(alive).is_true();
+        assert_that!(published(events).as_slice()).contains_exactly_in_given_order([0]);
+
+        // Cleanup
+        for one in &cues {
+            forget(&source, one);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker stops entirely once its results have nowhere to go, which means the
+    /// application has exited — including part-way through a window, where the grab
+    /// succeeded and only the neighbours are left.
+    #[test]
+    fn a_prefetch_with_nobody_listening_should_stop_the_worker() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-prefetch-deaf");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let ahead = cue(2000, 3000, "second");
+        framecache::store(&source.key(&ahead), &frame_bytes(64, 48));
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: None,
+            nearby: vec![FrameTarget {
+                cue_index: 1,
+                cue: ahead.clone(),
+                seek: Duration::ZERO,
+            }],
+            cells: Size::new(20, 10),
+        };
+        let (events_tx, events) = mpsc::channel();
+        drop(events);
+
+        // Act
+        let alive = frame(&request, &Picker::halfblocks(), &live(1), &events_tx);
+
+        // Assert
+        assert_that!(alive).is_false();
+
+        // Cleanup
+        forget(&source, &ahead);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The steady state once the cursor stops moving: the selected cue is already encoded
+    /// and only the far edge of the window is missing, so the request carries no `wanted`
+    /// at all and nothing is grabbed for it.
+    #[test]
+    fn a_request_for_nearby_cues_alone_should_grab_nothing() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-nearby-only");
+        let source = source(&directory.join("never-existed.mkv"), &directory);
+        let ahead = cue(2000, 3000, "next");
+        framecache::store(&source.key(&ahead), &frame_bytes(64, 48));
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: None,
+            nearby: vec![FrameTarget {
+                cue_index: 4,
+                cue: ahead.clone(),
+                seek: Duration::from_millis(2500),
+            }],
+            cells: Size::new(20, 10),
+        };
+
+        // Act
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert
+        assert_that!(frames.len()).is_equal_to(1);
+        assert_that!(frames[0].0).is_equal_to(4);
+        assert_that!(matches!(frames[0].1, FrameOutcome::Ready(_))).is_true();
+        assert_that!(directory.join(CUE_FILE).exists()).is_false();
+
+        // Cleanup
+        forget(&source, &ahead);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The whole point of the cache: the second time a cue is asked for, no subprocess
@@ -1862,10 +2419,10 @@ mod tests {
                 Duration::ZERO,
             )
         };
-        framecache::store(&request.source.key(&request.cue), &png_bytes(64, 48));
+        framecache::store(&request.source.key(wanted(&request)), &frame_bytes(64, 48));
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         let Some(FrameOutcome::Ready(protocol)) = outcome else {
@@ -1876,7 +2433,55 @@ mod tests {
         assert_that!(directory.join(CUE_FILE).exists()).is_false();
 
         // Cleanup
-        forget(&request.source, &request.cue);
+        forget(&request.source, wanted(&request));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// What a stored frame *is*, which is the whole reason a track's frames now survive in
+    /// the cache instead of evicting one another as they are written.
+    ///
+    /// A frame of real video stored as PNG is about two megabytes — PNG is lossless, and
+    /// there is nothing lossless to preserve in something that came out of h264, so the
+    /// encoder spends the space on grain. At the default 512 MB that is roughly 240 frames,
+    /// a fraction of a feature-length subtitle track: opening such a track pruned the cache,
+    /// rendered the track, and evicted the start of it on the way past, so *every* opening
+    /// rendered it again from the beginning. As JPEG the same frame is under a hundred
+    /// kilobytes at twice the resolution, and a whole film's cues fit several times over.
+    ///
+    /// The size itself cannot be asserted from a `lavfi` fixture — synthetic video
+    /// compresses losslessly in a way real footage does not, so a budget measured here
+    /// would mean nothing. What is asserted is the decision the size follows from.
+    #[test]
+    fn a_stored_frame_should_be_a_jpeg_under_a_jpeg_name() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_stored_frame_should_be_a_jpeg_under_a_jpeg_name");
+        let directory = scratch("frame-format");
+        let media = video(&directory);
+        let request = frame_request(&media, &directory, Duration::from_millis(2500));
+        let key = request.source.key(wanted(&request));
+        forget(&request.source, wanted(&request));
+
+        // Act
+        let frames = frames_of(&request, &Picker::halfblocks(), &live(1));
+
+        // Assert: drawn, and kept under a name that says what it holds.
+        assert_that!(frames.len()).is_equal_to(1);
+        let path = framecache::path(&key).expect("the test binary has a cache directory");
+        assert_that!(
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+        )
+        .is_equal_to(framecache::FRAME_EXTENSION);
+        // The JPEG start-of-image marker. Bytes rather than a decode, because what is at
+        // issue is which encoder `ffmpeg` was asked for — a PNG would decode perfectly well
+        // and cost twenty times the disk.
+        let stored = std::fs::read(&path).expect("the frame should have been cached");
+        assert_that!(stored.get(..3)).is_equal_to(Some([0xff, 0xd8, 0xff].as_slice()));
+
+        // Cleanup
+        forget(&request.source, wanted(&request));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1890,25 +2495,25 @@ mod tests {
         let directory = scratch("frame-caching");
         let media = video(&directory);
         let request = frame_request(&media, &directory, Duration::from_millis(2500));
-        forget(&request.source, &request.cue);
+        forget(&request.source, wanted(&request));
 
         // Act
-        let outcome = frame(&request, &Picker::halfblocks(), &live(1));
+        let outcome = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
 
         // Assert
         assert_that!(matches!(outcome, Some(FrameOutcome::Ready(_)))).is_true();
-        assert_that!(framecache::is_cached(&request.source.key(&request.cue))).is_true();
+        assert_that!(framecache::is_cached(&request.source.key(wanted(&request)))).is_true();
 
         // Act / Assert: and with the media deleted and the staged cue removed, the same
         // request still draws — from the cache, since there is nothing left to grab.
         std::fs::remove_file(&media).unwrap();
         std::fs::remove_file(directory.join(CUE_FILE)).unwrap();
-        let again = frame(&request, &Picker::halfblocks(), &live(1));
+        let again = only_frame(frames_of(&request, &Picker::halfblocks(), &live(1)));
         assert_that!(matches!(again, Some(FrameOutcome::Ready(_)))).is_true();
         assert_that!(directory.join(CUE_FILE).exists()).is_false();
 
         // Cleanup
-        forget(&request.source, &request.cue);
+        forget(&request.source, wanted(&request));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1936,21 +2541,23 @@ mod tests {
     /// whole film's cues stay a cache a laptop can hold, and never enlarged.
     #[test]
     fn a_frame_should_be_rendered_at_the_sources_size_within_the_cap() {
-        // Act / Assert: a source inside the cap is left alone.
+        // Act / Assert: a source inside the cap is left alone — including 1080p itself,
+        // which is the commonest source there is and is now stored at its own size.
         assert_that!(target_pixels(Some((640, 360)))).is_equal_to((640, 360));
-        // A 1080p source shrinks on its widest axis, keeping its shape.
-        assert_that!(target_pixels(Some((1920, 1080)))).is_equal_to((960, 540));
+        assert_that!(target_pixels(Some((1920, 1080)))).is_equal_to((1920, 1080));
+        // A 4K source shrinks on its widest axis, keeping its shape.
+        assert_that!(target_pixels(Some((3840, 2160)))).is_equal_to((1920, 1080));
         // A very wide source is bounded by width, a very tall one by height.
-        assert_that!(target_pixels(Some((3840, 1600)))).is_equal_to((960, 400));
-        assert_that!(target_pixels(Some((1200, 1600)))).is_equal_to((404, 540));
+        assert_that!(target_pixels(Some((3840, 1600)))).is_equal_to((1920, 800));
+        assert_that!(target_pixels(Some((1200, 1600)))).is_equal_to((810, 1080));
         // Odd sizes round down to even, since the decode on the way here is subsampled.
         assert_that!(target_pixels(Some((641, 361)))).is_equal_to((640, 360));
         // A resolution ffprobe could not measure takes the cap, which
         // `force_original_aspect_ratio=decrease` then treats as a bound rather than a
         // shape — and a zero-sized one is the same case, not a division by zero.
-        assert_that!(target_pixels(None)).is_equal_to((960, 540));
-        assert_that!(target_pixels(Some((0, 1080)))).is_equal_to((960, 540));
-        assert_that!(target_pixels(Some((1920, 0)))).is_equal_to((960, 540));
+        assert_that!(target_pixels(None)).is_equal_to((1920, 1080));
+        assert_that!(target_pixels(Some((0, 1080)))).is_equal_to((1920, 1080));
+        assert_that!(target_pixels(Some((1920, 0)))).is_equal_to((1920, 1080));
         // A source smaller than the two-pixel floor still has a size the scaler accepts.
         assert_that!(target_pixels(Some((1, 1)))).is_equal_to((2, 2));
     }
@@ -2042,7 +2649,7 @@ mod tests {
             cues.clone(),
         );
         for cue in &cues {
-            framecache::store(&request.source.key(cue), &png_bytes(8, 8));
+            framecache::store(&request.source.key(cue), &frame_bytes(8, 8));
         }
         let (events_tx, events) = mpsc::channel();
 
@@ -2227,7 +2834,7 @@ mod tests {
         let source = source(&directory.join("never-existed.mkv"), &directory);
         let first = cue(1000, 2000, "cached");
         let second = cue(3000, 4000, "missing");
-        framecache::store(&source.key(&first), &png_bytes(8, 8));
+        framecache::store(&source.key(&first), &frame_bytes(8, 8));
         forget(&source, &second);
 
         // Act
@@ -2258,11 +2865,12 @@ mod tests {
         let pane = Size::new(40, 20);
 
         // Act: one picture far smaller than the pane, one far larger.
-        let FrameOutcome::Ready(smaller) = encode(&png_bytes(8, 8), &Picker::halfblocks(), pane)
+        let FrameOutcome::Ready(smaller) = encode(&frame_bytes(8, 8), &Picker::halfblocks(), pane)
         else {
             panic!("a readable PNG should encode");
         };
-        let FrameOutcome::Ready(larger) = encode(&png_bytes(400, 400), &Picker::halfblocks(), pane)
+        let FrameOutcome::Ready(larger) =
+            encode(&frame_bytes(400, 400), &Picker::halfblocks(), pane)
         else {
             panic!("a readable PNG should encode");
         };
@@ -2281,7 +2889,7 @@ mod tests {
         let pane = Size::new(40, 10);
 
         // Act: a square picture.
-        let FrameOutcome::Ready(square) = encode(&png_bytes(64, 64), &Picker::halfblocks(), pane)
+        let FrameOutcome::Ready(square) = encode(&frame_bytes(64, 64), &Picker::halfblocks(), pane)
         else {
             panic!("a readable PNG should encode");
         };
@@ -2307,7 +2915,7 @@ mod tests {
             Size::new(20, 10),
         );
         let ready = drawn(
-            PngOutcome::Ready(png_bytes(64, 48)),
+            PngOutcome::Ready(frame_bytes(64, 48)),
             &Picker::halfblocks(),
             Size::new(20, 10),
         );

@@ -23,12 +23,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::KeyCode;
 use fixtures::{
-    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment, write_solid_png,
-    write_vobsub_media,
+    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment,
+    write_solid_frame, write_vobsub_media,
 };
 use harness::{
     Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
@@ -2319,7 +2319,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     // Plant a frame the application could not have rendered, then come back to it.
     app.press(key(KeyCode::Esc));
     app.pump();
-    write_solid_png(&keys[1], "magenta", 320, 240);
+    write_solid_frame(&keys[1], "magenta", 320, 240);
     open_sidecar_timing_page(&mut app);
     app.press(key(KeyCode::Char('j')));
     app.wait_until("the second cue's frame", |app| {
@@ -2385,12 +2385,202 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     );
 }
 
+/// Re-opening a track the background pass has already rendered must not render any of it
+/// again — that is the whole point of the cache, and it was silently not happening.
+///
+/// Frames were stored as PNG at around two megabytes each, so the default 512 MB cache held
+/// roughly 240 of them: fewer than a feature-length subtitle track has cues. Opening such a
+/// track pruned the cache, rendered the track, and evicted its own earliest frames on the
+/// way past, so the next opening found the start of the track missing and rendered it all
+/// over again — every time, forever.
+///
+/// Asserted on mtimes rather than on the files existing: a re-rendered frame is written
+/// again under the same content-addressed name, so existence alone would pass against
+/// exactly the bug this is here for.
+#[test]
+fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
+    let test = "re_opening_a_rendered_track_should_not_render_any_of_it_again";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-frame-reopen");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), WALKED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    wait_for_frames(&mut app);
+
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let paths: Vec<PathBuf> = state
+        .cues
+        .iter()
+        .map(|cue| frame_path(&state.frames.key(cue)))
+        .collect();
+    assert_eq!(paths.len(), 4, "the sidecar holds four cues");
+    let rendered: Vec<SystemTime> = paths
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .unwrap_or_else(|error| {
+                    panic!("the pass should have cached {}: {error}", path.display())
+                })
+                .modified()
+                .expect("the platform reports mtimes")
+        })
+        .collect();
+
+    // The filesystem's mtime granularity can be coarse enough that a rewrite within the
+    // same tick is indistinguishable from no rewrite at all.
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // Leave the page entirely and come back to the same track.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    open_sidecar_timing_page(&mut app);
+    wait_for_frames(&mut app);
+
+    // Every frame is the one already on disk, untouched.
+    for (path, was) in paths.iter().zip(&rendered) {
+        let now = fs::metadata(path)
+            .unwrap_or_else(|error| panic!("{} should still be cached: {error}", path.display()))
+            .modified()
+            .expect("the platform reports mtimes");
+        assert_eq!(
+            now,
+            *was,
+            "re-opening the track re-rendered {} rather than reading it back",
+            path.display()
+        );
+    }
+
+    // And the second visit really did go through the cache rather than skipping the pass:
+    // the page reports it finished, and the frames are still the ones it started with.
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().warm,
+        WarmState::Done,
+        "the pass should run and find everything already there"
+    );
+}
+
+/// Four cues far enough apart to sit on distinct frames of a six-second clip, with text
+/// distinctive enough to be counted on screen.
+const WALKED_CUES: &str = "1\n00:00:00,500 --> 00:00:01,500\nWalkedone\n\n\
+                           2\n00:00:02,000 --> 00:00:03,000\nWalkedtwo\n\n\
+                           3\n00:00:03,500 --> 00:00:04,500\nWalkedthree\n\n\
+                           4\n00:00:05,000 --> 00:00:05,800\nWalkedfour\n\n";
+
+/// Walking the cue list of an already-rendered track puts each cue's picture on screen in
+/// the draw that handles the keypress, and never stands the cue's text in for it.
+///
+/// Both halves of one complaint. The pane used to draw the line as text whenever it had no
+/// frame, and every frame took a round trip through the worker to arrive — so each `j`
+/// flashed the text and then replaced it with the picture a moment later. The page now
+/// keeps the cues either side of the selection encoded and ready, and draws nothing at all
+/// when it has nothing.
+///
+/// The single `pump` after each keypress is the assertion: it is one turn of the event
+/// loop, so a frame that needed the worker to answer could not possibly be on screen yet.
+#[test]
+fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress() {
+    let test =
+        "walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-frame-walk");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), WALKED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // Before any frame has been drawn, which is the state the text fallback used to fill.
+    let bare = app.screen();
+    let listed = bare.matches("Walkedone").count();
+    assert!(
+        listed > 0,
+        "the cue list should name the selected cue:\n{bare}"
+    );
+    assert!(
+        app.preview_shades().is_empty(),
+        "a page with no frame yet should draw an empty pane:\n{bare}"
+    );
+
+    // The whole track rendered to disk, and the window around the cursor encoded.
+    wait_for_frames(&mut app);
+    app.wait_until("the first cue's frame and the one behind it", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some() && state.has_frame(1))
+    });
+    assert_eq!(
+        app.screen().matches("Walkedone").count(),
+        listed,
+        "the arriving frame must not change how often the cue's text is on screen — \
+         it was never the preview pane drawing it"
+    );
+
+    // Walk the track. The wait before each keypress is the window refilling itself as the
+    // cursor advances; the single pump after it is the assertion — one turn of the event
+    // loop, so anything on screen got there without the worker being given a chance to
+    // answer.
+    for (selected, text) in [(1, "Walkedtwo"), (2, "Walkedthree"), (3, "Walkedfour")] {
+        app.wait_until(
+            "the next cue to be encoded ahead of the cursor",
+            move |app| {
+                app.subtitle_sync
+                    .as_ref()
+                    .is_some_and(|state| state.has_frame(selected))
+            },
+        );
+        app.press(key(KeyCode::Char('j')));
+        app.pump();
+
+        let state = app
+            .app
+            .subtitle_sync
+            .as_ref()
+            .expect("the page should still be open");
+        assert_eq!(state.selected, selected, "j should move the cursor");
+        assert!(
+            state.frame().is_some(),
+            "cue {selected} should already have been encoded before the cursor reached it"
+        );
+        let screen = app.screen();
+        assert!(
+            !app.preview_shades().is_empty(),
+            "cue {selected}'s frame should be on screen in the same pass as the keypress; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches(text).count(),
+            listed,
+            "the preview pane must not draw {text} as text alongside its picture; \
+             screen:\n{screen}"
+        );
+    }
+}
+
 /// Where a cached frame lives, under the `XDG_CACHE_HOME` the harness redirects.
 fn frame_path(key: &str) -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
         .join("reel-tui")
         .join("preview_frames")
-        .join(format!("{key}.png"))
+        .join(format!("{key}.{}", reel_tui::framecache::FRAME_EXTENSION))
 }
 
 /// Opens the timing page on the sidecar track and waits for its cues.
