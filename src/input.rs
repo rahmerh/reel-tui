@@ -909,6 +909,15 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.open_subtitle_sync();
         }
+        // `p` rather than Space, which is otherwise the obvious key for this: the help
+        // text is asserted to contain no "Space" binding
+        // (`keybindings_text_should_exclude_space_binding_when_space_action_is_removed`),
+        // and reintroducing one to save a keystroke would mean overriding a guard about
+        // something else entirely.
+        (KeyCode::Char('p'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.toggle_playback();
+        }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.move_selected_stream(-1);
@@ -3305,6 +3314,55 @@ mod tests {
         // Assert
         assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
         assert_that!(app.subtitle_sync.is_some()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `p` plays the span around the selected cue, and only on the page that has one. On
+    /// the file list it is a plain character with no binding, and binding it globally would
+    /// have taken a letter away from every layer for the sake of one.
+    #[test]
+    fn p_should_start_a_playback_only_on_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: ["subtitles", "scale"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act / Assert: nothing happens on the streams layer, where the page is not open.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.playback_active()).is_false();
+
+        // Arrange: open the page and get it into a state a span can be asked for from.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: std::time::Duration::from_secs(4),
+                end: std::time::Duration::from_secs(6),
+                text: "line".into(),
+                dialogue: None,
+            }],
+            crate::preview::CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+
+        // Act / Assert: and there it toggles.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+        assert_that!(app.playback_active()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+        assert_that!(app.playback_active()).is_false();
 
         // Cleanup
         drop(app);

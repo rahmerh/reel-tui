@@ -62,6 +62,11 @@ pub enum CueSlot {
     Interactive,
     /// One worker of the background pass.
     Warm(usize),
+    /// The scrub playback's span. Its own name for the same reason the others have one —
+    /// it runs while the background pass is still walking the track — and because what it
+    /// stages is a *differently timed* copy of the same cue, so sharing a name with the
+    /// interactive grab would have each drawing the other's timing.
+    Playback,
 }
 
 impl CueSlot {
@@ -77,6 +82,7 @@ impl CueSlot {
         match self {
             Self::Interactive => format!("cue.{extension}"),
             Self::Warm(worker) => format!("warm-{worker}.{extension}"),
+            Self::Playback => format!("playback.{extension}"),
         }
     }
 }
@@ -259,8 +265,20 @@ impl CueStyle {
     /// at its original time is a coin toss on exactly the boundary frames this page exists
     /// to inspect.
     fn stage(&self, cue: &Cue) -> String {
+        self.stage_between(cue, Duration::ZERO, BURN_WINDOW)
+    }
+
+    /// The same file, with the cue placed at `start..end` rather than covering everything.
+    ///
+    /// What [`Self::stage`] wants is a cue that is *always* on screen, because a still is
+    /// grabbed at one instant and the burn must not be a coin toss on the rounding. The
+    /// scrub playback wants the exact opposite: the span runs from before the cue to after
+    /// it, and watching the line appear and disappear against the picture is the whole
+    /// point of playing it. So the times are handed in, measured from the start of the
+    /// span — which is where `-ss` before `-i` puts the output's timestamps.
+    pub fn stage_between(&self, cue: &Cue, start: Duration, end: Duration) -> String {
         match self {
-            Self::SubRip => one_cue_srt(&cue.text),
+            Self::SubRip => one_cue_srt(&cue.text, start, end),
             Self::Ass {
                 header,
                 events_format,
@@ -268,9 +286,7 @@ impl CueStyle {
                 let events = cue
                     .dialogue
                     .as_deref()
-                    .and_then(|line| {
-                        retimed_dialogue(events_format, line, Duration::ZERO, BURN_WINDOW)
-                    })
+                    .and_then(|line| retimed_dialogue(events_format, line, start, end))
                     .unwrap_or_default();
                 // No `Dialogue:` line at all when the cue arrived without one — a state
                 // `parse_ass` cannot produce, since it emits a cue only for a line it
@@ -316,6 +332,12 @@ impl FrameSource {
     /// `ffmpeg` seek, and buys a key that cannot describe a picture it did not produce.
     pub fn key(&self, cue: &Cue) -> (String, String) {
         (self.media_key(), framecache::cue_key(cue, &self.stage(cue)))
+    }
+
+    /// The subtitle file for a cue that has to come and go inside a span — the scrub
+    /// playback's staging. See [`CueStyle::stage_between`].
+    pub fn stage_between(&self, cue: &Cue, start: Duration, end: Duration) -> String {
+        self.style.stage_between(cue, start, end)
     }
 }
 
@@ -369,6 +391,130 @@ pub struct WarmRequest {
     pub cache_tracks: usize,
 }
 
+/// One cue's span to play: a stretch of video, decoded and rendered ahead of time.
+///
+/// Nothing here is cached. The frame cache keys on a *cue* and evicts whole tracks, and a
+/// playback is a run of frames keyed on time — storing them would fill the cache with
+/// hundreds of pictures per cue for a thing the user watches once. See
+/// [`crate::framecache`], which this path deliberately never touches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaybackRequest {
+    /// The playback this is, counted separately from the page's own generation: stopping a
+    /// playback must not abandon the background pass that is still filling the track in.
+    pub generation: u64,
+    pub source: FrameSource,
+    /// Which cue in the page's list this span is around, so a span that arrives after the
+    /// cursor has moved on can be discarded rather than played under the wrong line.
+    pub cue_index: usize,
+    pub cue: Cue,
+    /// Where the span starts in the media, which is also where its timestamps are reset to
+    /// by `-ss` — so the cue is staged relative to it.
+    pub span_start: Duration,
+    pub span_end: Duration,
+    /// Frames a second, already reduced to what [`affordable_fps`] allows.
+    pub fps: u32,
+    /// The exact size each frame is rendered at. Exact, not a bound: the output is raw
+    /// `rgb24` sliced by `width * height * 3`, so a picture one row shorter than expected
+    /// does not crop the playback, it shears every frame after the first.
+    pub pixels: (u32, u32),
+    /// The cell area those pixels fill, which is what they are encoded into for drawing.
+    pub cells: Size,
+}
+
+/// A span's worth of raw video, and everything needed to read a frame out of it.
+///
+/// One buffer rather than a `Vec` of frames: `ffmpeg` writes them back to back on stdout
+/// already, so slicing is arithmetic and the whole span is one allocation.
+#[derive(Clone)]
+pub struct PlaybackFrames {
+    /// Every frame's `rgb24` pixels, back to back. `Arc` because the page hands it to the
+    /// encoder on every step and must not copy tens of megabytes to do so.
+    bytes: Arc<Vec<u8>>,
+    pub pixels: (u32, u32),
+    pub cells: Size,
+    pub fps: u32,
+    /// Where in the media frame zero sits, for the playhead the timeline draws.
+    pub span_start: Duration,
+}
+
+impl PlaybackFrames {
+    pub fn new(
+        bytes: Vec<u8>,
+        pixels: (u32, u32),
+        cells: Size,
+        fps: u32,
+        span_start: Duration,
+    ) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            pixels,
+            cells,
+            fps,
+            span_start,
+        }
+    }
+
+    /// How many bytes one frame occupies. Zero for a degenerate size, which is what makes
+    /// [`Self::count`] answer zero rather than divide by it.
+    pub fn stride(&self) -> usize {
+        let (width, height) = self.pixels;
+        (width as usize) * (height as usize) * 3
+    }
+
+    pub fn count(&self) -> usize {
+        match self.stride() {
+            0 => 0,
+            stride => self.bytes.len() / stride,
+        }
+    }
+
+    /// One frame's pixels, or `None` past the end of the span.
+    pub fn frame(&self, index: usize) -> Option<&[u8]> {
+        let stride = self.stride();
+        if stride == 0 {
+            // Otherwise every index answers with an empty slice, which reads downstream as
+            // a frame that exists and encodes to a picture of nothing.
+            return None;
+        }
+        let start = index.checked_mul(stride)?;
+        self.bytes.get(start..start.checked_add(stride)?)
+    }
+
+    /// How long the whole span lasts, as the frames themselves measure it.
+    ///
+    /// From the frame count rather than from the request, because `ffmpeg` decides how many
+    /// frames a span actually yields — a seek landing between keyframes, or a source
+    /// shorter than the span asked for, both come back with fewer.
+    pub fn duration(&self) -> Duration {
+        if self.fps == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(self.count() as f64 / f64::from(self.fps))
+    }
+}
+
+/// Prints what a reader wants — how much video, at what size — rather than megabytes of
+/// pixels, which is what a derived `Debug` would put in every test failure message.
+impl std::fmt::Debug for PlaybackFrames {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlaybackFrames")
+            .field("frames", &self.count())
+            .field("pixels", &self.pixels)
+            .field("cells", &self.cells)
+            .field("fps", &self.fps)
+            .field("span_start", &self.span_start)
+            .finish()
+    }
+}
+
+/// A span ready to play, or why there is none.
+#[derive(Debug)]
+pub enum PlaybackOutcome {
+    Ready(PlaybackFrames),
+    Failed(String),
+}
+
 /// A frame ready to draw, or why there is none.
 ///
 /// `Failed` is not an error dialog: the page leaves the preview pane empty and records the
@@ -420,6 +566,12 @@ pub enum PreviewEvent {
         done: usize,
         total: usize,
     },
+    /// A cue's span, decoded and ready to play, or why there is none.
+    Playback {
+        generation: u64,
+        cue_index: usize,
+        outcome: PlaybackOutcome,
+    },
 }
 
 /// The UI thread's half of the preview workers.
@@ -437,12 +589,20 @@ pub struct PreviewHandles {
     /// nothing to draw the result with.
     frame_tx: Option<Sender<FrameRequest>>,
     warm_tx: Option<Sender<WarmRequest>>,
+    playback_tx: Option<Sender<PlaybackRequest>>,
     /// The page generation every worker should still be working for, shared with them.
     ///
     /// An `AtomicU64` rather than a cancellation flag because it answers both questions
     /// a worker has — "is this request still wanted" and "should I stop now" — with one
     /// comparison, and because the value is already unique per page opening.
     live_generation: Arc<AtomicU64>,
+    /// The playback the worker should still be decoding for, counted apart from
+    /// `live_generation`.
+    ///
+    /// Its own cell rather than a share of the page's, because the two are stopped by
+    /// different things: pressing `p` again abandons the span, and the background pass that
+    /// is still filling the track in has nothing to do with that decision.
+    live_playback: Arc<AtomicU64>,
     /// Roughly what one encoded frame costs per cell, from the picker's protocol and font
     /// size. See [`frame_bytes_per_cell`].
     frame_cost: u64,
@@ -470,6 +630,24 @@ impl PreviewHandles {
         if let Some(warm_tx) = self.warm_tx.as_ref() {
             let _ = warm_tx.send(request);
         }
+    }
+
+    /// Asks for one cue's span to be decoded, making this the playback the worker decodes
+    /// for. Silently does nothing without a frame worker, for the same reason a frame
+    /// request does.
+    pub fn request_playback(&self, request: PlaybackRequest) {
+        self.live_playback
+            .store(request.generation, Ordering::Relaxed);
+        if let Some(playback_tx) = self.playback_tx.as_ref() {
+            let _ = playback_tx.send(request);
+        }
+    }
+
+    /// Tells the worker the span it is decoding is no longer wanted, so a running `ffmpeg`
+    /// is killed rather than left decoding seconds of video for a playback that has been
+    /// stopped.
+    pub fn abandon_playback(&self, generation: u64) {
+        self.live_playback.store(generation, Ordering::Relaxed);
     }
 
     /// Whether frames are being produced at all, so the page can skip asking for one it
@@ -530,6 +708,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
     let (prepare_tx, prepare_rx) = mpsc::channel::<PrepareRequest>();
     let (event_tx, event_rx) = mpsc::channel();
     let live_generation = Arc::new(AtomicU64::new(0));
+    let live_playback = Arc::new(AtomicU64::new(0));
     // Taken before the picker moves into the frame worker below, which is the last chance
     // to ask it anything. Both are `Copy` and neither changes for the run.
     let frame_cost = picker
@@ -560,9 +739,26 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
         }
     });
 
-    // Both image workers exist only when there is something that could draw their output.
-    let (frame_tx, warm_tx) = match picker {
+    // The image workers exist only when there is something that could draw their output.
+    let (frame_tx, warm_tx, playback_tx) = match picker {
         Some(picker) => {
+            // Cloned before the warm thread below moves the original: the playback worker
+            // reports on the same channel as the other three, so the event loop keeps a
+            // single drain and cannot end up pumping one worker's results and not another's.
+            let playback_events = event_tx.clone();
+            let (playback_tx, playback_rx) = mpsc::channel::<PlaybackRequest>();
+            let playback_generation = Arc::clone(&live_playback);
+            std::thread::spawn(move || {
+                while let Ok(request) = playback_rx.recv() {
+                    // Coalescing, like the others: a span takes a second or two to decode
+                    // and only the newest press of `p` is one anybody is waiting on.
+                    let request = newest(request, &playback_rx);
+                    if !playback(&request, &playback_generation, &playback_events) {
+                        break;
+                    }
+                }
+            });
+
             let (frame_tx, frame_rx) = mpsc::channel::<FrameRequest>();
             let frame_generation = Arc::clone(&live_generation);
             let frame_events = event_tx.clone();
@@ -587,9 +783,9 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
                     }
                 }
             });
-            (Some(frame_tx), Some(warm_tx))
+            (Some(frame_tx), Some(warm_tx), Some(playback_tx))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     (
@@ -597,7 +793,9 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             prepare_tx,
             frame_tx,
             warm_tx,
+            playback_tx,
             live_generation,
+            live_playback,
             frame_cost,
         },
         event_rx,
@@ -649,6 +847,99 @@ fn even(value: u32) -> u32 {
     (value & !1).max(2)
 }
 
+/// How much raw video one scrub playback may hold.
+///
+/// The span is decoded in full before a single frame is shown — that is what buys a
+/// slideshow that never stutters — so this is real resident memory, and it scales with
+/// three things at once: how long the cue is, how large the terminal is, and the frame
+/// rate. The first two are the user's, so the third is what gives. See [`affordable_fps`].
+pub const PLAYBACK_BUDGET: u64 = 96 * 1024 * 1024;
+
+/// The slowest a playback is allowed to get before the budget stops being honoured.
+///
+/// Below about this, consecutive frames stop reading as motion and the thing being judged —
+/// whether a line lands with the speech — becomes harder to see rather than easier, which
+/// is the opposite of the point. A span that cannot fit even at this rate overshoots the
+/// budget instead, because a playback that is over budget is recoverable and one that
+/// cannot be watched is not.
+pub const MIN_PLAYBACK_FPS: u32 = 5;
+
+/// The frame rate this span can afford at this size, never above `fps`.
+///
+/// The same shape as `SubtitleSyncState::window_radius`: a ceiling the user asked for,
+/// lowered to fit a budget, floored at the point where lowering it further defeats the
+/// feature.
+pub fn affordable_fps(fps: u32, span: Duration, pixels: (u32, u32)) -> u32 {
+    let (width, height) = pixels;
+    let stride = u64::from(width) * u64::from(height) * 3;
+    // Rounded up, so a span of a few milliseconds is still charged for the frame it holds
+    // rather than dividing by nothing.
+    let seconds = span.as_millis().div_ceil(1000).max(1) as u64;
+    let per_second = stride.saturating_mul(seconds);
+    if per_second == 0 {
+        return fps;
+    }
+    let affordable = PLAYBACK_BUDGET / per_second;
+    // Floored first, then capped: this only ever *lowers* a rate. Raising a user who asked
+    // for five to the floor would be answering a question they did not ask, and the floor
+    // exists to stop the budget making a playback unwatchable, not to enforce a minimum.
+    u32::try_from(affordable)
+        .unwrap_or(fps)
+        .max(MIN_PLAYBACK_FPS)
+        .min(fps)
+}
+
+/// The stretch of media a playback covers: `pad` either side of the cue.
+///
+/// Clamped to the media's own length at the end, for the reason [`seek_for`] clamps a seek
+/// — and only when the length is actually known, since a duration that would not parse
+/// arrives here as zero and clamping against that would play nothing at all.
+pub fn playback_span(cue: &Cue, pad: Duration, duration: Duration) -> (Duration, Duration) {
+    let start = cue.start.saturating_sub(pad);
+    let end = cue.end.saturating_add(pad);
+    let end = if duration.is_zero() {
+        end
+    } else {
+        end.min(duration)
+    };
+    (start, end.max(start))
+}
+
+/// The cell area a playback fills inside `pane`, keeping the source's proportions.
+///
+/// Worked out here rather than left to `Resize::Scale`, because a playback is rendered at
+/// exactly the size it is drawn at — `ffmpeg` is told the pixels, and `Halfblocks::new`
+/// resizes to whatever cell area it is handed *without regard to aspect ratio*. Handing it
+/// the whole pane would therefore stretch every frame to the pane's shape, which on a wide
+/// preview pane is a picture nobody could judge a subtitle's position against.
+///
+/// A halfblock cell is one pixel wide and two tall, so the grid is square-pixelled and the
+/// arithmetic is the source's aspect ratio with a factor of two in it.
+pub fn playback_cells(pane: Size, source: (u32, u32)) -> Size {
+    let (source_width, source_height) = source;
+    let (width, height) = (u32::from(pane.width), u32::from(pane.height));
+    if width == 0 || height == 0 || source_width == 0 || source_height == 0 {
+        return Size::new(0, 0);
+    }
+    // Widest first: a preview pane is usually wider than it is tall in pixels, so the
+    // height is what runs out.
+    let fitted = (width * source_height / (source_width * 2)).max(1);
+    if fitted <= height {
+        Size::new(pane.width, fitted as u16)
+    } else {
+        let fitted = (height * 2 * source_width / source_height).clamp(1, width);
+        Size::new(fitted as u16, pane.height)
+    }
+}
+
+/// The pixel size a cell area's frames are rendered at, for [`playback_cells`]'s answer.
+///
+/// One pixel per cell across and two down — the halfblock grid exactly, so the encode
+/// resamples nothing and the picture the terminal draws is the picture `ffmpeg` produced.
+pub fn playback_pixels(cells: Size) -> (u32, u32) {
+    (u32::from(cells.width), u32::from(cells.height) * 2)
+}
+
 /// Where in the media to grab the frame for `cue`.
 ///
 /// The midpoint, held back from the very end: seeking to the last instant of a file lands
@@ -672,7 +963,9 @@ pub(crate) struct TestHandles {
     pub prepare_rx: Receiver<PrepareRequest>,
     pub frame_rx: Receiver<FrameRequest>,
     pub warm_rx: Receiver<WarmRequest>,
+    pub playback_rx: Receiver<PlaybackRequest>,
     pub live_generation: Arc<AtomicU64>,
+    pub live_playback: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -680,13 +973,17 @@ pub(crate) fn test_handles() -> TestHandles {
     let (prepare_tx, prepare_rx) = mpsc::channel();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (warm_tx, warm_rx) = mpsc::channel();
+    let (playback_tx, playback_rx) = mpsc::channel();
     let live_generation = Arc::new(AtomicU64::new(0));
+    let live_playback = Arc::new(AtomicU64::new(0));
     TestHandles {
         handles: PreviewHandles {
             prepare_tx,
             frame_tx: Some(frame_tx),
             warm_tx: Some(warm_tx),
+            playback_tx: Some(playback_tx),
             live_generation: Arc::clone(&live_generation),
+            live_playback: Arc::clone(&live_playback),
             // What `Picker::halfblocks()` would report, which is what the tests that
             // actually encode a protocol use.
             frame_cost: frame_bytes_per_cell(ProtocolType::Halfblocks, FontSize::new(10, 20)),
@@ -694,7 +991,9 @@ pub(crate) fn test_handles() -> TestHandles {
         prepare_rx,
         frame_rx,
         warm_rx,
+        playback_rx,
         live_generation,
+        live_playback,
     }
 }
 
@@ -1108,6 +1407,122 @@ fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
     }
 }
 
+/// Decodes one cue's span into raw frames and hands them back.
+///
+/// Returns whether the worker should keep serving requests — `false` only when nobody is
+/// listening for events any more, which means the application has gone.
+fn playback(
+    request: &PlaybackRequest,
+    live_playback: &AtomicU64,
+    events: &Sender<PreviewEvent>,
+) -> bool {
+    let abandoned = || live_playback.load(Ordering::Relaxed) != request.generation;
+    let Some(outcome) = decoded(request, &abandoned) else {
+        // The playback was stopped mid-decode. Nothing to report: the page is already back
+        // to its still frame, and a span arriving now would start playing under it.
+        return true;
+    };
+    events
+        .send(PreviewEvent::Playback {
+            generation: request.generation,
+            cue_index: request.cue_index,
+            outcome,
+        })
+        .is_ok()
+}
+
+/// The span itself, or `None` if the playback was abandoned on the way.
+///
+/// One `ffmpeg` for the whole span rather than one per frame, which is the entire reason a
+/// playback is affordable at all: an accurate seek costs the same whether one frame comes
+/// out of it or four hundred, and measured here it is about eight times faster than seeking
+/// per frame.
+fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<PlaybackOutcome> {
+    if abandoned() {
+        return None;
+    }
+    let span = request.span_end.saturating_sub(request.span_start);
+    // The cue's own times, measured from the start of the span — which is where `-ss`
+    // before `-i` resets the output's timestamps to. Staging it at its original times
+    // instead would put the line minutes past the end of a span a few seconds long, and
+    // the playback would show a silent picture with no subtitle in it at all.
+    let staged = request.source.staged_name(CueSlot::Playback);
+    let path = request.source.workspace.join(&staged);
+    let text = request.source.stage_between(
+        &request.cue,
+        request.cue.start.saturating_sub(request.span_start),
+        request.cue.end.saturating_sub(request.span_start),
+    );
+    if let Err(error) = std::fs::write(&path, text) {
+        return Some(PlaybackOutcome::Failed(format!(
+            "Could not stage the cue to burn in: {error}"
+        )));
+    }
+    let mut command = playback_command(request, span, &staged);
+    let output = match run_cancellable(&mut command, abandoned) {
+        RunOutcome::Abandoned => return None,
+        RunOutcome::Failed(message) => return Some(PlaybackOutcome::Failed(message)),
+        RunOutcome::Finished(output) if !output.status.success() => {
+            return Some(PlaybackOutcome::Failed(command_failure(
+                "Could not play this cue",
+                &output.stderr,
+            )));
+        }
+        RunOutcome::Finished(output) => output,
+    };
+    let frames = PlaybackFrames::new(
+        output.stdout,
+        request.pixels,
+        request.cells,
+        request.fps,
+        request.span_start,
+    );
+    // A run that succeeded without writing a whole frame is what seeking past the end of
+    // the media looks like, and it is the one case the slicing arithmetic cannot represent
+    // — nothing to show, and no reason on screen for it.
+    if frames.count() == 0 {
+        return Some(PlaybackOutcome::Failed(
+            "There is no video at this cue to play.".to_string(),
+        ));
+    }
+    Some(PlaybackOutcome::Ready(frames))
+}
+
+/// Decodes a span of video with the cue burned in, straight to raw pixels.
+///
+/// `rawvideo` rather than the still path's mjpeg: hundreds of frames go by in a couple of
+/// seconds, and an encode plus a decode per frame is work whose only product is a smaller
+/// buffer. Raw at the *display* size is smaller than a JPEG at the cache's size anyway.
+///
+/// **`scale` is a literal `W:H` with no `force_original_aspect_ratio`.** The output is
+/// sliced by `width * height * 3`, so a frame that came back one row shorter than asked for
+/// would not crop the picture — it would shear every frame after the first. The proportions
+/// are kept by [`playback_cells`] deciding the size instead.
+///
+/// Filters in this order for the same reason the still grab orders its two: libass lays the
+/// text out against the source's own resolution before anything shrinks it, so the burn is
+/// legible at a size where a scaled-down overlay would not be. `fps` before `scale`, so the
+/// frames thrown away are thrown away before they are resized rather than after.
+fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> Command {
+    let (width, height) = request.pixels;
+    let mut command = Command::new("ffmpeg");
+    command
+        .current_dir(&request.source.workspace)
+        .args(["-v", "error", "-nostdin", "-y", "-ss"])
+        .arg(format!("{:.3}", request.span_start.as_secs_f64()))
+        .arg("-t")
+        .arg(format!("{:.3}", span.as_secs_f64()))
+        .arg("-i")
+        .arg(&request.source.media)
+        .args(["-map", "0:v:0", "-an", "-vf"])
+        .arg(format!(
+            "subtitles={staged},fps={},scale={width}:{height}",
+            request.fps
+        ))
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+    command
+}
+
 /// Renders every cue in a track into the cache, reporting progress as it goes.
 ///
 /// Returns whether the worker should keep serving requests: `false` only when nobody is
@@ -1307,11 +1722,11 @@ impl WarmProgress {
 /// or the container's `start_time` turns out to be. Handing libass the original file and
 /// original timings instead makes the burn a coin toss on exactly the boundary frames a
 /// timing page exists to inspect.
-fn one_cue_srt(text: &str) -> String {
+fn one_cue_srt(text: &str, start: Duration, end: Duration) -> String {
     format!(
         "1\n{} --> {}\n{}\n\n",
-        format_srt_timestamp(Duration::ZERO),
-        format_srt_timestamp(BURN_WINDOW),
+        format_srt_timestamp(start),
+        format_srt_timestamp(end),
         text.trim_end()
     )
 }
@@ -2423,12 +2838,58 @@ mod tests {
     /// the container's `start_time` is.
     #[test]
     fn the_cue_being_previewed_should_be_retimed_to_cover_the_whole_grab() {
+        // Arrange: a cue nowhere near the start of the media, so a staging that kept the
+        // original times would be visibly different.
+        let cue = cue(725_000, 727_000, "Hello\nthere\n");
+
         // Act
-        let staged = one_cue_srt("Hello\nthere\n");
+        let staged = CueStyle::SubRip.stage(&cue);
 
         // Assert
         assert_that!(staged.as_str())
             .is_equal_to("1\n00:00:00,000 --> 00:10:00,000\nHello\nthere\n\n");
+    }
+
+    /// The scrub playback wants the exact opposite of the grab: the span runs from before
+    /// the cue to after it, and watching the line arrive and leave against the picture is
+    /// the whole point of playing it. A cue staged to cover everything would sit on screen
+    /// for the entire span and say nothing about its timing.
+    #[test]
+    fn a_cue_being_played_should_be_retimed_to_where_it_falls_inside_the_span() {
+        // Arrange: the cue runs 12.0–14.5 s, and the span starts two seconds before it.
+        let cue = cue(12_000, 14_500, "Hello");
+
+        // Act
+        let staged = CueStyle::SubRip.stage_between(
+            &cue,
+            Duration::from_millis(2000),
+            Duration::from_millis(4500),
+        );
+
+        // Assert
+        assert_that!(staged.as_str()).is_equal_to("1\n00:00:02,000 --> 00:00:04,500\nHello\n\n");
+    }
+
+    /// An ASS cue is retimed the same way, through the file's own `Format:` line — and
+    /// keeps its style name and its positioning override, which is what makes previewing
+    /// an ASS track worth doing at all.
+    #[test]
+    fn an_ass_cue_being_played_should_keep_its_styling_at_its_place_in_the_span() {
+        // Arrange
+        let script = crate::cue::parse_ass(ASS);
+
+        // Act
+        let staged = ass_style().stage_between(
+            &script.cues[0],
+            Duration::from_millis(2000),
+            Duration::from_millis(3000),
+        );
+
+        // Assert
+        assert_that!(staged.as_str())
+            .contains("Dialogue: 0,0:00:02.00,0:00:03.00,Sign,,0,0,0,,{\\pos(320,10)}a sign");
+        assert_that!(staged.as_str()).contains("PlayResX: 384");
+        assert_that!(staged.as_str()).contains("Style: Sign,Impact,40,8");
     }
 
     /// The `subtitles=` filter value needs three layers of quoting if it is ever a real
@@ -4085,6 +4546,543 @@ mod tests {
         // And the grab really did start, rather than the worker giving up before it: the
         // cue was staged, which is the step every render begins with.
         assert_that!(directory.join(warm_cue_file(0)).exists()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A halfblock cell is one pixel across and two down, so the grid is square-pixelled
+    /// and a picture keeps its proportions only if the *cell* area is worked out from the
+    /// source's aspect ratio. Handing `Halfblocks::new` the whole pane instead stretches
+    /// every frame to the pane's shape, which on a preview pane wider than it is tall is a
+    /// picture nobody could judge a subtitle's placement against.
+    #[test]
+    fn a_playback_should_fill_the_pane_without_changing_the_pictures_shape() {
+        // Act / Assert: a 4:3 source in a pane far wider than that. The height runs out,
+        // so the width gives — 60 cells is 120 pixels tall, and 4:3 of that is 160 across.
+        assert_that!(playback_cells(Size::new(200, 60), (640, 480)))
+            .is_equal_to(Size::new(160, 60));
+
+        // Act / Assert: the same source in a pane taller than it is wide. Now the width is
+        // what runs out, and the height is chosen to match — 80 across is 60 cells of 4:3.
+        assert_that!(playback_cells(Size::new(80, 90), (640, 480))).is_equal_to(Size::new(80, 30));
+
+        // Act / Assert: a 16:9 source, which is what most media actually is.
+        assert_that!(playback_cells(Size::new(160, 60), (1920, 1080)))
+            .is_equal_to(Size::new(160, 45));
+
+        // Act / Assert: and the pixels are the cell grid exactly, so the encode resamples
+        // nothing at all.
+        assert_that!(playback_pixels(Size::new(160, 45))).is_equal_to((160, 90));
+    }
+
+    /// The renderer has not measured the pane on the first frame after the page opens, and
+    /// a container whose resolution would not parse arrives with no size at all. Neither
+    /// may become a `scale=0:0` or a division by zero.
+    #[test]
+    fn a_playback_should_ask_for_no_picture_when_there_is_nothing_to_size_it_against() {
+        // Act / Assert
+        assert_that!(playback_cells(Size::new(0, 60), (640, 480))).is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(Size::new(200, 0), (640, 480))).is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(Size::new(200, 60), (0, 480))).is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(Size::new(200, 60), (640, 0))).is_equal_to(Size::new(0, 0));
+    }
+
+    /// A pane so small that the proportional fit rounds to nothing still has to produce a
+    /// picture: one cell of video is useless, but `scale=0:120` is a command that fails.
+    #[test]
+    fn a_playback_in_a_sliver_of_a_pane_should_still_have_a_size() {
+        // Act / Assert: a very wide source in two cells rounds its height to zero.
+        assert_that!(playback_cells(Size::new(2, 40), (4000, 100))).is_equal_to(Size::new(2, 1));
+
+        // Act / Assert: and a very tall one in a single row rounds its width to zero.
+        assert_that!(playback_cells(Size::new(200, 1), (100, 4000))).is_equal_to(Size::new(1, 1));
+    }
+
+    /// The span is `pad` either side of the cue, and both ends are real edges: a cue near
+    /// the start of the media has nothing before it, and one at the end has nothing after.
+    #[test]
+    fn a_span_should_be_the_cue_with_padding_that_stops_at_the_medias_edges() {
+        // Act / Assert: an ordinary cue in the middle of the file.
+        let (start, end) = playback_span(
+            &cue(12_000, 14_500, "line"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::from_secs(10));
+        assert_that!(end).is_equal_to(Duration::from_millis(16_500));
+
+        // Act / Assert: a cue closer to the start than the pad is long.
+        let (start, end) = playback_span(
+            &cue(500, 1500, "line"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::ZERO);
+        assert_that!(end).is_equal_to(Duration::from_millis(3500));
+
+        // Act / Assert: and one running to the end of the media.
+        let (start, end) = playback_span(
+            &cue(58_000, 59_500, "line"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::from_secs(56));
+        assert_that!(end).is_equal_to(Duration::from_secs(60));
+    }
+
+    /// A duration that would not parse arrives here as zero, and clamping against that
+    /// would make every span empty — the same reason [`seek_for`] only clamps a known one.
+    #[test]
+    fn a_span_should_not_be_clamped_against_a_duration_that_is_not_known() {
+        // Act
+        let (start, end) = playback_span(
+            &cue(12_000, 14_500, "line"),
+            Duration::from_secs(2),
+            Duration::ZERO,
+        );
+
+        // Assert
+        assert_that!(start).is_equal_to(Duration::from_secs(10));
+        assert_that!(end).is_equal_to(Duration::from_millis(16_500));
+    }
+
+    /// A cue whose times sit past the end of the media — which a hand-edited subtitle file
+    /// can perfectly well hold — must not produce a span that ends before it starts. An
+    /// inverted one becomes a negative `-t`, which `ffmpeg` takes as "no limit" and turns a
+    /// two-second playback into the rest of the file decoded into memory.
+    #[test]
+    fn a_span_past_the_end_of_the_media_should_collapse_rather_than_invert() {
+        // Act
+        let (start, end) = playback_span(
+            &cue(90_000, 95_000, "line"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+
+        // Assert: empty rather than backwards. Nothing decodes, and the page says there is
+        // no video at this cue — which is the truth about a cue timed past the end.
+        assert_that!(start).is_equal_to(Duration::from_secs(88));
+        assert_that!(end).is_equal_to(start);
+    }
+
+    /// The whole span is decoded before a frame of it is shown — that is what buys a
+    /// slideshow that never stutters — so it is real resident memory, and the frame rate is
+    /// the only one of its three inputs that is not the user's to choose.
+    #[test]
+    fn a_span_too_large_to_hold_should_be_decoded_at_a_lower_rate() {
+        // Arrange: an ordinary seven-second span on an ordinary pane, well inside budget.
+        let ordinary = affordable_fps(30, Duration::from_secs(7), (200, 120));
+
+        // Act / Assert: nothing is taken away from it.
+        assert_that!(ordinary).is_equal_to(30);
+
+        // Act / Assert: a span and a pane that together will not fit at the rate asked for.
+        // 320x240 is 230 kB a frame, and forty-four seconds of it at 30 fps is three times
+        // the budget — so the rate comes down, and what comes back does fit.
+        let span = Duration::from_secs(44);
+        let squeezed = affordable_fps(30, span, (320, 240));
+        assert_that!(squeezed < 30).is_true();
+        assert_that!(squeezed > MIN_PLAYBACK_FPS).is_true();
+        assert_that!(u64::from(squeezed) * 44 * 320 * 240 * 3 <= PLAYBACK_BUDGET).is_true();
+    }
+
+    /// Below about five frames a second consecutive frames stop reading as motion, and the
+    /// thing being judged gets harder to see rather than easier — so a span that cannot fit
+    /// even at the floor goes over budget instead. Being over budget is recoverable; a
+    /// playback that cannot be watched is not.
+    #[test]
+    fn a_playback_should_never_be_slowed_past_the_point_of_being_watchable() {
+        // Act / Assert: a span nothing could hold.
+        assert_that!(affordable_fps(30, Duration::from_secs(600), (1920, 1080)))
+            .is_equal_to(MIN_PLAYBACK_FPS);
+
+        // Act / Assert: and a user who asked for less than the floor gets what they asked
+        // for — this lowers a rate, it never raises one.
+        assert_that!(affordable_fps(2, Duration::from_secs(1), (16, 16))).is_equal_to(2);
+    }
+
+    /// A pane the renderer has not measured yet has no pixels to charge for, and dividing
+    /// the budget by nothing would panic rather than merely misbehave.
+    #[test]
+    fn a_span_with_no_size_should_be_charged_nothing_rather_than_divided_by_it() {
+        // Act / Assert
+        assert_that!(affordable_fps(30, Duration::from_secs(7), (0, 0))).is_equal_to(30);
+        // A span of no length is still charged for the one frame it holds, rather than
+        // dividing by zero seconds.
+        assert_that!(affordable_fps(30, Duration::ZERO, (200, 120))).is_equal_to(30);
+    }
+
+    /// The span is one buffer and the frames are read out of it by arithmetic, so the
+    /// arithmetic is the thing that has to be right: an off-by-one in the stride does not
+    /// crop the picture, it shears every frame after the first.
+    #[test]
+    fn a_span_should_be_sliced_into_the_frames_it_actually_holds() {
+        // Arrange: three frames of a 2x2 picture, each byte naming its frame.
+        let pixels = (2u32, 2u32);
+        let stride = 2 * 2 * 3;
+        let mut bytes = Vec::new();
+        for frame in 0..3u8 {
+            bytes.extend(std::iter::repeat_n(frame, stride));
+        }
+        let frames =
+            PlaybackFrames::new(bytes, pixels, Size::new(2, 1), 10, Duration::from_secs(5));
+
+        // Act / Assert
+        assert_that!(frames.stride()).is_equal_to(stride);
+        assert_that!(frames.count()).is_equal_to(3);
+        assert_that!(frames.frame(0).unwrap()).is_equal_to([0u8; 12].as_slice());
+        assert_that!(frames.frame(2).unwrap()).is_equal_to([2u8; 12].as_slice());
+        // Past the end is nothing, rather than a slice straddling two frames.
+        assert_that!(frames.frame(3).is_none()).is_true();
+        assert_that!(frames.frame(usize::MAX).is_none()).is_true();
+        // And the span lasts as long as the frames say it does, not as long as it was
+        // asked to: `ffmpeg` decides how many a seek actually yields.
+        assert_that!(frames.duration()).is_equal_to(Duration::from_millis(300));
+    }
+
+    /// A degenerate size would make the slicing divide by zero. Unreachable through
+    /// `toggle_playback`, which refuses a pane with no cells, and cheap to rule out.
+    #[test]
+    fn a_span_with_no_frame_size_should_hold_no_frames_rather_than_divide_by_it() {
+        // Arrange
+        let frames =
+            PlaybackFrames::new(vec![1, 2, 3, 4], (0, 0), Size::new(0, 0), 0, Duration::ZERO);
+
+        // Act / Assert
+        assert_that!(frames.stride()).is_equal_to(0);
+        assert_that!(frames.count()).is_equal_to(0);
+        assert_that!(frames.frame(0).is_none()).is_true();
+        assert_that!(frames.duration()).is_equal_to(Duration::ZERO);
+    }
+
+    /// The frame buffer is tens of megabytes of pixels and `Protocol` has no `Debug` of its
+    /// own, so a derived one would put the whole span into every failure message.
+    #[test]
+    fn a_span_should_describe_itself_by_its_shape_rather_than_its_pixels() {
+        // Arrange
+        let frames = PlaybackFrames::new(
+            vec![7; 2 * 2 * 3 * 4],
+            (2, 2),
+            Size::new(2, 1),
+            25,
+            Duration::from_secs(9),
+        );
+
+        // Act
+        let described = format!("{frames:?}");
+
+        // Assert
+        assert_that!(described.as_str()).contains("frames: 4");
+        assert_that!(described.as_str()).contains("fps: 25");
+        assert_that!(described.contains("7, 7, 7")).is_false();
+    }
+
+    /// A playback runs while the background pass is still walking the track, and what it
+    /// stages is a *differently timed* copy of the very cue the interactive grab is drawing.
+    /// Sharing a filename with either would have each burning the other's timing in.
+    #[test]
+    fn the_playback_should_stage_its_cue_under_a_name_of_its_own() {
+        // Act / Assert
+        assert_that!(CueSlot::Playback.file(&CueStyle::SubRip).as_str())
+            .is_equal_to("playback.srt");
+        assert_that!(CueSlot::Playback.file(&ass_style()).as_str()).is_equal_to("playback.ass");
+        // And distinct from every other slot's, which is the whole point.
+        let names = [
+            CueSlot::Interactive.file(&CueStyle::SubRip),
+            CueSlot::Warm(0).file(&CueStyle::SubRip),
+            CueSlot::Playback.file(&CueStyle::SubRip),
+        ];
+        assert_that!(
+            names
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        )
+        .is_equal_to(3);
+    }
+
+    fn playback_request(media: &Path, workspace: &Path, cue: Cue) -> PlaybackRequest {
+        let cells = Size::new(32, 12);
+        PlaybackRequest {
+            generation: 1,
+            source: source(media, workspace),
+            cue_index: 0,
+            cue,
+            span_start: Duration::from_secs(1),
+            span_end: Duration::from_secs(4),
+            fps: 10,
+            pixels: playback_pixels(cells),
+            cells,
+        }
+    }
+
+    /// The command is what the whole feature rests on, and three of its parts are load
+    /// bearing in ways that fail invisibly: the seek and the length that bound the span,
+    /// the literal `scale` the slicing depends on, and the filter order that lets libass
+    /// lay the text out before anything shrinks it.
+    #[test]
+    fn the_playback_command_should_bound_the_span_and_scale_it_exactly() {
+        // Arrange
+        let directory = PathBuf::from("/tmp/reel-tui-preview/playback-command");
+        let request = playback_request(
+            Path::new("/media/it's a show; [2024].mkv"),
+            &directory,
+            cue(2000, 3000, "line"),
+        );
+
+        // Act
+        let command = playback_command(&request, Duration::from_secs(3), "playback.srt");
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect();
+
+        // Assert: the span, seeked to before the input so the decoder starts there.
+        let seek = arguments
+            .iter()
+            .position(|argument| argument == "-ss")
+            .unwrap();
+        assert_that!(arguments[seek + 1].as_str()).is_equal_to("1.000");
+        assert_that!(arguments[seek + 2].as_str()).is_equal_to("-t");
+        assert_that!(arguments[seek + 3].as_str()).is_equal_to("3.000");
+        assert_that!(
+            arguments
+                .iter()
+                .position(|argument| argument == "-i")
+                .unwrap()
+                > seek + 3
+        )
+        .is_true();
+
+        // Assert: `scale` is a literal size with no aspect-ratio option on it. A frame that
+        // came back one row short would shear every frame after the first, not crop.
+        let filters = arguments
+            .iter()
+            .find(|argument| argument.starts_with("subtitles="))
+            .expect("the filter graph should burn the staged cue in");
+        assert_that!(filters.as_str()).is_equal_to("subtitles=playback.srt,fps=10,scale=32:24");
+        assert_that!(filters.contains("force_original_aspect_ratio")).is_false();
+
+        // Assert: raw pixels out, and the workspace as the working directory so the staged
+        // name inside the filter graph needs no escaping.
+        assert_that!(arguments.iter().any(|argument| argument == "rawvideo")).is_true();
+        assert_that!(arguments.iter().any(|argument| argument == "rgb24")).is_true();
+        assert_that!(command.get_current_dir()).is_equal_to(Some(directory.as_path()));
+    }
+
+    /// The end-to-end shape of a playback, against a real decode: the span comes back as
+    /// whole frames at the size that was asked for, and — the part no assertion short of
+    /// the pixels would notice — the cue is burned in *only where it falls inside the span*.
+    ///
+    /// A staging that kept the cue's original times passes every count, every size and
+    /// every key here while showing a span with no subtitle in it at all, which is why this
+    /// looks at what the frames actually hold.
+    #[test]
+    fn a_decoded_span_should_carry_its_cue_only_where_the_cue_falls_in_it() {
+        // Arrange: six seconds of flat blue, and a cue running 3.0–4.0 s. With a one-second
+        // span start the line belongs 2.0–3.0 s in, and nowhere else.
+        //
+        // Rendered at 160x120 rather than the tiny size the other tests use, because that
+        // is about where a burned-in line survives being scaled down at all: libass sizes
+        // text as a fraction of the frame, so at 96x72 the strokes average away into the
+        // background entirely. Measured, not guessed.
+        require_ffmpeg("a_decoded_span_should_carry_its_cue_only_where_the_cue_falls_in_it");
+        let directory = scratch("playback-decode");
+        let media = video(&directory);
+        let mut request = playback_request(&media, &directory, cue(3000, 4000, "BURNED IN"));
+        request.span_start = Duration::from_secs(1);
+        request.span_end = Duration::from_secs(5);
+        request.cells = Size::new(160, 60);
+        request.pixels = playback_pixels(request.cells);
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+
+        // Assert
+        let PlaybackOutcome::Ready(frames) = outcome else {
+            panic!("a black clip with a cue in it should decode");
+        };
+        // Four seconds at ten frames a second, give or take how the seek lands.
+        assert_that!(frames.count() >= 38 && frames.count() <= 42).is_true();
+        assert_that!(frames.pixels).is_equal_to((160, 120));
+        // Whole frames, with nothing left over — which is what says the stride agrees with
+        // what `ffmpeg` was told to produce.
+        assert_that!(frames.frame(frames.count() - 1).is_some()).is_true();
+        assert_that!(frames.frame(frames.count()).is_none()).is_true();
+
+        // Assert: the burn is inside the cue's own second of the span and nowhere else.
+        // Measured against another frame of the same flat clip rather than against a
+        // brightness threshold, because the only thing that can differ between two frames
+        // of a solid colour is the text drawn onto one of them.
+        let flat = frames.frame(2).expect("frame inside the span").to_vec();
+        let burned = |index: usize| {
+            frames
+                .frame(index)
+                .expect("frame inside the span")
+                .iter()
+                .zip(&flat)
+                .filter(|(drawn, plain)| drawn != plain)
+                .count()
+        };
+        assert_that!(burned(5)).is_equal_to(0);
+        assert_that!(burned(15)).is_equal_to(0);
+        assert_that!(burned(25) > 0).is_true();
+        assert_that!(burned(35)).is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span the user has stopped waiting for is not reported at all — a span arriving
+    /// after `p` was pressed again would start playing under a page that has gone back to
+    /// its still frame.
+    #[test]
+    fn a_playback_stopped_before_it_started_should_report_nothing() {
+        // Arrange
+        let directory = scratch("playback-abandoned");
+        let request = playback_request(&directory.join("clip.mkv"), &directory, cue(0, 1000, "x"));
+        let always = || true;
+
+        // Act / Assert
+        assert_that!(decoded(&request, &always).is_none()).is_true();
+        // And nothing was staged, since it gave up before writing anything.
+        assert_that!(directory.join("playback.srt").exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A workspace that has gone — the page closed while the key was in flight — must
+    /// report why rather than spawning an `ffmpeg` that cannot find its subtitle.
+    #[test]
+    fn a_playback_that_cannot_stage_its_cue_should_say_so() {
+        // Arrange
+        let request = playback_request(
+            Path::new("/media/show.mkv"),
+            Path::new("/tmp/reel-tui-preview/does-not-exist"),
+            cue(0, 1000, "x"),
+        );
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+
+        // Assert
+        let PlaybackOutcome::Failed(message) = outcome else {
+            panic!("staging into a missing directory cannot succeed");
+        };
+        assert_that!(message.as_str()).contains("Could not stage the cue to burn in");
+    }
+
+    /// `ffmpeg` refusing the media is the ordinary failure — a file that is not video, a
+    /// codec this build cannot decode — and the page has to say which, not just that.
+    #[test]
+    fn a_playback_of_something_that_is_not_video_should_report_what_ffmpeg_said() {
+        // Arrange
+        require_ffmpeg("a_playback_of_something_that_is_not_video_should_report_what_ffmpeg_said");
+        let directory = scratch("playback-not-video");
+        let media = directory.join("clip.mkv");
+        std::fs::write(&media, b"this is not a matroska file").unwrap();
+        let request = playback_request(&media, &directory, cue(0, 1000, "x"));
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+
+        // Assert
+        let PlaybackOutcome::Failed(message) = outcome else {
+            panic!("a text file is not something ffmpeg can decode");
+        };
+        assert_that!(message.as_str()).contains("Could not play this cue");
+        assert_that!(message.len() > "Could not play this cue.".len()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A run that succeeded without writing a whole frame is what seeking past the end of
+    /// the media looks like. Nothing to show, and — without this — no reason on screen for
+    /// it either: the page would return to its still frame as though `p` had done nothing.
+    #[test]
+    fn a_span_that_decoded_no_frames_should_report_that_rather_than_play_silence() {
+        // Arrange: a span starting well past the end of a six-second clip.
+        require_ffmpeg("a_span_that_decoded_no_frames_should_report_that_rather_than_play_silence");
+        let directory = scratch("playback-past-end");
+        let media = video(&directory);
+        let mut request = playback_request(&media, &directory, cue(0, 1000, "x"));
+        request.span_start = Duration::from_secs(30);
+        request.span_end = Duration::from_secs(33);
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+
+        // Assert
+        let PlaybackOutcome::Failed(message) = outcome else {
+            panic!("there is no video thirty seconds into a six-second clip");
+        };
+        assert_that!(message.as_str()).contains("no video at this cue");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker answers on the same channel as the other three, keyed by the generation
+    /// the request carried — and a result for a playback that has been stopped is dropped
+    /// rather than sent, so it cannot start playing under a page that has moved on.
+    #[test]
+    fn the_playback_worker_should_answer_only_for_the_playback_still_wanted() {
+        // Arrange
+        require_ffmpeg("the_playback_worker_should_answer_only_for_the_playback_still_wanted");
+        let directory = scratch("playback-worker");
+        let media = video(&directory);
+        let request = playback_request(&media, &directory, cue(1000, 2000, "line"));
+        let (events_tx, events) = mpsc::channel();
+        let live = AtomicU64::new(request.generation);
+
+        // Act
+        let alive = playback(&request, &live, &events_tx);
+
+        // Assert
+        assert_that!(alive).is_true();
+        let event = events.try_recv().expect("a live playback reports its span");
+        let PreviewEvent::Playback {
+            generation,
+            cue_index,
+            outcome: PlaybackOutcome::Ready(frames),
+        } = event
+        else {
+            panic!("the span should have decoded");
+        };
+        assert_that!(generation).is_equal_to(1);
+        assert_that!(cue_index).is_equal_to(0);
+        assert_that!(frames.count() > 0).is_true();
+
+        // Act / Assert: the same request against a generation that has moved on says
+        // nothing at all, and the worker stays up for the next one.
+        let stale = AtomicU64::new(request.generation + 1);
+        assert_that!(playback(&request, &stale, &events_tx)).is_true();
+        assert_that!(events.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker stops only when nobody is listening for events any more, which means the
+    /// application itself has gone.
+    #[test]
+    fn the_playback_worker_should_stop_once_nobody_is_listening() {
+        // Arrange
+        let directory = scratch("playback-deaf");
+        let request = playback_request(&directory.join("clip.mkv"), &directory, cue(0, 1000, "x"));
+        let (events_tx, events) = mpsc::channel();
+        drop(events);
+        let live = AtomicU64::new(request.generation);
+
+        // Act / Assert
+        assert_that!(playback(&request, &live, &events_tx)).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

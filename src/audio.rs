@@ -208,6 +208,17 @@ impl AudioOutput for SilentOutput {
     }
 }
 
+/// Somewhere to send a span's sound, falling back rather than failing.
+///
+/// A machine with no working audio output still gets the slideshow — at the right rate,
+/// because the clock does not depend on there being any sound to hear. Refusing to play at
+/// all would be the wrong trade: most of what this page shows is in the picture, and a user
+/// without a sound card would lose the whole feature to a device they already know they do
+/// not have.
+pub fn open() -> Box<dyn AudioOutput> {
+    Box::new(SilentOutput::new())
+}
+
 #[cfg(test)]
 mod tests {
     use kernal::prelude::*;

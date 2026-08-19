@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 
@@ -26,6 +26,16 @@ pub struct Config {
     /// a thousand-odd accurate seeks, and doing that across NFS or SMB unasked is not a
     /// trade the user made.
     pub network_preview_prefetch: bool,
+    /// How many frames a second the timing page's scrub playback aims for.
+    ///
+    /// The escape hatch for a terminal that cannot keep up with the picture: over ssh, or
+    /// inside tmux, the bytes for a halfblocks frame have further to travel than they do
+    /// locally, and lowering this is what turns a playback that stutters into one that is
+    /// merely chunky. A ceiling rather than a promise — a span too large to hold in memory
+    /// at this rate is decoded at a lower one.
+    pub playback_fps: u32,
+    /// How much of the media either side of the cue that playback covers.
+    pub playback_pad: Duration,
 }
 
 impl Default for Config {
@@ -39,9 +49,35 @@ impl Default for Config {
             preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
             preview_prefetch: true,
             network_preview_prefetch: false,
+            playback_fps: DEFAULT_PLAYBACK_FPS,
+            playback_pad: DEFAULT_PLAYBACK_PAD,
         }
     }
 }
+
+/// Frames a second a scrub playback aims for.
+///
+/// Thirty rather than something cheaper because the point of the playback is judging
+/// whether a line lands with the speech, and below about twenty the gaps between frames
+/// become the thing you are measuring against instead of the picture.
+const DEFAULT_PLAYBACK_FPS: u32 = 30;
+
+/// The floor and ceiling a mistyped rate is held between. Five is where consecutive frames
+/// stop reading as motion at all; sixty is past what any terminal keeps up with, and
+/// nothing above it would be drawn anyway.
+const MIN_PLAYBACK_FPS: u32 = 5;
+const MAX_PLAYBACK_FPS: u32 = 60;
+
+/// How much of the media either side of the cue a scrub playback covers.
+///
+/// Two seconds is long enough to hear the speech start before the line is due and to hear
+/// it finish after, which is the judgement being made; much more and the span takes longer
+/// to decode and longer to sit through for the same answer.
+const DEFAULT_PLAYBACK_PAD: Duration = Duration::from_secs(2);
+
+/// A pad of zero is meaningful — play exactly the cue and nothing else — so only the top
+/// is capped. Ten seconds either side is already a twenty-second span.
+const MAX_PLAYBACK_PAD: f64 = 10.0;
 
 /// A typo'd or malicious huge value in the config file must not spawn an unreasonable
 /// number of threads.
@@ -85,6 +121,16 @@ struct RawWorkers {
 struct RawPreview {
     cache_tracks: Option<usize>,
     prefetch: Option<RawPrefetch>,
+    playback: Option<RawPlayback>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPlayback {
+    fps: Option<u32>,
+    /// Seconds, as a float, so half a second is expressible. `Duration` itself is not
+    /// deserialised directly — TOML has no duration type, and the field being plainly a
+    /// number of seconds is what makes the config file readable.
+    pad: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -153,6 +199,7 @@ impl Config {
         let network = workers.network.unwrap_or_default();
         let preview = raw.preview.unwrap_or_default();
         let prefetch = preview.prefetch.unwrap_or_default();
+        let playback = preview.playback.unwrap_or_default();
         Self {
             notifications: notifications.enabled.unwrap_or(defaults.notifications),
             transcode_workers: clamp(workers.transcode.unwrap_or(defaults.transcode_workers)),
@@ -171,6 +218,21 @@ impl Config {
             network_preview_prefetch: prefetch
                 .network
                 .unwrap_or(defaults.network_preview_prefetch),
+            playback_fps: playback
+                .fps
+                .unwrap_or(defaults.playback_fps)
+                .clamp(MIN_PLAYBACK_FPS, MAX_PLAYBACK_FPS),
+            playback_pad: playback
+                .pad
+                // NaN first, because `f64::min` answers with the *other* operand for it —
+                // so a `pad = nan` would clamp to the maximum and give a twenty-second
+                // playback rather than falling back to the default.
+                .filter(|pad| !pad.is_nan())
+                // `try_from_secs_f64` rather than `from_secs_f64`, which panics outright on
+                // a negative — which a hand-written config file can perfectly well hold,
+                // and which must not take the process down at launch.
+                .and_then(|pad| Duration::try_from_secs_f64(pad.min(MAX_PLAYBACK_PAD)).ok())
+                .unwrap_or(defaults.playback_pad),
         }
     }
 
@@ -242,7 +304,7 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_tracks = 4\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n",
+            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_tracks = 4\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n\n[preview.playback]\nfps = 24\npad = 1.5\n",
         )
         .unwrap();
         let config = Config::load_from(&path);
@@ -257,6 +319,8 @@ mod tests {
                 preview_cache_tracks: 4,
                 preview_prefetch: false,
                 network_preview_prefetch: true,
+                playback_fps: 24,
+                playback_pad: Duration::from_millis(1500),
             }
         );
         fs::remove_dir_all(directory).unwrap();
@@ -402,6 +466,64 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The rate is the escape hatch for a terminal that cannot keep up with the picture —
+    /// over ssh, or inside tmux — so a value that is missing, absurd, or nonsense has to
+    /// leave a playback that still works rather than one that divides by zero or asks for
+    /// a thousand frames a second.
+    #[test]
+    fn playback_settings_should_fall_back_and_stay_inside_their_limits() {
+        let directory = scratch("playback");
+        let load = |body: &[u8]| {
+            let path = directory.join("config.toml");
+            fs::write(&path, body).unwrap();
+            Config::load_from(&path)
+        };
+
+        // Act / Assert: an absent section keeps the defaults.
+        let defaults = load(b"[preview]\ncache_tracks = 4\n");
+        assert_eq!(defaults.playback_fps, DEFAULT_PLAYBACK_FPS);
+        assert_eq!(defaults.playback_pad, DEFAULT_PLAYBACK_PAD);
+
+        // Act / Assert: one value set leaves the other alone, down to the leaf.
+        let partial = load(b"[preview.playback]\nfps = 15\n");
+        assert_eq!(partial.playback_fps, 15);
+        assert_eq!(partial.playback_pad, DEFAULT_PLAYBACK_PAD);
+
+        // Act / Assert: a rate nothing could draw, and one nothing could watch.
+        assert_eq!(
+            load(b"[preview.playback]\nfps = 9000\n").playback_fps,
+            MAX_PLAYBACK_FPS
+        );
+        assert_eq!(
+            load(b"[preview.playback]\nfps = 0\n").playback_fps,
+            MIN_PLAYBACK_FPS
+        );
+
+        // Act / Assert: a pad of nothing is meaningful — play exactly the cue — so only
+        // the top is capped.
+        assert_eq!(
+            load(b"[preview.playback]\npad = 0\n").playback_pad,
+            Duration::ZERO
+        );
+        assert_eq!(
+            load(b"[preview.playback]\npad = 600.0\n").playback_pad,
+            Duration::from_secs_f64(MAX_PLAYBACK_PAD)
+        );
+
+        // Act / Assert: and a negative or a non-finite pad, both of which `from_secs_f64`
+        // panics on outright, fall back rather than take the process down at launch.
+        assert_eq!(
+            load(b"[preview.playback]\npad = -3.0\n").playback_pad,
+            DEFAULT_PLAYBACK_PAD
+        );
+        assert_eq!(
+            load(b"[preview.playback]\npad = nan\n").playback_pad,
+            DEFAULT_PLAYBACK_PAD
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn effective_workers_should_use_the_network_limits_only_on_a_network_mount() {
         let config = Config {
@@ -413,6 +535,8 @@ mod tests {
             preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
             preview_prefetch: true,
             network_preview_prefetch: false,
+            playback_fps: DEFAULT_PLAYBACK_FPS,
+            playback_pad: DEFAULT_PLAYBACK_PAD,
         };
         assert_eq!(config.effective_workers(false), (1, 5));
         assert_eq!(config.effective_workers(true), (1, 1));

@@ -2739,6 +2739,7 @@ fn a_full_cache_should_evict_whole_tracks_and_never_the_open_one() {
         prefetch: true,
         network: false,
         cache_tracks: 1,
+        ..PreviewSettings::default()
     });
     // The filesystem's mtime granularity can be coarse enough that a rewrite within the
     // same tick is indistinguishable from no rewrite at all.

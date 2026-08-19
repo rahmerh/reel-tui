@@ -13,9 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
+use ratatui_image::protocol::halfblocks::Halfblocks;
 
+use crate::audio::{AudioOutput, frame_index_at};
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
-use crate::preview::{CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, seek_for};
+use crate::preview::{
+    CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, seek_for,
+};
 use crate::subtitle::SubtitleSource;
 
 /// How long the selection has to stop moving before a frame is asked for.
@@ -179,6 +183,151 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+/// One cue's span, decoded and playing.
+///
+/// Holds the whole span's raw pixels rather than encoding them all up front: a protocol is
+/// several times the size of the pixels it came from, and only one of them is ever on
+/// screen. The frame under the playhead is encoded as it is reached and kept until the
+/// playhead leaves it, so a step that does not cross a frame boundary costs nothing at all.
+pub struct Playback {
+    /// Which cue this span was played for. A span that arrives after the cursor has moved
+    /// is dropped rather than played under a line it is not about.
+    cue_index: usize,
+    frames: PlaybackFrames,
+    /// Where the sound is, which is the only clock here — see [`crate::audio`]. Held so
+    /// that dropping the page stops the device, whichever way the page was left.
+    output: Box<dyn AudioOutput>,
+    /// Which frame [`Self::drawn`] holds, so a step inside one frame period re-draws
+    /// nothing.
+    shown: Option<usize>,
+    drawn: Option<Box<Protocol>>,
+}
+
+/// What one step of a playback did, which is what tells the page whether to repaint and
+/// when to let go of the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackStep {
+    /// Either the sound has not started yet, or the playhead is still inside the frame
+    /// already on screen. Nothing to redraw.
+    Unchanged,
+    Drew,
+    /// The playhead has run off the end of the span.
+    Finished,
+}
+
+impl Playback {
+    pub fn new(cue_index: usize, frames: PlaybackFrames, output: Box<dyn AudioOutput>) -> Self {
+        Self {
+            cue_index,
+            frames,
+            output,
+            shown: None,
+            drawn: None,
+        }
+    }
+
+    pub fn cue_index(&self) -> usize {
+        self.cue_index
+    }
+
+    /// Where in the media the playhead is, or `None` before the sound has started.
+    ///
+    /// Derived from the frame on screen rather than from the clock directly, so the picture
+    /// and the playhead in one drawn frame describe the same instant — a playhead read
+    /// straight off the clock would sit up to a frame period ahead of the picture beside it.
+    pub fn position(&self) -> Option<Duration> {
+        let shown = self.shown?;
+        if self.frames.fps == 0 {
+            return Some(self.frames.span_start);
+        }
+        Some(
+            self.frames.span_start
+                + Duration::from_secs_f64(shown as f64 / f64::from(self.frames.fps)),
+        )
+    }
+
+    pub fn frame(&self) -> Option<&Protocol> {
+        self.drawn.as_deref()
+    }
+
+    /// Moves the playhead to wherever the sound has got to, encoding the frame there.
+    ///
+    /// The clock is sampled once, here, rather than by each thing that wants to know: two
+    /// reads a few microseconds apart could straddle a frame boundary and put the picture
+    /// and the playhead on either side of it.
+    pub fn advance(&mut self, now: Instant) -> PlaybackStep {
+        let Some(position) = self.output.position(now) else {
+            // The device has not started yet. Nothing is drawn during this rather than the
+            // first frame being held up: starting the picture before the sound is exactly
+            // the error the clock exists to prevent.
+            return PlaybackStep::Unchanged;
+        };
+        let index = frame_index_at(position, self.frames.fps);
+        if index >= self.frames.count() {
+            return PlaybackStep::Finished;
+        }
+        if self.shown == Some(index) {
+            return PlaybackStep::Unchanged;
+        }
+        let Some(drawn) = self.encode(index) else {
+            // Unreachable for an index inside the span — the size was fixed before the
+            // decode and the slice is exactly that many bytes — so there is nothing to
+            // report and nothing to recover. Ending is what stops it being asked again for
+            // every frame of the rest of the span.
+            return PlaybackStep::Finished;
+        };
+        self.shown = Some(index);
+        self.drawn = Some(drawn);
+        PlaybackStep::Drew
+    }
+
+    /// One frame's pixels as something the terminal can draw.
+    ///
+    /// `Halfblocks::new` directly rather than `Picker::new_protocol`: the picker's
+    /// halfblocks font size is an arbitrary 1:2 placeholder, so `Resize::Scale` would blow
+    /// the frame up to that font's idea of the pane and `Halfblocks` would immediately
+    /// resample it back down to the cell grid — two passes, the expensive one wasted. The
+    /// frame was decoded at exactly the cell grid's pixels ([`crate::preview::playback_pixels`]),
+    /// so this way there is nothing to scale.
+    fn encode(&self, index: usize) -> Option<Box<Protocol>> {
+        let (width, height) = self.frames.pixels;
+        let bytes = self.frames.frame(index)?;
+        let image = image::RgbImage::from_raw(width, height, bytes.to_vec())?;
+        let halfblocks =
+            Halfblocks::new(image::DynamicImage::ImageRgb8(image), self.frames.cells).ok()?;
+        Some(Box::new(Protocol::Halfblocks(halfblocks)))
+    }
+}
+
+/// `Protocol` has no `Debug` and the frame buffer is megabytes of pixels, so this reports
+/// what a reader of a failure message actually wants: which cue, how far in, out of what.
+impl std::fmt::Debug for Playback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Playback")
+            .field("cue_index", &self.cue_index)
+            .field("shown", &self.shown)
+            .field("frames", &self.frames)
+            .finish()
+    }
+}
+
+/// Whether the page is playing a cue's span, getting ready to, or neither.
+///
+/// One field rather than a set of flags, so the audio device is released by every way of
+/// leaving the page — the same reason the page itself is one `Option` on `App`.
+#[derive(Debug, Default)]
+pub enum PlaybackState {
+    #[default]
+    Idle,
+    /// The span is being decoded. The still frame stays on screen throughout, so the page
+    /// does not blank for the second or two this takes.
+    Preparing {
+        cue_index: usize,
+    },
+    Playing(Playback),
+}
+
 /// Everything the subtitle timing page draws and navigates.
 #[derive(Debug)]
 pub struct SubtitleSyncState {
@@ -244,6 +393,14 @@ pub struct SubtitleSyncState {
     ///
     /// [`PreviewHandles::frame_bytes_per_cell`]: crate::preview::PreviewHandles::frame_bytes_per_cell
     frame_cost: u64,
+    /// The scrub playback, if one is running or being decoded.
+    playback: PlaybackState,
+    /// Why the last playback of the cue at this index could not run.
+    ///
+    /// Keyed on the cue for the same reason `frame_error` is, and on the status row for the
+    /// same reason too: a playback is asked for by a keypress against one line, and the
+    /// reason it failed says nothing about the next one.
+    playback_error: Option<(usize, String)>,
     workspace: PreviewWorkspace,
 }
 
@@ -276,6 +433,8 @@ impl SubtitleSyncState {
             frame_error: None,
             frame_pending_since: None,
             refill_nearby: false,
+            playback: PlaybackState::Idle,
+            playback_error: None,
             workspace,
         }
     }
@@ -348,6 +507,8 @@ impl SubtitleSyncState {
         self.encoded.clear();
         self.frame_pending_since = None;
         self.refill_nearby = false;
+        // Nothing left to play against, and the device is let go of with it.
+        self.stop_playback();
     }
 
     /// The frame to draw, if the cue currently selected has one ready.
@@ -455,6 +616,13 @@ impl SubtitleSyncState {
     /// Asked for even when the selected cue is already encoded: the window has moved, so
     /// there is a new cue at its far edge to get ready before the cursor reaches it.
     pub fn request_frame(&mut self) {
+        // Every caller of this is a reason a playback on screen is no longer about what is
+        // on screen: the cursor moved to another cue, the pane resized under frames encoded
+        // for the old one, or a whole new track arrived. One place rather than five, for
+        // the same reason `prune_frames` lives here — an exit path that forgot would leave
+        // a span playing under a line it is not about, which reads as the timing being
+        // wrong on the one page built to judge that.
+        self.stop_playback();
         self.prune_frames();
         self.frame_pending_since = Some(Instant::now());
     }
@@ -554,6 +722,103 @@ impl SubtitleSyncState {
         })
     }
 
+    /// Whether a playback is running or being decoded, which is what `p` toggles.
+    pub fn playback_active(&self) -> bool {
+        !matches!(self.playback, PlaybackState::Idle)
+    }
+
+    /// The frame the playhead is on, if a playback is drawing one.
+    ///
+    /// `None` while a span is still decoding *and* for the moment between the stream
+    /// starting and the device's first callback, which is what leaves the still frame on
+    /// screen rather than blanking the pane.
+    pub fn playback_frame(&self) -> Option<&Protocol> {
+        match &self.playback {
+            PlaybackState::Playing(playback) => playback.frame(),
+            _ => None,
+        }
+    }
+
+    /// Where in the media the playhead is, for the timeline to mark.
+    pub fn playback_position(&self) -> Option<Duration> {
+        match &self.playback {
+            PlaybackState::Playing(playback) => playback.position(),
+            _ => None,
+        }
+    }
+
+    /// Records that a span is being decoded for `cue_index`, clearing any earlier reason.
+    pub fn prepare_playback(&mut self, cue_index: usize) {
+        self.playback_error = None;
+        self.playback = PlaybackState::Preparing { cue_index };
+    }
+
+    /// Whether a span is being decoded, and for which cue — so one arriving for a cue the
+    /// cursor has since left can be dropped.
+    pub fn preparing_playback(&self) -> Option<usize> {
+        match self.playback {
+            PlaybackState::Preparing { cue_index } => Some(cue_index),
+            _ => None,
+        }
+    }
+
+    /// Starts playing a decoded span.
+    pub fn begin_playback(
+        &mut self,
+        cue_index: usize,
+        frames: PlaybackFrames,
+        output: Box<dyn AudioOutput>,
+    ) {
+        self.playback_error = None;
+        self.playback = PlaybackState::Playing(Playback::new(cue_index, frames, output));
+    }
+
+    /// Records why a span could not be played, and stops waiting for it.
+    pub fn fail_playback(&mut self, cue_index: usize, message: String) {
+        self.playback = PlaybackState::Idle;
+        self.playback_error = Some((cue_index, message));
+    }
+
+    /// Why the cue under the cursor could not be played, if that is why it is not playing.
+    pub fn playback_error(&self) -> Option<&str> {
+        self.playback_error
+            .as_ref()
+            .filter(|(cue_index, _)| *cue_index == self.selected)
+            .map(|(_, message)| message.as_str())
+    }
+
+    /// Stops any playback, releasing the audio device with it. Reports whether there was
+    /// one, so the caller knows whether to tell the worker to stop decoding.
+    pub fn stop_playback(&mut self) -> bool {
+        if matches!(self.playback, PlaybackState::Idle) {
+            return false;
+        }
+        self.playback = PlaybackState::Idle;
+        true
+    }
+
+    /// Moves the playhead to wherever the sound has got to, reporting whether the page
+    /// needs repainting.
+    ///
+    /// Called once per loop iteration rather than from the renderer, so the picture and the
+    /// playhead are decided together and drawn together.
+    pub fn advance_playback(&mut self) -> bool {
+        let PlaybackState::Playing(playback) = &mut self.playback else {
+            return false;
+        };
+        match playback.advance(Instant::now()) {
+            PlaybackStep::Unchanged => false,
+            PlaybackStep::Drew => true,
+            PlaybackStep::Finished => {
+                // Back to the still frame, and the device let go of. A playback that ran to
+                // its end is finished with, not paused at the last frame — the next `p`
+                // should replay the span rather than have to stop it first.
+                self.playback = PlaybackState::Idle;
+                true
+            }
+        }
+    }
+
     /// Records the pane size the renderer measured, dropping every frame on hand and
     /// asking again when it changed: each one was encoded for the old size, and `Image`
     /// draws nothing at all rather than clipping when it no longer fits.
@@ -642,6 +907,7 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+    use crate::audio::SilentOutput;
 
     fn cue(start: u64, end: u64, text: &str) -> Cue {
         Cue {
@@ -1482,5 +1748,311 @@ mod tests {
     fn the_page_should_name_the_media_its_frames_come_from() {
         // Act / Assert
         assert_that!(state().media()).is_equal_to(Path::new("/media/show.mkv"));
+    }
+
+    /// A span of `count` frames, each a solid colour naming its index, so a test can tell
+    /// which one is on screen from the picture rather than from a counter beside it.
+    fn span(count: usize, cells: Size, fps: u32) -> PlaybackFrames {
+        let pixels = crate::preview::playback_pixels(cells);
+        let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
+        let mut bytes = Vec::with_capacity(stride * count);
+        for index in 0..count {
+            bytes.extend(std::iter::repeat_n(index as u8, stride));
+        }
+        PlaybackFrames::new(bytes, pixels, cells, fps, Duration::from_secs(10))
+    }
+
+    /// An output whose position is set by the test rather than by a device, so the
+    /// picture's dependence on the clock can be asserted a frame at a time.
+    #[derive(Debug)]
+    struct SteppedOutput(std::sync::Mutex<Option<Duration>>);
+
+    impl SteppedOutput {
+        fn at(position: Option<Duration>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self(std::sync::Mutex::new(position)))
+        }
+
+        fn set(&self, position: Duration) {
+            *self.0.lock().unwrap() = Some(position);
+        }
+    }
+
+    impl AudioOutput for SteppedOutput {
+        fn position(&self, _now: Instant) -> Option<Duration> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn playing(state: &mut SubtitleSyncState) -> &Playback {
+        match &state.playback {
+            PlaybackState::Playing(playback) => playback,
+            other => panic!("expected a playing page, got {other:?}"),
+        }
+    }
+
+    /// The picture is derived from the sound, not scheduled against a clock of its own —
+    /// so a step that does not cross a frame boundary must not re-encode anything, and one
+    /// that does must land on the frame that had already started rather than the next.
+    #[test]
+    fn the_playhead_should_follow_the_sound_a_frame_at_a_time() {
+        // Arrange: ten frames at ten a second, so a frame is exactly 100 ms.
+        let mut state = ready(3);
+        let clock = SteppedOutput::at(None);
+        state.begin_playback(
+            0,
+            span(10, Size::new(4, 2), 10),
+            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+        );
+
+        // Act / Assert: nothing is drawn before the device has said where it is. Holding
+        // the first frame up instead would start the picture ahead of the sound, which is
+        // the one error this page must not make.
+        assert_that!(state.advance_playback()).is_false();
+        assert_that!(state.playback_frame().is_none()).is_true();
+        assert_that!(state.playback_position()).is_none();
+
+        // Act / Assert: the sound starts, and the first frame goes up.
+        clock.set(Duration::ZERO);
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_frame().is_some()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(0));
+
+        // Act / Assert: a step inside that frame's own period redraws nothing.
+        clock.set(Duration::from_millis(99));
+        assert_that!(state.advance_playback()).is_false();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(0));
+
+        // Act / Assert: and crossing the boundary moves exactly one frame on.
+        clock.set(Duration::from_millis(100));
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(1));
+
+        // Act / Assert: the sound jumping — which is what a device catching up looks like —
+        // takes the picture straight to where the sound is, rather than walking to it.
+        clock.set(Duration::from_millis(750));
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(7));
+    }
+
+    /// An `AudioOutput` the test keeps a handle on. `Playback` owns its output outright —
+    /// that is what makes dropping the page release the device — so driving one from
+    /// outside needs a shared cell rather than a borrow.
+    #[derive(Debug)]
+    struct SharedOutput(std::sync::Arc<SteppedOutput>);
+
+    impl AudioOutput for SharedOutput {
+        fn position(&self, now: Instant) -> Option<Duration> {
+            self.0.position(now)
+        }
+    }
+
+    /// A playback that reached its last frame is finished with, not paused on it: the next
+    /// `p` should replay the span rather than having to stop it first. The device goes back
+    /// at the same moment, which is what stops a page left open holding one open forever.
+    #[test]
+    fn a_playback_should_end_itself_when_the_sound_runs_past_the_span() {
+        // Arrange: three frames at ten a second, so the span lasts 300 ms.
+        let mut state = ready(3);
+        let clock = SteppedOutput::at(Some(Duration::from_millis(250)));
+        state.begin_playback(
+            0,
+            span(3, Size::new(4, 2), 10),
+            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+        );
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_active()).is_true();
+
+        // Act: past the last frame.
+        clock.set(Duration::from_millis(300));
+        let dirty = state.advance_playback();
+
+        // Assert: over, and back to the still frame.
+        assert_that!(dirty).is_true();
+        assert_that!(state.playback_active()).is_false();
+        assert_that!(state.playback_frame().is_none()).is_true();
+        // And advancing again reports nothing, rather than ending a second time.
+        assert_that!(state.advance_playback()).is_false();
+    }
+
+    /// The playhead is read off the frame on screen rather than off the clock, so the
+    /// picture and the mark on the timeline in one drawn frame describe the same instant.
+    /// Straight off the clock it would sit up to a frame period ahead of the picture.
+    #[test]
+    fn the_playhead_should_report_where_the_picture_is_rather_than_where_the_sound_is() {
+        // Arrange: a span starting ten seconds into the media, at ten frames a second.
+        let mut state = ready(3);
+        let clock = SteppedOutput::at(Some(Duration::from_millis(2_390)));
+        state.begin_playback(
+            0,
+            span(30, Size::new(4, 2), 10),
+            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+        );
+
+        // Act: the picture is settled on frame 23, and *then* the sound moves on — which is
+        // what happens on every iteration, since the loop advances the playback and draws
+        // it in one pass while the device keeps going underneath.
+        state.advance_playback();
+        clock.set(Duration::from_millis(2_990));
+
+        // Assert: the playhead still reports frame 23's moment, 10 s + 2.3 s. Read off the
+        // clock instead it would say 12.99 s and sit most of a second ahead of the picture
+        // drawn beside it.
+        assert_that!(state.playback_position()).is_equal_to(Some(Duration::from_millis(12_300)));
+    }
+
+    /// A playback is *about* the cue it was started on. Leaving it running while the cursor
+    /// moves would play one line's span under another line's timing, which reads as the
+    /// timing being wrong on the one page built to judge exactly that.
+    #[test]
+    fn every_way_the_page_moves_under_a_playback_should_stop_it() {
+        let started = |state: &mut SubtitleSyncState| {
+            state.begin_playback(
+                0,
+                span(30, Size::new(4, 2), 10),
+                Box::new(SilentOutput::new()),
+            );
+        };
+
+        // Act / Assert: the cursor moving.
+        let mut state = ready(5);
+        started(&mut state);
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: jumping to either end.
+        started(&mut state);
+        assert_that!(state.select_last()).is_true();
+        assert_that!(state.playback_active()).is_false();
+        started(&mut state);
+        assert_that!(state.select_first()).is_true();
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: the pane resizing, which every frame in the span was encoded for.
+        started(&mut state);
+        state.set_preview_cells(Size::new(40, 20));
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: a new track arriving.
+        started(&mut state);
+        state.apply_prepared(vec![cue(0, 1000, "a")], CueStyle::SubRip);
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: and the track failing to load.
+        started(&mut state);
+        state.fail("ffmpeg exploded".to_string());
+        assert_that!(state.playback_active()).is_false();
+    }
+
+    /// A span takes a second or two to decode, and `p` has to be the way out of that as
+    /// well as the way in — otherwise pressing it by mistake means waiting for a playback
+    /// you have already decided you do not want.
+    #[test]
+    fn a_playback_should_be_stoppable_before_it_has_started() {
+        // Arrange
+        let mut state = ready(3);
+        state.prepare_playback(0);
+
+        // Assert: waiting, and saying so.
+        assert_that!(state.playback_active()).is_true();
+        assert_that!(state.preparing_playback()).is_equal_to(Some(0));
+        assert_that!(state.playback_frame().is_none()).is_true();
+
+        // Act
+        assert_that!(state.stop_playback()).is_true();
+
+        // Assert
+        assert_that!(state.playback_active()).is_false();
+        assert_that!(state.preparing_playback()).is_none();
+        // And stopping what is already stopped reports that there was nothing to stop,
+        // which is what makes the keybinding a toggle rather than a switch.
+        assert_that!(state.stop_playback()).is_false();
+    }
+
+    /// A span that could not be decoded has to say why, or `p` looks like it did nothing —
+    /// and it says it about the cue it was pressed on, since the reason says nothing about
+    /// the next line.
+    #[test]
+    fn a_playback_that_failed_should_explain_itself_under_the_cue_it_was_asked_for() {
+        // Arrange
+        let mut state = ready(3);
+        state.prepare_playback(0);
+
+        // Act
+        state.fail_playback(0, "Could not play this cue: no such file".to_string());
+
+        // Assert
+        assert_that!(state.playback_active()).is_false();
+        assert_that!(state.playback_error())
+            .is_equal_to(Some("Could not play this cue: no such file"));
+
+        // Act / Assert: and it does not follow the cursor onto a line it is not about.
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.playback_error()).is_none();
+
+        // Act / Assert: asking again clears it, so a retry that works leaves nothing behind.
+        state.prepare_playback(1);
+        assert_that!(state.playback_error()).is_none();
+    }
+
+    /// A span arriving for a cue the cursor has already left is dropped rather than played,
+    /// which is what `preparing_playback` is consulted for — so it has to answer `None` the
+    /// moment the page stops waiting.
+    #[test]
+    fn a_page_not_waiting_for_a_span_should_say_so() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act / Assert
+        assert_that!(state.preparing_playback()).is_none();
+        state.prepare_playback(2);
+        assert_that!(state.preparing_playback()).is_equal_to(Some(2));
+        state.begin_playback(
+            2,
+            span(4, Size::new(4, 2), 10),
+            Box::new(SilentOutput::new()),
+        );
+        assert_that!(state.preparing_playback()).is_none();
+        assert_that!(playing(&mut state).cue_index()).is_equal_to(2);
+    }
+
+    /// The page's state is printed whole in every test failure and in the harness's timeout
+    /// dump. `Protocol` has no `Debug` and the span is megabytes of pixels, so a derived one
+    /// would either not compile or drown the message.
+    #[test]
+    fn a_playback_should_describe_itself_by_where_it_is_rather_than_by_its_pixels() {
+        // Arrange
+        let mut state = ready(3);
+        state.begin_playback(
+            1,
+            span(6, Size::new(4, 2), 10),
+            Box::new(SilentOutput::new()),
+        );
+
+        // Act
+        let described = format!("{:?}", state.playback);
+
+        // Assert
+        assert_that!(described.as_str()).contains("cue_index: 1");
+        assert_that!(described.as_str()).contains("frames: 6");
+        assert_that!(described.contains("bytes")).is_false();
+    }
+
+    /// The frame is encoded straight to halfblocks at the cell area the span was decoded
+    /// for, so what the terminal draws is what `ffmpeg` produced with nothing resampled in
+    /// between — and it has to fill exactly the cells the pane was measured at, since
+    /// `Image` draws nothing at all rather than clipping when it does not fit.
+    #[test]
+    fn a_played_frame_should_encode_to_exactly_the_cells_it_was_decoded_for() {
+        // Arrange
+        let mut state = ready(3);
+        let cells = Size::new(8, 4);
+        state.begin_playback(0, span(3, cells, 10), Box::new(SilentOutput::new()));
+
+        // Act
+        assert_that!(state.advance_playback()).is_true();
+
+        // Assert
+        let protocol = state.playback_frame().expect("a frame should be drawn");
+        assert_that!(protocol.size()).is_equal_to(cells);
     }
 }

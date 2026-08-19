@@ -29,8 +29,8 @@ use crate::{
     files::{DirectorySnapshot, FileEntry, scan_directory},
     framecache,
     preview::{
-        CueStyle, FrameOutcome, FrameRequest, FrameSource, PrepareOutcome, PrepareRequest,
-        PreviewEvent, PreviewHandles, WarmRequest,
+        CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackOutcome, PlaybackRequest,
+        PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -58,17 +58,39 @@ pub struct PreviewSettings {
     /// How many media files' frames the cache may hold before the least recently used is
     /// dropped whole.
     pub cache_tracks: usize,
+    /// How many frames a second the scrub playback aims for. A ceiling: a span too large
+    /// to hold at this rate is decoded at a lower one — see `preview::affordable_fps`.
+    pub playback_fps: u32,
+    /// How much of the media either side of the cue a scrub playback covers.
+    pub playback_pad: Duration,
 }
 
 impl Default for PreviewSettings {
     fn default() -> Self {
+        let defaults = crate::config::Config::default();
         Self {
             prefetch: true,
             network: false,
-            cache_tracks: crate::config::Config::default().preview_cache_tracks,
+            cache_tracks: defaults.preview_cache_tracks,
+            playback_fps: defaults.playback_fps,
+            playback_pad: defaults.playback_pad,
         }
     }
 }
+
+/// How long the event loop blocks waiting for a key when nothing is playing.
+///
+/// Twenty hertz: fast enough that a keypress feels immediate, slow enough that an idle
+/// `reel` costs nothing.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long it blocks while a span is playing.
+///
+/// A playback draws at up to sixty frames a second, and a poll interval of the same order
+/// as a frame period would land the picture on whichever side of the boundary the loop
+/// happened to wake on. Small enough to be well inside one frame; not zero, because a
+/// spin would be a whole core for a slideshow.
+const PLAYBACK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Layer {
@@ -1101,6 +1123,16 @@ pub struct App {
     /// Bumped for each page opening, so a worker result that arrives after the user has
     /// moved on can be recognised as stale and dropped.
     sync_generation: u64,
+    /// Bumped for each scrub playback, counted apart from `sync_generation`: stopping a
+    /// playback must not abandon the background frame pass, which is a different piece of
+    /// work for the same page.
+    playback_generation: u64,
+    /// Whether the worker has been asked for a span it has not been told to stop decoding.
+    ///
+    /// The page drops a playback on its own whenever what it was for changed — the cursor
+    /// moved, the pane resized — and this is what lets `advance_playback` notice that and
+    /// tell the worker, rather than each of those points having to.
+    playback_live: bool,
     /// The preview worker, when one is running. `None` in tests and for library
     /// consumers that never open the timing page, exactly like
     /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
@@ -1249,6 +1281,8 @@ impl App {
             subtitle_capabilities: ToolCapabilities::detect_cached(),
             subtitle_sync: None,
             sync_generation: 0,
+            playback_generation: 0,
+            playback_live: false,
             preview_settings: PreviewSettings::default(),
             preview: None,
             container_target: None,
@@ -2380,6 +2414,10 @@ impl App {
     /// happens to the workspace" rather than one per exit path.
     fn close_subtitle_sync(&mut self) {
         if self.subtitle_sync.take().is_some() {
+            // Before the page goes: dropping the state releases the audio device on its
+            // own, but a span still being decoded for it would otherwise run to completion
+            // with nowhere to go.
+            self.abandon_playback();
             self.sync_generation = self.sync_generation.wrapping_add(1);
             // Tell the worker the page is gone as well as marking its answers stale: an
             // extraction that has not finished is killed rather than left demuxing a
@@ -2397,6 +2435,7 @@ impl App {
     pub fn receive_preview_events(&mut self, receiver: &Receiver<PreviewEvent>) -> bool {
         let mut received = false;
         let mut prepared = false;
+        let mut stopped_playback = false;
         while let Ok(event) = receiver.try_recv() {
             received = true;
             let Some(state) = self.subtitle_sync.as_mut() else {
@@ -2426,6 +2465,27 @@ impl App {
                     FrameOutcome::Ready(protocol) => state.apply_frame(cue_index, protocol),
                     FrameOutcome::Failed(message) => state.fail_frame(cue_index, message),
                 },
+                // Two gates, not one. The generation says the span is for the playback that
+                // is still wanted; the cue index says the page has not moved to another
+                // line since — which it can have, because moving the cursor is one of the
+                // things that stops a playback.
+                PreviewEvent::Playback {
+                    generation,
+                    cue_index,
+                    outcome,
+                } if generation == self.playback_generation
+                    && state.preparing_playback() == Some(cue_index) =>
+                {
+                    match outcome {
+                        PlaybackOutcome::Ready(frames) => {
+                            state.begin_playback(cue_index, frames, crate::audio::open())
+                        }
+                        PlaybackOutcome::Failed(message) => {
+                            state.fail_playback(cue_index, message);
+                            stopped_playback = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2433,6 +2493,12 @@ impl App {
         // which are `self` fields the loop's borrow of `subtitle_sync` rules out.
         if prepared {
             self.start_warming();
+        }
+        // A span that could not be decoded leaves nothing running, so the worker is told
+        // straight away rather than at the next `advance_playback` — which would not fire,
+        // since there is no playback left to advance.
+        if stopped_playback {
+            self.abandon_playback();
         }
         received
     }
@@ -2586,6 +2652,134 @@ impl App {
         }
     }
 
+    /// Starts or stops the scrub playback of the selected cue.
+    ///
+    /// A span is `PLAYBACK_PAD` either side of the cue, played as a slideshow of frames the
+    /// worker decodes in one pass. Pressing the key again while one is running — or while
+    /// one is still decoding — stops it, which is what makes the same key both the way in
+    /// and the way out of something that takes a second or two to start.
+    pub fn toggle_playback(&mut self) {
+        if self.stop_playback() {
+            return;
+        }
+        // The same two gates the still frames take. A terminal that cannot draw images has
+        // nothing to show a slideshow with, and a build that cannot burn subtitles in would
+        // play a span with no line on it — which on this page is not a degraded playback,
+        // it is the wrong answer to the only question being asked.
+        if !self
+            .preview
+            .as_ref()
+            .is_some_and(PreviewHandles::draws_frames)
+            || !self.subtitle_capabilities.can_burn_subtitles()
+        {
+            return;
+        }
+        let settings = self.preview_settings;
+        let request = {
+            let Some(state) = self.subtitle_sync.as_mut() else {
+                return;
+            };
+            let Some(cue) = state.selected_cue().cloned() else {
+                return;
+            };
+            let cells = crate::preview::playback_cells(state.preview_cells, state.frames.pixels);
+            if cells.width == 0 || cells.height == 0 {
+                return;
+            }
+            let pixels = crate::preview::playback_pixels(cells);
+            let (span_start, span_end) =
+                crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
+            let cue_index = state.selected;
+            state.prepare_playback(cue_index);
+            PlaybackRequest {
+                generation: self.playback_generation.wrapping_add(1),
+                source: state.frames.clone(),
+                cue_index,
+                cue,
+                span_start,
+                span_end,
+                // Lowered from what the user asked for only when the span at this size
+                // would not fit in memory — see `preview::affordable_fps`.
+                fps: crate::preview::affordable_fps(
+                    settings.playback_fps,
+                    span_end.saturating_sub(span_start),
+                    pixels,
+                ),
+                pixels,
+                cells,
+            }
+        };
+        self.playback_generation = request.generation;
+        self.playback_live = true;
+        if let Some(preview) = self.preview.as_ref() {
+            preview.request_playback(request);
+        }
+    }
+
+    /// Stops any playback and tells the worker to stop decoding for it.
+    ///
+    /// Reports whether there was one, which is what makes the keybinding a toggle.
+    fn stop_playback(&mut self) -> bool {
+        let stopped = self
+            .subtitle_sync
+            .as_mut()
+            .is_some_and(SubtitleSyncState::stop_playback);
+        if stopped {
+            self.abandon_playback();
+        }
+        stopped
+    }
+
+    /// Tells the worker that whatever span it is decoding is no longer wanted.
+    fn abandon_playback(&mut self) {
+        self.playback_live = false;
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        if let Some(preview) = self.preview.as_ref() {
+            preview.abandon_playback(self.playback_generation);
+        }
+    }
+
+    /// Moves the playhead to wherever the sound has got to, reporting whether the page
+    /// needs repainting.
+    ///
+    /// Called once per loop iteration, beside the other pumps. Also the single point that
+    /// reconciles the worker with the page: `SubtitleSyncState` drops a playback on its own
+    /// whenever the cursor moves or the pane resizes, and this is where that becomes a
+    /// running `ffmpeg` being killed rather than left decoding a span nobody will watch.
+    pub fn advance_playback(&mut self) -> bool {
+        let Some(state) = self.subtitle_sync.as_mut() else {
+            // The page itself is gone, which `close_subtitle_sync` has already reported.
+            return false;
+        };
+        let dirty = state.advance_playback();
+        if self.playback_live && !self.playback_active() {
+            self.abandon_playback();
+        }
+        dirty
+    }
+
+    /// Whether a span is playing or being decoded, for the loop's poll interval and for
+    /// the status row.
+    pub fn playback_active(&self) -> bool {
+        self.subtitle_sync
+            .as_ref()
+            .is_some_and(SubtitleSyncState::playback_active)
+    }
+
+    /// How long the event loop may block waiting for a key.
+    ///
+    /// Fifty milliseconds is a twenty-hertz ceiling, which is fine for everything else this
+    /// application draws and would turn a thirty-frame-a-second playback into a judder. A
+    /// playback is the one thing here whose picture is timed rather than merely animated,
+    /// so it — and only it — is worth waking up for at a rate above what it draws at.
+    pub fn poll_interval(&self) -> Duration {
+        if self.playback_active() {
+            PLAYBACK_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        }
+    }
+
     pub fn back(&mut self) -> bool {
         match self.layer {
             Layer::StreamDetails => {
@@ -2599,6 +2793,12 @@ impl App {
                 true
             }
             Layer::SubtitleSync => {
+                // Peeled one layer at a time, the same way Esc backs out of a file search
+                // before leaving the file list: a playback is something on screen the user
+                // may want gone without also losing the page they spent a second opening.
+                if self.stop_playback() {
+                    return true;
+                }
                 self.close_subtitle_sync();
                 self.layer = Layer::Streams;
                 true
@@ -6622,6 +6822,11 @@ impl App {
                 .subtitle_sync
                 .as_ref()
                 .is_some_and(SubtitleSyncState::is_busy)
+            // A playback repaints because the picture moved, which `advance_playback`
+            // already reports — but the frames *between* those, and the wait while a span
+            // decodes, need the loop drawing too, or the page freezes on whatever was on
+            // screen when `p` was pressed.
+            || self.playback_active()
     }
 
     pub fn scroll_conflicts(&mut self, direction: isize) {
@@ -20519,6 +20724,392 @@ mod tests {
         assert_that!(drained).is_true();
         assert_that!(app.subtitle_sync.as_ref().unwrap().warm)
             .is_equal_to(WarmState::Working { done: 1, total: 2 });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span, sized for the cell area a request asked for, so it can be handed straight
+    /// back through `PreviewEvent::Playback` as the worker would.
+    fn decoded_span(request: &PlaybackRequest, count: usize) -> crate::preview::PlaybackFrames {
+        let stride = (request.pixels.0 as usize) * (request.pixels.1 as usize) * 3;
+        crate::preview::PlaybackFrames::new(
+            vec![7; stride * count],
+            request.pixels,
+            request.cells,
+            request.fps,
+            request.span_start,
+        )
+    }
+
+    /// The worker cannot see the page, so everything a span needs has to be in the request:
+    /// which media, which cue, the stretch of it either side, the rate, and the exact size
+    /// the frames come back at — which the slicing depends on being exact.
+    #[test]
+    fn toggling_playback_should_ask_for_the_span_around_the_selected_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.subtitle_sync.as_mut().unwrap().select(1);
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: the cue under the cursor, with two seconds either side of it.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.cue_index).is_equal_to(1);
+        assert_that!(request.cue.text.as_str()).is_equal_to("two");
+        assert_that!(request.span_start).is_equal_to(Duration::from_secs(3));
+        assert_that!(request.span_end).is_equal_to(Duration::from_secs(9));
+        assert_that!(request.fps).is_equal_to(30);
+        // The pane is 40x20 cells; a 1920x1080 source fitted into it proportionally is
+        // 40 cells wide and 11 tall, which is 40x22 pixels.
+        assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 11));
+        assert_that!(request.pixels).is_equal_to((40, 22));
+        assert_that!(request.source.media.clone())
+            .is_equal_to(app.subtitle_sync.as_ref().unwrap().media().to_path_buf());
+        // And the worker is told this is the span it should be decoding for.
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Assert: the page says it is waiting, so `p` does not look like it did nothing.
+        assert_that!(app.subtitle_sync.as_ref().unwrap().preparing_playback()).is_equal_to(Some(1));
+        assert_that!(app.playback_active()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same key is the way in and the way out, including during the second or two a
+    /// span takes to decode — otherwise pressing it by mistake means sitting through a
+    /// playback you have already decided you do not want.
+    #[test]
+    fn toggling_playback_again_should_stop_it_and_tell_the_worker() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: stopped, the worker told, and nothing new asked for.
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A terminal that cannot draw images has nothing to show a slideshow with, and a build
+    /// that cannot burn subtitles in would play a span with no line on it — which on this
+    /// page is not a degraded playback, it is the wrong answer to the only question asked.
+    #[test]
+    fn playback_should_be_refused_without_the_tools_to_draw_it() {
+        // Arrange: a page with the frame workers, but an FFmpeg that cannot burn. Stated
+        // rather than left to the default, since `App::new` reads the real one off this
+        // machine and a developer's build very much can burn.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+        assert_that!(app.playback_active()).is_false();
+
+        // Arrange / Act / Assert: and with no image protocol at all.
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_handles(None);
+        app.toggle_playback();
+        assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The renderer has not measured the pane on the first frame after the page opens, and
+    /// a track whose cues have not arrived has no cue to play. Either would become a
+    /// `scale=0:0` that fails, or a request for a cue that does not exist.
+    #[test]
+    fn playback_should_wait_for_something_to_play_and_somewhere_to_play_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+
+        // Act / Assert: cues have not arrived.
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+
+        // Arrange / Act / Assert: cues, but a pane nobody has measured.
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "one".into(),
+                dialogue: None,
+            }],
+            CueStyle::SubRip,
+        );
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+        assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Two gates, not one. The generation says the span is for the playback still wanted;
+    /// the cue index says the cursor has not moved since — which it can have, because
+    /// moving it is one of the things that stops a playback.
+    #[test]
+    fn a_span_should_only_play_for_the_request_that_is_still_wanted() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act / Assert: a span from an older playback is dropped.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation.wrapping_sub(1),
+                cue_index: request.cue_index,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(
+            app.subtitle_sync
+                .as_ref()
+                .unwrap()
+                .playback_frame()
+                .is_none()
+        )
+        .is_true();
+
+        // Act / Assert: so is one for a cue the page is no longer waiting on.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                cue_index: request.cue_index + 1,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.subtitle_sync.as_ref().unwrap().preparing_playback()).is_equal_to(Some(0));
+
+        // Act: the one that was actually asked for.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                cue_index: request.cue_index,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert: playing, and drawing a picture once stepped.
+        assert_that!(app.advance_playback()).is_true();
+        assert_that!(
+            app.subtitle_sync
+                .as_ref()
+                .unwrap()
+                .playback_frame()
+                .is_some()
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span that could not be decoded leaves nothing running, so the worker has to be
+    /// told at the point the failure lands — `advance_playback` would not fire, since there
+    /// is no playback left to advance.
+    #[test]
+    fn a_span_that_failed_should_report_it_and_release_the_worker() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                cue_index: request.cue_index,
+                outcome: PlaybackOutcome::Failed("Could not play this cue: nope".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().playback_error())
+            .is_equal_to(Some("Could not play this cue: nope"));
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page drops a playback on its own when the cursor moves or the pane resizes, and
+    /// this is the one place that becomes a running `ffmpeg` being killed rather than left
+    /// decoding seconds of video nobody will watch.
+    #[test]
+    fn a_playback_the_page_dropped_should_release_the_worker_on_the_next_step() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Act: the cursor moves, which `SubtitleSyncState` drops the playback for without
+        // knowing anything about the worker.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.advance_playback();
+
+        // Assert
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        // And a second step does not keep bumping it, which would abandon each new playback
+        // the moment it was asked for.
+        let settled = live.load(std::sync::atomic::Ordering::Relaxed);
+        app.advance_playback();
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(settled);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Esc peels one layer at a time, the same way it backs out of a file search before
+    /// leaving the file list: a playback is something on screen the user may want gone
+    /// without also losing the page they spent a second opening.
+    #[test]
+    fn escape_should_stop_a_playback_before_it_closes_the_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+
+        // Act / Assert: the playback goes, the page stays.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // Act / Assert: and again closes it.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span still decoding when the page closes would run to completion with nowhere to
+    /// go — seconds of `ffmpeg` for a page nobody is looking at.
+    #[test]
+    fn closing_the_page_should_stop_a_span_still_being_decoded() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+
+        // Act: straight out of the page, without stopping the playback first.
+        app.close_subtitle_sync();
+
+        // Assert
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        // And stepping a page that is gone reports nothing rather than panicking.
+        assert_that!(app.advance_playback()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Fifty milliseconds is a twenty-hertz ceiling, which would turn a thirty-frame-a-
+    /// second playback into a judder — the loop would wake on whichever side of a frame
+    /// boundary it happened to. A playback is the one thing here whose picture is timed
+    /// rather than merely animated.
+    #[test]
+    fn the_loop_should_wake_faster_only_while_something_is_playing() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        assert_that!(app.poll_interval()).is_equal_to(IDLE_POLL_INTERVAL);
+        assert_that!(app.is_animating()).is_false();
+        app.toggle_playback();
+        assert_that!(app.poll_interval()).is_equal_to(PLAYBACK_POLL_INTERVAL);
+        // And the loop keeps repainting, or the page would freeze on whatever was on
+        // screen when the key was pressed.
+        assert_that!(app.is_animating()).is_true();
+        app.toggle_playback();
+        assert_that!(app.poll_interval()).is_equal_to(IDLE_POLL_INTERVAL);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

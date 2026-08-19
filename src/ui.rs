@@ -238,8 +238,17 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
     // Here rather than in the pane, unlike the permanent reasons: this one changes as the
     // cursor moves, and text in the pane that changes per keypress is the flicker the
     // pane had its fallback removed to stop.
+    if let Some(reason) = state.playback_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
     if let Some(reason) = state.frame_error() {
         return Some((format!(" {reason}"), Color::Red));
+    }
+    // Ahead of the background pass's count, because this one the user is waiting on: a
+    // span takes a second or two to decode and the page would otherwise sit there looking
+    // as though `p` did nothing at all.
+    if state.preparing_playback().is_some() {
+        return Some((" Preparing playback…".to_string(), Color::Cyan));
     }
     match state.warm {
         WarmState::Working { done, total } => Some((
@@ -291,8 +300,14 @@ fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: R
     // the area it is given, so a frame encoded for a pane that has since shrunk is left
     // out rather than rendered into an empty box. Only in-flight frames can be that stale:
     // a measured resize drops every frame on hand.
+    //
+    // The playback's frame takes the pane while one is running, and the still one is what
+    // is left when it stops. Before the first frame of a span is drawn — while it decodes,
+    // and for the moment between the sound starting and the device's first callback — the
+    // playback has no frame and the still one stays, so `p` never blanks the pane.
     if let Some(protocol) = state
-        .frame()
+        .playback_frame()
+        .or_else(|| state.frame())
         .filter(|protocol| protocol.size().width <= inner.width)
         .filter(|protocol| protocol.size().height <= inner.height)
     {
@@ -2110,6 +2125,16 @@ fn keybindings_text() -> Text<'static> {
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
     keybinding(&mut lines, "c", "Preview subtitle timing (SRT tracks)");
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
+
+    // The page's navigation is the general `j/k`, `gg/G` and `Esc` above; this is the one
+    // key it adds. It lives here because this popup is the only place the application
+    // documents a key — see the no-inline-control-help rule in `AGENTS.md`.
+    keybindings_section(&mut lines, "Subtitle timing");
+    keybinding(
+        &mut lines,
+        "p",
+        "Play a few seconds around the selected cue, with sound",
+    );
 
     keybindings_section(&mut lines, "Text input");
     keybinding(
@@ -13023,5 +13048,134 @@ mod tests {
         // Cleanup
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span takes a second or two to decode, during which the page looks exactly as it
+    /// did before the key was pressed. Without a word about it, `p` reads as a key that
+    /// does nothing — and ahead of the background pass's count, because this is the one
+    /// the user is actually waiting on.
+    #[test]
+    fn the_page_should_say_that_a_playback_is_being_prepared() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-preparing", vec![sync_cue(1000, 3000, "a")]);
+        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+
+        // Act
+        app.subtitle_sync.as_mut().unwrap().prepare_playback(0);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Preparing playback")).is_true();
+        assert_that!(screen.contains("Generating preview frames")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A playback that could not be decoded says why, against the cue it was asked for —
+    /// and ahead of everything else, since it is the only line here explaining something
+    /// the user just did.
+    #[test]
+    fn the_page_should_explain_a_playback_it_could_not_start() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-playback-failed", vec![sync_cue(1000, 3000, "a")]);
+        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+
+        // Act
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .fail_playback(0, "Could not play this cue: no video".to_string());
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Could not play this cue: no video")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The playback takes the pane while it runs, and the still frame is what is left when
+    /// it stops. Before its first frame — while the span decodes, and for the moment
+    /// between the sound starting and the device's first callback — the still one stays,
+    /// so pressing `p` never blanks the pane.
+    #[test]
+    fn the_preview_pane_should_show_the_playback_while_one_is_running() {
+        // Arrange: a still frame on screen, painted a colour nothing else here draws.
+        let (mut app, directory) =
+            sync_page_app("sync-playback-pane", vec![sync_cue(1000, 3000, "a")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, still_frame(cells, [255, 0, 0]));
+        let still = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Act: a span whose picture differs in *shape*, not just colour. A flat frame
+        // encodes to spaces under halfblocks whatever colour it is — the two halves of
+        // every cell match — so striping the rows is what makes the difference land in the
+        // characters a `TestBackend` records.
+        let playback_cells = crate::preview::playback_cells(cells, (1920, 1080));
+        let pixels = crate::preview::playback_pixels(playback_cells);
+        let striped: Vec<u8> = (0..pixels.1)
+            .flat_map(|row| {
+                let shade = if row % 2 == 0 { 0u8 } else { 255 };
+                std::iter::repeat_n(shade, pixels.0 as usize * 3)
+            })
+            .collect();
+        app.subtitle_sync.as_mut().unwrap().begin_playback(
+            0,
+            crate::preview::PlaybackFrames::new(
+                striped,
+                pixels,
+                playback_cells,
+                10,
+                std::time::Duration::from_secs(1),
+            ),
+            Box::new(crate::audio::SilentOutput::new()),
+        );
+        app.advance_playback();
+        let playing = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the pane changed, so it is the playback being drawn and not the still.
+        assert_that!(playing == still).is_false();
+
+        // Act / Assert: and when the playback ends, the still frame is back.
+        app.subtitle_sync.as_mut().unwrap().stop_playback();
+        assert_that!(drawn(80, 24, |frame| render(frame, &mut app))).is_equal_to(still);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A protocol filling `cells` exactly, in one flat colour, for asserting which picture
+    /// the pane is drawing.
+    fn still_frame(
+        cells: ratatui::layout::Size,
+        colour: [u8; 3],
+    ) -> Box<ratatui_image::protocol::Protocol> {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let font = picker.font_size();
+        let mut image = image::RgbImage::new(
+            u32::from(cells.width) * u32::from(font.width),
+            u32::from(cells.height) * u32::from(font.height),
+        );
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgb(colour);
+        }
+        Box::new(
+            picker
+                .new_protocol(
+                    image::DynamicImage::ImageRgb8(image),
+                    cells,
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks should encode any image"),
+        )
     }
 }

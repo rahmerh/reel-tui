@@ -1,4 +1,3 @@
-use std::time::Duration;
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
@@ -58,6 +57,8 @@ fn run(target_dir: PathBuf) -> Result<()> {
         prefetch: app_config.effective_prefetch(is_network_mount),
         network: is_network_mount,
         cache_tracks: app_config.preview_cache_tracks,
+        playback_fps: app_config.playback_fps,
+        playback_pad: app_config.playback_pad,
     });
     let mut input = InputState::default();
 
@@ -82,12 +83,15 @@ fn run(target_dir: PathBuf) -> Result<()> {
             dirty |= app.receive_preview_events(&preview_rx);
             app.start_pending_probe();
             app.start_pending_preview();
+            // After the drains, so a span that arrived this iteration is stepped in the
+            // same pass it landed in rather than sitting on its first frame until the next.
+            dirty |= app.advance_playback();
             dirty |= app.maybe_open_conflict_dialog();
             if redraw.tick(std::mem::take(&mut dirty), app.is_animating()) {
                 terminal.draw(|frame| ui::render(frame, &mut app))?;
             }
 
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(app.poll_interval())? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if handle_key(&mut app, &mut input, key) == InputOutcome::Quit {
