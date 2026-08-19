@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// What the sound has to be produced as, so `ffmpeg` can be told to emit exactly that.
@@ -208,6 +209,41 @@ impl AudioOutput for SilentOutput {
     }
 }
 
+/// A real audio device, playing one span's samples once.
+///
+/// **The stream lives on its own thread and never leaves it.** `cpal::Stream` is not
+/// guaranteed to be `Send` on every host, and this has to be owned by `SubtitleSyncState`,
+/// which lives on `App` — so instead of moving the stream anywhere, a short-lived thread
+/// builds it, starts it, and parks. Dropping this closes the channel it is parked on, the
+/// thread wakes, and the stream is dropped there. That is the single stop path, which is
+/// what makes every way of leaving the page — Esc, another cue, quitting — release the
+/// device without any of them having to know that a device exists.
+pub struct CpalOutput {
+    clock: Arc<PlaybackClock>,
+    /// Dropped to stop the device. Never sent on; the disconnect *is* the message.
+    _stop: mpsc::Sender<()>,
+}
+
+impl std::fmt::Debug for CpalOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CpalOutput").finish_non_exhaustive()
+    }
+}
+
+impl AudioOutput for CpalOutput {
+    fn position(&self, now: Instant) -> Option<Duration> {
+        self.clock.position(now)
+    }
+}
+
+/// How long to wait for the device thread to report that it opened a stream.
+///
+/// Opening a device is milliseconds when it works. This bounds the case where it does not
+/// answer at all — a wedged sound server, a device another process is holding exclusively —
+/// so that a page which would otherwise hang instead plays silently, which is what a
+/// machine with no device gets anyway.
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Somewhere to send a span's sound, falling back rather than failing.
 ///
 /// A machine with no working audio output still gets the slideshow — at the right rate,
@@ -215,8 +251,171 @@ impl AudioOutput for SilentOutput {
 /// all would be the wrong trade: most of what this page shows is in the picture, and a user
 /// without a sound card would lose the whole feature to a device they already know they do
 /// not have.
-pub fn open() -> Box<dyn AudioOutput> {
-    Box::new(SilentOutput::new())
+///
+/// `samples` are interleaved floats at `format`, which is what `ffmpeg` was told to emit —
+/// so the callback copies rather than resamples, and the one thread that must never be late
+/// does no work beyond a memcpy.
+pub fn open(format: OutputFormat, samples: Vec<f32>) -> Box<dyn AudioOutput> {
+    if samples.is_empty() {
+        // No audio track in this media. The silent path is the same one a machine with no
+        // device takes, which is why it is production code rather than a fallback.
+        return Box::new(SilentOutput::new());
+    }
+    match CpalOutput::open(format, samples) {
+        Some(output) => Box::new(output),
+        None => Box::new(SilentOutput::new()),
+    }
+}
+
+/// What the default output device wants, or [`OutputFormat::FALLBACK`] if it will not say.
+///
+/// **Queried once in `main`, before the terminal is taken over.** Some hosts print to
+/// stderr while enumerating devices — ALSA is notorious for it — and on the alternate
+/// screen that lands in the middle of the UI. Doing it here also means `ffmpeg` can be told
+/// the exact rate and channel count up front, so the resampling happens in a process that
+/// is already scaling and burning rather than in the audio callback, where being late is
+/// the one thing that cannot happen.
+pub fn device_format() -> OutputFormat {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.default_output_config().ok())
+        .map(|config| OutputFormat {
+            sample_rate: config.sample_rate(),
+            channels: config.channels(),
+        })
+        .unwrap_or(OutputFormat::FALLBACK)
+}
+
+impl CpalOutput {
+    /// Opens a device and starts playing, or `None` if there is nothing to play through.
+    fn open(format: OutputFormat, samples: Vec<f32>) -> Option<Self> {
+        let clock = Arc::new(PlaybackClock::new());
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+        let stream_clock = Arc::clone(&clock);
+        std::thread::spawn(move || {
+            let stream = start(format, samples, &stream_clock);
+            // Reported before parking, so the caller learns whether there is sound coming
+            // rather than assuming it. A caller that has already given up leaves this
+            // undeliverable, which is the signal to stop.
+            if ready_tx.send(stream.is_some()).is_err() {
+                return;
+            }
+            if stream.is_none() {
+                return;
+            }
+            // Parked until the handle is dropped. `recv` returns `Err` on disconnect, which
+            // is the only thing that ever happens on this channel.
+            let _ = stop_rx.recv();
+            // Explicit, because the whole arrangement exists so that the stream is dropped
+            // *here* rather than wherever the handle happens to go.
+            drop(stream);
+        });
+        match ready_rx.recv_timeout(DEVICE_TIMEOUT) {
+            Ok(true) => Some(Self {
+                clock,
+                _stop: stop_tx,
+            }),
+            // A device that refused, or one that did not answer in time. Either way the
+            // page plays silently — and dropping `stop_tx` here stops the thread, so a
+            // device that opens late does not go on playing into a page that gave up.
+            _ => None,
+        }
+    }
+}
+
+/// Builds and starts the output stream, on the thread that will own it.
+///
+/// Generic over the device's own sample format rather than demanding `f32`: hosts hand out
+/// `i16` often enough that refusing would silence real machines, and the conversion is a
+/// multiply in the same loop as the copy.
+fn start(
+    format: OutputFormat,
+    samples: Vec<f32>,
+    clock: &Arc<PlaybackClock>,
+) -> Option<cpal::Stream> {
+    use cpal::SampleFormat;
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let device = cpal::default_host().default_output_device()?;
+    let supported = device.default_output_config().ok()?;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let stream = match sample_format {
+        SampleFormat::F32 => stream_of::<f32>(&device, config, format, samples, clock),
+        SampleFormat::I16 => stream_of::<i16>(&device, config, format, samples, clock),
+        SampleFormat::U16 => stream_of::<u16>(&device, config, format, samples, clock),
+        SampleFormat::I32 => stream_of::<i32>(&device, config, format, samples, clock),
+        SampleFormat::F64 => stream_of::<f64>(&device, config, format, samples, clock),
+        // Anything else plays silently rather than wrongly. Reaching this needs a host
+        // whose default is one of the packed integer formats, which none of the ones this
+        // runs on use.
+        _ => None,
+    }?;
+    cpal::traits::StreamTrait::play(&stream).ok()?;
+    Some(stream)
+}
+
+fn stream_of<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    format: OutputFormat,
+    samples: Vec<f32>,
+    clock: &Arc<PlaybackClock>,
+) -> Option<cpal::Stream>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    use cpal::traits::DeviceTrait;
+
+    let clock = Arc::clone(clock);
+    // How much of the span the device has been handed, counted in *buffers* rather than in
+    // samples copied — see below.
+    let mut handed_over = 0usize;
+    device
+        .build_output_stream(
+            config,
+            move |buffer: &mut [T], info: &cpal::OutputCallbackInfo| {
+                let timestamp = info.timestamp();
+                // The correction the whole module exists for: how far ahead of this
+                // callback the sound being written will actually be heard. On ALSA this
+                // comes from `snd_pcm_status_get_htstamp`, and it grows with the backlog as
+                // well as the device period — which is what keeps the anchored origin still
+                // rather than creeping once per buffer.
+                let lead = timestamp
+                    .playback
+                    .saturating_duration_since(timestamp.callback);
+                clock.anchor(Instant::now(), lead, format.duration_of(handed_over));
+
+                let taken = samples.len().saturating_sub(handed_over).min(buffer.len());
+                for (slot, sample) in buffer
+                    .iter_mut()
+                    .zip(&samples[handed_over..handed_over + taken])
+                {
+                    *slot = T::from_sample(*sample);
+                }
+                for slot in &mut buffer[taken..] {
+                    *slot = T::from_sample(0.0f32);
+                }
+
+                // **A whole buffer, not just what was copied.** Once the samples run out
+                // the device keeps consuming time at the same rate, and freezing this at
+                // the last sample would leave the anchor's `already_queued` still while
+                // `now` kept moving — which walks the reported position *backwards*. A
+                // video span outlasting its audio is ordinary: a cue at the end of a file,
+                // or media whose streams do not end together.
+                handed_over += buffer.len();
+            },
+            |_| {
+                // Nothing useful to do with a device error mid-playback: the page has no
+                // room to report it, and the picture keeps moving off the last anchor
+                // either way. A span is seconds long and the next `p` opens a fresh device.
+            },
+            None,
+        )
+        .ok()
 }
 
 #[cfg(test)]
@@ -422,5 +621,89 @@ mod tests {
         assert_that!(OutputFormat::FALLBACK.channels).is_equal_to(2);
         assert_that!(OutputFormat::FALLBACK.duration_of(96_000))
             .is_equal_to(Duration::from_secs(1));
+    }
+
+    /// Media with no audio track produces no samples, and opening a device for them would
+    /// be a device held open playing nothing. The slideshow still runs, at the right rate,
+    /// because the clock does not depend on there being sound to hear.
+    #[test]
+    fn a_span_with_no_sound_should_not_open_a_device_at_all() {
+        // Act
+        let output = open(OutputFormat::FALLBACK, Vec::new());
+
+        // Assert
+        assert_that!(format!("{output:?}").as_str()).contains("SilentOutput");
+        assert_that!(output.position(Instant::now()).is_some()).is_true();
+    }
+
+    /// `main` asks this before the terminal is taken over, and it has to answer on a
+    /// machine with no sound card as readily as on one with a device — a launch that failed
+    /// over the audio output would be a regression for every user who never presses `p`.
+    #[test]
+    fn the_device_format_should_answer_whether_or_not_there_is_a_device() {
+        // Act
+        let format = device_format();
+
+        // Assert: a rate and a channel count something could actually be emitted at. Not
+        // pinned to particular numbers — this reads whatever hardware the test runs on, and
+        // a runner with no device answers with the fallback.
+        assert_that!(format.sample_rate >= 8_000).is_true();
+        assert_that!(format.sample_rate <= 768_000).is_true();
+        assert_that!(format.channels >= 1).is_true();
+        // And it is a shape the clock's arithmetic can use, rather than one that divides by
+        // zero the first time a buffer is handed over.
+        assert_that!(format.duration_of(0)).is_equal_to(Duration::ZERO);
+        assert_that!(format.duration_of(usize::from(format.channels) * 100) > Duration::ZERO)
+            .is_true();
+    }
+
+    /// Whether a device turns up is the machine's business, but either answer has to be an
+    /// `AudioOutput` the page can hold — one whose clock starts, and whose position moves,
+    /// or the picture would sit on its first frame forever waiting to be told where the
+    /// sound is.
+    #[test]
+    fn opening_a_span_with_sound_should_give_something_that_plays_it() {
+        // Arrange: a fifth of a second of very quiet tone, so a machine with its speakers
+        // on is not made to listen to anything.
+        let format = OutputFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let samples: Vec<f32> = (0..9_600)
+            .map(|index| (index as f32 * 0.05).sin() * 0.01)
+            .collect();
+
+        // Act
+        let output = open(format, samples);
+
+        // Assert: a device may or may not exist here, so what is asserted is the contract
+        // both paths share — and the one the picture depends on.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let first = loop {
+            if let Some(position) = output.position(Instant::now()) {
+                break position;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an output should start its clock, with a device or without one"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        // Assert: the clock runs at real time. The frame index is derived straight from
+        // this, so a clock running fast or slow is a playback whose picture drifts away
+        // from its sound over the span — the one thing the whole module exists to prevent.
+        // Generous either side, because this measures a real device against a real sleep.
+        let waited = Duration::from_millis(200);
+        std::thread::sleep(waited);
+        let later = output
+            .position(Instant::now())
+            .expect("a clock that has started does not stop");
+        let advanced = later.saturating_sub(first);
+        assert_that!(advanced >= waited.mul_f64(0.8)).is_true();
+        assert_that!(advanced <= waited.mul_f64(1.5)).is_true();
+
+        // Act / Assert: and dropping it is the single stop path, which must not hang.
+        drop(output);
     }
 }

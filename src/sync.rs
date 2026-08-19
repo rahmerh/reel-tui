@@ -1759,7 +1759,14 @@ mod tests {
         for index in 0..count {
             bytes.extend(std::iter::repeat_n(index as u8, stride));
         }
-        PlaybackFrames::new(bytes, pixels, cells, fps, Duration::from_secs(10))
+        PlaybackFrames::new(
+            bytes,
+            pixels,
+            cells,
+            fps,
+            Duration::from_secs(10),
+            Vec::new(),
+        )
     }
 
     /// An output whose position is set by the test rather than by a device, so the

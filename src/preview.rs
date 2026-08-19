@@ -419,6 +419,13 @@ pub struct PlaybackRequest {
     pub pixels: (u32, u32),
     /// The cell area those pixels fill, which is what they are encoded into for drawing.
     pub cells: Size,
+    /// The rate and channel count to emit sound at, or `None` when this media has no audio
+    /// track to emit.
+    ///
+    /// The device's own format, so the callback copies rather than resamples. `None` is not
+    /// a failure — a video with no sound plays as a silent slideshow at the right rate,
+    /// which is the same path a machine with no output device takes.
+    pub audio: Option<crate::audio::OutputFormat>,
 }
 
 /// A span's worth of raw video, and everything needed to read a frame out of it.
@@ -435,6 +442,9 @@ pub struct PlaybackFrames {
     pub fps: u32,
     /// Where in the media frame zero sits, for the playhead the timeline draws.
     pub span_start: Duration,
+    /// The span's sound as interleaved floats, at whatever the device asked for. Empty for
+    /// media with no audio track, which plays as a silent slideshow rather than not at all.
+    samples: Vec<f32>,
 }
 
 impl PlaybackFrames {
@@ -444,6 +454,7 @@ impl PlaybackFrames {
         cells: Size,
         fps: u32,
         span_start: Duration,
+        samples: Vec<f32>,
     ) -> Self {
         Self {
             bytes: Arc::new(bytes),
@@ -451,7 +462,17 @@ impl PlaybackFrames {
             cells,
             fps,
             span_start,
+            samples,
         }
+    }
+
+    /// Takes the span's sound, leaving the frames behind.
+    ///
+    /// Taken rather than borrowed because it is handed to the audio device, which owns what
+    /// it plays for the life of the stream — and because a span's samples are megabytes
+    /// that nothing else ever looks at again.
+    pub fn take_samples(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.samples)
     }
 
     /// How many bytes one frame occupies. Zero for a degenerate size, which is what makes
@@ -504,6 +525,7 @@ impl std::fmt::Debug for PlaybackFrames {
             .field("cells", &self.cells)
             .field("fps", &self.fps)
             .field("span_start", &self.span_start)
+            .field("samples", &self.samples.len())
             .finish()
     }
 }
@@ -1476,6 +1498,11 @@ fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<Playba
         request.cells,
         request.fps,
         request.span_start,
+        // Read back off disk rather than off a second pipe: `ffmpeg` writes both outputs
+        // concurrently, and two pipes into one process is a deadlock waiting for whichever
+        // reader falls behind. The file is a few hundred kilobytes in the workspace that
+        // the page deletes when it closes.
+        read_samples(&request.source.workspace.join(AUDIO_FILE)),
     );
     // A run that succeeded without writing a whole frame is what seeking past the end of
     // the media looks like, and it is the one case the slicing arithmetic cannot represent
@@ -1520,7 +1547,47 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> 
             request.fps
         ))
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+    // A second output, from the same seek and the same decode — which is what makes the
+    // sound and the picture describe the same stretch of media by construction rather than
+    // by two commands agreeing about a timestamp.
+    //
+    // Emitted at the *device's* rate and channel count, so the audio callback copies rather
+    // than resamples: the resampling lands in a process that is already scaling video and
+    // burning subtitles, instead of on the one thread that must never be late.
+    //
+    // Written to a file rather than a second pipe. `ffmpeg` writes both outputs as it goes,
+    // so two pipes into one process deadlock the moment either reader falls behind — and
+    // the video pipe is being drained on a thread that knows nothing about the other.
+    if let Some(audio) = request.audio {
+        command
+            .args(["-map", "0:a:0", "-vn", "-f", "f32le", "-ar"])
+            .arg(audio.sample_rate.to_string())
+            .arg("-ac")
+            .arg(audio.channels.to_string())
+            .arg(AUDIO_FILE);
+    }
     command
+}
+
+/// The span's sound, staged in the page's workspace beside its cue.
+///
+/// A bare relative name for the same reason [`CueSlot`] uses one: `ffmpeg` runs with the
+/// workspace as its working directory, so nothing here needs escaping.
+const AUDIO_FILE: &str = "playback.f32";
+
+/// Reads a span's sound back as interleaved floats.
+///
+/// Empty for media with no audio track, and empty for a file that could not be read —
+/// which are the same thing as far as the page is concerned, and both play as a silent
+/// slideshow at the right rate rather than as a failure.
+fn read_samples(path: &Path) -> Vec<f32> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 /// Renders every cue in a track into the cache, reporting progress as it goes.
@@ -4725,8 +4792,14 @@ mod tests {
         for frame in 0..3u8 {
             bytes.extend(std::iter::repeat_n(frame, stride));
         }
-        let frames =
-            PlaybackFrames::new(bytes, pixels, Size::new(2, 1), 10, Duration::from_secs(5));
+        let frames = PlaybackFrames::new(
+            bytes,
+            pixels,
+            Size::new(2, 1),
+            10,
+            Duration::from_secs(5),
+            Vec::new(),
+        );
 
         // Act / Assert
         assert_that!(frames.stride()).is_equal_to(stride);
@@ -4746,8 +4819,14 @@ mod tests {
     #[test]
     fn a_span_with_no_frame_size_should_hold_no_frames_rather_than_divide_by_it() {
         // Arrange
-        let frames =
-            PlaybackFrames::new(vec![1, 2, 3, 4], (0, 0), Size::new(0, 0), 0, Duration::ZERO);
+        let frames = PlaybackFrames::new(
+            vec![1, 2, 3, 4],
+            (0, 0),
+            Size::new(0, 0),
+            0,
+            Duration::ZERO,
+            Vec::new(),
+        );
 
         // Act / Assert
         assert_that!(frames.stride()).is_equal_to(0);
@@ -4767,6 +4846,7 @@ mod tests {
             Size::new(2, 1),
             25,
             Duration::from_secs(9),
+            vec![0.5; 8],
         );
 
         // Act
@@ -4814,6 +4894,7 @@ mod tests {
             fps: 10,
             pixels: playback_pixels(cells),
             cells,
+            audio: None,
         }
     }
 
@@ -4869,6 +4950,162 @@ mod tests {
         assert_that!(arguments.iter().any(|argument| argument == "rawvideo")).is_true();
         assert_that!(arguments.iter().any(|argument| argument == "rgb24")).is_true();
         assert_that!(command.get_current_dir()).is_equal_to(Some(directory.as_path()));
+
+        // Assert: no audio output at all when the media has none. `-map 0:a:0` on such a
+        // file fails the whole run, and the optional `0:a:0?` form leaves an output with no
+        // streams in it, which fails just as hard — so it is left out rather than made
+        // conditional inside `ffmpeg`.
+        assert_that!(arguments.iter().any(|argument| argument == "f32le")).is_false();
+    }
+
+    /// The sound comes out of the same seek and the same decode as the picture, which is
+    /// what makes them describe the same stretch of media by construction rather than by
+    /// two commands agreeing about a timestamp — and it is emitted at the device's own
+    /// format, so the audio callback copies rather than resamples.
+    #[test]
+    fn the_playback_command_should_take_its_sound_from_the_same_pass_as_its_picture() {
+        // Arrange
+        let directory = PathBuf::from("/tmp/reel-tui-preview/playback-audio-command");
+        let mut request = playback_request(
+            Path::new("/media/show.mkv"),
+            &directory,
+            cue(2000, 3000, "line"),
+        );
+        request.audio = Some(crate::audio::OutputFormat {
+            sample_rate: 44_100,
+            channels: 1,
+        });
+
+        // Act
+        let command = playback_command(&request, Duration::from_secs(3), "playback.srt");
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect();
+
+        // Assert: one input, so one seek and one decode feeding both outputs.
+        assert_that!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "-i")
+                .count()
+        )
+        .is_equal_to(1);
+
+        // Assert: the device's rate and channel count, verbatim.
+        let rate = arguments
+            .iter()
+            .position(|argument| argument == "-ar")
+            .unwrap();
+        assert_that!(arguments[rate + 1].as_str()).is_equal_to("44100");
+        let channels = arguments
+            .iter()
+            .position(|argument| argument == "-ac")
+            .unwrap();
+        assert_that!(arguments[channels + 1].as_str()).is_equal_to("1");
+
+        // Assert: raw little-endian floats, to a file rather than a second pipe — two pipes
+        // into one process deadlock the moment either reader falls behind, and the video
+        // pipe is drained on a thread that knows nothing about the other.
+        assert_that!(arguments.iter().any(|argument| argument == "f32le")).is_true();
+        assert_that!(arguments.last().map(String::as_str)).is_equal_to(Some(AUDIO_FILE));
+    }
+
+    /// Media with no audio track, and a run whose audio file never appeared, are the same
+    /// thing as far as the page is concerned: a silent slideshow at the right rate, rather
+    /// than a failure or a panic on a short read.
+    #[test]
+    fn sound_that_is_not_there_should_read_as_silence_rather_than_fail() {
+        // Arrange
+        let directory = scratch("playback-samples");
+
+        // Act / Assert: a file that was never written.
+        assert_that!(read_samples(&directory.join("playback.f32")).is_empty()).is_true();
+
+        // Act / Assert: and one whose length is not a whole number of floats, which is what
+        // a run killed part-way through writing leaves behind.
+        let path = directory.join("ragged.f32");
+        let mut bytes = 1.0f32.to_le_bytes().to_vec();
+        bytes.extend([0u8, 1, 2]);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_that!(read_samples(&path).as_slice()).is_equal_to([1.0f32].as_slice());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The end-to-end shape of the sound: a real decode of media that has some, read back
+    /// as the floats the device will be handed.
+    #[test]
+    fn a_decoded_span_should_bring_back_the_sound_that_goes_with_it() {
+        // Arrange: six seconds of tone against six seconds of blue, and a two-second span.
+        require_ffmpeg("a_decoded_span_should_bring_back_the_sound_that_goes_with_it");
+        let directory = scratch("playback-sound");
+        let media = directory.join("clip.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:r=10:d=6",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&media)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            built.status.success(),
+            "failed to build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let mut request = playback_request(&media, &directory, cue(2000, 3000, "line"));
+        request.span_start = Duration::from_secs(1);
+        request.span_end = Duration::from_secs(3);
+        request.audio = Some(crate::audio::OutputFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        });
+        let never = || false;
+
+        // Act
+        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+
+        // Assert
+        let PlaybackOutcome::Ready(mut frames) = outcome else {
+            panic!("a clip with a tone in it should decode");
+        };
+        let samples = frames.take_samples();
+        // Two seconds of stereo at 48 kHz, give or take how the seek lands on a frame.
+        let format = request.audio.unwrap();
+        let played = format.duration_of(samples.len());
+        assert_that!(played >= Duration::from_millis(1900)).is_true();
+        assert_that!(played <= Duration::from_millis(2100)).is_true();
+        // And it is a tone rather than silence, which is what a mapping that pulled the
+        // wrong stream — or no stream — would leave behind. The threshold is well under
+        // `sine`'s own peak, which lavfi produces at around a tenth of full scale, and well
+        // over the exact zero that digital silence is.
+        assert_that!(samples.iter().any(|sample| sample.abs() > 0.01)).is_true();
+        // Taken, not copied: the device owns what it plays, and a span's samples are
+        // megabytes nothing else looks at again.
+        assert_that!(frames.take_samples().is_empty()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The end-to-end shape of a playback, against a real decode: the span comes back as

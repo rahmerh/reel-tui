@@ -13135,6 +13135,7 @@ mod tests {
                 playback_cells,
                 10,
                 std::time::Duration::from_secs(1),
+                Vec::new(),
             ),
             Box::new(crate::audio::SilentOutput::new()),
         );
