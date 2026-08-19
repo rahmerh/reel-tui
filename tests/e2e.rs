@@ -34,8 +34,8 @@ use harness::{
     Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
 };
 use reel_tui::app::{
-    AudioSettingsField, ContainerSettingsField, Layer, SubtitleSettingsField, TrackRef,
-    VideoSettingsField,
+    AudioSettingsField, ContainerSettingsField, Layer, PreviewSettings, SubtitleSettingsField,
+    TrackRef, VideoSettingsField,
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
@@ -2468,6 +2468,137 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
         WarmState::Done,
         "the pass should run and find everything already there"
     );
+}
+
+/// Two cues, for the shorter of the two tracks the eviction scenario uses.
+const SHORT_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nShort first\n\n\
+                          2\n00:00:03,000 --> 00:00:04,000\nShort second\n\n";
+
+/// A cache too small for two tracks evicts the one that is *not* open, not the one that
+/// is — even though the open one is older and plain oldest-first eviction would take it.
+///
+/// This is the residual of the frame-cache fix. Opening a track prunes the cache and then
+/// renders the track, so a track not looked at for a while is the oldest thing there and
+/// was the first thing thrown away — by the very pass that had just been opened to show
+/// it, which then rendered the whole track again. `framecache::prune` now takes the open
+/// track's keys and considers them last.
+///
+/// The limit is derived from what the short track actually occupies rather than guessed:
+/// exactly enough for it and not for both, so eviction has to choose between them.
+#[test]
+fn a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open() {
+    let test = "a_cache_too_small_for_two_tracks_should_evict_the_one_that_is_not_open";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-frame-eviction");
+    for (name, cues) in [("short", SHORT_CUES), ("long", WALKED_CUES)] {
+        write_media(
+            &scratch.join(&format!("{name}.mkv")),
+            &MediaSpec::mkv()
+                .size(320, 240)
+                .duration(6.0)
+                .audio(&["eng"]),
+        );
+        fs::write(scratch.join(&format!("{name}.eng.srt")), cues).unwrap();
+    }
+
+    let mut app = Harness::start(scratch);
+
+    // The short track first, so it is the older of the two in the cache.
+    let short = render_sidecar_track(&mut app, "short.mkv");
+    assert_eq!(short.len(), 2, "the short sidecar holds two cues");
+    let rendered: Vec<SystemTime> = short.iter().map(|path| modified(path)).collect();
+    let short_bytes: u64 = short
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum();
+
+    // Then the long one, which is larger and newer.
+    let long = render_sidecar_track(&mut app, "long.mkv");
+    assert_eq!(long.len(), 4, "the long sidecar holds four cues");
+    let long_bytes: u64 = long
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum();
+    assert!(
+        long_bytes > short_bytes,
+        "the long track has to outweigh the short one for eviction to have to choose: \
+         {long_bytes} vs {short_bytes}"
+    );
+
+    // Room for the short track and nothing else.
+    app.app.set_preview_settings(PreviewSettings {
+        prefetch: true,
+        network: false,
+        cache_limit: short_bytes,
+    });
+    // The filesystem's mtime granularity can be coarse enough that a rewrite within the
+    // same tick is indistinguishable from no rewrite at all.
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // Act: back to the short track, whose pass has to prune before it can render.
+    let reopened = render_sidecar_track(&mut app, "short.mkv");
+
+    // Assert: not one of its frames was touched, despite every one of them being older
+    // than everything else in the cache.
+    assert_eq!(
+        reopened, short,
+        "the same track should hash to the same frames"
+    );
+    for (path, was) in short.iter().zip(&rendered) {
+        assert_eq!(
+            modified(path),
+            *was,
+            "the open track's own pass evicted and re-rendered {}",
+            path.display()
+        );
+    }
+    // And the pruning really happened, rather than the limit turning out to be generous:
+    // the track that was not open is the one that went.
+    for path in &long {
+        assert!(
+            !path.exists(),
+            "the track that was not open should have been evicted first, but {} survived",
+            path.display()
+        );
+    }
+}
+
+/// Opens a file's sidecar timing page, renders the whole track, and answers where each
+/// cue's frame landed. Leaves the page closed, ready for the next file.
+fn render_sidecar_track(app: &mut Harness, file: &str) -> Vec<PathBuf> {
+    // `Harness::open` only ever walks downwards, so the cursor has to start above the file
+    // it is looking for — which after the previous track it is not.
+    app.wait_until("the file panel to list the media", |state| {
+        state.files.iter().any(|entry| entry.display_name == file)
+    });
+    for _ in 0..app.app.files.len() {
+        app.press(key(KeyCode::Char('k')));
+    }
+    app.open(file);
+    open_sidecar_timing_page(app);
+    wait_for_frames(app);
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let paths = state
+        .cues
+        .iter()
+        .map(|cue| frame_path(&state.frames.key(cue)))
+        .collect();
+    // Back out to the file panel: Esc leaves the timing page for the track list, and
+    // again for the files, which is where the next `open` starts from.
+    while app.app.layer != Layer::Files {
+        app.press(key(KeyCode::Esc));
+        app.pump();
+    }
+    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    paths
+}
+
+fn modified(path: &PathBuf) -> SystemTime {
+    fs::metadata(path)
+        .unwrap_or_else(|error| panic!("{} should be cached: {error}", path.display()))
+        .modified()
+        .expect("the platform reports mtimes")
 }
 
 /// Four cues far enough apart to sit on distinct frames of a six-second clip, with text

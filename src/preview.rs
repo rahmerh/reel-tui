@@ -27,6 +27,7 @@
 //! per round trip: by the time the cursor reaches a cue, the page is already holding it
 //! encoded (see `SubtitleSyncState::nearby_frame_targets`).
 
+use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -802,6 +803,20 @@ fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<Prev
 /// up — between cues, and part-way through rendering one — are a race against a real
 /// `ffmpeg` otherwise, and they are what stops a thousand-cue track running on for a page
 /// nobody is looking at.
+/// The cache keys of every cue in a track, for the frames a prune should take last.
+///
+/// Recomputed here rather than carried on the request: it is a short hash per cue, which
+/// for even a feature-length track is microseconds on a thread that is about to spend
+/// minutes in `ffmpeg`, and the alternative is a second copy of the track's keys that
+/// could disagree with the ones the pass then renders under.
+fn track_keys(request: &WarmRequest) -> HashSet<String> {
+    request
+        .cues
+        .iter()
+        .map(|cue| request.source.key(cue))
+        .collect()
+}
+
 fn warm_track(
     request: &WarmRequest,
     abandoned: &dyn Fn() -> bool,
@@ -812,7 +827,12 @@ fn warm_track(
     }
     // Before rendering, not after: the pass is about to add a frame per cue, and pruning
     // first is what keeps the cache inside its limit rather than over it until next time.
-    framecache::prune(request.cache_limit);
+    //
+    // This track's own keys are handed over so that they are the last thing evicted. A
+    // track that has not been opened for a while is the *oldest* thing in the cache, so
+    // plain oldest-first eviction would throw away exactly the frames this pass exists to
+    // avoid rendering, in favour of frames belonging to tracks nobody is looking at.
+    framecache::prune(request.cache_limit, &track_keys(request));
 
     let total = request.cues.len();
     let mut progress = WarmProgress::new(request.generation, total);
@@ -2598,6 +2618,94 @@ mod tests {
             progress.push((done, total));
         }
         progress
+    }
+
+    /// The pass hands the prune the track it is about to render, so those frames are the
+    /// last thing evicted rather than the first.
+    ///
+    /// A track that has not been opened for a while is the *oldest* thing in the cache, so
+    /// plain oldest-first eviction would throw it away in favour of frames belonging to
+    /// tracks nobody is looking at — and the pass would then render the whole thing again,
+    /// which is precisely what the cache is for avoiding.
+    ///
+    /// Takes the exclusive guard and empties the shared directory, because a real limit is
+    /// the point here and every other test's frames would otherwise be counted towards it.
+    #[test]
+    fn the_background_pass_should_prune_around_the_track_it_is_about_to_render() {
+        // Arrange
+        let _guard = crate::framecache::testing::whole_directory();
+        let cache = framecache::directory().expect("the test binary has a cache directory");
+        let _ = std::fs::remove_dir_all(&cache);
+        let directory = scratch("warm-prune");
+        // A media file that does not exist, so a cue that is *not* already cached could
+        // not be rendered — every frame this pass keeps is one it found.
+        let cues = vec![
+            cue(1000, 2000, "open first"),
+            cue(3000, 4000, "open second"),
+        ];
+        let request = WarmRequest {
+            // Room for two frames of a hundred bytes, against the three that are there.
+            cache_limit: 250,
+            ..warm_request(
+                &directory.join("never-existed.mkv"),
+                &directory,
+                cues.clone(),
+            )
+        };
+        let aged = |key: &str, hours: u64| {
+            assert_that!(framecache::store(key, &[0u8; 100])).is_true();
+            let path = framecache::path(key).expect("the frame was just stored");
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
+                .expect("the test filesystem should allow setting an mtime");
+        };
+        // The open track's frames are the oldest; some other track's is the newest.
+        aged(&request.source.key(&cues[0]), 100);
+        aged(&request.source.key(&cues[1]), 99);
+        aged("some-other-tracks-frame", 1);
+
+        // Act
+        let (events, published) = mpsc::channel();
+        let alive = warm_track(&request, &|| false, &events);
+        drop(events);
+        drop(published);
+
+        // Assert: the other track's frame went despite being newer, and both of the open
+        // track's stayed despite being older.
+        assert_that!(alive).is_true();
+        assert_that!(framecache::is_cached("some-other-tracks-frame")).is_false();
+        for cue in &cues {
+            assert_that!(framecache::is_cached(&request.source.key(cue))).is_true();
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The keys the pass protects are exactly the ones it is about to render under, so a
+    /// disagreement between the two cannot spare the wrong frames.
+    #[test]
+    fn a_tracks_keys_should_be_the_ones_its_own_frames_are_stored_under() {
+        // Arrange
+        let directory = scratch("warm-keys");
+        let cues = vec![cue(0, 1000, "first"), cue(2000, 3000, "second")];
+        let request = warm_request(&directory.join("clip.mkv"), &directory, cues.clone());
+
+        // Act
+        let keys = track_keys(&request);
+
+        // Assert
+        assert_that!(keys.len()).is_equal_to(2);
+        for cue in &cues {
+            assert_that!(keys.contains(&request.source.key(cue))).is_true();
+        }
+        // And a cue the track does not hold is not protected by it.
+        assert_that!(keys.contains(&request.source.key(&cue(9000, 9500, "absent")))).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The background pass: every cue in the track rendered and cached ahead of the user

@@ -19,6 +19,7 @@
 //! test binary shares — and the first is then a line long, with only the "this machine
 //! has no cache directory at all" arm the test binary cannot reach.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,7 +168,8 @@ pub fn store_in(directory: &Path, key: &str, bytes: &[u8]) -> bool {
     true
 }
 
-/// Deletes the least recently modified frames until the directory fits inside `limit`.
+/// Deletes the least recently modified frames until the directory fits inside `limit`,
+/// taking the keys in `spare` last.
 ///
 /// Called once per page opening, from the background worker rather than the event loop:
 /// it stats every file in the directory, which on a full cache is thousands of them.
@@ -176,40 +178,75 @@ pub fn store_in(directory: &Path, key: &str, bytes: &[u8]) -> bool {
 /// generated" — a frame that is still being looked at is re-read, not rewritten, so this
 /// is an approximation of least-recently-used that costs no bookkeeping. The worst case
 /// of getting it wrong is regenerating a frame.
-pub fn prune(limit: u64) {
+///
+/// `spare` is the track that is about to be rendered, and it is a *priority*, not an
+/// exemption: those frames still go if evicting everything else was not enough. Without it
+/// the pass could evict exactly the frames it was opened to show — a track not looked at
+/// for a while is the oldest thing in the cache, so plain oldest-first eviction throws it
+/// away in favour of frames from tracks nobody is looking at, and then renders it all
+/// again. Ordering costs nothing and makes the common case impossible.
+///
+/// What it deliberately does *not* do is let the cache exceed `limit`. A track whose own
+/// frames do not fit still evicts itself as it writes, because the alternative is ignoring
+/// a limit the user set — `cache_mb = 0` has to keep nothing, whatever is open.
+pub fn prune(limit: u64, spare: &HashSet<String>) {
     if let Some(directory) = directory() {
-        prune_in(&directory, limit);
+        prune_in(&directory, limit, spare);
     }
 }
 
-pub fn prune_in(directory: &Path, limit: u64) {
+pub fn prune_in(directory: &Path, limit: u64, spare: &HashSet<String>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut frames: Vec<(SystemTime, u64, PathBuf)> = entries
+    let mut frames: Vec<Candidate> = entries
         .flatten()
         .filter_map(|entry| {
             let metadata = entry.metadata().ok()?;
-            metadata.is_file().then(|| {
-                (
-                    metadata.modified().unwrap_or(UNIX_EPOCH),
-                    metadata.len(),
-                    entry.path(),
-                )
+            if !metadata.is_file() {
+                return None;
+            }
+            let path = entry.path();
+            Some(Candidate {
+                spared: is_spared(&path, spare),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                length: metadata.len(),
+                path,
             })
         })
         .collect();
 
-    let mut total: u64 = frames.iter().map(|(_, length, _)| *length).sum();
-    frames.sort_by_key(|(modified, _, _)| *modified);
-    for (_, length, path) in frames {
+    let mut total: u64 = frames.iter().map(|frame| frame.length).sum();
+    // `false` sorts before `true`, so everything that is not the open track is offered up
+    // first, and each group is still oldest-first within itself.
+    frames.sort_by_key(|frame| (frame.spared, frame.modified));
+    for frame in frames {
         if total <= limit {
             break;
         }
-        if fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(length);
+        if fs::remove_file(&frame.path).is_ok() {
+            total = total.saturating_sub(frame.length);
         }
     }
+}
+
+/// One file prune is considering, in the order it considers them.
+struct Candidate {
+    spared: bool,
+    modified: SystemTime,
+    length: u64,
+    path: PathBuf,
+}
+
+/// Whether a file in the cache directory is one of `spare`'s frames.
+///
+/// By stem, which is the key: the in-flight temporaries `store_in` writes are named
+/// `.{key}.{pid}.{n}.tmp` and so cannot match one, which is what keeps a torn write from
+/// being protected as though it were the frame it is on its way to becoming.
+fn is_spared(path: &Path, spare: &HashSet<String>) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| spare.contains(stem))
 }
 
 /// FNV-1a over 128 bits, fed one field at a time.
@@ -497,6 +534,11 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    /// No track open, which is what every prune that is not the background pass's does.
+    fn nothing() -> HashSet<String> {
+        HashSet::new()
+    }
+
     /// Frames are hundreds of kilobytes each and a film's subtitle track has thousands of
     /// cues, so the directory has to have a ceiling — and the frames that go are the ones
     /// least recently written.
@@ -514,7 +556,7 @@ mod tests {
         }
 
         // Act: room for two of the three.
-        prune_in(&directory, 250);
+        prune_in(&directory, 250, &nothing());
 
         // Assert: the oldest went, the two newer stayed.
         assert_that!(is_cached_in(&directory, "frame-0")).is_false();
@@ -522,9 +564,104 @@ mod tests {
         assert_that!(is_cached_in(&directory, "frame-2")).is_true();
 
         // Act / Assert: and a cache already inside its limit is left entirely alone.
-        prune_in(&directory, 250);
+        prune_in(&directory, 250, &nothing());
         assert_that!(is_cached_in(&directory, "frame-1")).is_true();
         assert_that!(is_cached_in(&directory, "frame-2")).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The open track's frames go last, whatever their age.
+    ///
+    /// Without this the background pass could evict exactly what it was opened to show: a
+    /// track not looked at for a while is the *oldest* thing in the cache, so plain
+    /// oldest-first eviction throws it away in favour of frames belonging to tracks nobody
+    /// is looking at — and then renders the whole thing again.
+    #[test]
+    fn pruning_should_take_the_open_tracks_frames_last() {
+        // Arrange: the open track's two frames are the oldest in the cache, and two
+        // frames of some other track are the newest.
+        let directory = scratch("prune-spared");
+        let aged = |key: &str, hours: u64| {
+            assert_that!(store_in(&directory, key, &[0u8; 100])).is_true();
+            fs::File::open(path_in(&directory, key))
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
+                .expect("the test filesystem should allow setting an mtime");
+        };
+        aged("open-0", 100);
+        aged("open-1", 99);
+        aged("other-0", 2);
+        aged("other-1", 1);
+        let spare = HashSet::from(["open-0".to_string(), "open-1".to_string()]);
+
+        // Act: room for two of the four.
+        prune_in(&directory, 250, &spare);
+
+        // Assert: the other track went despite being newer, and the open one stayed
+        // despite being older.
+        assert_that!(is_cached_in(&directory, "open-0")).is_true();
+        assert_that!(is_cached_in(&directory, "open-1")).is_true();
+        assert_that!(is_cached_in(&directory, "other-0")).is_false();
+        assert_that!(is_cached_in(&directory, "other-1")).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A priority, not an exemption. Sparing the open track must not let the cache run
+    /// past the limit the user set — `cache_mb = 0` has to keep nothing, whatever is
+    /// open — so once everything else is gone the open track goes too, oldest first.
+    #[test]
+    fn a_spared_track_should_still_go_when_evicting_everything_else_was_not_enough() {
+        // Arrange
+        let directory = scratch("prune-spared-overflow");
+        let aged = |key: &str, hours: u64| {
+            assert_that!(store_in(&directory, key, &[0u8; 100])).is_true();
+            fs::File::open(path_in(&directory, key))
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
+                .expect("the test filesystem should allow setting an mtime");
+        };
+        aged("open-old", 10);
+        aged("open-new", 1);
+        aged("other", 5);
+        let spare = HashSet::from(["open-old".to_string(), "open-new".to_string()]);
+
+        // Act: room for one of the three, so sparing cannot save both.
+        prune_in(&directory, 150, &spare);
+
+        // Assert: the other track first, then the older of the spared pair.
+        assert_that!(is_cached_in(&directory, "other")).is_false();
+        assert_that!(is_cached_in(&directory, "open-old")).is_false();
+        assert_that!(is_cached_in(&directory, "open-new")).is_true();
+
+        // Act / Assert: and a limit of zero still keeps nothing at all.
+        prune_in(&directory, 0, &spare);
+        assert_that!(is_cached_in(&directory, "open-new")).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A half-written frame is named `.{key}.{pid}.{n}.tmp`, which must not be protected
+    /// as though it were the frame it is on its way to becoming — sparing a torn write
+    /// would keep bytes no reader will ever accept in place of ones it would.
+    #[test]
+    fn an_in_flight_temporary_should_not_be_spared_by_its_keys_name() {
+        // Arrange
+        let directory = scratch("prune-spared-temporary");
+        fs::create_dir_all(&directory).unwrap();
+        let temporary = directory.join(".frame.999.0.tmp");
+        fs::write(&temporary, [0u8; 100]).unwrap();
+        let spare = HashSet::from(["frame".to_string()]);
+
+        // Act
+        prune_in(&directory, 0, &spare);
+
+        // Assert
+        assert_that!(temporary.exists()).is_false();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -540,7 +677,7 @@ mod tests {
         assert_that!(store_in(&directory, "frame", &[0u8; 100])).is_true();
 
         // Act
-        prune_in(&directory, 50);
+        prune_in(&directory, 50, &nothing());
 
         // Assert: the frame went, the directory stayed.
         assert_that!(is_cached_in(&directory, "frame")).is_false();
@@ -559,7 +696,7 @@ mod tests {
         let directory = parent.join("never-created");
 
         // Act / Assert: no panic, and nothing created.
-        prune_in(&directory, 0);
+        prune_in(&directory, 0, &nothing());
         assert_that!(directory.exists()).is_false();
 
         // Cleanup
@@ -584,7 +721,7 @@ mod tests {
         assert_that!(store("frame", &[0u8; 100])).is_true();
         assert_that!(is_cached("frame")).is_true();
         assert_that!(read("frame")).is_equal_to(Some(vec![0u8; 100]));
-        prune(0);
+        prune(0, &nothing());
         assert_that!(is_cached("frame")).is_false();
 
         // Cleanup
