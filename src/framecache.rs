@@ -240,13 +240,25 @@ struct Candidate {
 
 /// Whether a file in the cache directory is one of `spare`'s frames.
 ///
-/// By stem, which is the key: the in-flight temporaries `store_in` writes are named
-/// `.{key}.{pid}.{n}.tmp` and so cannot match one, which is what keeps a torn write from
-/// being protected as though it were the frame it is on its way to becoming.
+/// By stem *and* extension, and both halves earn their place. The stem is the key. The
+/// extension is what keeps a file the cache can no longer read from being protected as
+/// though it were the frame it once was: a key does not encode the format, so a frame left
+/// behind by an older build — `{key}.png`, from before frames were JPEG — hashes to the
+/// same name as the one that replaced it whenever the media's size is unchanged. Sparing
+/// that would give the *least* useful file in the directory the highest priority.
+///
+/// The in-flight temporaries `store_in` writes are `.{key}.{pid}.{n}.tmp`, which fail both
+/// halves, so a torn write is never protected as the frame it is on its way to becoming.
 fn is_spared(path: &Path, spare: &HashSet<String>) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| spare.contains(stem))
+    let is_frame = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == FRAME_EXTENSION);
+    is_frame
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| spare.contains(stem))
 }
 
 /// FNV-1a over 128 bits, fed one field at a time.
@@ -605,6 +617,39 @@ mod tests {
         assert_that!(is_cached_in(&directory, "open-1")).is_true();
         assert_that!(is_cached_in(&directory, "other-0")).is_false();
         assert_that!(is_cached_in(&directory, "other-1")).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame left behind by an older build must not be spared as though it were the one
+    /// that replaced it.
+    ///
+    /// A key does not encode the format, so `{key}.png` from before frames were JPEG hashes
+    /// to the same name as `{key}.jpg` whenever the media's size is unchanged. Protecting
+    /// it would hand the highest priority in the directory to the one file the cache can
+    /// never read — and evict the frame that would actually have been used.
+    #[test]
+    fn a_frame_in_a_format_the_cache_no_longer_reads_should_not_be_spared() {
+        // Arrange: the readable frame first, so it is the *older* of the two — without the
+        // extension check it is the one oldest-first eviction would take.
+        let directory = scratch("prune-spared-stale-format");
+        assert_that!(store_in(&directory, "frame", &[0u8; 100])).is_true();
+        fs::File::open(path_in(&directory, "frame"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .expect("the test filesystem should allow setting an mtime");
+        let stale = directory.join("frame.png");
+        fs::write(&stale, [0u8; 100]).unwrap();
+        let spare = HashSet::from(["frame".to_string()]);
+
+        // Act: room for one of the two.
+        prune_in(&directory, 150, &spare);
+
+        // Assert: the unreadable leftover went, the frame the cache would actually serve
+        // stayed — despite being the older of the two.
+        assert_that!(stale.exists()).is_false();
+        assert_that!(is_cached_in(&directory, "frame")).is_true();
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();

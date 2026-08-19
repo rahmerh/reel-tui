@@ -37,9 +37,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Size;
-use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
+use ratatui_image::{FilterType, Resize};
 
 use crate::cue::{Cue, format_srt_timestamp, read_srt};
 use crate::framecache::{self, FrameKeyParts};
@@ -777,7 +777,30 @@ fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
     // it at its stored size. `Scale` is what fills the pane from a frame of any size, and
     // it is also why a resize no longer re-runs `ffmpeg`: the same cached bytes re-encode
     // to whatever the pane has become.
-    match picker.new_protocol(image, cells, Resize::Scale(None)) {
+    //
+    // The filter is stated rather than defaulted, and this is the step the whole rendering
+    // resolution rests on. `ratatui-image` defaults to `FilterType::Nearest`, which does
+    // not average: going from a 1080p frame to a pane is a large reduction — a halfblocks
+    // pane is around 120×70 *pixels* — so nearest simply picks one source pixel per
+    // destination and throws the rest away. On a burned-in subtitle, whose strokes are a
+    // pixel or two wide at that scale, that is the difference between text and a dashed
+    // line, and it makes rendering at a higher resolution actively pointless.
+    //
+    // `Triangle` over the sharper cubics: `image`'s resampler scales the filter's support
+    // by the reduction ratio, so this is a genuine area average rather than a 2×2 tap, and
+    // it does not ring. `CatmullRom` measured the same speed but overshoots at high
+    // contrast, which on white-on-black text is a halo around every glyph. It also handles
+    // the other direction — a pane wider than the stored frame — where nearest is what
+    // makes an enlarged picture look blocky.
+    //
+    // Not asserted anywhere, and that is not an oversight. The only protocol `TestBackend`
+    // can read back is halfblocks, which reduces the resized image a second time to reach
+    // the cell grid and averages as it does so; measured against a stripe pattern, nearest
+    // and triangle come out of that path indistinguishable. The protocols where this
+    // decision is the *last* step before the terminal draws — kitty, sixel, iTerm2 — write
+    // escape sequences the test buffer never stores. A test here could only be tuned to
+    // pass, so there is none.
+    match picker.new_protocol(image, cells, Resize::Scale(Some(FilterType::Triangle))) {
         Ok(protocol) => FrameOutcome::Ready(Box::new(protocol)),
         Err(error) => FrameOutcome::Failed(format!("Could not draw this frame: {error}")),
     }
