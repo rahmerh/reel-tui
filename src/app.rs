@@ -41,7 +41,7 @@ use crate::{
         stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
         stream_original, stream_title,
     },
-    sync::{PreviewWorkspace, SubtitleSyncState, WarmState},
+    sync::{PreviewSupport, PreviewWorkspace, SubtitleSyncState, WarmState},
 };
 
 /// What the subtitle timing page's frame cache and background pass are allowed to do.
@@ -2319,8 +2319,29 @@ impl App {
 
         self.notice = None;
         self.sync_generation = self.sync_generation.wrapping_add(1);
-        let state =
-            SubtitleSyncState::new(self.sync_generation, frames, source, duration, workspace);
+        // Decided here rather than per frame: neither of these changes while the page is
+        // open, and the page has to be able to say why it is empty without waiting for a
+        // request it is never going to make. `start_pending_preview` gates on the same two
+        // conditions, so a page that reports frames are coming is one that asks for them.
+        let support = if !self
+            .preview
+            .as_ref()
+            .is_some_and(PreviewHandles::draws_frames)
+        {
+            PreviewSupport::NoImageProtocol
+        } else if !self.subtitle_capabilities.can_burn_subtitles() {
+            PreviewSupport::NoSubtitleBurn
+        } else {
+            PreviewSupport::Available
+        };
+        let state = SubtitleSyncState::new(
+            self.sync_generation,
+            frames,
+            source,
+            duration,
+            support,
+            workspace,
+        );
         if let Some(preview) = self.preview.as_ref() {
             // A sidecar is its own input and needs no extraction; an embedded track is
             // read out of the media file by its absolute stream index.
@@ -8600,13 +8621,20 @@ mod tests {
     }
 
     fn test_app(info: MediaInfo) -> App {
+        // The counter matters: the test runner is threaded and two tests reaching here in
+        // the same nanosecond read the same clock, so they would share a directory — and
+        // whichever finished second would panic removing one that was already gone. It
+        // showed up as a rare failure in an unrelated test, which is the worst way for a
+        // suite to tell you something.
+        static DIRECTORIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "reel-tui-app-test-{}-{}",
+            "reel-tui-app-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            DIRECTORIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
@@ -20008,7 +20036,7 @@ mod tests {
         app.receive_preview_events(&receiver);
         let state = app.subtitle_sync.as_ref().unwrap();
         assert_that!(state.frame().is_some()).is_false();
-        assert_that!(state.frame_error.clone()).is_equal_to(Some("no libass".to_string()));
+        assert_that!(state.frame_error()).is_equal_to(Some("no libass"));
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

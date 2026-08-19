@@ -39,6 +39,7 @@ use reel_tui::app::{
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
+use reel_tui::subtitle::ToolCapabilities;
 use reel_tui::sync::WarmState;
 
 /// An FFmpeg older than the supported floor has to stop `reel` at the door.
@@ -1054,7 +1055,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         app.screen()
     );
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().frame_error,
+        app.app.subtitle_sync.as_ref().unwrap().frame_error(),
         None,
         "a frame that drew should leave no failure behind"
     );
@@ -2466,6 +2467,74 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
         app.app.subtitle_sync.as_ref().unwrap().warm,
         WarmState::Done,
         "the pass should run and find everything already there"
+    );
+}
+
+/// A build that cannot burn subtitles in says so in the preview pane, for as long as the
+/// page is open.
+///
+/// Without this the pane is an unexplained empty box: the page opens, the cues load, the
+/// timeline draws, and the largest thing on screen stays blank forever with nothing to
+/// say why. The reason is drawn *in* the pane rather than on the status row precisely
+/// because it cannot change while the page is open — a message that moves with the cursor
+/// is the flicker the pane had its text fallback removed to stop.
+#[test]
+fn a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane() {
+    let test = "a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-no-burn");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), SHORT_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    // An FFmpeg without the `subtitles` filter, which is what a build without libass is.
+    app.app.subtitle_capabilities = ToolCapabilities {
+        ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+        ..app.app.subtitle_capabilities.clone()
+    };
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // The page is fully usable — cues, timeline, navigation — it simply cannot draw.
+    let screen = app.screen();
+    assert!(
+        screen.contains("Preview is not possible"),
+        "the pane should say why it will stay empty:\n{screen}"
+    );
+    assert!(
+        screen.contains("libass"),
+        "the reason should name what is missing:\n{screen}"
+    );
+
+    // And it stays said, rather than being a message that flashes past: pumping the loop
+    // asks for no frame at all, since asking could only produce the same failure again.
+    for _ in 0..5 {
+        app.pump();
+    }
+    assert!(
+        app.screen().contains("Preview is not possible"),
+        "the reason should hold for as long as the page is open"
+    );
+    assert!(
+        app.preview_shades().is_empty(),
+        "nothing should have been drawn into the pane"
+    );
+
+    // The cue list still works, which is the point of saying this rather than refusing to
+    // open the page.
+    app.press(key(KeyCode::Char('j')));
+    app.pump();
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        1,
+        "the page should still navigate"
     );
 }
 

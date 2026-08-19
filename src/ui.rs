@@ -230,6 +230,17 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
 /// This is a status line, not control help — the keybindings popup (`?`) remains the only
 /// place this application documents its keys.
 fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
+    // A cue that could not be drawn comes first. It is the only line here that explains
+    // something the user is looking *at* — an empty pane under the cursor — where the
+    // others describe work going on elsewhere, and it clears itself as soon as the cursor
+    // moves to a cue that drew.
+    //
+    // Here rather than in the pane, unlike the permanent reasons: this one changes as the
+    // cursor moves, and text in the pane that changes per keypress is the flicker the
+    // pane had its fallback removed to stop.
+    if let Some(reason) = state.frame_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
     match state.warm {
         WarmState::Working { done, total } => Some((
             format!(" Generating preview frames [{done}/{total}]"),
@@ -251,6 +262,12 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
 /// before the real frame replaced it. With the cues either side of the selection kept
 /// encoded and ready (`SubtitleSyncState::nearby_frame_targets`) there is usually no gap
 /// left to fill, and the cue's text is on screen in the list beside this anyway.
+///
+/// The one thing that *is* written here is a reason no frame will ever arrive — no libass,
+/// no image protocol. That is fixed for the page's lifetime, so it reads as an explanation
+/// rather than as a flicker, and without it the pane is an unexplained empty box for a
+/// user whose build simply cannot do this. A failure on one *cue* is a different thing and
+/// goes to the status row, because it changes as the cursor moves.
 fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
     let block = Block::bordered().title(" Preview ");
     let inner = block.inner(area);
@@ -258,6 +275,17 @@ fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: R
     // Recorded for the frame worker, which has to scale to a pane only the renderer has
     // measured, and which has to be told when that measurement changes.
     state.set_preview_cells(inner.as_size());
+
+    if let Some(reason) = state.support.reason() {
+        let padding = usize::from(inner.height).saturating_sub(2) / 2;
+        let mut lines = vec![Line::from(""); padding];
+        lines.push(Line::styled(reason, Style::default().fg(Color::DarkGray)));
+        frame.render_widget(
+            Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
 
     // `Image` draws nothing at all — not even clipped — when the protocol is larger than
     // the area it is given, so a frame encoded for a pane that has since shrunk is left
@@ -11794,6 +11822,17 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
+        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
         app.open_subtitle_sync();
         app.subtitle_sync
             .as_mut()
@@ -11844,6 +11883,17 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
+        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
         app.open_subtitle_sync();
 
         // Act / Assert: still reading.
@@ -11901,6 +11951,17 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
+        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
         app.open_subtitle_sync();
         app.subtitle_sync.as_mut().unwrap().apply_prepared(cues);
         (app, directory)
@@ -12067,6 +12128,90 @@ mod tests {
         // and the pane is left empty rather than half-painted.
         let shades = image_shades(&painted);
         assert_that!(shades.is_empty()).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A build that can never draw a frame has to say so, or the pane is an unexplained
+    /// empty box for the whole session.
+    ///
+    /// Drawn *in* the pane, unlike a per-cue failure, because it cannot change while the
+    /// page is open — so it reads as an explanation rather than as the flicker the pane
+    /// had its text fallback removed to stop.
+    #[test]
+    fn a_build_that_cannot_draw_frames_should_say_so_in_the_pane() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-unsupported", vec![sync_cue(0, 1000, "spoken")]);
+        app.subtitle_sync.as_mut().unwrap().support = crate::sync::PreviewSupport::NoSubtitleBurn;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&screen).contains("Preview is not possible");
+        assert_that!(&screen).contains("libass");
+        // And still not the cue's text standing in for a picture — the pane says why
+        // there will never be one, which is a different thing.
+        assert_that!(screen.matches("spoken").count()).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A terminal with no way to show an image gets its own reason rather than the
+    /// libass one, since telling a user to rebuild FFmpeg would send them somewhere that
+    /// cannot help.
+    #[test]
+    fn a_terminal_that_cannot_show_images_should_say_that_instead() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("sync-no-protocol", vec![sync_cue(0, 1000, "a")]);
+        app.subtitle_sync.as_mut().unwrap().support = crate::sync::PreviewSupport::NoImageProtocol;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: "display images" rather than the whole sentence, which the pane wraps
+        // across lines and this screen dump joins without a separator.
+        assert_that!(&screen).contains("display images");
+        assert_that!(&screen).does_not_contain("libass");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue that could not be drawn goes to the status row, not the pane: it changes as
+    /// the cursor moves, and it clears itself the moment the cursor reaches a cue that
+    /// drew — so it can never be left blaming the wrong line.
+    #[test]
+    fn a_cue_that_could_not_be_drawn_should_report_on_the_status_row() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-cue-failure",
+            vec![sync_cue(0, 1000, "first"), sync_cue(2000, 3000, "second")],
+        );
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .fail_frame(0, "Could not draw this frame: no such file".to_string());
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: reported, and outside the pane — which stays empty rather than gaining
+        // text that moves with the cursor.
+        assert_that!(&screen).contains("Could not draw this frame");
+        assert_that!(image_shades(&painted).is_empty()).is_true();
+
+        // Act / Assert: moving to a cue the failure says nothing about drops it.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        let moved = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(&moved).does_not_contain("Could not draw this frame");
 
         // Cleanup
         drop(app);

@@ -7,6 +7,7 @@
 //! including its temp directory, without each exit path having to remember to.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::Size;
@@ -60,6 +61,42 @@ pub enum WarmState {
     Done,
 }
 
+/// Whether this page can ever draw a frame, and if not, why.
+///
+/// Decided once when the page opens and fixed for its lifetime — neither the FFmpeg build
+/// nor the terminal's image support changes while it is open. That permanence is the whole
+/// reason it is drawn *in* the preview pane while a per-cue failure is not: a message that
+/// never changes reads as an explanation, where one that changed as the cursor moved read
+/// as the flicker this page had text removed from it to stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewSupport {
+    /// Frames will be drawn.
+    Available,
+    /// This FFmpeg has no `subtitles` filter, so a cue cannot be burned onto a frame at
+    /// all. The one reachable case in a shipped build.
+    NoSubtitleBurn,
+    /// Nothing to draw an image with. Only reachable without a picker, which the binary
+    /// always has — `Picker::halfblocks()` is its fallback and every terminal can draw
+    /// those — so this is here because the code branches on it, not because a user meets
+    /// it.
+    NoImageProtocol,
+}
+
+impl PreviewSupport {
+    /// What to tell the user, or `None` when frames are coming.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Available => None,
+            Self::NoSubtitleBurn => Some(
+                "Preview is not possible: this FFmpeg was built without libass, so a cue cannot be drawn onto a frame.",
+            ),
+            Self::NoImageProtocol => {
+                Some("Preview is not possible: this terminal cannot display images.")
+            }
+        }
+    }
+}
+
 /// How far the page has got in loading a track's cues.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncStatus {
@@ -104,13 +141,20 @@ impl Drop for PreviewWorkspace {
 }
 
 fn unique_name() -> String {
+    // The counter is not belt-and-braces: the clock alone is not enough. Two calls in the
+    // same nanosecond read the same timestamp, and then two pages share a scratch
+    // directory — so the first to close deletes the second's staged subtitles out from
+    // under it. Rare enough to look like a flake and not like a bug, which is exactly why
+    // it is worth ruling out rather than relying on the clock's granularity.
+    static WORKSPACES: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos(),
+        WORKSPACES.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -147,6 +191,8 @@ pub struct SubtitleSyncState {
     pub source: SubtitleSource,
     pub duration: Duration,
     pub status: SyncStatus,
+    /// Whether frames can be drawn at all, and if not, why. Fixed for the page's life.
+    pub support: PreviewSupport,
     /// How far the background frame pass has got, or why there is not one.
     pub warm: WarmState,
     pub cues: Vec<Cue>,
@@ -170,8 +216,12 @@ pub struct SubtitleSyncState {
     /// pruned to the window by [`Self::prune_frames`], so it is bounded by how far the
     /// cursor is from what has been drawn rather than by how long the page has been open.
     encoded: Vec<Frame>,
-    /// Why the last frame request produced nothing.
-    pub frame_error: Option<String>,
+    /// Why the cue at this index has no frame, for the one it was reported against.
+    ///
+    /// Keyed on the cue for the same reason `encoded` is: the reason a *different* line
+    /// could not be drawn says nothing about the one under the cursor, and showing it
+    /// there would blame the wrong cue.
+    frame_error: Option<(usize, String)>,
     /// Set when something invalidated the frames on hand — the selection moved, the cues
     /// arrived, the pane resized — and cleared when the request is actually sent.
     frame_pending_since: Option<Instant>,
@@ -194,6 +244,7 @@ impl SubtitleSyncState {
         frames: FrameSource,
         source: SubtitleSource,
         duration: Duration,
+        support: PreviewSupport,
         workspace: PreviewWorkspace,
     ) -> Self {
         Self {
@@ -202,6 +253,7 @@ impl SubtitleSyncState {
             source,
             duration,
             status: SyncStatus::Preparing,
+            support,
             warm: WarmState::Off,
             cues: Vec::new(),
             layout: LaneLayout::default(),
@@ -296,7 +348,9 @@ impl SubtitleSyncState {
 
     /// Takes a rendered frame, for the selection or for a cue near it.
     pub fn apply_frame(&mut self, cue_index: usize, protocol: Box<Protocol>) {
-        self.frame_error = None;
+        // Only this cue's reason, since it is only this cue that turned out to be
+        // drawable after all.
+        self.frame_error.take_if(|(failed, _)| *failed == cue_index);
         let frame = Frame {
             cue_index,
             protocol,
@@ -323,7 +377,19 @@ impl SubtitleSyncState {
     /// Records why one cue could not be drawn, dropping any frame held for it.
     pub fn fail_frame(&mut self, cue_index: usize, message: String) {
         self.encoded.retain(|frame| frame.cue_index != cue_index);
-        self.frame_error = Some(message);
+        self.frame_error = Some((cue_index, message));
+    }
+
+    /// Why the cue under the cursor has no frame, if that is why it has none.
+    ///
+    /// `None` while one is merely still being rendered — an empty pane during a render is
+    /// a wait, not a failure, and saying anything about it would put a message on screen
+    /// for the ordinary case.
+    pub fn frame_error(&self) -> Option<&str> {
+        self.frame_error
+            .as_ref()
+            .filter(|(cue_index, _)| *cue_index == self.selected)
+            .map(|(_, message)| message.as_str())
     }
 
     /// Drops every frame further from the selection than [`NEARBY_FRAMES`].
@@ -517,6 +583,7 @@ mod tests {
             },
             SubtitleSource::Embedded(2),
             Duration::from_secs(600),
+            PreviewSupport::Available,
             PreviewWorkspace::new().unwrap(),
         )
     }
@@ -1006,10 +1073,14 @@ mod tests {
         // Act
         state.fail_frame(1, "libass is missing".to_string());
 
-        // Assert
+        // Assert: cue 0's frame is untouched, and cue 1's is gone…
         assert_that!(state.frame().is_some()).is_true();
         assert_that!(state.has_frame(1)).is_false();
-        assert_that!(state.frame_error.clone()).is_equal_to(Some("libass is missing".to_string()));
+        // …and the reason belongs to cue 1, so it is not offered under cue 0. Showing it
+        // there would blame a line that drew perfectly well.
+        assert_that!(state.frame_error()).is_none();
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.frame_error()).is_equal_to(Some("libass is missing"));
 
         // Cleanup
         drop(state);
@@ -1026,11 +1097,11 @@ mod tests {
 
         // Assert
         assert_that!(state.frame().is_some()).is_false();
-        assert_that!(state.frame_error.clone()).is_equal_to(Some("libass is missing".to_string()));
+        assert_that!(state.frame_error()).is_equal_to(Some("libass is missing"));
 
         // Act / Assert: and a frame that does arrive clears the reason again.
         state.apply_frame(0, protocol(10, 5));
-        assert_that!(state.frame_error.clone()).is_none();
+        assert_that!(state.frame_error()).is_none();
     }
 
     /// A frame that has to be rendered waits out the debounce, or a held-down `j` starts
