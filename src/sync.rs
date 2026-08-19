@@ -200,6 +200,13 @@ pub struct Playback {
     /// Which frame [`Self::drawn`] holds, so a step inside one frame period re-draws
     /// nothing.
     shown: Option<usize>,
+    /// The cell area [`Self::drawn`] was encoded for, which is the pane as it was when the
+    /// frame went up rather than as it was when the span was asked for.
+    ///
+    /// The two differ routinely: saying "Preparing playback…" puts a status row on the page
+    /// and takes a row off the preview pane, so the pane the user sees a playback in is
+    /// almost never the one the playback was requested against.
+    cells: Size,
     drawn: Option<Box<Protocol>>,
 }
 
@@ -217,11 +224,13 @@ pub enum PlaybackStep {
 
 impl Playback {
     pub fn new(cue_index: usize, frames: PlaybackFrames, output: Box<dyn AudioOutput>) -> Self {
+        let cells = frames.cells;
         Self {
             cue_index,
             frames,
             output,
             shown: None,
+            cells,
             drawn: None,
         }
     }
@@ -255,7 +264,12 @@ impl Playback {
     /// The clock is sampled once, here, rather than by each thing that wants to know: two
     /// reads a few microseconds apart could straddle a frame boundary and put the picture
     /// and the playhead on either side of it.
-    pub fn advance(&mut self, now: Instant) -> PlaybackStep {
+    pub fn advance(&mut self, now: Instant, cells: Size) -> PlaybackStep {
+        if cells.width == 0 || cells.height == 0 {
+            // The renderer has not measured the pane yet. Encoding for no cells trips a
+            // `debug_assert!` inside `ratatui-image`, and there is nowhere to draw anyway.
+            return PlaybackStep::Unchanged;
+        }
         let Some(position) = self.output.position(now) else {
             // The device has not started yet. Nothing is drawn during this rather than the
             // first frame being held up: starting the picture before the sound is exactly
@@ -266,9 +280,10 @@ impl Playback {
         if index >= self.frames.count() {
             return PlaybackStep::Finished;
         }
-        if self.shown == Some(index) {
+        if self.shown == Some(index) && self.cells == cells {
             return PlaybackStep::Unchanged;
         }
+        self.cells = cells;
         let Some(drawn) = self.encode(index) else {
             // Unreachable for an index inside the span — the size was fixed before the
             // decode and the slice is exactly that many bytes — so there is nothing to
@@ -287,14 +302,14 @@ impl Playback {
     /// halfblocks font size is an arbitrary 1:2 placeholder, so `Resize::Scale` would blow
     /// the frame up to that font's idea of the pane and `Halfblocks` would immediately
     /// resample it back down to the cell grid — two passes, the expensive one wasted. The
-    /// frame was decoded at exactly the cell grid's pixels ([`crate::preview::playback_pixels`]),
-    /// so this way there is nothing to scale.
+    /// frame is decoded at the cell grid's own pixels
+    /// ([`crate::preview::playback_pixels`]), so when the pane has not moved there is
+    /// nothing to scale at all; when it has, this is the single pass that absorbs it.
     fn encode(&self, index: usize) -> Option<Box<Protocol>> {
         let (width, height) = self.frames.pixels;
         let bytes = self.frames.frame(index)?;
         let image = image::RgbImage::from_raw(width, height, bytes.to_vec())?;
-        let halfblocks =
-            Halfblocks::new(image::DynamicImage::ImageRgb8(image), self.frames.cells).ok()?;
+        let halfblocks = Halfblocks::new(image::DynamicImage::ImageRgb8(image), self.cells).ok()?;
         Some(Box::new(Protocol::Halfblocks(halfblocks)))
     }
 }
@@ -494,7 +509,7 @@ impl SubtitleSyncState {
         self.cues = cues;
         self.selected = 0;
         self.list_scroll = 0;
-        self.request_frame();
+        self.select_cue();
     }
 
     pub fn fail(&mut self, message: String) {
@@ -616,15 +631,27 @@ impl SubtitleSyncState {
     /// Asked for even when the selected cue is already encoded: the window has moved, so
     /// there is a new cue at its far edge to get ready before the cursor reaches it.
     pub fn request_frame(&mut self) {
-        // Every caller of this is a reason a playback on screen is no longer about what is
-        // on screen: the cursor moved to another cue, the pane resized under frames encoded
-        // for the old one, or a whole new track arrived. One place rather than five, for
-        // the same reason `prune_frames` lives here — an exit path that forgot would leave
-        // a span playing under a line it is not about, which reads as the timing being
-        // wrong on the one page built to judge that.
-        self.stop_playback();
         self.prune_frames();
         self.frame_pending_since = Some(Instant::now());
+    }
+
+    /// Marks the frames stale *and* drops any playback, for the moves where the page is no
+    /// longer about the same cue.
+    ///
+    /// **Deliberately not every caller of [`Self::request_frame`].** A pane resize also
+    /// makes the still frames stale, and it must *not* stop a playback: saying "Preparing
+    /// playback…" puts a status row on the page, which takes a row off the preview pane —
+    /// so a playback that stopped on a resize would be stopped by the very act of
+    /// announcing itself, every time, on any page that had no status row before. The
+    /// playback absorbs a resize by encoding into the pane it finds
+    /// ([`Playback::advance`]) instead.
+    ///
+    /// What does belong here is the cursor landing on another cue, or a whole new track
+    /// arriving: a span left playing under a line it is not about reads as the timing being
+    /// wrong, on the one page built to judge exactly that.
+    fn select_cue(&mut self) {
+        self.stop_playback();
+        self.request_frame();
     }
 
     /// Whether the selected cue's own frame has been asked for since the last request was
@@ -797,16 +824,32 @@ impl SubtitleSyncState {
         true
     }
 
+    /// The cell area a playback should be drawn into, for the pane as it is *now*.
+    ///
+    /// Derived from the frames' own pixel size rather than remembered from the request:
+    /// that size carries the source's proportions, so this keeps them whatever the pane has
+    /// become since — and the pane does change, because announcing the playback is itself
+    /// what adds the status row that shortens it.
+    fn playback_cells(&self) -> Size {
+        match &self.playback {
+            PlaybackState::Playing(playback) => {
+                crate::preview::playback_cells(self.preview_cells, playback.frames.pixels)
+            }
+            _ => Size::new(0, 0),
+        }
+    }
+
     /// Moves the playhead to wherever the sound has got to, reporting whether the page
     /// needs repainting.
     ///
     /// Called once per loop iteration rather than from the renderer, so the picture and the
     /// playhead are decided together and drawn together.
     pub fn advance_playback(&mut self) -> bool {
+        let cells = self.playback_cells();
         let PlaybackState::Playing(playback) = &mut self.playback else {
             return false;
         };
-        match playback.advance(Instant::now()) {
+        match playback.advance(Instant::now(), cells) {
             PlaybackStep::Unchanged => false,
             PlaybackStep::Drew => true,
             PlaybackStep::Finished => {
@@ -857,7 +900,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = next;
-        self.request_frame();
+        self.select_cue();
         true
     }
 
@@ -866,7 +909,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = 0;
-        self.request_frame();
+        self.select_cue();
         true
     }
 
@@ -879,7 +922,7 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = last;
-        self.request_frame();
+        self.select_cue();
         true
     }
 
@@ -1790,6 +1833,23 @@ mod tests {
         }
     }
 
+    /// Starts a playback with the pane measured, which in the application the renderer does
+    /// on the first draw. The height is generous so the fit is decided by the width, which
+    /// makes the drawn cell area exactly the one the span was built with.
+    fn play(state: &mut SubtitleSyncState, cue_index: usize, frames: PlaybackFrames) {
+        play_through(state, cue_index, frames, Box::new(SilentOutput::new()));
+    }
+
+    fn play_through(
+        state: &mut SubtitleSyncState,
+        cue_index: usize,
+        frames: PlaybackFrames,
+        output: Box<dyn AudioOutput>,
+    ) {
+        state.set_preview_cells(Size::new(frames.cells.width, frames.cells.height * 4));
+        state.begin_playback(cue_index, frames, output);
+    }
+
     fn playing(state: &mut SubtitleSyncState) -> &Playback {
         match &state.playback {
             PlaybackState::Playing(playback) => playback,
@@ -1805,7 +1865,8 @@ mod tests {
         // Arrange: ten frames at ten a second, so a frame is exactly 100 ms.
         let mut state = ready(3);
         let clock = SteppedOutput::at(None);
-        state.begin_playback(
+        play_through(
+            &mut state,
             0,
             span(10, Size::new(4, 2), 10),
             Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
@@ -1861,7 +1922,8 @@ mod tests {
         // Arrange: three frames at ten a second, so the span lasts 300 ms.
         let mut state = ready(3);
         let clock = SteppedOutput::at(Some(Duration::from_millis(250)));
-        state.begin_playback(
+        play_through(
+            &mut state,
             0,
             span(3, Size::new(4, 2), 10),
             Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
@@ -1889,7 +1951,8 @@ mod tests {
         // Arrange: a span starting ten seconds into the media, at ten frames a second.
         let mut state = ready(3);
         let clock = SteppedOutput::at(Some(Duration::from_millis(2_390)));
-        state.begin_playback(
+        play_through(
+            &mut state,
             0,
             span(30, Size::new(4, 2), 10),
             Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
@@ -1912,13 +1975,7 @@ mod tests {
     /// timing being wrong on the one page built to judge exactly that.
     #[test]
     fn every_way_the_page_moves_under_a_playback_should_stop_it() {
-        let started = |state: &mut SubtitleSyncState| {
-            state.begin_playback(
-                0,
-                span(30, Size::new(4, 2), 10),
-                Box::new(SilentOutput::new()),
-            );
-        };
+        let started = |state: &mut SubtitleSyncState| play(state, 0, span(30, Size::new(4, 2), 10));
 
         // Act / Assert: the cursor moving.
         let mut state = ready(5);
@@ -1934,11 +1991,6 @@ mod tests {
         assert_that!(state.select_first()).is_true();
         assert_that!(state.playback_active()).is_false();
 
-        // Act / Assert: the pane resizing, which every frame in the span was encoded for.
-        started(&mut state);
-        state.set_preview_cells(Size::new(40, 20));
-        assert_that!(state.playback_active()).is_false();
-
         // Act / Assert: a new track arriving.
         started(&mut state);
         state.apply_prepared(vec![cue(0, 1000, "a")], CueStyle::SubRip);
@@ -1948,6 +2000,98 @@ mod tests {
         started(&mut state);
         state.fail("ffmpeg exploded".to_string());
         assert_that!(state.playback_active()).is_false();
+    }
+
+    /// **A resize must not stop a playback**, unlike every other way the page moves — and
+    /// this is a regression test, not a preference.
+    ///
+    /// Announcing the playback is itself what resizes the pane: "Preparing playback…" puts
+    /// a status row on the page, and that row comes out of the preview pane's height. A
+    /// playback that stopped on a resize was therefore stopped by the act of saying it was
+    /// starting, every single time, on any page that had no status row already — which is
+    /// every page where the background frame pass has finished. The e2e scenario timed out
+    /// waiting for a span that had been cancelled before it arrived.
+    ///
+    /// So the frames absorb the resize instead: they hold pixels, and the encode targets
+    /// whatever the pane has become.
+    #[test]
+    fn a_playback_should_survive_the_pane_resizing_under_it() {
+        // Arrange: playing, with a frame on screen. The pane is exactly as tall as the
+        // picture needs, so the row it is about to lose is one the picture was using.
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(8, 4));
+        state.begin_playback(
+            0,
+            span(30, Size::new(8, 4), 10),
+            Box::new(SilentOutput::new()),
+        );
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_frame().map(|frame| frame.size()))
+            .is_equal_to(Some(Size::new(8, 4)));
+
+        // Act: the pane loses a row, exactly as it does when the status line appears.
+        state.set_preview_cells(Size::new(8, 3));
+
+        // Assert: still playing.
+        assert_that!(state.playback_active()).is_true();
+
+        // Assert: and the next step re-encodes for the pane it now has, rather than leaving
+        // a protocol too large for it — `Image` draws nothing at all rather than clipping.
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_frame().map(|frame| frame.size()))
+            .is_equal_to(Some(Size::new(6, 3)));
+    }
+
+    /// A rate of zero would make the playhead's arithmetic divide by nothing — and in
+    /// floating point that is not a panic but an infinity, which `Duration::from_secs_f64`
+    /// *does* panic on, in the event loop. Unreachable through the config, which clamps the
+    /// rate well above zero, and cheap to rule out rather than reason about.
+    #[test]
+    fn a_span_with_no_frame_rate_should_park_the_playhead_at_its_start() {
+        // Arrange
+        let mut state = ready(3);
+        let cells = Size::new(4, 2);
+        state.set_preview_cells(Size::new(4, 8));
+        state.begin_playback(
+            0,
+            PlaybackFrames::new(
+                vec![0; 4 * 4 * 3 * 2],
+                crate::preview::playback_pixels(cells),
+                cells,
+                0,
+                Duration::from_secs(7),
+                Vec::new(),
+            ),
+            Box::new(SilentOutput::new()),
+        );
+
+        // Act / Assert
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_position()).is_equal_to(Some(Duration::from_secs(7)));
+    }
+
+    /// The renderer has not measured the pane on the first draw after a span arrives, and
+    /// encoding for no cells trips a `debug_assert!` inside `ratatui-image` — which would
+    /// take the process down rather than merely draw nothing.
+    #[test]
+    fn a_playback_should_wait_for_the_pane_to_be_measured() {
+        // Arrange: a page nothing has drawn yet.
+        let mut state = ready(3);
+        state.begin_playback(
+            0,
+            span(4, Size::new(4, 2), 10),
+            Box::new(SilentOutput::new()),
+        );
+
+        // Act / Assert
+        assert_that!(state.advance_playback()).is_false();
+        assert_that!(state.playback_frame().is_none()).is_true();
+        assert_that!(state.playback_active()).is_true();
+
+        // Act / Assert: and it starts drawing the moment the pane is measured.
+        state.set_preview_cells(Size::new(4, 8));
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_frame().is_some()).is_true();
     }
 
     /// A span takes a second or two to decode, and `p` has to be the way out of that as
@@ -2013,11 +2157,7 @@ mod tests {
         assert_that!(state.preparing_playback()).is_none();
         state.prepare_playback(2);
         assert_that!(state.preparing_playback()).is_equal_to(Some(2));
-        state.begin_playback(
-            2,
-            span(4, Size::new(4, 2), 10),
-            Box::new(SilentOutput::new()),
-        );
+        play(&mut state, 2, span(4, Size::new(4, 2), 10));
         assert_that!(state.preparing_playback()).is_none();
         assert_that!(playing(&mut state).cue_index()).is_equal_to(2);
     }
@@ -2029,11 +2169,7 @@ mod tests {
     fn a_playback_should_describe_itself_by_where_it_is_rather_than_by_its_pixels() {
         // Arrange
         let mut state = ready(3);
-        state.begin_playback(
-            1,
-            span(6, Size::new(4, 2), 10),
-            Box::new(SilentOutput::new()),
-        );
+        play(&mut state, 1, span(6, Size::new(4, 2), 10));
 
         // Act
         let described = format!("{:?}", state.playback);
@@ -2053,7 +2189,7 @@ mod tests {
         // Arrange
         let mut state = ready(3);
         let cells = Size::new(8, 4);
-        state.begin_playback(0, span(3, cells, 10), Box::new(SilentOutput::new()));
+        play(&mut state, 0, span(3, cells, 10));
 
         // Act
         assert_that!(state.advance_playback()).is_true();

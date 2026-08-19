@@ -968,6 +968,9 @@ const SIDECAR_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nSidecar first\n\n\
 /// directory with it.
 #[test]
 fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -1122,9 +1125,224 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     );
 }
 
+/// `p` plays the stretch of media around the selected cue as a slideshow with its sound.
+///
+/// Drives the whole thing through the real application: one `ffmpeg` decoding a span into
+/// raw frames with the cue burned in by libass, the slicing that reads frames out of it,
+/// the halfblocks encode, the audio clock the picture is derived from, and the event loop
+/// stepping the two together.
+///
+/// The audio device is real here and stays real on a runner that has none — `audio::open`
+/// falls back to `SilentOutput`, which is the production path for a machine without a
+/// sound card. The fixture's audio track is `anullsrc`, so a developer running this hears
+/// nothing either way.
+#[test]
+fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "the_subtitle_timing_page_should_play_the_span_around_a_cue";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-playback");
+    write_media(
+        &scratch.join("clip.mkv"),
+        // Long enough that a cue in the middle has real media either side of it, which is
+        // what the padding is for — a span clamped at both ends would prove nothing about
+        // the padding at all.
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(20.0)
+            .audio(&["eng"]),
+    );
+    // One cue, well inside the file: 8.0–10.0 s, so the span runs 6.0–12.0 s.
+    fs::write(
+        scratch.join("clip.eng.srt"),
+        "1\n00:00:08,000 --> 00:00:10,000\nPLAY THIS LINE\n\n",
+    )
+    .unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    app.wait_until("a still frame for the cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    let still = app.preview_shades();
+
+    // Act
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+
+    // Assert: the page says it is working, so the key does not read as having done nothing
+    // during the second or two the decode takes.
+    let screen = app.screen();
+    assert!(
+        screen.contains("Preparing playback"),
+        "pressing p should say a playback is being prepared:\n{screen}"
+    );
+
+    // Assert: the span arrives and starts drawing.
+    app.wait_until("the span to start playing", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let first = state
+        .playback_position()
+        .expect("a playing span knows where it is");
+    assert!(
+        first >= Duration::from_secs(6) && first < Duration::from_secs(7),
+        "the span should start two seconds before the cue, not at it: {first:?}"
+    );
+    assert_eq!(
+        state.playback_error(),
+        None,
+        "a span that played should leave no failure behind"
+    );
+
+    // Assert: the playback has taken the pane over from the still frame. The fixture's
+    // video is solid black, so the span opens on a single shade where the still frame — a
+    // grab from inside the cue, with the line burned into it — has several.
+    let playing = app.preview_shades();
+    assert!(
+        playing != still,
+        "the playback should take the pane over from the still frame; \
+         playing: {playing:?}, still: {still:?}"
+    );
+
+    // Counted rather than searched for, since the same glyph draws every vertical border.
+    let marks = |app: &Harness| app.screen().matches('│').count();
+    let with_playhead = marks(&app);
+
+    // Assert: over the span the picture moves, the playhead follows it, and — the part
+    // nothing short of the pixels would notice — the burned line *arrives and leaves*.
+    //
+    // That last one is what says the cue was staged at its place inside the span rather
+    // than covering it. A staging that covered the whole span passes every other assertion
+    // here: same frame count, same playhead, same everything but the picture. Against solid
+    // black, more than one shade on screen is the line and nothing else.
+    let started = Instant::now();
+    let mut moved_playhead = false;
+    let mut with_line = false;
+    let mut without_line = false;
+    let mut ended = false;
+    while started.elapsed() < harness::DEFAULT_TIMEOUT {
+        app.pump();
+        let Some(state) = app.app.subtitle_sync.as_ref() else {
+            break;
+        };
+        if !state.playback_active() {
+            ended = true;
+            break;
+        }
+        if let Some(position) = state.playback_position()
+            && position > first
+        {
+            moved_playhead = true;
+        }
+        if state.playback_frame().is_some() {
+            if app.preview_shades().len() > 1 {
+                with_line = true;
+            } else {
+                without_line = true;
+            }
+        }
+    }
+    assert!(
+        moved_playhead,
+        "the playhead should follow the sound through the span"
+    );
+    assert!(
+        with_line,
+        "the cue should be burned into the frames where it falls inside the span"
+    );
+    assert!(
+        without_line,
+        "the cue should be absent from the padding either side of it, \
+         rather than covering the whole span"
+    );
+
+    // Assert: a playback is over when the span is, not paused on its last frame — the next
+    // `p` should replay it rather than having to stop it first.
+    assert!(
+        ended,
+        "a six-second span should finish on its own well inside the timeout"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "a six-second span should not take thirty seconds to play: {:?}",
+        started.elapsed()
+    );
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert!(
+        state.playback_frame().is_none(),
+        "a finished playback should hand the pane back to the still frame"
+    );
+    assert_eq!(
+        marks(&app),
+        with_playhead - 1,
+        "the playhead should go when the playback does:\n{}",
+        app.screen()
+    );
+
+    // Assert: and the same key stops one that is still being decoded, so pressing it by
+    // mistake does not mean sitting through a playback you have decided against.
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+    assert!(
+        app.app
+            .subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.preparing_playback().is_some()),
+        "p should start another span"
+    );
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert!(
+        !state.playback_active(),
+        "p again should stop a span that is still decoding"
+    );
+
+    // Assert: and Esc peels the playback before it closes the page.
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "Esc should stop the playback before leaving the page"
+    );
+    assert!(
+        app.app
+            .subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.playback_active()),
+        "Esc should have stopped the playback"
+    );
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert_eq!(
+        app.app.layer,
+        Layer::Streams,
+        "Esc should then close the page"
+    );
+}
+
 /// A format the page has no road to a cue list through is turned away at the door rather
 /// than opening a page that can never fill in. Covers a text format and a bitmap one;
 /// runs no ffmpeg beyond building the fixtures.
+///
+/// The text one is TTML, and it is a **sidecar** rather than an embedded track: TTML has no
+/// FFmpeg decoder at all, so there is nothing to mux one into a Matroska with. That is also
+/// exactly why the page refuses it. ASS used to stand here and no longer can — it opens the
+/// page now, with its own styles, which
+/// `an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults` covers.
 #[test]
 fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
     let test = "the_subtitle_timing_page_should_refuse_a_format_it_cannot_read";
@@ -1134,20 +1352,35 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
     );
 
     let scratch = Scratch::new("subtitle-sync-refusal");
-    write_media(
-        &scratch.join("styled.mkv"),
-        &MediaSpec::mkv()
-            .audio(&["eng"])
-            .subtitles(vec![SubtitleSpec::new("eng", "ass")]),
-    );
     write_vobsub_media(&scratch.join("bitmap.mkv"), "eng");
+    write_media(
+        &scratch.join("timed.mkv"),
+        &MediaSpec::mkv().audio(&["eng"]),
+    );
+    fs::write(
+        scratch.join("timed.eng.ttml"),
+        "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div>\
+         <p begin=\"00:00:01.000\" end=\"00:00:02.000\">A timed line</p>\
+         </div></body></tt>",
+    )
+    .unwrap();
 
     let mut app = Harness::start(scratch);
     // Alphabetical, because the file panel is walked downward from wherever the cursor
     // already is.
-    for (file, format) in [("bitmap.mkv", "VobSub"), ("styled.mkv", "ASS")] {
+    for (file, format) in [("bitmap.mkv", "VobSub"), ("timed.mkv", "TTML")] {
         app.open(file);
-        let subtitle_row = app.first_subtitle_row();
+        // One fixture carries its track inside the container and the other beside it, so
+        // the sidecar's row is taken when there is one and the embedded track's otherwise.
+        let sidecar_row = app
+            .app
+            .track_rows()
+            .iter()
+            .position(|track| matches!(track, TrackRef::Sidecar(_)));
+        let subtitle_row = match sidecar_row {
+            Some(row) => row,
+            None => app.first_subtitle_row(),
+        };
         app.select_track_row(subtitle_row);
         app.press(key(KeyCode::Char('c')));
         app.pump();
@@ -1189,6 +1422,9 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
 /// the page fails with a codec error nothing about WebVTT would suggest.
 #[test]
 fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2346,6 +2582,9 @@ const RETYPED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
 /// stops it being drawn, while the cue left alone still is.
 #[test]
 fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "the_subtitle_timing_page_should_cache_and_prefetch_preview_frames";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2476,6 +2715,9 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
 /// exactly the bug this is here for.
 #[test]
 fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "re_opening_a_rendered_track_should_not_render_any_of_it_again";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2557,6 +2799,9 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
 /// is the flicker the pane had its text fallback removed to stop.
 #[test]
 fn a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2639,6 +2884,9 @@ const PARALLEL_CUES: &str = "1\n00:00:00,200 --> 00:00:00,600\nParallel alpha\n\
 /// lines have to produce nine different files. A collision makes two of them identical.
 #[test]
 fn the_background_pass_should_render_every_cue_with_its_own_line_burned_in() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "the_background_pass_should_render_every_cue_with_its_own_line_burned_in";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2700,6 +2948,9 @@ const SHORT_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nShort first\n\n\
 /// exclusion is doing the work rather than the ranking happening to agree.
 #[test]
 fn a_full_cache_should_evict_whole_tracks_and_never_the_open_one() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "a_full_cache_should_evict_whole_tracks_and_never_the_open_one";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
@@ -2829,6 +3080,9 @@ const WALKED_CUES: &str = "1\n00:00:00,500 --> 00:00:01,500\nWalkedone\n\n\
 /// loop, so a frame that needed the worker to answer could not possibly be on screen yet.
 #[test]
 fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test =
         "walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
@@ -2949,6 +3203,9 @@ const STYLED_ASS: &str = "[Script Info]\n\
 /// files, or reading the screen all pass in that world. Comparing the frames does not.
 #[test]
 fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
     let test = "an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 

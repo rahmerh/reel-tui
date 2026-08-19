@@ -1481,19 +1481,13 @@ fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<Playba
         )));
     }
     let mut command = playback_command(request, span, &staged);
-    let output = match run_cancellable(&mut command, abandoned) {
-        RunOutcome::Abandoned => return None,
-        RunOutcome::Failed(message) => return Some(PlaybackOutcome::Failed(message)),
-        RunOutcome::Finished(output) if !output.status.success() => {
-            return Some(PlaybackOutcome::Failed(command_failure(
-                "Could not play this cue",
-                &output.stderr,
-            )));
-        }
-        RunOutcome::Finished(output) => output,
+    let pixels = match played(run_cancellable(&mut command, abandoned)) {
+        SpanOutcome::Abandoned => return None,
+        SpanOutcome::Failed(message) => return Some(PlaybackOutcome::Failed(message)),
+        SpanOutcome::Ready(pixels) => pixels,
     };
     let frames = PlaybackFrames::new(
-        output.stdout,
+        pixels,
         request.pixels,
         request.cells,
         request.fps,
@@ -1513,6 +1507,30 @@ fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<Playba
         ));
     }
     Some(PlaybackOutcome::Ready(frames))
+}
+
+/// A span's raw pixels, or why there are none.
+enum SpanOutcome {
+    Ready(Vec<u8>),
+    /// The playback was stopped while the decode was running.
+    Abandoned,
+    Failed(String),
+}
+
+/// What a finished playback run means.
+///
+/// Separated from [`decoded`] for the same reason [`grabbed`] is separated from [`png`]:
+/// giving up part-way and failing to start are endings a test cannot reliably steer a real
+/// `ffmpeg` into, and the first must not be mistaken for a span that failed to decode.
+fn played(run: RunOutcome) -> SpanOutcome {
+    match run {
+        RunOutcome::Abandoned => SpanOutcome::Abandoned,
+        RunOutcome::Failed(message) => SpanOutcome::Failed(message),
+        RunOutcome::Finished(output) if !output.status.success() => {
+            SpanOutcome::Failed(command_failure("Could not play this cue", &output.stderr))
+        }
+        RunOutcome::Finished(output) => SpanOutcome::Ready(output.stdout),
+    }
 }
 
 /// Decodes a span of video with the cue burned in, straight to raw pixels.
@@ -5170,6 +5188,62 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An exit status without a subprocess to produce it.
+    ///
+    /// `ExitStatus` cannot be constructed portably, and this crate already only builds
+    /// where `/proc/mounts` exists (`mount.rs`), so the Unix extension is no narrower than
+    /// the rest of it.
+    fn ok_status() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(0)
+    }
+
+    fn failed_status() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(256)
+    }
+
+    /// The three ways a playback run ends, from the outcome itself: giving up part-way and
+    /// failing to start are not endings a test can reliably steer a real `ffmpeg` into, and
+    /// the first must not be mistaken for a span that decoded nothing.
+    #[test]
+    fn every_ending_a_playback_run_can_have_should_be_told_apart() {
+        // Act / Assert: the page went away mid-decode. Reported as neither ready nor
+        // failed, so nothing is sent and nothing starts playing under a page that stopped.
+        assert!(matches!(
+            played(RunOutcome::Abandoned),
+            SpanOutcome::Abandoned
+        ));
+
+        // Act / Assert: `ffmpeg` could not be started at all.
+        let SpanOutcome::Failed(message) = played(RunOutcome::Failed(
+            "ffmpeg was not found in PATH.".to_string(),
+        )) else {
+            panic!("a run that could not start is a failure");
+        };
+        assert_that!(message.as_str()).is_equal_to("ffmpeg was not found in PATH.");
+
+        // Act / Assert: `ffmpeg` ran and refused, and its reason reaches the page rather
+        // than only the heading — which on its own reads as a bug in reel.
+        let SpanOutcome::Failed(message) = played(RunOutcome::Finished(Output {
+            status: failed_status(),
+            stdout: Vec::new(),
+            stderr: b"Invalid data found when processing input\n".to_vec(),
+        })) else {
+            panic!("a run ffmpeg refused is a failure");
+        };
+        assert_that!(message.as_str()).contains("Could not play this cue");
+        assert_that!(message.as_str()).contains("Invalid data found");
+
+        // Act / Assert: and a run that worked hands its pixels straight back.
+        let SpanOutcome::Ready(pixels) = played(RunOutcome::Finished(Output {
+            status: ok_status(),
+            stdout: vec![1, 2, 3],
+            stderr: Vec::new(),
+        })) else {
+            panic!("a successful run yields its pixels");
+        };
+        assert_that!(pixels.as_slice()).is_equal_to([1u8, 2, 3].as_slice());
     }
 
     /// A span the user has stopped waiting for is not reported at all — a span arriving

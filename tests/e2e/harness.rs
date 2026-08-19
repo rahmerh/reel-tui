@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 use std::sync::mpsc::Receiver;
+use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -64,6 +64,29 @@ fn redirect_cache_dir() {
             std::env::set_var("XDG_CACHE_HOME", &dir);
         }
     });
+}
+
+/// Serialises the scenarios that share the preview frame cache.
+///
+/// `XDG_CACHE_HOME` is process-global (see [`redirect_cache_dir`]), so every scenario in
+/// this binary renders into **one** frame cache — and the timing page prunes that cache to
+/// `cache_tracks` whole media directories at the start of every background pass. Run in
+/// parallel, the scenarios therefore evict each other's frames: one that walks a cue list
+/// expecting the cache to answer waits forever for frames another scenario has just
+/// deleted. `a_full_cache_should_evict_whole_tracks_and_never_the_open_one` is the sharpest
+/// case, since it deliberately prunes to a single track.
+///
+/// A lock rather than `--test-threads=1`, because the invocation is not ours to control —
+/// CI runs a bare `cargo test --test e2e` — and because the rest of the suite has no reason
+/// to give up its parallelism. It costs nothing in wall clock: these scenarios are `ffmpeg`
+/// waiting on `ffmpeg`, which is already using every core.
+///
+/// Poisoning is ignored on purpose. The lock guards nothing but ordering, so a scenario
+/// that panicked while holding it has left no state for the next one to be confused by —
+/// and a poisoned lock would turn one real failure into a cascade of unrelated ones.
+pub fn frame_cache_lock() -> MutexGuard<'static, ()> {
+    static FRAME_CACHE: Mutex<()> = Mutex::new(());
+    FRAME_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A temp directory that cleans itself up even when a test panics — unlike the manual
@@ -159,6 +182,9 @@ impl Harness {
         self.app.receive_preview_events(&self.preview_rx);
         self.app.start_pending_probe();
         self.app.start_pending_preview();
+        // In the same place and the same order `main`'s loop has it: after the drains, so a
+        // span that arrived this iteration is stepped in the pass it landed in.
+        self.app.advance_playback();
         self.app.maybe_open_conflict_dialog();
         let app = &mut self.app;
         self.terminal.draw(|frame| ui::render(frame, app)).unwrap();
