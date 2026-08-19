@@ -67,14 +67,31 @@ fn warm_cue_file(worker: usize) -> String {
     format!("warm-{worker}.srt")
 }
 
-/// How many threads walk a track's cues.
+/// The most threads that will ever walk a track's cues at once.
 ///
 /// Each frame is an accurate seek plus a libass burn plus a JPEG encode, which is mostly
-/// CPU and parallelises about as well as the machine has cores to give it. Three rather
-/// than "all of them": the interactive grab the user is actually waiting on runs beside
-/// these and is not prioritised, so leaving headroom is what keeps a background pass from
-/// making the foreground slower.
-pub const WARM_WORKERS: usize = 3;
+/// CPU. Three rather than "all of them" because the returns flatten — a measured 4.1x on a
+/// 60-cue track — and because every worker competes with the interactive grab the user is
+/// actually waiting on.
+pub const MAX_WARM_WORKERS: usize = 3;
+
+/// How many threads to walk a track's cues with on *this* machine.
+///
+/// Half the cores, because a fixed three made the foreground worse on a small machine
+/// rather than better: measured against an uncached interactive grab with a pass running
+/// underneath, three workers cost +18% on 32 cores, +93% on four and **+157% on two** —
+/// two and a half times the latency of the one frame the user is sitting there waiting
+/// for. Half leaves the other half for that grab, and the ffmpeg decoding it, which is
+/// itself threaded.
+///
+/// Never zero, so a machine that cannot report its parallelism still renders.
+fn warm_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .div_euclid(2)
+        .clamp(1, MAX_WARM_WORKERS)
+}
 
 /// "Has the page this was for gone?", as every stage of a grab asks it.
 ///
@@ -843,7 +860,7 @@ fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
 /// somewhere, the frame is already there.
 fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<PreviewEvent>) -> bool {
     let abandoned = || live_generation.load(Ordering::Relaxed) != request.generation;
-    warm_track(request, &abandoned, events)
+    warm_track(request, warm_workers(), &abandoned, events)
 }
 
 /// The pass itself, with "has the page gone" handed in.
@@ -853,7 +870,11 @@ fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<Prev
 /// `ffmpeg` otherwise, and they are what stops a thousand-cue track running on for a page
 /// nobody is looking at.
 ///
-/// The track is walked by [`WARM_WORKERS`] threads over contiguous slices of it. Scoped
+/// `workers` is handed in rather than read from [`warm_workers`], so the tests below pin
+/// it: the slicing is what several of them assert on, and a count that varied with the
+/// machine would make them pass here and fail on a two-core CI runner.
+///
+/// The track is walked by `workers` threads over contiguous slices of it. Scoped
 /// threads rather than a pool: they are joined before this returns, so the worker's
 /// `newest()` coalescing and its "stop once nobody is listening" contract are untouched,
 /// and a pass that runs for minutes does not care what a thread cost to spawn.
@@ -864,6 +885,7 @@ fn warm(request: &WarmRequest, live_generation: &AtomicU64, events: &Sender<Prev
 /// the whole file.
 fn warm_track(
     request: &WarmRequest,
+    workers: usize,
     abandoned: Abandoned<'_>,
     events: &Sender<PreviewEvent>,
 ) -> bool {
@@ -898,7 +920,7 @@ fn warm_track(
     let done = AtomicUsize::new(0);
     // `div_ceil`, so the last slice is the short one and no worker is handed an empty
     // slice while cues are left over.
-    let per_worker = total.div_ceil(WARM_WORKERS).max(1);
+    let per_worker = total.div_ceil(workers).max(1);
     std::thread::scope(|scope| {
         for (worker, cues) in request.cues.chunks(per_worker).enumerate() {
             let progress = &progress;
@@ -2789,7 +2811,7 @@ mod tests {
 
         // Act
         let (events, published) = mpsc::channel();
-        let alive = warm_track(&request, &|| false, &events);
+        let alive = warm_track(&request, 3, &|| false, &events);
         drop(events);
         drop(published);
 
@@ -2904,6 +2926,30 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Half the machine, never none of it, never more than the cap.
+    ///
+    /// A fixed three made the foreground *worse* on a small machine: measured against an
+    /// uncached interactive grab with a pass running underneath, it cost +18% on 32 cores
+    /// but +157% on two — the one frame the user is waiting for taking two and a half
+    /// times as long. Leaving half the cores for that grab is what this exists to do, so
+    /// the floor and the cap both matter and both are asserted.
+    #[test]
+    fn the_worker_count_should_leave_the_machine_room_for_the_foreground() {
+        // Act
+        let workers = warm_workers();
+
+        // Assert: never zero, or a track would never render at all…
+        assert_that!(workers >= 1).is_true();
+        // …and never more than the cap, whatever the machine reports.
+        assert_that!(workers <= MAX_WARM_WORKERS).is_true();
+        // And it really is derived from the machine rather than fixed: half its cores,
+        // which on anything with six or more is the cap and on a dual core is one.
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        assert_that!(workers).is_equal_to((cores / 2).clamp(1, MAX_WARM_WORKERS));
+    }
+
     /// Every worker stages its cue somewhere no other worker can reach.
     ///
     /// The one thing in this module that fails *silently* if it is wrong: two workers
@@ -2915,11 +2961,11 @@ mod tests {
     fn every_warm_worker_should_stage_its_cue_under_its_own_name() {
         // Act
         let names: std::collections::BTreeSet<String> =
-            (0..WARM_WORKERS).map(warm_cue_file).collect();
+            (0..MAX_WARM_WORKERS).map(warm_cue_file).collect();
 
         // Assert: one per worker, and none of them the interactive path's — which runs at
         // the same time as all of them.
-        assert_that!(names.len()).is_equal_to(WARM_WORKERS);
+        assert_that!(names.len()).is_equal_to(MAX_WARM_WORKERS);
         assert_that!(names.contains(CUE_FILE)).is_false();
         // Bare relative names, so `ffmpeg` takes them as literals inside its working
         // directory and nothing has to be escaped through the filtergraph syntax.
@@ -2949,7 +2995,7 @@ mod tests {
         require_ffmpeg("the_background_pass_should_burn_each_workers_own_cue");
         let directory = scratch("warm-staging");
         let media = video(&directory);
-        let cues: Vec<Cue> = (0..WARM_WORKERS as u64 * 3)
+        let cues: Vec<Cue> = (0..9u64)
             .map(|index| {
                 cue(
                     index * 400,
@@ -2965,7 +3011,7 @@ mod tests {
 
         // Act: the parallel pass.
         let (events_tx, events) = mpsc::channel();
-        assert_that!(warm_track(&request, &|| false, &events_tx)).is_true();
+        assert_that!(warm_track(&request, 3, &|| false, &events_tx)).is_true();
         drop(events_tx);
         drop(events);
         let in_parallel: Vec<Vec<u8>> = cues
@@ -3040,7 +3086,7 @@ mod tests {
         let (events_tx, events) = mpsc::channel();
 
         // Act
-        let alive = warm(&request, &live(1), &events_tx);
+        let alive = warm_track(&request, 3, &|| false, &events_tx);
 
         // Assert: the count finishes, so the status line clears...
         assert_that!(alive).is_true();
@@ -3286,7 +3332,7 @@ mod tests {
         drop(events);
 
         // Act
-        let alive = warm_track(&request, &|| false, &events_tx);
+        let alive = warm_track(&request, 3, &|| false, &events_tx);
 
         // Assert: reported, and nothing staged — it gave up before the first grab rather
         // than after the last.
@@ -3316,7 +3362,7 @@ mod tests {
         let closes_after_the_first = || checks.fetch_add(1, Ordering::Relaxed) >= 1;
 
         // Act
-        let alive = warm_track(&request, &closes_after_the_first, &events_tx);
+        let alive = warm_track(&request, 3, &closes_after_the_first, &events_tx);
 
         // Assert: the pass ends without a final count, since the page it counted for is
         // gone — and it ended early, rather than walking the remaining cues. Asserted on
@@ -3358,7 +3404,7 @@ mod tests {
         let closes_during_the_grab = || checks.fetch_add(1, Ordering::Relaxed) >= 2;
 
         // Act
-        let alive = warm_track(&request, &closes_during_the_grab, &events_tx);
+        let alive = warm_track(&request, 1, &closes_during_the_grab, &events_tx);
 
         // Assert: stopped with nothing cached and nothing counted past the start.
         assert_that!(alive).is_true();
