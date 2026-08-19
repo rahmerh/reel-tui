@@ -2270,12 +2270,17 @@ impl App {
                 Some("Unmark this subtitle track for deletion before previewing it.".to_string());
             return;
         }
-        let format = self.subtitle_source_format(&source);
-        if format != Some(SubtitleFormat::SubRip) {
-            let subject = format.map_or("This subtitle format", SubtitleFormat::overview_label);
-            self.notice = Some(format!(
-                "{subject} subtitle previewing is not implemented yet. Only SRT is supported."
-            ));
+        let Some(format) = self.subtitle_source_format(&source) else {
+            self.notice = Some(
+                "This subtitle format is not one reel recognises, so it cannot be previewed."
+                    .to_string(),
+            );
+            return;
+        };
+        // Asked before anything is opened, so a track needing a tool that is not installed
+        // says which tool rather than opening a page that loads and then fails.
+        if let Some(reason) = self.subtitle_capabilities.preview_blocked(format) {
+            self.notice = Some(reason);
             return;
         }
         let Some(media) = self.selected_file().map(|file| file.path.clone()) else {
@@ -2357,6 +2362,7 @@ impl App {
                 generation: state.generation,
                 input,
                 stream_index,
+                format,
                 workspace: state.workspace().to_path_buf(),
             });
         }
@@ -9121,6 +9127,12 @@ mod tests {
             ]),
             ffmpeg_muxers: BTreeSet::from(["matroska".to_string()]),
             ffmpeg_filters: BTreeSet::from(["subtitles".to_string(), "scale".to_string()]),
+            ffmpeg_decoders: BTreeSet::from([
+                "subrip".to_string(),
+                "ass".to_string(),
+                "webvtt".to_string(),
+                "mov_text".to_string(),
+            ]),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         }
@@ -19179,22 +19191,21 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Nothing on this page converts — it reads the track exactly as stored — so every
-    /// non-SubRip format is turned away by one guard, naming itself so the message is
-    /// about the track the user actually picked.
+    /// A format with no road to a cue list is turned away before the page opens, naming
+    /// itself so the message is about the track the user actually picked rather than about
+    /// subtitles in general.
     #[test]
-    fn open_subtitle_sync_should_refuse_every_format_other_than_subrip() {
+    fn open_subtitle_sync_should_refuse_a_format_it_cannot_reach_cues_through() {
         for (codec, expected) in [
             ("ass", "ASS"),
-            ("webvtt", "VTT"),
-            ("mov_text", "MOVTXT"),
+            ("ttml", "TTML"),
             ("hdmv_pgs_subtitle", "PGS"),
             ("dvd_subtitle", "VobSub"),
-            ("nonsense_codec", "This subtitle format"),
         ] {
             // Arrange
             let mut app = app_with_subtitle_codec(codec);
             let directory = app.directory.clone();
+            app.subtitle_capabilities = full_subtitle_capabilities();
 
             // Act
             app.open_subtitle_sync();
@@ -19205,6 +19216,65 @@ mod tests {
             let notice = app.notice.clone().expect("a refusal should say why");
             assert_that!(notice.contains(expected)).is_true();
             assert_that!(notice.contains("not implemented yet")).is_true();
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// A codec string this program has no `SubtitleFormat` for cannot be routed at all, so
+    /// it is refused separately — and without naming a format, since there is not one to
+    /// name.
+    #[test]
+    fn open_subtitle_sync_should_refuse_a_codec_it_does_not_recognise() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("nonsense_codec");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+
+        // Act
+        app.open_subtitle_sync();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().as_str()).contains("not one reel recognises");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// WebVTT and MOV Text reach the cue list by being transcoded to SubRip, so the page
+    /// opens on them — but only on a build that can decode them, which is a different
+    /// question from the encoder list the rest of the program asks about.
+    #[test]
+    fn open_subtitle_sync_should_open_a_transcodable_track_only_when_ffmpeg_can_decode_it() {
+        for (codec, expected) in [("webvtt", "VTT"), ("mov_text", "MOVTXT")] {
+            // Arrange: a build that can encode the format but not read it, which is the
+            // case a check against `ffmpeg_encoders` would wave straight through.
+            let mut app = app_with_subtitle_codec(codec);
+            let directory = app.directory.clone();
+            app.subtitle_capabilities = ToolCapabilities {
+                ffmpeg_decoders: BTreeSet::from(["subrip".to_string()]),
+                ..full_subtitle_capabilities()
+            };
+
+            // Act
+            app.open_subtitle_sync();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_sync.is_none()).is_true();
+            let notice = app.notice.clone().expect("a refusal should say why");
+            assert_that!(notice.contains(expected)).is_true();
+            assert_that!(notice.as_str()).contains("decode it");
+
+            // Act / Assert: and a build that can read it opens the page.
+            app.notice = None;
+            app.subtitle_capabilities = full_subtitle_capabilities();
+            app.open_subtitle_sync();
+            assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+            assert_that!(app.notice.clone()).is_none();
 
             // Cleanup
             std::fs::remove_dir_all(directory).unwrap();

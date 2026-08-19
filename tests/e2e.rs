@@ -1122,13 +1122,12 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     );
 }
 
-/// The timing page reads a track exactly as it is stored and converts nothing, so every
-/// format that is not SubRip has to be turned away at the door rather than opening a
-/// page that can never fill in. Covers a text format and a bitmap one; runs no ffmpeg
-/// beyond building the fixtures.
+/// A format the page has no road to a cue list through is turned away at the door rather
+/// than opening a page that can never fill in. Covers a text format and a bitmap one;
+/// runs no ffmpeg beyond building the fixtures.
 #[test]
-fn the_subtitle_timing_page_should_refuse_formats_other_than_srt() {
-    let test = "the_subtitle_timing_page_should_refuse_formats_other_than_srt";
+fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
+    let test = "the_subtitle_timing_page_should_refuse_a_format_it_cannot_read";
     require_tools(
         test,
         &["ffmpeg:libx264", "ffmpeg:aac", "seconv", "tesseract"],
@@ -1168,16 +1167,96 @@ fn the_subtitle_timing_page_should_refuse_formats_other_than_srt() {
             .clone()
             .unwrap_or_else(|| panic!("{file} should have been refused with a reason"));
         assert!(
-            notice.contains(format) && notice.contains("Only SRT is supported"),
+            notice.contains(format) && notice.contains("not implemented yet"),
             "the refusal should name the format it turned away: {notice:?}"
         );
         assert!(
-            app.screen().contains("Only SRT is supported"),
+            app.screen().contains("not implemented yet"),
             "the refusal should reach the screen:\n{}",
             app.screen()
         );
         app.press(key(KeyCode::Esc));
     }
+}
+
+/// A WebVTT track opens the timing page and draws frames, exactly as SubRip does.
+///
+/// The page's own parser reads SubRip and nothing else, so this track reaches the cue list
+/// only by being transcoded on the way out of the container — one `ffmpeg` rather than
+/// two, since the extraction does it as it demuxes. What makes this worth an end-to-end
+/// scenario is that the staged filename and the extraction's `-c:s` have to agree: written
+/// to `cues.vtt` instead, the WebVTT muxer refuses the SubRip the extraction hands it, and
+/// the page fails with a codec error nothing about WebVTT would suggest.
+#[test]
+fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
+    let test = "the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-webvtt");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"])
+            .subtitles(vec![
+                SubtitleSpec::new("eng", "webvtt").cues(WALKED_CUES),
+            ]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let subtitle_row = app.first_subtitle_row();
+    app.select_track_row(subtitle_row);
+    app.press(key(KeyCode::Char('c')));
+    app.pump();
+
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "a WebVTT track should open the page; notice: {:?}",
+        app.app.notice
+    );
+    app.wait_until("the transcoded track's cues to be read", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // The cues themselves, with their own timings — not a single cue spanning the clip,
+    // which is what a transcode that dropped the timing would collapse to.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(
+        state.cues.len(),
+        4,
+        "every cue should have survived the transcode: {:?}",
+        state.cues
+    );
+    assert_eq!(state.cues[0].text, "Walkedone");
+    assert_eq!(state.cues[3].text, "Walkedfour");
+    assert!(
+        state.cues[1].start > state.cues[0].start,
+        "the cues should keep their own timings: {:?}",
+        state.cues
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("Walkedone") && screen.contains("Walkedfour"),
+        "the cue list should be drawn:\n{screen}"
+    );
+
+    // And a real frame gets burned and drawn, so the whole pipeline behind the transcode
+    // works rather than only the parsing half.
+    app.wait_until("a frame for the first cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    assert!(
+        app.preview_shades().len() > 1,
+        "the preview should hold a decoded image:\n{}",
+        app.screen()
+    );
 }
 
 /// Chapters and attachments are not editable track groups, but every ordinary remux

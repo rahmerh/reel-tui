@@ -43,6 +43,7 @@ use ratatui_image::{FilterType, Resize};
 
 use crate::cue::{Cue, format_srt_timestamp, read_srt};
 use crate::framecache::{self, FrameKeyParts};
+use crate::subtitle::SubtitleFormat;
 
 /// Filename an embedded track is staged under inside the page's workspace.
 pub const CUES_FILE: &str = "cues.srt";
@@ -161,6 +162,12 @@ pub struct PrepareRequest {
     /// The **absolute** ffprobe stream index for an embedded track, matching `edit.rs`'s
     /// convention — never the `0:s:N` per-type form. `None` means `input` is a sidecar.
     pub stream_index: Option<u64>,
+    /// What `input` holds, which decides how it is turned into cues. Settled by
+    /// `App::open_subtitle_sync`, which has already refused the formats with no road here
+    /// at all — see [`ToolCapabilities::preview_blocked`].
+    ///
+    /// [`ToolCapabilities::preview_blocked`]: crate::subtitle::ToolCapabilities::preview_blocked
+    pub format: SubtitleFormat,
     pub workspace: PathBuf,
 }
 
@@ -589,18 +596,81 @@ pub(crate) fn test_handles() -> TestHandles {
 }
 
 /// Reads one track's cues, or `None` if the page it was for closed on the way.
+///
+/// Every format ends at the same place — a SubRip file this crate's own parser can read —
+/// and differs only in how it gets there:
+///
+/// - **SubRip** is copied out of the container bit for bit, or read where it already lies.
+/// - **WebVTT and MOV Text** are transcoded to SubRip: on the way out of the container for
+///   an embedded track, in a second pass for a sidecar. Neither carries styling that
+///   survives anywhere, so there is nothing to lose by it.
+///
+/// Anything else was refused before the page opened, by
+/// [`ToolCapabilities::preview_blocked`].
+///
+/// [`ToolCapabilities::preview_blocked`]: crate::subtitle::ToolCapabilities::preview_blocked
 fn prepare(request: &PrepareRequest, live_generation: &AtomicU64) -> Option<PrepareOutcome> {
     let abandoned = || live_generation.load(Ordering::Relaxed) != request.generation;
     if abandoned() {
         return None;
     }
-    let Some(index) = request.stream_index else {
-        return Some(read_cues(&request.input));
+    // The source as a file to read from: pulled out of the container, or the sidecar
+    // exactly where it lies. A sidecar is never copied — the common case is one that needs
+    // no conversion at all, and one fewer file written is one fewer thing to fail.
+    let source = match request.stream_index {
+        Some(index) => {
+            // Always SubRip, whatever went in: the format either copies out as SubRip or
+            // is transcoded into it. `ffmpeg` picks its muxer from the extension, so this
+            // name and `extract_command`'s `-c:s` have to agree or the muxer refuses the
+            // codec — a disagreement neither half shows on its own.
+            let staged = request.workspace.join(CUES_FILE);
+            let mut command = extract_command(&request.input, index, request.format, &staged);
+            match run_cancellable(&mut command, &abandoned) {
+                RunOutcome::Abandoned => return None,
+                RunOutcome::Failed(message) => return Some(PrepareOutcome::Failed(message)),
+                RunOutcome::Finished(output) if !output.status.success() => {
+                    return Some(PrepareOutcome::Failed(command_failure(
+                        "Could not read this subtitle track",
+                        &output.stderr,
+                    )));
+                }
+                RunOutcome::Finished(_) => staged,
+            }
+        }
+        None => request.input.clone(),
     };
+    if abandoned() {
+        return None;
+    }
+    converted(&source, request, &abandoned)
+}
 
-    let staged = request.workspace.join(CUES_FILE);
-    let mut command = extract_command(&request.input, index, &staged);
-    extracted(run_cancellable(&mut command, &abandoned), &staged)
+/// Turns the extracted or sidecar file into cues, converting it first when it is not
+/// already something this crate can read.
+fn converted(
+    source: &Path,
+    request: &PrepareRequest,
+    abandoned: Abandoned<'_>,
+) -> Option<PrepareOutcome> {
+    match request.format {
+        SubtitleFormat::SubRip => Some(read_cues(source)),
+        // An embedded track was transcoded on the way out already; a sidecar has had
+        // nothing done to it and still needs the pass.
+        SubtitleFormat::WebVtt | SubtitleFormat::MovText => {
+            if request.stream_index.is_some() {
+                return Some(read_cues(source));
+            }
+            let staged = request.workspace.join(CUES_FILE);
+            let mut command = transcode_command(source, &staged);
+            extracted(run_cancellable(&mut command, abandoned), &staged)
+        }
+        // Refused before the page opened, so this is unreachable from the application and
+        // exists to keep the match total.
+        other => Some(PrepareOutcome::Failed(format!(
+            "{} subtitle previewing is not implemented yet.",
+            other.overview_label()
+        ))),
+    }
 }
 
 /// What an extraction run means for the page.
@@ -1161,16 +1231,40 @@ fn frame_command(
     command
 }
 
-/// Copies one subtitle stream out of a container, unchanged.
+/// Pulls one subtitle stream out of a container.
 ///
-/// `-c:s copy` because the page shows the track as it is actually stored; anything that
-/// re-encoded it would be previewing a file the user does not have.
-fn extract_command(media: &Path, index: u64, output: &Path) -> Command {
+/// **`-c:s copy` wherever the format is one this crate parses itself**, because the page
+/// shows the track as it is actually stored and anything that re-encoded it would be
+/// previewing a file the user does not have. For ASS that is not a preference but a
+/// requirement: a transcode to SubRip discards the styles, the `PlayRes`, and every
+/// positioning override, which is most of what an ASS track *is*.
+///
+/// The rest transcode to SubRip on the way out, since nothing here can read them and they
+/// carry no styling that would survive the trip anyway.
+fn extract_command(media: &Path, index: u64, format: SubtitleFormat, output: &Path) -> Command {
+    let codec = match format {
+        SubtitleFormat::SubRip | SubtitleFormat::Ass => "copy",
+        _ => "subrip",
+    };
     let mut command = Command::new("ffmpeg");
     command
         .args(["-v", "error", "-nostdin", "-y", "-i"])
         .arg(media)
-        .args(["-map", &format!("0:{index}"), "-c:s", "copy"])
+        .args(["-map", &format!("0:{index}"), "-c:s", codec])
+        .arg(output);
+    command
+}
+
+/// Rewrites a sidecar into SubRip, for the formats FFmpeg can read but this crate cannot.
+///
+/// The embedded path gets this for free — `extract_command` transcodes as it demuxes — so
+/// this exists only for a file that was never inside a container.
+fn transcode_command(source: &Path, output: &Path) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(source)
+        .args(["-c:s", "subrip"])
         .arg(output);
     command
 }
@@ -1549,6 +1643,7 @@ mod tests {
             generation: 7,
             input: sidecar,
             stream_index: None,
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 
@@ -1565,6 +1660,139 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A WebVTT sidecar is nothing this crate's parser can read, so it takes a second
+    /// pass through `ffmpeg` into SubRip before the cue list ever sees it — and the result
+    /// has to land in the workspace rather than beside the user's file.
+    #[test]
+    fn preparing_a_webvtt_sidecar_should_transcode_it_into_the_workspace_first() {
+        // Arrange
+        require_ffmpeg("preparing_a_webvtt_sidecar_should_transcode_it_into_the_workspace_first");
+        let directory = scratch("vtt-sidecar");
+        let sidecar = directory.join("clip.eng.vtt");
+        std::fs::write(
+            &sidecar,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nfirst\n\n\
+             00:00:03.000 --> 00:00:04.500\nsecond\n",
+        )
+        .unwrap();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let request = PrepareRequest {
+            generation: 5,
+            input: sidecar.clone(),
+            stream_index: None,
+            format: SubtitleFormat::WebVtt,
+            workspace: workspace.clone(),
+        };
+
+        // Act
+        let outcome = prepare(&request, &live(5));
+
+        // Assert
+        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+            panic!("a readable WebVTT sidecar should be ready");
+        };
+        assert_that!(cues.len()).is_equal_to(2);
+        assert_that!(cues[0].text.as_str()).is_equal_to("first");
+        assert_that!(cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(cues[1].text.as_str()).is_equal_to("second");
+        assert_that!(workspace.join(CUES_FILE).exists()).is_true();
+        // The user's own file is left exactly as it was. Nothing on this page edits.
+        assert_that!(std::fs::read_to_string(&sidecar).unwrap().as_str()).contains("WEBVTT");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An embedded WebVTT track is transcoded on the way *out* of the container, so it
+    /// needs no second pass at all — one `ffmpeg` where the sidecar takes two.
+    #[test]
+    fn preparing_an_embedded_webvtt_track_should_transcode_it_as_it_demuxes() {
+        // Arrange
+        require_ffmpeg("preparing_an_embedded_webvtt_track_should_transcode_it_as_it_demuxes");
+        let directory = scratch("vtt-embedded");
+        let text = directory.join("source.srt");
+        std::fs::write(&text, SRT).unwrap();
+        let media = directory.join("clip.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=32x24:r=5:d=5",
+                "-i",
+            ])
+            .arg(&text)
+            .args([
+                "-map", "0:v:0", "-map", "1:s:0", "-c:v", "ffv1", "-c:s", "webvtt",
+            ])
+            .arg(&media)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            built.status.success(),
+            "failed to build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let request = PrepareRequest {
+            generation: 2,
+            input: media,
+            stream_index: Some(1),
+            format: SubtitleFormat::WebVtt,
+            workspace: workspace.clone(),
+        };
+
+        // Act
+        let outcome = prepare(&request, &live(2));
+
+        // Assert
+        let PrepareOutcome::Ready(cues) = outcome.expect("the page is still open") else {
+            panic!("an embedded WebVTT track should be ready");
+        };
+        assert_that!(cues.len()).is_equal_to(2);
+        assert_that!(cues[0].text.as_str()).is_equal_to("first");
+        assert_that!(cues[1].start).is_equal_to(Duration::from_secs(3));
+        // Staged as SubRip, whatever the source was. Written to `cues.vtt` instead, the
+        // WebVTT muxer would refuse the `subrip` the extraction asks it to write.
+        let staged = std::fs::read_to_string(workspace.join(CUES_FILE)).unwrap();
+        assert_that!(staged.as_str()).contains("00:00:01,000 --> 00:00:02,000");
+        assert_that!(staged.contains("WEBVTT")).is_false();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The extraction copies what this crate parses itself and transcodes what it does
+    /// not. Getting this wrong is silent in one direction: a `copy` of a WebVTT track
+    /// writes a file the SubRip parser reads as zero cues, which the page shows as an
+    /// empty track rather than as a failure.
+    #[test]
+    fn an_extraction_should_copy_only_the_formats_this_crate_reads_itself() {
+        // Act / Assert
+        let codec = |format| {
+            let command = extract_command(
+                Path::new("/media/show.mkv"),
+                4,
+                format,
+                Path::new("/tmp/o.srt"),
+            );
+            let arguments: Vec<String> = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            let at = arguments
+                .iter()
+                .position(|argument| argument == "-c:s")
+                .expect("an extraction always names a subtitle codec");
+            arguments[at + 1].clone()
+        };
+        assert_that!(codec(SubtitleFormat::SubRip).as_str()).is_equal_to("copy");
+        assert_that!(codec(SubtitleFormat::WebVtt).as_str()).is_equal_to("subrip");
+        assert_that!(codec(SubtitleFormat::MovText).as_str()).is_equal_to("subrip");
+    }
+
     /// The page distinguishes "nothing to show" from "something went wrong", so an
     /// unreadable file has to fail rather than come back as an empty track.
     #[test]
@@ -1575,6 +1803,7 @@ mod tests {
             generation: 1,
             input: directory.join("gone.eng.srt"),
             stream_index: None,
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 
@@ -1603,6 +1832,7 @@ mod tests {
             generation: 3,
             input: media,
             stream_index: Some(1),
+            format: SubtitleFormat::SubRip,
             workspace: workspace.clone(),
         };
 
@@ -1629,6 +1859,7 @@ mod tests {
         let command = extract_command(
             Path::new("/media/show.mkv"),
             4,
+            SubtitleFormat::SubRip,
             Path::new("/tmp/w/cues.srt"),
         );
 
@@ -1667,6 +1898,7 @@ mod tests {
             // No such stream: the fixture has two.
             input: media,
             stream_index: Some(9),
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 
@@ -1693,6 +1925,7 @@ mod tests {
             generation: 2,
             input: sidecar,
             stream_index: None,
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 
@@ -1829,6 +2062,7 @@ mod tests {
             generation,
             input: sidecar.clone(),
             stream_index: None,
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 
@@ -2246,6 +2480,7 @@ mod tests {
             generation,
             input: sidecar.clone(),
             stream_index: None,
+            format: SubtitleFormat::SubRip,
             workspace: directory.clone(),
         };
 

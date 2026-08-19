@@ -399,6 +399,13 @@ pub struct ToolCapabilities {
     /// frame preview. A build without libass has no `subtitles` filter, and asking one to
     /// burn a cue in fails per keypress rather than once.
     pub ffmpeg_filters: BTreeSet<String>,
+    /// Decoder names from `ffmpeg -decoders`, consulted by the subtitle timing page.
+    ///
+    /// Separate from `ffmpeg_encoders` because the page reads where the rest of the
+    /// program writes: previewing a WebVTT or MOV Text track transcodes it *to* SubRip on
+    /// the way out, so what matters is whether this build can read the source format, and
+    /// a build can perfectly well encode a format it cannot decode.
+    pub ffmpeg_decoders: BTreeSet<String>,
     pub seconv: bool,
     pub tesseract_languages: Vec<String>,
 }
@@ -413,6 +420,7 @@ impl ToolCapabilities {
         let encoders = command_stdout("ffmpeg", &["-hide_banner", "-encoders"]);
         let muxers = command_stdout("ffmpeg", &["-hide_banner", "-muxers"]);
         let filters = command_stdout("ffmpeg", &["-hide_banner", "-filters"]);
+        let decoders = command_stdout("ffmpeg", &["-hide_banner", "-decoders"]);
         let ffmpeg = encoders.is_some() && muxers.is_some();
         let seconv = command_stdout("seconv", &["--help"])
             .as_deref()
@@ -436,6 +444,10 @@ impl ToolCapabilities {
                 .as_deref()
                 .map(parse_filter_names)
                 .unwrap_or_default(),
+            ffmpeg_decoders: decoders
+                .as_deref()
+                .map(parse_capability_names)
+                .unwrap_or_default(),
             seconv,
             tesseract_languages,
         }
@@ -449,6 +461,43 @@ impl ToolCapabilities {
     /// terminal with no image protocol gets.
     pub fn can_burn_subtitles(&self) -> bool {
         self.ffmpeg_filters.contains("subtitles") && self.ffmpeg_filters.contains("scale")
+    }
+
+    /// Why the timing page cannot be opened on a track of this format, if it cannot.
+    ///
+    /// Checked before the page opens rather than reported by a worker afterwards, so a
+    /// missing tool reads as a refusal with a reason instead of a page that loads, sits on
+    /// its loader, and fails. The same reason `format_choices` gates conversion up front.
+    ///
+    /// Each format reaches the cue list by a different road, and it is the road that
+    /// decides what has to be installed:
+    ///
+    /// - **SubRip** is parsed by [`crate::cue`] straight off a `-c:s copy` extraction, so
+    ///   no codec is involved and nothing can be missing.
+    /// - **WebVTT and MOV Text** are transcoded to SubRip on the way out, which needs a
+    ///   build that can *decode* them — a different question from the encoder list the
+    ///   rest of the program asks about.
+    /// - **PGS and VobSub** carry pictures rather than text, so there is nothing for any
+    ///   of this to read.
+    pub fn preview_blocked(&self, format: SubtitleFormat) -> Option<String> {
+        match format {
+            SubtitleFormat::SubRip => None,
+            SubtitleFormat::WebVtt | SubtitleFormat::MovText => {
+                (!self.ffmpeg_decoders.contains(format.ffmpeg_codec())).then(|| {
+                    format!(
+                        "{} previewing needs an FFmpeg build that can decode it.",
+                        format.overview_label()
+                    )
+                })
+            }
+            SubtitleFormat::Ass
+            | SubtitleFormat::Ttml
+            | SubtitleFormat::Pgs
+            | SubtitleFormat::VobSub => Some(format!(
+                "{} subtitle previewing is not implemented yet.",
+                format.overview_label()
+            )),
+        }
     }
 
     pub fn format_choices(
@@ -1406,6 +1455,7 @@ mod tests {
             ]),
             ffmpeg_muxers: BTreeSet::new(),
             ffmpeg_filters: BTreeSet::new(),
+            ffmpeg_decoders: BTreeSet::new(),
             seconv: false,
             tesseract_languages: Vec::new(),
         };
@@ -1470,6 +1520,7 @@ mod tests {
             ffmpeg_encoders: BTreeSet::from(["subrip".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
             ffmpeg_filters: BTreeSet::new(),
+            ffmpeg_decoders: BTreeSet::new(),
             seconv: false,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1508,6 +1559,7 @@ mod tests {
             ffmpeg_encoders: BTreeSet::from(["subrip".to_string(), "dvdsub".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
             ffmpeg_filters: BTreeSet::new(),
+            ffmpeg_decoders: BTreeSet::new(),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1604,6 +1656,7 @@ mod tests {
             ffmpeg_encoders: BTreeSet::from(["dvdsub".to_string()]),
             ffmpeg_muxers: BTreeSet::new(),
             ffmpeg_filters: BTreeSet::new(),
+            ffmpeg_decoders: BTreeSet::new(),
             seconv: false,
             tesseract_languages: Vec::new(),
         };
@@ -1637,6 +1690,7 @@ mod tests {
             ffmpeg_encoders: BTreeSet::new(),
             ffmpeg_muxers: BTreeSet::new(),
             ffmpeg_filters: BTreeSet::new(),
+            ffmpeg_decoders: BTreeSet::new(),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         };
@@ -1878,6 +1932,86 @@ mod tests {
         assert_that!(filters.contains("=")).is_false();
         assert_that!(filters.contains("Timeline")).is_false();
         assert_that!(filters.len()).is_equal_to(4);
+    }
+
+    /// The timing page reads where the rest of the program writes, so it has to ask about
+    /// decoders rather than encoders. FFmpeg ships plenty of one without the other — TTML
+    /// most notably, which is why that format does not take this road at all.
+    #[test]
+    fn preview_should_be_blocked_by_a_missing_decoder_rather_than_a_missing_encoder() {
+        // Arrange: a build that can write every text format and read only SubRip, which a
+        // check against `ffmpeg_encoders` would wave straight through.
+        let capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_encoders: BTreeSet::from([
+                "subrip".to_string(),
+                "webvtt".to_string(),
+                "mov_text".to_string(),
+            ]),
+            ffmpeg_decoders: BTreeSet::from(["subrip".to_string()]),
+            ..ToolCapabilities::default()
+        };
+
+        // Act / Assert
+        assert_that!(capabilities.preview_blocked(SubtitleFormat::SubRip)).is_none();
+        let vtt = capabilities
+            .preview_blocked(SubtitleFormat::WebVtt)
+            .expect("a build that cannot read WebVTT should refuse it");
+        assert_that!(vtt.as_str()).contains("VTT");
+        assert_that!(vtt.as_str()).contains("decode it");
+        assert_that!(
+            capabilities
+                .preview_blocked(SubtitleFormat::MovText)
+                .is_some()
+        )
+        .is_true();
+
+        // Act / Assert: and a build that can read them lets them through.
+        let readable = ToolCapabilities {
+            ffmpeg_decoders: BTreeSet::from([
+                "subrip".to_string(),
+                "webvtt".to_string(),
+                "mov_text".to_string(),
+            ]),
+            ..capabilities
+        };
+        assert_that!(readable.preview_blocked(SubtitleFormat::WebVtt)).is_none();
+        assert_that!(readable.preview_blocked(SubtitleFormat::MovText)).is_none();
+    }
+
+    /// The formats with no road to a cue list say so whatever is installed, since no
+    /// amount of tooling changes that there is nothing yet to read them with.
+    #[test]
+    fn preview_should_refuse_the_formats_with_no_road_to_a_cue_list() {
+        // Arrange: everything installed.
+        let capabilities = ToolCapabilities {
+            ffmpeg: true,
+            ffmpeg_decoders: BTreeSet::from([
+                "subrip".to_string(),
+                "ass".to_string(),
+                "webvtt".to_string(),
+                "mov_text".to_string(),
+                "hdmv_pgs_subtitle".to_string(),
+                "dvd_subtitle".to_string(),
+            ]),
+            seconv: true,
+            tesseract_languages: vec!["eng".to_string()],
+            ..ToolCapabilities::default()
+        };
+
+        // Act / Assert
+        for format in [
+            SubtitleFormat::Ass,
+            SubtitleFormat::Ttml,
+            SubtitleFormat::Pgs,
+            SubtitleFormat::VobSub,
+        ] {
+            let reason = capabilities
+                .preview_blocked(format)
+                .unwrap_or_else(|| panic!("{format:?} should be refused"));
+            assert_that!(reason.as_str()).contains(format.overview_label());
+            assert_that!(reason.as_str()).contains("not implemented yet");
+        }
     }
 
     /// A build without libass has no `subtitles` filter at all, and the timing page has
