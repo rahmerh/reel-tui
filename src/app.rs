@@ -2688,12 +2688,21 @@ impl App {
         // nothing to show a slideshow with, and a build that cannot burn subtitles in would
         // play a span with no line on it — which on this page is not a degraded playback,
         // it is the wrong answer to the only question being asked.
-        if !self
+        //
+        // The picker is taken through the first of those rather than beside it: it is
+        // present exactly when the frame worker is, so binding it here asks the same
+        // question `draws_frames` did and leaves nothing to unwrap further down. It decides
+        // how many pixels a cell is worth, which is what makes a burned-in line readable
+        // rather than a coloured smear — see `preview::playback_subcell`.
+        let Some(picker) = self
             .preview
             .as_ref()
-            .is_some_and(PreviewHandles::draws_frames)
-            || !self.subtitle_capabilities.can_burn_subtitles()
-        {
+            .and_then(PreviewHandles::picker)
+            .cloned()
+        else {
+            return;
+        };
+        if !self.subtitle_capabilities.can_burn_subtitles() {
             return;
         }
         let settings = self.preview_settings;
@@ -2709,11 +2718,15 @@ impl App {
             let Some(cue) = state.selected_cue().cloned() else {
                 return;
             };
-            let cells = crate::preview::playback_cells(state.preview_cells, state.frames.pixels);
+            let cells = crate::preview::playback_cells(
+                state.preview_cells,
+                state.frames.pixels,
+                picker.font_size(),
+            );
             if cells.width == 0 || cells.height == 0 {
                 return;
             }
-            let pixels = crate::preview::playback_pixels(cells);
+            let pixels = crate::preview::playback_pixels(cells, picker.font_size());
             let (span_start, span_end) =
                 crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
             let cue_index = state.selected;
@@ -20776,8 +20789,12 @@ mod tests {
         let stride = (request.pixels.0 as usize) * (request.pixels.1 as usize) * 3;
         crate::preview::PlaybackFrames::new(
             vec![7; stride * count],
-            request.pixels,
-            request.cells,
+            crate::preview::SpanShape {
+                pixels: request.pixels,
+
+                cells: request.cells,
+                picker: ratatui_image::picker::Picker::halfblocks(),
+            },
             request.fps,
             request.span_start,
             Vec::new(),
@@ -20802,17 +20819,18 @@ mod tests {
         // Act
         app.toggle_playback();
 
-        // Assert: the cue under the cursor, with two seconds either side of it.
+        // Assert: the cue under the cursor, with a second either side of it.
         let request = playbacks.try_recv().expect("a span should be asked for");
         assert_that!(request.cue_index).is_equal_to(1);
         assert_that!(request.cue.text.as_str()).is_equal_to("two");
-        assert_that!(request.span_start).is_equal_to(Duration::from_secs(3));
-        assert_that!(request.span_end).is_equal_to(Duration::from_secs(9));
+        assert_that!(request.span_start).is_equal_to(Duration::from_secs(4));
+        assert_that!(request.span_end).is_equal_to(Duration::from_secs(8));
         assert_that!(request.fps).is_equal_to(30);
         // The pane is 40x20 cells; a 1920x1080 source fitted into it proportionally is
-        // 40 cells wide and 11 tall, which is 40x22 pixels.
+        // 40 cells wide and 11 tall, which at the test picker's 10x20 cell is 400x220
+        // pixels — the resolution the terminal will actually draw.
         assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 11));
-        assert_that!(request.pixels).is_equal_to((40, 22));
+        assert_that!(request.pixels).is_equal_to((400, 220));
         assert_that!(request.source.media.clone())
             .is_equal_to(app.subtitle_sync.as_ref().unwrap().media().to_path_buf());
         // And the worker is told this is the span it should be decoding for.

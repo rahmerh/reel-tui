@@ -137,18 +137,34 @@ pub struct Harness {
 
 impl Harness {
     /// Wires up exactly what `main()` does, against an already-populated directory.
+    ///
+    /// The picker stands in for a terminal that offered a real image protocol. Halfblocks
+    /// is the stand-in because it is the only protocol whose output `TestBackend` can be
+    /// asserted on — it draws ordinary cells with colours where kitty, sixel and iTerm2
+    /// write escape sequences the buffer never stores — and because
+    /// `Picker::from_query_stdio` would write to the real terminal and wait for a reply no
+    /// test runner sends. Everything the page does with a frame is protocol-agnostic; only
+    /// the encoder differs. A terminal that offered *nothing* is
+    /// [`Self::start_without_image_protocol`], which is what `preview::drawing_picker`
+    /// produces for a real halfblocks terminal.
     pub fn start(scratch: Scratch) -> Self {
+        Self::start_with_picker(scratch, Some(Picker::halfblocks()))
+    }
+
+    /// A terminal that offered no image protocol at all, so the timing page can never draw
+    /// a frame and says so instead of rendering one nobody could read.
+    pub fn start_without_image_protocol(scratch: Scratch) -> Self {
+        Self::start_with_picker(scratch, None)
+    }
+
+    fn start_with_picker(scratch: Scratch, picker: Option<Picker>) -> Self {
         redirect_cache_dir();
         let directory = scratch.path().to_path_buf();
         let directory_rx = spawn_directory_monitor(directory.clone());
         let (request_tx, probe_rx) = spawn_probe_worker();
         let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
         let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
-        // Halfblocks rather than a queried protocol: `Picker::from_query_stdio` writes to
-        // the real terminal and waits for a reply that a test runner never sends. Halfblocks
-        // also happen to be the one protocol whose output `TestBackend` can be asserted on,
-        // since it draws ordinary cells with colors rather than an escape sequence.
-        let (preview_handles, preview_rx) = spawn_preview_workers(Some(Picker::halfblocks()));
+        let (preview_handles, preview_rx) = spawn_preview_workers(picker);
         let mut app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
         app.set_preview_handles(Some(preview_handles));
         Self {

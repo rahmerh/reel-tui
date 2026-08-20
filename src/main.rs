@@ -46,13 +46,18 @@ fn run(target_dir: PathBuf) -> Result<()> {
     // needs a cooked terminal and an stdin nothing else is draining. Inside the closure it
     // hangs or corrupts the first frame. A terminal that answers nothing falls back to
     // halfblocks, which every terminal can draw.
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // `drawing_picker` then discards a halfblocks answer: two coloured half-cells cannot
+    // show a subtitle burned into a frame, and the timing page says so once rather than
+    // rendering and caching a picture nobody could read.
+    let picker = Picker::from_query_stdio()
+        .ok()
+        .and_then(reel_tui::preview::drawing_picker);
     // Here for the same reason the picker is: enumerating audio devices makes some hosts
     // write to stderr — ALSA especially — and on the alternate screen that lands in the
     // middle of the UI. A machine with no device answers with the fallback, which nothing
     // ends up playing anyway.
     let audio_format = reel_tui::audio::device_format();
-    let (preview_handles, preview_rx) = spawn_preview_workers(Some(picker));
+    let (preview_handles, preview_rx) = spawn_preview_workers(picker);
     let mut app = App::new(target_dir, request_tx, conflict_tx, transcode_tx, remux_tx)?;
     app.set_completion_notification_sender(completion_notification_sender(
         app_config.notifications,

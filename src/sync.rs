@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
-use ratatui_image::protocol::halfblocks::Halfblocks;
+use ratatui_image::{FilterType, Resize};
 
 use crate::audio::{AudioOutput, frame_index_at};
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
@@ -80,10 +80,11 @@ pub enum PreviewSupport {
     /// This FFmpeg has no `subtitles` filter, so a cue cannot be burned onto a frame at
     /// all. The one reachable case in a shipped build.
     NoSubtitleBurn,
-    /// Nothing to draw an image with. Only reachable without a picker, which the binary
-    /// always has — `Picker::halfblocks()` is its fallback and every terminal can draw
-    /// those — so this is here because the code branches on it, not because a user meets
-    /// it.
+    /// Nothing to draw an image with. The answer for every terminal that offers no image
+    /// protocol: `preview::drawing_picker` refuses a halfblocks fallback at startup, since
+    /// two coloured half-cells cannot show a subtitle burned into a frame, and this page
+    /// exists to judge exactly that. Said once and kept on screen, because silence here is
+    /// indistinguishable from a slow render.
     NoImageProtocol,
 }
 
@@ -305,12 +306,31 @@ impl Playback {
     /// frame is decoded at the cell grid's own pixels
     /// ([`crate::preview::playback_pixels`]), so when the pane has not moved there is
     /// nothing to scale at all; when it has, this is the single pass that absorbs it.
+    ///
+    /// The frame is drawn as pixels, through whatever image protocol the terminal offered
+    /// — which is the only way a burned-in subtitle is *readable* rather than merely
+    /// present. The span was decoded at `preview::playback_pixels` for this very picker, so
+    /// `Resize::Scale` has nothing left to scale and the picture reaches the terminal
+    /// untouched.
+    ///
+    /// There is no halfblocks case because there is no halfblocks *page*: `drawing_picker`
+    /// refuses that terminal at startup, and the timing page says why instead of rendering
+    /// something nobody could read.
     fn encode(&self, index: usize) -> Option<Box<Protocol>> {
         let (width, height) = self.frames.pixels;
         let bytes = self.frames.frame(index)?;
-        let image = image::RgbImage::from_raw(width, height, bytes.to_vec())?;
-        let halfblocks = Halfblocks::new(image::DynamicImage::ImageRgb8(image), self.cells).ok()?;
-        Some(Box::new(Protocol::Halfblocks(halfblocks)))
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(
+            width,
+            height,
+            bytes.to_vec(),
+        )?);
+        let protocol = self
+            .frames
+            .picker
+            .clone()
+            .new_protocol(image, self.cells, Resize::Scale(Some(FilterType::Triangle)))
+            .ok()?;
+        Some(Box::new(protocol))
     }
 }
 
@@ -827,14 +847,16 @@ impl SubtitleSyncState {
     /// The cell area a playback should be drawn into, for the pane as it is *now*.
     ///
     /// Derived from the frames' own pixel size rather than remembered from the request:
-    /// that size carries the source's proportions, so this keeps them whatever the pane has
+    /// that carries the picture's proportions, so this keeps them whatever the pane has
     /// become since — and the pane does change, because announcing the playback is itself
     /// what adds the status row that shortens it.
     fn playback_cells(&self) -> Size {
         match &self.playback {
-            PlaybackState::Playing(playback) => {
-                crate::preview::playback_cells(self.preview_cells, playback.frames.pixels)
-            }
+            PlaybackState::Playing(playback) => crate::preview::playback_cells(
+                self.preview_cells,
+                playback.frames.pixels,
+                playback.frames.picker.font_size(),
+            ),
             _ => Size::new(0, 0),
         }
     }
@@ -963,12 +985,14 @@ mod tests {
     }
 
     fn state() -> SubtitleSyncState {
-        costed_state(HALFBLOCKS_BYTES_PER_CELL)
+        costed_state(CHEAP_BYTES_PER_CELL)
     }
 
-    /// What halfblocks costs: two `Color`s and a `char` per cell, and no dependence on the
-    /// font size. The protocol the tests here actually encode with, via `protocol`.
-    const HALFBLOCKS_BYTES_PER_CELL: u64 = 12;
+    /// A per-cell cost small enough that no pane reaches [`FRAME_WINDOW_BUDGET`], so tests
+    /// that are not about the budget get the full window. Sixel on a small font is around
+    /// this; kitty is two orders of magnitude more, which is what
+    /// `a_costly_window_should_be_shortened_to_fit_the_budget` uses instead.
+    const CHEAP_BYTES_PER_CELL: u64 = 12;
 
     fn costed_state(frame_cost: u64) -> SubtitleSyncState {
         SubtitleSyncState::new(
@@ -991,8 +1015,14 @@ mod tests {
 
     /// A protocol occupying exactly `width` x `height` cells.
     ///
-    /// Sized in pixels from the halfblocks font size, because `Resize::Fit` takes the
-    /// cell size from the image's own proportions rather than from what it was asked for.
+    /// Encoded as halfblocks purely as a fixture: what these tests assert is the window
+    /// arithmetic, which is driven by the `frame_cost` handed to [`costed_state`] rather
+    /// than by the encoder, and halfblocks is the cheapest way to obtain a `Protocol` of a
+    /// known cell size. Production never sees this one — `preview::drawing_picker` refuses
+    /// a halfblocks terminal at startup.
+    ///
+    /// Sized in pixels from the picker's font size, because `Resize::Fit` takes the cell
+    /// size from the image's own proportions rather than from what it was asked for.
     fn protocol(width: u16, height: u16) -> Box<Protocol> {
         let picker = ratatui_image::picker::Picker::halfblocks();
         let font = picker.font_size();
@@ -1735,12 +1765,13 @@ mod tests {
         assert_that!(state.has_frame(2)).is_true();
     }
 
-    /// Halfblocks is twelve bytes a cell whatever the pane, and a build with no picker
-    /// encodes nothing at all — neither can ever reach the budget, so neither should be
-    /// made to pay for it with a shortened window.
+    /// A cheap protocol on a huge pane still cannot reach the budget, and a build with no
+    /// picker encodes nothing at all — neither should be made to pay for the budget with a
+    /// shortened window.
     #[test]
     fn a_window_that_costs_nothing_should_never_be_shortened() {
-        // Arrange / Act / Assert: halfblocks, on a pane far past what kitty could afford.
+        // Arrange / Act / Assert: a cheap protocol, on a pane far past what kitty could
+        // afford.
         let mut state = ready(5);
         state.set_preview_cells(Size::new(400, 120));
         state.select(2);
@@ -1793,10 +1824,44 @@ mod tests {
         assert_that!(state().media()).is_equal_to(Path::new("/media/show.mkv"));
     }
 
+    /// The picker a test's spans are decoded and drawn for.
+    ///
+    /// Kitty, because that is what production looks like now: `preview::drawing_picker`
+    /// refuses a halfblocks terminal, so a span is always encoded through a real image
+    /// protocol. Built from `Picker::halfblocks` and switched, since that is the one
+    /// constructor that does not query the terminal — a test runner has none to query.
+    fn test_picker() -> ratatui_image::picker::Picker {
+        let mut picker = ratatui_image::picker::Picker::halfblocks();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        picker
+    }
+
+    /// How many pixels a cell is worth for [`test_picker`].
+    fn test_font() -> ratatui_image::FontSize {
+        test_picker().font_size()
+    }
+
+    /// The shape a test's span is decoded and drawn at: the cell area it was asked for,
+    /// the pixels [`test_picker`] wants per cell, and a source whose proportions hand those
+    /// same cells back — so a resize test moves the pane and nothing else.
+    fn test_shape(cells: Size) -> crate::preview::SpanShape {
+        crate::preview::SpanShape {
+            pixels: crate::preview::playback_pixels(cells, test_font()),
+            cells,
+            picker: test_picker(),
+        }
+    }
+
+    /// How many bytes one frame of a `cells`-sized playback occupies.
+    fn frame_bytes(cells: Size) -> usize {
+        let (width, height) = crate::preview::playback_pixels(cells, test_font());
+        (width as usize) * (height as usize) * 3
+    }
+
     /// A span of `count` frames, each a solid colour naming its index, so a test can tell
     /// which one is on screen from the picture rather than from a counter beside it.
     fn span(count: usize, cells: Size, fps: u32) -> PlaybackFrames {
-        let pixels = crate::preview::playback_pixels(cells);
+        let pixels = crate::preview::playback_pixels(cells, test_font());
         let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
         let mut bytes = Vec::with_capacity(stride * count);
         for index in 0..count {
@@ -1804,8 +1869,7 @@ mod tests {
         }
         PlaybackFrames::new(
             bytes,
-            pixels,
-            cells,
+            test_shape(cells),
             fps,
             Duration::from_secs(10),
             Vec::new(),
@@ -2042,6 +2106,98 @@ mod tests {
             .is_equal_to(Some(Size::new(6, 3)));
     }
 
+    /// Growing the pane re-fits the playback to it without distorting the picture.
+    ///
+    /// The pane changes under a running playback as a matter of course — announcing one is
+    /// itself what adds the status row that shortens it — so the re-fit is not an edge
+    /// case. What it must preserve is the picture's shape: the decoded frames are re-encoded
+    /// into whatever cell area the pane has become, and the proportions of the drawn result
+    /// have to match the proportions of the pixels that went in, whatever the pane's own
+    /// shape is.
+    #[test]
+    fn a_resized_playback_should_fill_the_new_pane_without_distorting_the_picture() {
+        // Arrange: a span whose frames are 4:3, in a pane of exactly that shape.
+        let cells = Size::new(8, 3);
+        let mut state = ready(3);
+        state.set_preview_cells(cells);
+        state.begin_playback(
+            0,
+            PlaybackFrames::new(
+                vec![0; frame_bytes(cells) * 3],
+                test_shape(cells),
+                10,
+                Duration::from_secs(10),
+                Vec::new(),
+            ),
+            Box::new(SilentOutput::new()),
+        );
+        let font = test_font();
+        let (span_width, span_height) = crate::preview::playback_pixels(cells, font);
+
+        // Act: a pane far larger, and a different shape — squarer than the picture.
+        state.set_preview_cells(Size::new(40, 40));
+        assert_that!(state.advance_playback()).is_true();
+
+        // Assert: it grew into the new pane rather than staying at its old size.
+        let drawn = state
+            .playback_frame()
+            .map(|frame| frame.size())
+            .expect("a frame under the playhead");
+        assert_that!(drawn.width > cells.width && drawn.height > cells.height).is_true();
+
+        // Assert: and it kept the picture's proportions rather than the pane's. Compared in
+        // pixels, since that is where a cell's own two-to-one shape cancels out.
+        let width = u32::from(drawn.width) * u32::from(font.width);
+        let height = u32::from(drawn.height) * u32::from(font.height);
+        assert_that!(width * span_height).is_equal_to(height * span_width);
+    }
+
+    /// A playback is drawn as pixels, through the protocol the terminal actually offered,
+    /// at that terminal's own resolution.
+    ///
+    /// This is the difference between a burned-in subtitle being readable and being a
+    /// coloured smear, and it has two halves that must agree: the span is *decoded* at the
+    /// cell's own pixel size, and it is *encoded* through the picker that size came from.
+    /// The picker travels with the span so those cannot drift apart — and an encode that
+    /// fell back to cells-and-colours would still be the right size, the right frame and
+    /// the right cue, so every assertion short of this one passes while the picture is
+    /// unreadable.
+    #[test]
+    fn a_playback_should_draw_through_the_protocol_its_terminal_offered() {
+        // Arrange: a span sized and carried for the terminal's own picker.
+        let cells = Size::new(4, 2);
+        let pixels = crate::preview::playback_pixels(cells, test_font());
+        let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
+        let mut state = ready(3);
+        state.set_preview_cells(cells);
+        state.begin_playback(
+            0,
+            PlaybackFrames::new(
+                vec![120; stride * 3],
+                test_shape(cells),
+                10,
+                Duration::from_secs(1),
+                Vec::new(),
+            ),
+            Box::new(SilentOutput::new()),
+        );
+
+        // Act
+        assert_that!(state.advance_playback()).is_true();
+
+        // Assert: the image protocol, not cells and colours.
+        let protocol = state.playback_frame().expect("a frame under the playhead");
+        assert_that!(matches!(protocol, Protocol::Kitty(_))).is_true();
+
+        // Assert: and the frames were decoded at the cell's own pixels, so there is nothing
+        // to resample on the way to that encoder.
+        let font = test_font();
+        assert_that!(pixels).is_equal_to((
+            u32::from(cells.width) * u32::from(font.width),
+            u32::from(cells.height) * u32::from(font.height),
+        ));
+    }
+
     /// A rate of zero would make the playhead's arithmetic divide by nothing — and in
     /// floating point that is not a panic but an infinity, which `Duration::from_secs_f64`
     /// *does* panic on, in the event loop. Unreachable through the config, which clamps the
@@ -2055,9 +2211,8 @@ mod tests {
         state.begin_playback(
             0,
             PlaybackFrames::new(
-                vec![0; 4 * 4 * 3 * 2],
-                crate::preview::playback_pixels(cells),
-                cells,
+                vec![0; frame_bytes(cells) * 2],
+                test_shape(cells),
                 0,
                 Duration::from_secs(7),
                 Vec::new(),
