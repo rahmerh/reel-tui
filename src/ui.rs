@@ -12088,8 +12088,12 @@ mod tests {
             u32::from(width) * u32::from(font.width),
             u32::from(height) * u32::from(font.height),
         );
+        // Bands several cells wide rather than alternating pixels. `Picker::halfblocks`
+        // fits the image down to one pixel per cell across, so a stripe one pixel wide does
+        // not survive the round trip and the fixture comes back a single averaged shade.
+        let band = u32::from(font.width) * 4;
         for (x, _y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = if x % 2 == 0 {
+            *pixel = if (x / band) % 2 == 0 {
                 image::Rgb([255, 0, 0])
             } else {
                 image::Rgb([0, 0, 255])
@@ -13143,8 +13147,10 @@ mod tests {
         // encodes to spaces under halfblocks whatever colour it is — the two halves of
         // every cell match — so striping the rows is what makes the difference land in the
         // characters a `TestBackend` records.
-        let playback_cells = crate::preview::playback_cells(cells, (1920, 1080));
-        let pixels = crate::preview::playback_pixels(playback_cells);
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let playback_cells =
+            crate::preview::playback_cells(cells, (1920, 1080), picker.font_size());
+        let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
         let striped: Vec<u8> = (0..pixels.1)
             .flat_map(|row| {
                 let shade = if row % 2 == 0 { 0u8 } else { 255 };
@@ -13155,8 +13161,12 @@ mod tests {
             0,
             crate::preview::PlaybackFrames::new(
                 striped,
-                pixels,
-                playback_cells,
+                crate::preview::SpanShape {
+                    pixels,
+
+                    cells: playback_cells,
+                    picker,
+                },
                 10,
                 std::time::Duration::from_secs(1),
                 Vec::new(),
@@ -13260,15 +13270,21 @@ mod tests {
 
         // Act: a span starting where the cue does, stepped onto its first frame.
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        let playback_cells = crate::preview::playback_cells(cells, (1920, 1080));
-        let pixels = crate::preview::playback_pixels(playback_cells);
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let playback_cells =
+            crate::preview::playback_cells(cells, (1920, 1080), picker.font_size());
+        let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
         let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
         app.subtitle_sync.as_mut().unwrap().begin_playback(
             0,
             crate::preview::PlaybackFrames::new(
                 vec![40; stride * 20],
-                pixels,
-                playback_cells,
+                crate::preview::SpanShape {
+                    pixels,
+
+                    cells: playback_cells,
+                    picker,
+                },
                 10,
                 std::time::Duration::from_secs(8),
                 Vec::new(),

@@ -1195,8 +1195,8 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
         .playback_position()
         .expect("a playing span knows where it is");
     assert!(
-        first >= Duration::from_secs(6) && first < Duration::from_secs(7),
-        "the span should start two seconds before the cue, not at it: {first:?}"
+        first >= Duration::from_secs(7) && first < Duration::from_secs(8),
+        "the span should start a second before the cue, not at it: {first:?}"
     );
     assert_eq!(
         state.playback_error(),
@@ -1332,6 +1332,98 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
         Layer::Streams,
         "Esc should then close the page"
     );
+}
+
+/// A terminal with no image protocol gets a page that says so, and renders nothing.
+///
+/// The page's whole job is judging a subtitle against the picture it is burned into, and a
+/// terminal that cannot draw a picture cannot answer that. So `preview::drawing_picker`
+/// refuses the halfblocks fallback at startup and the page opens with its reason on screen
+/// — rather than rendering, caching and playing frames that arrive as coloured mush and
+/// leave the user judging the subtitle by them.
+///
+/// Asserted at this level because the refusal has to hold across four things that are wired
+/// separately: the cue list still loads, no frame is requested, the background cache pass
+/// never starts, and `p` starts no playback. Any one of them left on would spend real work
+/// on a picture that cannot be shown.
+#[test]
+fn a_terminal_with_no_image_protocol_should_say_so_rather_than_draw() {
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "a_terminal_with_no_image_protocol_should_say_so_rather_than_draw";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("no-image-protocol");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(20.0)
+            .audio(&["eng"]),
+    );
+    fs::write(
+        scratch.join("clip.eng.srt"),
+        "1\n00:00:08,000 --> 00:00:10,000\nPLAY THIS LINE\n\n",
+    )
+    .unwrap();
+
+    let mut app = Harness::start_without_image_protocol(scratch);
+    // Read after the harness starts, since that is what redirects `XDG_CACHE_HOME`.
+    let before = cached_tracks();
+    app.open("clip.mkv");
+    // The page opens and reads the track — the cue list is the half that still works.
+    open_sidecar_timing_page(&mut app);
+
+    // Assert: and it says why there is no picture, rather than leaving the pane blank —
+    // silence there is indistinguishable from a render that has not finished.
+    let screen = app.screen();
+    assert!(
+        screen.contains("cannot display images"),
+        "the page should name what the terminal cannot do:\n{screen}"
+    );
+
+    // Assert: nothing was drawn and nothing is coming.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert!(
+        state.frame().is_none(),
+        "a page that cannot draw should hold no frame"
+    );
+    assert_eq!(
+        state.support,
+        reel_tui::sync::PreviewSupport::NoImageProtocol,
+        "the page should know why it is empty"
+    );
+
+    // Act / Assert: and `p` starts no playback either, however long it is given to.
+    app.press(key(KeyCode::Char('p')));
+    for _ in 0..10 {
+        app.pump();
+    }
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert!(
+        state.preparing_playback().is_none() && state.playback_frame().is_none(),
+        "a terminal that cannot draw a frame should not start a playback"
+    );
+
+    // Assert: and the frame cache gained nothing, so the refusal cost no ffmpeg either.
+    // Compared against a reading taken before the page opened rather than against zero:
+    // `XDG_CACHE_HOME` is process-global, so this directory also holds whatever the other
+    // scenarios in this binary have rendered.
+    assert_eq!(
+        cached_tracks(),
+        before,
+        "a page that cannot draw should render no frames"
+    );
+}
+
+/// The media directories the preview frame cache currently holds.
+fn cached_tracks() -> BTreeSet<std::ffi::OsString> {
+    fs::read_dir(
+        reel_tui::cache::DiskCache::cache_dir()
+            .expect("the redirected cache directory")
+            .join("preview_frames"),
+    )
+    .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+    .unwrap_or_default()
 }
 
 /// A format the page has no road to a cue list through is turned away at the door rather

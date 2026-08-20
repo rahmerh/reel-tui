@@ -432,6 +432,32 @@ pub struct PlaybackRequest {
 ///
 /// One buffer rather than a `Vec` of frames: `ffmpeg` writes them back to back on stdout
 /// already, so slicing is arithmetic and the whole span is one allocation.
+/// How one span's frames are shaped.
+///
+/// One value rather than three parameters because the three have to agree and are unusually
+/// easy to mismatch: `pixels` is derived from `cells` and `picker`'s font, and a mismatch
+/// between any two of them is invisible in every assertion short of the drawn picture.
+/// Travelling together is what makes them one decision instead of three.
+#[derive(Clone, Debug)]
+pub struct SpanShape {
+    /// The exact pixel size each frame holds. Exact, not a bound: the span is sliced by
+    /// `width * height * 3`, so a picture one row short shears every frame after the first.
+    ///
+    /// Also the picture's true proportions, because [`playback_cells`] and
+    /// [`playback_pixels`] apply the cell's aspect ratio in opposite directions and cancel
+    /// — which is why re-fitting to a resized pane can ask this and needs no separate
+    /// record of the media's own size.
+    pub pixels: (u32, u32),
+    /// The cell area those pixels fill, which is what they are encoded into for drawing.
+    pub cells: Size,
+    /// The encoder [`Self::pixels`] was chosen for, so the frames are drawn through the
+    /// same picker they were sized for. Carried with the span rather than looked up when a
+    /// frame is drawn, which is what makes it impossible for the two to disagree — and what
+    /// removes the question of what to do with a span that arrived without one, since a
+    /// terminal with no protocol never starts a playback in the first place.
+    pub picker: Picker,
+}
+
 #[derive(Clone)]
 pub struct PlaybackFrames {
     /// Every frame's `rgb24` pixels, back to back. `Arc` because the page hands it to the
@@ -440,6 +466,7 @@ pub struct PlaybackFrames {
     pub pixels: (u32, u32),
     pub cells: Size,
     pub fps: u32,
+    pub picker: Picker,
     /// Where in the media frame zero sits, for the playhead the timeline draws.
     pub span_start: Duration,
     /// The span's sound as interleaved floats, at whatever the device asked for. Empty for
@@ -450,17 +477,22 @@ pub struct PlaybackFrames {
 impl PlaybackFrames {
     pub fn new(
         bytes: Vec<u8>,
-        pixels: (u32, u32),
-        cells: Size,
+        shape: SpanShape,
         fps: u32,
         span_start: Duration,
         samples: Vec<f32>,
     ) -> Self {
+        let SpanShape {
+            pixels,
+            cells,
+            picker,
+        } = shape;
         Self {
             bytes: Arc::new(bytes),
             pixels,
             cells,
             fps,
+            picker,
             span_start,
             samples,
         }
@@ -628,6 +660,12 @@ pub struct PreviewHandles {
     /// Roughly what one encoded frame costs per cell, from the picker's protocol and font
     /// size. See [`frame_bytes_per_cell`].
     frame_cost: u64,
+    /// A copy of the picker the frame worker took, kept because a *playback* is encoded on
+    /// the UI thread rather than by a worker: the frames arrive as raw pixels and are drawn
+    /// straight from the buffer as the audio clock reaches them, so there is no round trip
+    /// to a thread that could hold the picker instead. `None` for the same reason
+    /// [`Self::frame_tx`] is — no protocol, nothing to encode for.
+    picker: Option<Picker>,
 }
 
 impl PreviewHandles {
@@ -688,6 +726,11 @@ impl PreviewHandles {
         self.frame_cost
     }
 
+    /// The picker a playback should encode its frames with, if the terminal has one.
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
     /// Tells the workers that the page they were working for is gone, so a running
     /// `ffmpeg` is killed rather than left demuxing a file nobody is looking at.
     pub fn abandon(&self, generation: u64) {
@@ -720,9 +763,11 @@ impl PreviewHandles {
 fn frame_bytes_per_cell(protocol: ProtocolType, font: FontSize) -> u64 {
     let pixels = u64::from(font.width) * u64::from(font.height);
     match protocol {
-        ProtocolType::Halfblocks => 12,
-        ProtocolType::Kitty | ProtocolType::Iterm2 => pixels * 4 * 4 / 3,
         ProtocolType::Sixel => pixels,
+        // Kitty and iTerm2 keep base64 RGBA. Halfblocks never reaches here — `drawing_picker`
+        // refuses it before the workers are spawned — and charging it the same rather than
+        // its own twelve bytes keeps the match total without a branch nothing can take.
+        _ => pixels * 4 * 4 / 3,
     }
 }
 
@@ -737,6 +782,8 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
         .as_ref()
         .map(|picker| frame_bytes_per_cell(picker.protocol_type(), picker.font_size()))
         .unwrap_or_default();
+    // Cloned for the same reason: the playback encodes on the UI thread and needs one too.
+    let ui_picker = picker.clone();
     let prepare_generation = Arc::clone(&live_generation);
     let prepare_events = event_tx.clone();
 
@@ -770,12 +817,21 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             let playback_events = event_tx.clone();
             let (playback_tx, playback_rx) = mpsc::channel::<PlaybackRequest>();
             let playback_generation = Arc::clone(&live_playback);
+            // The span carries the encoder it was sized for, and this is where that becomes
+            // impossible to get wrong: a playback worker exists only inside this arm, so
+            // there is no such thing as a decoded span without a picker to draw it with.
+            let playback_picker = picker.clone();
             std::thread::spawn(move || {
                 while let Ok(request) = playback_rx.recv() {
                     // Coalescing, like the others: a span takes a second or two to decode
                     // and only the newest press of `p` is one anybody is waiting on.
                     let request = newest(request, &playback_rx);
-                    if !playback(&request, &playback_generation, &playback_events) {
+                    if !playback(
+                        &request,
+                        &playback_picker,
+                        &playback_generation,
+                        &playback_events,
+                    ) {
                         break;
                     }
                 }
@@ -819,6 +875,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             live_generation,
             live_playback,
             frame_cost,
+            picker: ui_picker,
         },
         event_rx,
     )
@@ -875,7 +932,15 @@ fn even(value: u32) -> u32 {
 /// slideshow that never stutters — so this is real resident memory, and it scales with
 /// three things at once: how long the cue is, how large the terminal is, and the frame
 /// rate. The first two are the user's, so the third is what gives. See [`affordable_fps`].
-pub const PLAYBACK_BUDGET: u64 = 96 * 1024 * 1024;
+///
+/// Raised from 96 MB when playbacks started being decoded at the terminal's own pixel
+/// resolution rather than at a halfblock grid ([`playback_pixels`]), which multiplied a
+/// frame's cost by roughly sixty-five. The old figure would have answered that with five
+/// frames a second on any full-screen terminal. That is the trade being made deliberately:
+/// a readable subtitle at a lower rate answers the question this page exists for, and a
+/// smooth unreadable one does not — but a third of a gigabyte, held for the second or two a
+/// span plays and released with it, is a fair price for the rate not collapsing too.
+pub const PLAYBACK_BUDGET: u64 = 384 * 1024 * 1024;
 
 /// The slowest a playback is allowed to get before the budget stops being honoured.
 ///
@@ -929,37 +994,69 @@ pub fn playback_span(cue: &Cue, pad: Duration, duration: Duration) -> (Duration,
 
 /// The cell area a playback fills inside `pane`, keeping the source's proportions.
 ///
-/// Worked out here rather than left to `Resize::Scale`, because a playback is rendered at
-/// exactly the size it is drawn at — `ffmpeg` is told the pixels, and `Halfblocks::new`
-/// resizes to whatever cell area it is handed *without regard to aspect ratio*. Handing it
-/// the whole pane would therefore stretch every frame to the pane's shape, which on a wide
-/// preview pane is a picture nobody could judge a subtitle's position against.
+/// Worked out here rather than left to `Resize::Scale`, because a playback is decoded at
+/// exactly the size it is drawn at: `ffmpeg` is told literal pixels, so this is what
+/// decides them. Getting it wrong does not merely mislay a row — it decodes a picture of
+/// the wrong shape and then asks the encoder to letterbox it, spending memory and frame
+/// rate on bars.
 ///
-/// A halfblock cell is one pixel wide and two tall, so the grid is square-pixelled and the
-/// arithmetic is the source's aspect ratio with a factor of two in it.
-pub fn playback_cells(pane: Size, source: (u32, u32)) -> Size {
+/// The source's aspect ratio, corrected by the cell's: a cell is roughly twice as tall as
+/// it is wide, so a 16:9 picture is nothing like 16:9 *in cells*. Taking that correction
+/// from the font rather than from a constant two is what makes [`playback_pixels`]'s answer
+/// come back to the source's own proportions exactly — the two factors cancel, and a cell
+/// that is 8x17 rather than a tidy 10x20 no longer stretches the picture by a seventeenth.
+pub fn playback_cells(pane: Size, source: (u32, u32), font: FontSize) -> Size {
     let (source_width, source_height) = source;
     let (width, height) = (u32::from(pane.width), u32::from(pane.height));
+    let (cell_width, cell_height) = (u32::from(font.width).max(1), u32::from(font.height).max(1));
     if width == 0 || height == 0 || source_width == 0 || source_height == 0 {
         return Size::new(0, 0);
     }
     // Widest first: a preview pane is usually wider than it is tall in pixels, so the
     // height is what runs out.
-    let fitted = (width * source_height / (source_width * 2)).max(1);
+    let fitted = (width * source_height * cell_width / (source_width * cell_height)).max(1);
     if fitted <= height {
         Size::new(pane.width, fitted as u16)
     } else {
-        let fitted = (height * 2 * source_width / source_height).clamp(1, width);
+        let fitted =
+            (height * cell_height * source_width / (source_height * cell_width)).clamp(1, width);
         Size::new(fitted as u16, pane.height)
     }
 }
 
 /// The pixel size a cell area's frames are rendered at, for [`playback_cells`]'s answer.
 ///
-/// One pixel per cell across and two down — the halfblock grid exactly, so the encode
-/// resamples nothing and the picture the terminal draws is the picture `ffmpeg` produced.
-pub fn playback_pixels(cells: Size) -> (u32, u32) {
-    (u32::from(cells.width), u32::from(cells.height) * 2)
+/// Exactly the terminal's own cell size per cell, so the playback is decoded at the
+/// resolution it will be drawn at: nothing is resampled on the way, and a burned-in
+/// subtitle is as sharp as the source allows. That is what makes the line *readable* rather
+/// than merely present, and it is why the figure comes off the picker rather than out of a
+/// constant.
+///
+/// **This is where a scrub playback's whole cost comes from.** A cell is upwards of 130
+/// pixels, and a playback holds its entire span decoded — see [`PLAYBACK_BUDGET`] and
+/// [`affordable_fps`], which is what gives when the span will not fit.
+pub fn playback_pixels(cells: Size, font: FontSize) -> (u32, u32) {
+    (
+        u32::from(cells.width) * u32::from(font.width).max(1),
+        u32::from(cells.height) * u32::from(font.height).max(1),
+    )
+}
+
+/// The picker previews should be drawn with, or `None` when this terminal cannot draw one.
+///
+/// Halfblocks is not an image protocol, it is two coloured half-cells — and the timing
+/// page's whole job is judging a subtitle against the picture it is burned into, which
+/// needs the picture to be legible. `Picker::from_query_stdio` reports halfblocks for every
+/// terminal that answered nothing, so without this the page would open, render, cache and
+/// play for terminals that can only ever show a coloured smear. Refusing here means the
+/// page says [`crate::sync::PreviewSupport::NoImageProtocol`] once and stays quiet, which
+/// is the honest answer.
+///
+/// Taken at startup rather than checked per frame: the protocol cannot change under a
+/// running process, and one `None` here switches off the workers, the cache pass and the
+/// playback together.
+pub fn drawing_picker(picker: Picker) -> Option<Picker> {
+    (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }
 
 /// Where in the media to grab the frame for `cue`.
@@ -1009,6 +1106,7 @@ pub(crate) fn test_handles() -> TestHandles {
             // What `Picker::halfblocks()` would report, which is what the tests that
             // actually encode a protocol use.
             frame_cost: frame_bytes_per_cell(ProtocolType::Halfblocks, FontSize::new(10, 20)),
+            picker: Some(Picker::halfblocks()),
         },
         prepare_rx,
         frame_rx,
@@ -1435,11 +1533,12 @@ fn encode(bytes: &[u8], picker: &Picker, cells: Size) -> FrameOutcome {
 /// listening for events any more, which means the application has gone.
 fn playback(
     request: &PlaybackRequest,
+    picker: &Picker,
     live_playback: &AtomicU64,
     events: &Sender<PreviewEvent>,
 ) -> bool {
     let abandoned = || live_playback.load(Ordering::Relaxed) != request.generation;
-    let Some(outcome) = decoded(request, &abandoned) else {
+    let Some(outcome) = decoded(request, picker, &abandoned) else {
         // The playback was stopped mid-decode. Nothing to report: the page is already back
         // to its still frame, and a span arriving now would start playing under it.
         return true;
@@ -1459,7 +1558,11 @@ fn playback(
 /// playback is affordable at all: an accurate seek costs the same whether one frame comes
 /// out of it or four hundred, and measured here it is about eight times faster than seeking
 /// per frame.
-fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<PlaybackOutcome> {
+fn decoded(
+    request: &PlaybackRequest,
+    picker: &Picker,
+    abandoned: Abandoned<'_>,
+) -> Option<PlaybackOutcome> {
     if abandoned() {
         return None;
     }
@@ -1488,8 +1591,11 @@ fn decoded(request: &PlaybackRequest, abandoned: Abandoned<'_>) -> Option<Playba
     };
     let frames = PlaybackFrames::new(
         pixels,
-        request.pixels,
-        request.cells,
+        SpanShape {
+            pixels: request.pixels,
+            cells: request.cells,
+            picker: picker.clone(),
+        },
         request.fps,
         request.span_start,
         // Read back off disk rather than off a second pipe: `ffmpeg` writes both outputs
@@ -2156,24 +2262,14 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The spread across protocols is three orders of magnitude, which is the whole reason
-    /// the window's budget consults the picker rather than assuming a figure: halfblocks
-    /// could not reach the budget on any pane a terminal can draw, and kitty reaches it on
-    /// a pane people actually have.
+    /// A frame's cost is the pixels it holds, which is why the window's budget consults the
+    /// picker rather than assuming a figure: the same pane costs four times as much under
+    /// kitty as under sixel, and both scale with the font where nothing about the *cell*
+    /// count does.
     #[test]
     fn a_frame_should_cost_what_its_protocol_actually_holds() {
         // Arrange: a 10x20 font, so a cell is two hundred pixels.
         let font = FontSize::new(10, 20);
-
-        // Act / Assert: halfblocks holds one `HalfBlock` per cell — two `Color`s and a
-        // `char` — and the font size does not enter into it, since the picture *is* the
-        // cell grid.
-        assert_that!(frame_bytes_per_cell(ProtocolType::Halfblocks, font)).is_equal_to(12);
-        assert_that!(frame_bytes_per_cell(
-            ProtocolType::Halfblocks,
-            FontSize::new(30, 60)
-        ))
-        .is_equal_to(12);
 
         // Act / Assert: kitty holds the pixels as RGBA base64, four bytes each and a third
         // again for the encoding. iTerm2 holds base64 PNG, taken uncompressed because how
@@ -2183,6 +2279,14 @@ mod tests {
 
         // Act / Assert: sixel carries no alpha and no base64.
         assert_that!(frame_bytes_per_cell(ProtocolType::Sixel, font)).is_equal_to(200);
+
+        // Act / Assert: and it tracks the font, since that is what says how many pixels a
+        // cell actually is.
+        assert_that!(frame_bytes_per_cell(
+            ProtocolType::Sixel,
+            FontSize::new(30, 60)
+        ))
+        .is_equal_to(1800);
     }
 
     /// The picker moves into the frame worker, so anything the rest of the program needs
@@ -2191,12 +2295,18 @@ mod tests {
     #[test]
     fn spawning_the_workers_should_carry_the_pickers_frame_cost_out_with_them() {
         // Act / Assert
-        let (handles, _events) = spawn_preview_workers(Some(Picker::halfblocks()));
-        assert_that!(handles.frame_bytes_per_cell()).is_equal_to(12);
+        let picker = test_picker();
+        let font = picker.font_size();
+        let (handles, _events) = spawn_preview_workers(Some(picker));
+        assert_that!(handles.frame_bytes_per_cell())
+            .is_equal_to(u64::from(font.width) * u64::from(font.height) * 4 * 4 / 3);
 
-        // Act / Assert
+        // Act / Assert: the shape a terminal with no image protocol arrives in, since
+        // `drawing_picker` turns that answer into `None` before it gets here.
         let (handles, _events) = spawn_preview_workers(None);
         assert_that!(handles.frame_bytes_per_cell()).is_equal_to(0);
+        assert_that!(handles.draws_frames()).is_false();
+        assert_that!(handles.picker().is_none()).is_true();
     }
 
     fn scratch(label: &str) -> PathBuf {
@@ -4645,20 +4755,92 @@ mod tests {
     fn a_playback_should_fill_the_pane_without_changing_the_pictures_shape() {
         // Act / Assert: a 4:3 source in a pane far wider than that. The height runs out,
         // so the width gives — 60 cells is 120 pixels tall, and 4:3 of that is 160 across.
-        assert_that!(playback_cells(Size::new(200, 60), (640, 480)))
-            .is_equal_to(Size::new(160, 60));
+        assert_that!(playback_cells(
+            Size::new(200, 60),
+            (640, 480),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(160, 60));
 
         // Act / Assert: the same source in a pane taller than it is wide. Now the width is
         // what runs out, and the height is chosen to match — 80 across is 60 cells of 4:3.
-        assert_that!(playback_cells(Size::new(80, 90), (640, 480))).is_equal_to(Size::new(80, 30));
+        assert_that!(playback_cells(
+            Size::new(80, 90),
+            (640, 480),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(80, 30));
 
         // Act / Assert: a 16:9 source, which is what most media actually is.
-        assert_that!(playback_cells(Size::new(160, 60), (1920, 1080)))
-            .is_equal_to(Size::new(160, 45));
+        assert_that!(playback_cells(
+            Size::new(160, 60),
+            (1920, 1080),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(160, 45));
 
-        // Act / Assert: and the pixels are the cell grid exactly, so the encode resamples
-        // nothing at all.
-        assert_that!(playback_pixels(Size::new(160, 45))).is_equal_to((160, 90));
+        // Act / Assert: and the pixels are the terminal's own cell size per cell exactly,
+        // so the encode resamples nothing at all.
+        let font = test_picker().font_size();
+        assert_that!(playback_pixels(Size::new(160, 45), font))
+            .is_equal_to((160 * u32::from(font.width), 45 * u32::from(font.height)));
+    }
+
+    /// A terminal offering no image protocol gets no preview at all.
+    ///
+    /// Halfblocks is what `Picker::from_query_stdio` reports for every terminal that
+    /// answered nothing, and two coloured half-cells cannot show a subtitle burned into a
+    /// frame — which is the only thing this page is for. Refusing the picker at startup is
+    /// what turns that into one honest sentence instead of a page that opens, renders,
+    /// caches and plays a picture nobody could read.
+    #[test]
+    fn a_terminal_with_no_image_protocol_should_get_no_picker() {
+        // Act / Assert: the fallback every unanswering terminal lands on is refused.
+        assert_that!(drawing_picker(Picker::halfblocks()).is_none()).is_true();
+
+        // Act / Assert: and every protocol that draws real pixels is kept, with its font
+        // size intact — that figure is what a playback is decoded at.
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            let font = picker.font_size();
+            let kept = drawing_picker(picker).expect("an image protocol should be kept");
+            assert_that!(kept.protocol_type()).is_equal_to(protocol);
+            assert_that!((kept.font_size().width, kept.font_size().height))
+                .is_equal_to((font.width, font.height));
+        }
+    }
+
+    /// The cells and the font each carry half of the picture's proportions, and the two
+    /// halves have to cancel.
+    ///
+    /// [`playback_cells`] divides by two because a *cell* is about twice as tall as it is
+    /// wide, so its answer is deliberately not the source's ratio. [`playback_pixels`] then
+    /// multiplies by the font, which is about twice as tall as it is wide for the same
+    /// reason — and the product comes back to the source's own proportions. Dropping either
+    /// factor, or applying one of them twice, leaves every frame stretched by about four,
+    /// which no assertion about counts, keys or command lines would notice.
+    #[test]
+    fn a_playbacks_cells_and_font_should_cancel_back_to_the_sources_proportions() {
+        // Arrange: a 16:9 source given a pane it fits by height.
+        let font = test_picker().font_size();
+        let cells = playback_cells(Size::new(160, 60), (1920, 1080), test_picker().font_size());
+        let (width, height) = playback_pixels(cells, font);
+
+        // Assert: the cells alone are *not* 16:9 — they carry the factor of two.
+        assert_that!(u32::from(cells.width) * 9).is_equal_to(u32::from(cells.height) * 2 * 16);
+
+        // Assert: the pixels are exactly the font per cell, each way — so the decode lands
+        // on the grid the terminal will draw and nothing is resampled.
+        assert_that!(width).is_equal_to(u32::from(cells.width) * u32::from(font.width));
+        assert_that!(height).is_equal_to(u32::from(cells.height) * u32::from(font.height));
+
+        // Assert: and the two together are back to 16:9, which is the picture the user sees.
+        assert_that!(width * 9).is_equal_to(height * 16);
     }
 
     /// The renderer has not measured the pane on the first frame after the page opens, and
@@ -4667,10 +4849,30 @@ mod tests {
     #[test]
     fn a_playback_should_ask_for_no_picture_when_there_is_nothing_to_size_it_against() {
         // Act / Assert
-        assert_that!(playback_cells(Size::new(0, 60), (640, 480))).is_equal_to(Size::new(0, 0));
-        assert_that!(playback_cells(Size::new(200, 0), (640, 480))).is_equal_to(Size::new(0, 0));
-        assert_that!(playback_cells(Size::new(200, 60), (0, 480))).is_equal_to(Size::new(0, 0));
-        assert_that!(playback_cells(Size::new(200, 60), (640, 0))).is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(
+            Size::new(0, 60),
+            (640, 480),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(
+            Size::new(200, 0),
+            (640, 480),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(
+            Size::new(200, 60),
+            (0, 480),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(0, 0));
+        assert_that!(playback_cells(
+            Size::new(200, 60),
+            (640, 0),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(0, 0));
     }
 
     /// A pane so small that the proportional fit rounds to nothing still has to produce a
@@ -4678,10 +4880,20 @@ mod tests {
     #[test]
     fn a_playback_in_a_sliver_of_a_pane_should_still_have_a_size() {
         // Act / Assert: a very wide source in two cells rounds its height to zero.
-        assert_that!(playback_cells(Size::new(2, 40), (4000, 100))).is_equal_to(Size::new(2, 1));
+        assert_that!(playback_cells(
+            Size::new(2, 40),
+            (4000, 100),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(2, 1));
 
         // Act / Assert: and a very tall one in a single row rounds its width to zero.
-        assert_that!(playback_cells(Size::new(200, 1), (100, 4000))).is_equal_to(Size::new(1, 1));
+        assert_that!(playback_cells(
+            Size::new(200, 1),
+            (100, 4000),
+            test_picker().font_size()
+        ))
+        .is_equal_to(Size::new(1, 1));
     }
 
     /// The span is `pad` either side of the cue, and both ends are real edges: a cue near
@@ -4756,20 +4968,20 @@ mod tests {
     /// the only one of its three inputs that is not the user's to choose.
     #[test]
     fn a_span_too_large_to_hold_should_be_decoded_at_a_lower_rate() {
-        // Arrange: an ordinary seven-second span on an ordinary pane, well inside budget.
-        let ordinary = affordable_fps(30, Duration::from_secs(7), (200, 120));
+        // Arrange: an ordinary three-second span on a modest pane, well inside budget.
+        let ordinary = affordable_fps(30, Duration::from_secs(3), (640, 360));
 
         // Act / Assert: nothing is taken away from it.
         assert_that!(ordinary).is_equal_to(30);
 
-        // Act / Assert: a span and a pane that together will not fit at the rate asked for.
-        // 320x240 is 230 kB a frame, and forty-four seconds of it at 30 fps is three times
-        // the budget — so the rate comes down, and what comes back does fit.
-        let span = Duration::from_secs(44);
-        let squeezed = affordable_fps(30, span, (320, 240));
+        // Act / Assert: a full-screen terminal, where a playback is decoded at the cell's
+        // own pixels — a 1136x680 pane is 2.3 MB a frame, and seven seconds of it at 30 fps
+        // is past the budget. The rate comes down, and what comes back does fit.
+        let span = Duration::from_secs(7);
+        let squeezed = affordable_fps(30, span, (1136, 680));
         assert_that!(squeezed < 30).is_true();
         assert_that!(squeezed > MIN_PLAYBACK_FPS).is_true();
-        assert_that!(u64::from(squeezed) * 44 * 320 * 240 * 3 <= PLAYBACK_BUDGET).is_true();
+        assert_that!(u64::from(squeezed) * 7 * 1136 * 680 * 3 <= PLAYBACK_BUDGET).is_true();
     }
 
     /// Below about five frames a second consecutive frames stop reading as motion, and the
@@ -4812,8 +5024,12 @@ mod tests {
         }
         let frames = PlaybackFrames::new(
             bytes,
-            pixels,
-            Size::new(2, 1),
+            SpanShape {
+                pixels,
+
+                cells: Size::new(2, 1),
+                picker: test_picker(),
+            },
             10,
             Duration::from_secs(5),
             Vec::new(),
@@ -4839,8 +5055,12 @@ mod tests {
         // Arrange
         let frames = PlaybackFrames::new(
             vec![1, 2, 3, 4],
-            (0, 0),
-            Size::new(0, 0),
+            SpanShape {
+                pixels: (0, 0),
+
+                cells: Size::new(0, 0),
+                picker: test_picker(),
+            },
             0,
             Duration::ZERO,
             Vec::new(),
@@ -4860,8 +5080,12 @@ mod tests {
         // Arrange
         let frames = PlaybackFrames::new(
             vec![7; 2 * 2 * 3 * 4],
-            (2, 2),
-            Size::new(2, 1),
+            SpanShape {
+                pixels: (2, 2),
+
+                cells: Size::new(2, 1),
+                picker: test_picker(),
+            },
             25,
             Duration::from_secs(9),
             vec![0.5; 8],
@@ -4910,10 +5134,22 @@ mod tests {
             span_start: Duration::from_secs(1),
             span_end: Duration::from_secs(4),
             fps: 10,
-            pixels: playback_pixels(cells),
+            pixels: playback_pixels(cells, test_picker().font_size()),
             cells,
             audio: None,
         }
+    }
+
+    /// The picker a test's playbacks are sized and encoded for.
+    ///
+    /// Kitty, because that is what production looks like: [`drawing_picker`] refuses a
+    /// halfblocks terminal, so a span is always sized and drawn for a real image protocol.
+    /// Built from `Picker::halfblocks` and switched, since that is the one constructor that
+    /// does not query the terminal — a test runner has none to query.
+    fn test_picker() -> Picker {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        picker
     }
 
     /// The command is what the whole feature rests on, and three of its parts are load
@@ -4960,7 +5196,7 @@ mod tests {
             .iter()
             .find(|argument| argument.starts_with("subtitles="))
             .expect("the filter graph should burn the staged cue in");
-        assert_that!(filters.as_str()).is_equal_to("subtitles=playback.srt,fps=10,scale=32:24");
+        assert_that!(filters.as_str()).is_equal_to("subtitles=playback.srt,fps=10,scale=320:240");
         assert_that!(filters.contains("force_original_aspect_ratio")).is_false();
 
         // Assert: raw pixels out, and the workspace as the working directory so the staged
@@ -5101,7 +5337,8 @@ mod tests {
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
 
         // Assert
         let PlaybackOutcome::Ready(mut frames) = outcome else {
@@ -5148,12 +5385,16 @@ mod tests {
         let mut request = playback_request(&media, &directory, cue(3000, 4000, "BURNED IN"));
         request.span_start = Duration::from_secs(1);
         request.span_end = Duration::from_secs(5);
-        request.cells = Size::new(160, 60);
-        request.pixels = playback_pixels(request.cells);
+        // Small deliberately: `playback_pixels` is eight subcells across *and* down, so a
+        // pane-sized cell area here would hold the whole span in tens of megabytes of RGB
+        // for a comparison that only needs two frames to differ.
+        request.cells = Size::new(16, 6);
+        request.pixels = playback_pixels(request.cells, test_picker().font_size());
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
 
         // Assert
         let PlaybackOutcome::Ready(frames) = outcome else {
@@ -5315,12 +5556,13 @@ mod tests {
         request.span_end = Duration::from_secs(6);
         request.fps = 25;
         request.cells = cells;
-        request.pixels = playback_pixels(cells);
+        request.pixels = playback_pixels(cells, test_picker().font_size());
         request.audio = Some(format);
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
         let PlaybackOutcome::Ready(mut frames) = outcome else {
             panic!("the fixture should decode");
         };
@@ -5372,7 +5614,7 @@ mod tests {
         let always = || true;
 
         // Act / Assert
-        assert_that!(decoded(&request, &always).is_none()).is_true();
+        assert_that!(decoded(&request, &test_picker(), &always).is_none()).is_true();
         // And nothing was staged, since it gave up before writing anything.
         assert_that!(directory.join("playback.srt").exists()).is_false();
 
@@ -5393,7 +5635,8 @@ mod tests {
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
 
         // Assert
         let PlaybackOutcome::Failed(message) = outcome else {
@@ -5415,7 +5658,8 @@ mod tests {
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
 
         // Assert
         let PlaybackOutcome::Failed(message) = outcome else {
@@ -5443,7 +5687,8 @@ mod tests {
         let never = || false;
 
         // Act
-        let outcome = decoded(&request, &never).expect("a live playback reports its outcome");
+        let outcome =
+            decoded(&request, &test_picker(), &never).expect("a live playback reports its outcome");
 
         // Assert
         let PlaybackOutcome::Failed(message) = outcome else {
@@ -5469,7 +5714,7 @@ mod tests {
         let live = AtomicU64::new(request.generation);
 
         // Act
-        let alive = playback(&request, &live, &events_tx);
+        let alive = playback(&request, &test_picker(), &live, &events_tx);
 
         // Assert
         assert_that!(alive).is_true();
@@ -5489,7 +5734,7 @@ mod tests {
         // Act / Assert: the same request against a generation that has moved on says
         // nothing at all, and the worker stays up for the next one.
         let stale = AtomicU64::new(request.generation + 1);
-        assert_that!(playback(&request, &stale, &events_tx)).is_true();
+        assert_that!(playback(&request, &test_picker(), &stale, &events_tx)).is_true();
         assert_that!(events.try_recv().is_err()).is_true();
 
         // Cleanup
@@ -5508,7 +5753,7 @@ mod tests {
         let live = AtomicU64::new(request.generation);
 
         // Act / Assert
-        assert_that!(playback(&request, &live, &events_tx)).is_false();
+        assert_that!(playback(&request, &test_picker(), &live, &events_tx)).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

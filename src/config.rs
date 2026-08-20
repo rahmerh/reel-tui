@@ -70,10 +70,15 @@ const MAX_PLAYBACK_FPS: u32 = 60;
 
 /// How much of the media either side of the cue a scrub playback covers.
 ///
-/// Two seconds is long enough to hear the speech start before the line is due and to hear
-/// it finish after, which is the judgement being made; much more and the span takes longer
-/// to decode and longer to sit through for the same answer.
-const DEFAULT_PLAYBACK_PAD: Duration = Duration::from_secs(2);
+/// A second is long enough to hear the speech start before the line is due and to hear it
+/// finish after, which is the judgement being made; much more and the span takes longer to
+/// decode and longer to sit through for the same answer.
+///
+/// Lowered from two when playbacks started being decoded at the terminal's own pixel
+/// resolution. The span's length multiplies its cost — see `preview::affordable_fps` — so
+/// two seconds either side was buying run-up nobody watches at the price of the frame rate
+/// during the part they do.
+const DEFAULT_PLAYBACK_PAD: Duration = Duration::from_secs(1);
 
 /// A pad of zero is meaningful — play exactly the cue and nothing else — so only the top
 /// is capped. Ten seconds either side is already a twenty-second span.
