@@ -428,10 +428,6 @@ pub struct PlaybackRequest {
     pub audio: Option<crate::audio::OutputFormat>,
 }
 
-/// A span's worth of raw video, and everything needed to read a frame out of it.
-///
-/// One buffer rather than a `Vec` of frames: `ffmpeg` writes them back to back on stdout
-/// already, so slicing is arithmetic and the whole span is one allocation.
 /// How one span's frames are shaped.
 ///
 /// One value rather than three parameters because the three have to agree and are unusually
@@ -458,6 +454,10 @@ pub struct SpanShape {
     pub picker: Picker,
 }
 
+/// A span's worth of raw video, and everything needed to read a frame out of it.
+///
+/// One buffer rather than a `Vec` of frames: `ffmpeg` writes them back to back on stdout
+/// already, so slicing is arithmetic and the whole span is one allocation.
 #[derive(Clone)]
 pub struct PlaybackFrames {
     /// Every frame's `rgb24` pixels, back to back. `Arc` because the page hands it to the
@@ -738,21 +738,12 @@ impl PreviewHandles {
     }
 }
 
-/// Starts the page's background workers: one that reads a track's cues, and — when the
-/// terminal can draw images at all — one that renders the frame at the selected cue along
-/// with the cues around it, and one that renders the rest of the track behind them.
-///
-/// Three threads rather than one because they are asked for different things at different
-/// rates. A single thread would make a held-down `j` queue behind an extraction that is
-/// demuxing a container, or behind a thousand-cue background pass.
 /// Roughly what one encoded frame costs per cell of the pane it was drawn for.
 ///
 /// Read out of `ratatui-image`'s protocol implementations rather than guessed, because the
-/// spread between them is three orders of magnitude and a single figure would be wrong at
-/// one end or the other:
+/// spread between them is fourfold and a single figure would be wrong at one end or the
+/// other:
 ///
-/// - **Halfblocks** keeps a `Vec<HalfBlock>`, one per cell: two `Color`s and a `char`,
-///   twelve bytes. Independent of the font size — the picture *is* the cell grid.
 /// - **Kitty** keeps the transmit string, which is the frame's pixels as RGBA base64:
 ///   four bytes a pixel and a third again for the encoding. That is where the megabytes
 ///   are, and the font size is what turns cells into pixels.
@@ -760,17 +751,26 @@ impl PreviewHandles {
 ///   uncompressed because how well a video frame packs is not knowable here and a budget
 ///   that under-counts is not a budget.
 /// - **Sixel** keeps its own encoding, around a byte a pixel and no alpha.
+///
+/// Halfblocks is not listed because it never arrives: [`drawing_picker`] refuses that
+/// terminal before the workers are spawned. It falls through the same arm as kitty rather
+/// than carrying its own twelve-bytes-a-cell branch, which keeps the match total without a
+/// case nothing can take.
 fn frame_bytes_per_cell(protocol: ProtocolType, font: FontSize) -> u64 {
     let pixels = u64::from(font.width) * u64::from(font.height);
     match protocol {
         ProtocolType::Sixel => pixels,
-        // Kitty and iTerm2 keep base64 RGBA. Halfblocks never reaches here — `drawing_picker`
-        // refuses it before the workers are spawned — and charging it the same rather than
-        // its own twelve bytes keeps the match total without a branch nothing can take.
         _ => pixels * 4 * 4 / 3,
     }
 }
 
+/// Starts the page's background workers: one that reads a track's cues, and — when the
+/// terminal can draw images at all — one that renders the frame at the selected cue along
+/// with the cues around it, and one that renders the rest of the track behind them.
+///
+/// Three threads rather than one because they are asked for different things at different
+/// rates. A single thread would make a held-down `j` queue behind an extraction that is
+/// demuxing a container, or behind a thousand-cue background pass.
 pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receiver<PreviewEvent>) {
     let (prepare_tx, prepare_rx) = mpsc::channel::<PrepareRequest>();
     let (event_tx, event_rx) = mpsc::channel();
