@@ -175,6 +175,57 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                 }
             }
         }
+        // No text entry, so this is the plainest of the settings dialogs: `j`/`k` walk the
+        // fields or an open dropdown's choices, `Enter` opens, commits or flips, and `Esc`
+        // backs out one level. Deliberately no `h`/`l` — picking a value from a list is what
+        // every other settings popup does, and a second grammar for the same job here would
+        // be one this application uses nowhere else.
+        Some(Dialog::PreviewSettings) => match (key.code, key.modifiers) {
+            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_preview_settings_cursor(1);
+            }
+            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_preview_settings_cursor(-1);
+            }
+            // Only the two switches answer these, and only in the summary: their buttons sit
+            // side by side on the row, so `h` is the left one and `l` the right one. A
+            // dropdown row ignores them — a value there is chosen from a list, the way it is
+            // in every other settings popup.
+            (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.set_preview_toggle(true);
+            }
+            (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.set_preview_toggle(false);
+            }
+            (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.move_preview_settings_to_endpoint(true);
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.reset_preview_setting();
+            }
+            // No confirmation, unlike `R` on a file: nothing here is staged, and the worst
+            // an unwanted reset costs is picking the speed again.
+            (KeyCode::Char('R'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                input.reset_sequence();
+                app.reset_preview_settings();
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_preview_setting();
+            }
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.escape_preview_settings();
+            }
+            _ if input.is_double_g(key) => app.move_preview_settings_to_endpoint(false),
+            _ => {}
+        },
         Some(Dialog::AudioSettings) => {
             let mode = app
                 .audio_settings_popup
@@ -918,6 +969,14 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.toggle_playback();
         }
+        // `:` because vim keeps its settings behind `:set`, and this page has no command
+        // line for anything else to be confused with. Modifiers are `_` rather than `NONE`:
+        // `:` is a shifted key on most layouts and arrives carrying `SHIFT` from terminals
+        // that report it, the same reason the `?` and `G` arms do not spell one out.
+        (KeyCode::Char(':'), _) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.open_preview_settings();
+        }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.move_selected_stream(-1);
@@ -1453,6 +1512,7 @@ mod tests {
             (Layer::Streams, Some(Dialog::BatchProcessing)),
             (Layer::Streams, Some(Dialog::ConfirmCancel)),
             (Layer::Streams, Some(Dialog::Error)),
+            (Layer::SubtitleSync, Some(Dialog::PreviewSettings)),
         ];
 
         for (layer, dialog) in contexts {
@@ -3363,6 +3423,199 @@ mod tests {
         assert_that!(app.playback_active()).is_true();
         handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
         assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `:` is vim's settings key, and this is the one page that has any. It must not fire
+    /// anywhere else — and, because `:` is shifted on most layouts, it has to be answered
+    /// whether or not the terminal reports the modifier.
+    #[test]
+    fn colon_should_open_the_preview_settings_only_on_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: nothing on the streams layer.
+        handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
+        assert_that!(app.dialog).is_none();
+
+        // Arrange: open the timing page.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // Act / Assert: and there it opens, shift reported or not.
+        handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `:` and `?` are inert while a span is playing, because a popup cannot be drawn over
+    /// a picture the terminal is repainting through its own image protocol — see
+    /// `App::playback_in_progress`. Checked from the key rather than only from the method,
+    /// since the binding is what a user actually presses.
+    #[test]
+    fn a_playback_should_make_the_dialog_keys_inert_on_the_timing_page() {
+        // Arrange: the page, with a span on the way.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: ["subtitles", "scale"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: std::time::Duration::from_secs(4),
+                end: std::time::Duration::from_secs(6),
+                text: "line".into(),
+                dialogue: None,
+            }],
+            crate::preview::CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+        assert_that!(app.playback_in_progress()).is_true();
+
+        // Act / Assert: neither key raises anything.
+        handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
+        assert_that!(app.dialog).is_none();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
+        assert_that!(app.dialog).is_none();
+
+        // Act / Assert: and both work again the moment the playback stops, so the gate is
+        // the playback rather than the page.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A dialog swallows the keys of the page underneath it. Without that, `h`/`l` in the
+    /// popup would also be the page's own keys and `p` would start a playback the user
+    /// cannot see behind the popup they are still reading.
+    #[test]
+    fn the_preview_settings_popup_should_swallow_the_pages_own_keys() {
+        // Arrange: the popup open over the timing page, with more than one cue to move
+        // between so a leaked `j` would be visible.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(
+            (0..3)
+                .map(|index| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(index as u64 * 4),
+                    end: std::time::Duration::from_secs(index as u64 * 4 + 2),
+                    text: "line".into(),
+                    dialogue: None,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
+
+        // Act: the page's own keys, pressed into the popup.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
+
+        // Assert: the cursor stayed on the first cue and nothing started playing — `j` moved
+        // the popup's own cursor instead.
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::Loop));
+
+        // Act / Assert: `Enter` on a toggle flips it in place — no list opens over a row
+        // whose two answers are already both on it.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.preview_settings().playback_loop).is_true();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(crate::app::PreviewSettingsMode::Summary));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.preview_settings().playback_loop).is_false();
+
+        // Act / Assert: `h` and `l` pick the left button and the right one, and *set* rather
+        // than flip — holding one down lands on an answer and stays there.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.preview_settings().playback_loop).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.preview_settings().playback_loop).is_false();
+        assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+
+        // Act / Assert: `G` walks to the last field, `Enter` opens its list, and `j` moves
+        // inside the list rather than back out to the fields. `h` and `l` are inert there:
+        // a value in a list is chosen the way it is in every other settings popup.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::FrameRate));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::FrameRate));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        // The list runs highest first and opens on the rate in force, so one step down from
+        // thirty is twenty-five... except this config asked for thirty, whose neighbour is
+        // twenty-four.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+
+        // Act / Assert: `r` puts the field back, `gg` returns to the first, and `R` resets
+        // the lot.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        assert_that!(app.preview_settings().playback_fps)
+            .is_equal_to(app.preview_defaults().playback_fps);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::Speed));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
+        assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+
+        // Act / Assert: Esc closes an open list, then the popup, one level at a time.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.preview_settings().playback_speed)
+            .is_equal_to(crate::preview::PlaybackSpeed::STEPS[2]);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.preview_settings().playback_speed)
+            .is_equal_to(crate::preview::PlaybackSpeed::STEPS[2]);
 
         // Cleanup
         drop(app);

@@ -1334,6 +1334,221 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
     );
 }
 
+/// The preview-settings popup decides how the *next* playback is decoded.
+///
+/// Asserted end to end because the popup is wired through five separate things that each
+/// look right on their own: a key that opens a dialog, a dialog that mutates
+/// `PreviewSettings`, a request built from those settings, an `ffmpeg` command built from
+/// that request, and a page that maps the resulting playhead back to media time. A unit test
+/// of any one of them passes while the chain is broken anywhere else.
+///
+/// Speed is checked by *rate* rather than by the command line: at half speed the playhead
+/// crosses the media at half the wall clock, which is the thing the user is actually
+/// judging, and which a `setpts` that reached `ffmpeg` but was never accounted for in
+/// `Playback::position` would fail while every command-line assertion still passed.
+#[test]
+fn preview_settings_should_change_how_the_next_playback_is_decoded() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "preview_settings_should_change_how_the_next_playback_is_decoded";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("preview-settings");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(20.0)
+            .audio(&["eng"]),
+    );
+    // Two cues: a long one to measure a speed against, and a short one whose span ends
+    // quickly enough that a loop is what tells it apart from a playback that never started.
+    fs::write(
+        scratch.join("clip.eng.srt"),
+        "1\n00:00:08,000 --> 00:00:10,000\nPLAY THIS LINE\n\n\
+         2\n00:00:14,000 --> 00:00:14,500\nAND THIS ONE\n\n",
+    )
+    .unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    app.wait_until("a still frame for the cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+
+    // Act: open the popup and set half speed, no sound, and no padding.
+    app.press(key(KeyCode::Char(':')));
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("Preview settings") && screen.contains("Speed"),
+        "`:` should open the preview settings popup:\n{screen}"
+    );
+    // Speed: Enter opens the list, G walks to its slowest entry, k steps back up to half,
+    // Enter commits — the lists run fastest first, so the slow end is the bottom. Assert the
+    // list is really on screen first, since a dropdown that opened into nothing would still
+    // leave the keys below doing something plausible.
+    app.press(key(KeyCode::Enter));
+    app.pump();
+    let open = app.screen();
+    assert!(
+        open.contains("0.25x") && open.contains("2x"),
+        "Enter should open the speed dropdown with every speed in it:\n{open}"
+    );
+    app.press(key(KeyCode::Char('G')));
+    app.press(key(KeyCode::Char('k')));
+    app.press(key(KeyCode::Enter));
+    // Sound: a toggle, so `l` picks the right-hand button where a dropdown would need three
+    // keys.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('l')));
+    // Padding: down to the list's last entry, which is no padding at all.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('G')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Esc));
+    app.pump();
+
+    // Assert: the popup closed onto the page rather than out of it, and the page says what
+    // it will now do without the user having to open the popup again to find out.
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "Esc should close the popup, not the page"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("0.5x") && screen.contains("muted"),
+        "the preview pane should name the settings that differ from the config file:\n{screen}"
+    );
+
+    // Act
+    app.press(key(KeyCode::Char('p')));
+    app.wait_until("the span to start playing", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+
+    // Assert: no padding means the span starts at the cue rather than a second before it,
+    // which is the settings reaching the request.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let started_at = state
+        .playback_position()
+        .expect("a playing span knows where it is");
+    assert!(
+        started_at >= Duration::from_secs(8) && started_at < Duration::from_millis(8_300),
+        "a playback with no padding should start at the cue, not before it: {started_at:?}"
+    );
+
+    // Assert: and the playhead crosses the media at about half the wall clock.
+    let sampling = Instant::now();
+    let mut moved = Duration::ZERO;
+    while sampling.elapsed() < Duration::from_millis(1_200) {
+        app.pump();
+        let Some(state) = app.app.subtitle_sync.as_ref() else {
+            break;
+        };
+        if !state.playback_active() {
+            break;
+        }
+        if let Some(position) = state.playback_position() {
+            moved = position.saturating_sub(started_at);
+        }
+    }
+    let elapsed = sampling.elapsed().as_secs_f64();
+    let rate = moved.as_secs_f64() / elapsed;
+    assert!(
+        (0.3..0.75).contains(&rate),
+        "half speed should cross the media at about half the wall clock, \
+         not {rate:.2}x ({moved:?} of media in {elapsed:.2} s)"
+    );
+
+    // Assert: the popup cannot be raised over the playback. A span's pixels reach the
+    // terminal through its image protocol rather than through the cell buffer a dialog is
+    // drawn into, so a popup opened here would be painted once, wiped by the next frame,
+    // and left open swallowing every key while invisible.
+    app.press(key(KeyCode::Char(':')));
+    app.pump();
+    assert!(
+        app.app.dialog.is_none(),
+        "`:` should be inert while a span is playing, not open a popup the next frame wipes"
+    );
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    assert!(
+        app.app.dialog.is_none(),
+        "`?` should be inert while a span is playing, for the same reason"
+    );
+
+    // Act: back to the config file's settings, then loop the short cue instead.
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+    app.press(key(KeyCode::Char(':')));
+    app.press(key(KeyCode::Char('R')));
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        !screen.contains("0.5x") && !screen.contains("muted"),
+        "resetting should take the badge away again:\n{screen}"
+    );
+    // Loop on — a toggle, so `h` picks its left-hand button — then padding back to nothing.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('h')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('G')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Esc));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('p')));
+    app.wait_until("the short span to start playing", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+
+    // Assert: a half-second span is still going several seconds later, which it could only
+    // be by starting again.
+    let looping = Instant::now();
+    while looping.elapsed() < Duration::from_secs(3) {
+        app.pump();
+        assert!(
+            app.app
+                .subtitle_sync
+                .as_ref()
+                .is_some_and(|state| state.playback_active()),
+            "a looping playback should start again rather than end after {:?}",
+            looping.elapsed()
+        );
+    }
+
+    // Assert: and it is still an ordinary playback — `p` stops it, and Esc leaves the page.
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+    assert!(
+        app.app
+            .subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.playback_active()),
+        "p should stop a looping playback"
+    );
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert_eq!(
+        app.app.layer,
+        Layer::Streams,
+        "Esc should close the page once nothing is playing"
+    );
+}
+
 /// A terminal with no image protocol gets a page that says so, and renders nothing.
 ///
 /// The page's whole job is judging a subtitle against the picture it is burned into, and a

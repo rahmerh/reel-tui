@@ -16,10 +16,11 @@ use crate::{
     app::{
         App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
         ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
-        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer, ResetChoice,
-        SearchState, StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField,
-        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
-        TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
+        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer,
+        PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState, StagedFileStatus,
+        SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode, SubtitleSettingsPopup,
+        TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
+        VideoSettingsMode, describe_track_groups,
     },
     cue::{Cue, LaneLayout, TimelineWindow, format_clock, format_timestamp},
     edit::{AudioSettings, ContainerFormat, stream_index},
@@ -139,6 +140,9 @@ const TICK: u64 = 10;
 /// the timeline track across the bottom. The track's height follows the lane count, so a
 /// track whose cues never overlap spends one row on it and gives the rest to the preview.
 fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Read before the page is borrowed, because `App`'s accessors take the whole of it
+    // while `subtitle_sync` is held mutably below.
+    let badge = playback_settings_badge(app.preview_settings(), app.preview_defaults());
     let Some(state) = app.subtitle_sync.as_mut() else {
         return;
     };
@@ -204,7 +208,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
-    render_sync_preview(frame, state, columns[0]);
+    render_sync_preview(frame, state, columns[0], badge.as_deref());
     render_sync_cues(frame, state, columns[1]);
     render_sync_timeline(frame, state, rows[1]);
     if let Some((message, color)) = status {
@@ -263,6 +267,48 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
     }
 }
 
+/// How the next playback differs from what the config file asked for, if it does.
+///
+/// Absent when nothing has been changed, so the ordinary page is unchanged and the badge
+/// only ever appears because the user made it appear. It goes in the preview pane's title
+/// rather than on the status row because that row already carries one message at a time and
+/// "Preparing playback…" is the one worth reading while a span decodes.
+///
+/// Padding and frame rate are deliberately left out: they change how long a playback takes
+/// to decode rather than what it looks like, and a title listing all five would be longer
+/// than most panes are wide. This is a status line, not control help — the keybindings
+/// popup (`?`) remains the only place this application documents its keys.
+fn playback_settings_badge(
+    settings: crate::app::PreviewSettings,
+    defaults: crate::app::PreviewSettings,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if settings.playback_speed != defaults.playback_speed {
+        parts.push(settings.playback_speed.to_string());
+    }
+    if settings.playback_loop != defaults.playback_loop {
+        parts.push(
+            if settings.playback_loop {
+                "loop"
+            } else {
+                "once"
+            }
+            .to_string(),
+        );
+    }
+    if settings.playback_muted != defaults.playback_muted {
+        parts.push(
+            if settings.playback_muted {
+                "muted"
+            } else {
+                "sound"
+            }
+            .to_string(),
+        );
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The frame at the selected cue, with that cue burned into it.
 ///
 /// An empty pane when there is no frame for the cue under the cursor. The cue's text used
@@ -277,8 +323,17 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
 /// rather than as a flicker, and without it the pane is an unexplained empty box for a
 /// user whose build simply cannot do this. A failure on one *cue* is a different thing and
 /// goes to the status row, because it changes as the cursor moves.
-fn render_sync_preview(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
-    let block = Block::bordered().title(" Preview ");
+fn render_sync_preview(
+    frame: &mut Frame,
+    state: &mut SubtitleSyncState,
+    area: Rect,
+    badge: Option<&str>,
+) {
+    let title = match badge {
+        Some(badge) => format!(" Preview · {badge} "),
+        None => " Preview ".to_string(),
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Recorded for the frame worker, which has to scale to a pane only the renderer has
@@ -1716,6 +1771,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_subtitle_settings_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::PreviewSettings {
+        render_preview_settings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::ConfirmCancel {
         render_batch_progress_dialog(frame, app);
         render_cancel_edit_dialog(frame, app);
@@ -1746,6 +1805,7 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::AudioSettings
         | Dialog::VideoSettings
         | Dialog::SubtitleSettings
+        | Dialog::PreviewSettings
         | Dialog::ConfirmCancel
         | Dialog::ConfirmProcessAll
         | Dialog::BatchProcessing
@@ -1941,12 +2001,20 @@ fn render_cancel_edit_dialog(frame: &mut Frame, app: &App) {
         Line::from(vec![
             action_option(
                 " Keep processing ",
-                app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
+                choice_style(
+                    app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
+                    false,
+                    true,
+                ),
             ),
             Span::raw("  "),
             action_option(
                 " Cancel processing ",
-                app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
+                choice_style(
+                    app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
+                    false,
+                    true,
+                ),
             ),
         ])
         .centered(),
@@ -1977,9 +2045,15 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
         Line::from(scope.label()).centered(),
         Line::from(""),
         Line::from(vec![
-            action_option(" Keep edits ", app.reset_choice == ResetChoice::KeepEdits),
+            action_option(
+                " Keep edits ",
+                choice_style(app.reset_choice == ResetChoice::KeepEdits, false, true),
+            ),
             Span::raw("  "),
-            action_option(" Reset edits ", app.reset_choice == ResetChoice::ResetEdits),
+            action_option(
+                " Reset edits ",
+                choice_style(app.reset_choice == ResetChoice::ResetEdits, false, true),
+            ),
         ])
         .centered(),
     ];
@@ -1999,15 +2073,19 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, focused: bool) -> Span<'static> {
-    Span::styled(
-        label.into(),
-        if focused {
-            focused_style(false)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    )
+/// One button in a row of them — a confirm dialog's Keep/Cancel pair, or a settings row's
+/// Yes/No.
+///
+/// The padding is the caller's, and part of the look: a button reads as a button because its
+/// label has a space either side of it inside the highlight.
+///
+/// Takes the style rather than deriving one, because the two kinds of row mean different
+/// things by "lit". A confirm dialog highlights where the *cursor* is; a settings row
+/// highlights the answer *in force* and shades it by whether that row is focused and whether
+/// it differs from what was configured. Both come out of [`choice_style`], so a button, a
+/// dropdown row and a field value all say "chosen", "changed" and "inert" the same way.
+fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, style: Style) -> Span<'static> {
+    Span::styled(label.into(), style)
 }
 
 pub fn filter_keybindings_text(text: Text<'static>, query: &str) -> (Text<'static>, usize) {
@@ -2158,6 +2236,21 @@ fn keybindings_text() -> Text<'static> {
         &mut lines,
         "p",
         "Play a few seconds around the selected cue, with sound",
+    );
+    keybinding(
+        &mut lines,
+        ":",
+        "Preview settings for this session: speed, loop, sound, padding, frame rate",
+    );
+    keybinding(
+        &mut lines,
+        "h / l",
+        "Choose Yes or No on a switch, in the preview settings dialog",
+    );
+    keybinding(
+        &mut lines,
+        "R",
+        "Reset every preview setting, in the preview settings dialog",
     );
 
     keybindings_section(&mut lines, "Text input");
@@ -2340,12 +2433,20 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
     let buttons = Line::from(vec![
         action_option(
             " \u{25b6} Start ",
-            app.confirm_process_all_choice == ConfirmProcessAllChoice::Start,
+            choice_style(
+                app.confirm_process_all_choice == ConfirmProcessAllChoice::Start,
+                false,
+                true,
+            ),
         ),
         Span::raw("  "),
         action_option(
             " Cancel ",
-            app.confirm_process_all_choice == ConfirmProcessAllChoice::Cancel,
+            choice_style(
+                app.confirm_process_all_choice == ConfirmProcessAllChoice::Cancel,
+                false,
+                true,
+            ),
         ),
     ])
     .centered();
@@ -2555,8 +2656,11 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
     // appears unprompted, so an Enter already in flight must not acknowledge it. See
     // `App::conflict_countdown`.
     let button = match app.conflict_countdown() {
-        Some(seconds) => action_option(format!(" Understood ({seconds}) "), false),
-        None => action_option(" Understood ", true),
+        Some(seconds) => action_option(
+            format!(" Understood ({seconds}) "),
+            choice_style(false, false, true),
+        ),
+        None => action_option(" Understood ", choice_style(true, false, true)),
     };
     frame.render_widget(Paragraph::new(Line::from(button).centered()), chunks[1]);
 }
@@ -4180,6 +4284,122 @@ fn setting_line(
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(format!("[ {value} ]"), value_style),
+    ])
+}
+
+/// How the timing page's scrub playback is done, for this session.
+///
+/// Five stepped values and nothing else — no dropdowns, no text entry, no help panel — so
+/// this is the plainest use of the shared [`SettingsDialog`] in the application. A value
+/// differing from what `config.toml` asked for is drawn as *changed*, which is what makes
+/// "did I leave the speed at half?" answerable at a glance.
+fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.preview_settings_popup.as_ref() else {
+        return;
+    };
+    let settings = app.preview_settings();
+    let defaults = app.preview_defaults();
+    let expanded = popup.mode == PreviewSettingsMode::Dropdown;
+    let mut lines = Vec::new();
+    let mut focus_line = 0;
+
+    for field in PreviewSettingsField::ORDER {
+        let selected = field == popup.field;
+        let (value, changed) = match field {
+            PreviewSettingsField::Speed => (
+                settings.playback_speed.to_string(),
+                settings.playback_speed != defaults.playback_speed,
+            ),
+            PreviewSettingsField::Loop => (
+                String::new(),
+                settings.playback_loop != defaults.playback_loop,
+            ),
+            PreviewSettingsField::Sound => (
+                String::new(),
+                settings.playback_muted != defaults.playback_muted,
+            ),
+            PreviewSettingsField::Padding => (
+                format!("{:.2} s", settings.playback_pad.as_secs_f64()),
+                settings.playback_pad != defaults.playback_pad,
+            ),
+            PreviewSettingsField::FrameRate => (
+                format!("{} fps", settings.playback_fps),
+                settings.playback_fps != defaults.playback_fps,
+            ),
+        };
+        if selected && !(expanded && !field.is_toggle()) {
+            focus_line = lines.len();
+        }
+        if field.is_toggle() {
+            // Phrased as sound rather than as muting, so `Yes` is the ordinary state on this
+            // row the way it is on the one above it.
+            let yes = match field {
+                PreviewSettingsField::Sound => !settings.playback_muted,
+                _ => settings.playback_loop,
+            };
+            lines.push(toggle_line(field.label(), yes, selected, changed));
+            continue;
+        }
+        let open = selected && expanded;
+        lines.push(setting_line(field.label(), &value, selected, changed, open));
+        if !open {
+            continue;
+        }
+        // The same tree-guide children the container, audio and subtitle dropdowns use, so a
+        // list opened here reads exactly like a list opened anywhere else.
+        let choices = app.preview_choices(field);
+        let in_force = app.preview_choice_cursor(field);
+        let last = choices.len().saturating_sub(1);
+        for (index, choice) in choices.iter().enumerate() {
+            if index == popup.cursor {
+                focus_line = lines.len();
+            }
+            lines.push(dropdown_line(
+                choice,
+                index == popup.cursor,
+                index == in_force,
+                true,
+                index == in_force && changed,
+                index == last,
+            ));
+        }
+    }
+
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: " Preview settings ".to_string(),
+            focus_line,
+            help: None,
+            min_height: 10,
+        },
+    );
+}
+
+/// A two-state field, drawn as the same [`action_option`] buttons the confirm dialogs use,
+/// with the answer in force lit.
+///
+/// A dropdown would be the wrong shape here: both states fit on the row, so opening a list
+/// to choose between them hides the answer in order to ask the question. `Enter` flips it,
+/// and `h`/`l` pick the left button or the right one.
+///
+/// Both buttons go through [`choice_style`], which is where the lit one picks up the row's
+/// focused or changed styling and the other its dimming — so which answer is *true* reads at
+/// a glance, and which row the cursor is on reads exactly as it does on a dropdown row.
+fn toggle_line(label: &str, yes: bool, selected: bool, changed: bool) -> Line<'static> {
+    Line::from(vec![
+        field_label_span(
+            "▹",
+            label,
+            Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
+        ),
+        action_option(" Yes ", choice_style(yes && selected, yes && changed, yes)),
+        Span::raw(" "),
+        action_option(
+            " No ",
+            choice_style(!yes && selected, !yes && changed, !yes),
+        ),
     ])
 }
 
@@ -5959,6 +6179,9 @@ mod tests {
         app.layer = Layer::Streams;
         match dialog {
             Dialog::Keybindings => {}
+            Dialog::PreviewSettings => {
+                app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup::default());
+            }
             Dialog::ContainerSettings => {
                 app.container_settings_popup = Some(ContainerSettingsPopup {
                     field: ContainerSettingsField::Title,
@@ -6115,9 +6338,10 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 11] = [
+        const DIALOGS: [(Dialog, &str); 12] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
+            (Dialog::PreviewSettings, "Preview settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
             (Dialog::AudioSettings, "Audio track #1 settings"),
             (Dialog::SubtitleSettings, "Subtitle track #2"),
@@ -11820,7 +12044,7 @@ mod tests {
     #[test]
     fn action_option_should_keep_an_unfocused_action_available() {
         // Act
-        let action = action_option(" Keep processing ", false);
+        let action = action_option(" Keep processing ", choice_style(false, false, true));
 
         // Assert
         assert_eq!(action.style.fg, Some(Color::White));
@@ -13126,6 +13350,184 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The popup is the only place the five values are visible, so it has to show all of
+    /// them — and mark the ones that differ from the config file, which is what answers
+    /// "did I leave the speed at half?" without reading every row.
+    #[test]
+    fn the_preview_settings_dialog_should_show_every_value_and_mark_the_changed_ones() {
+        // Arrange: a config that asked for a lower rate than the built-in default, so the
+        // *file's* answer is what an unchanged row has to show.
+        let (mut app, directory) = sync_page_app("preview-settings", vec![sync_cue(0, 2000, "a")]);
+        app.set_preview_settings(crate::app::PreviewSettings {
+            playback_fps: 24,
+            ..crate::app::PreviewSettings::default()
+        });
+        app.open_preview_settings();
+
+        // Act
+        let screen = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: every row, with the values in force.
+        assert_that!(screen.contains("Preview settings")).is_true();
+        for row in ["Speed", "Loop", "Sound", "Padding", "Frame rate"] {
+            assert_that!(screen.contains(row)).is_true();
+        }
+        assert_that!(screen.contains("[ 1x ]")).is_true();
+        assert_that!(screen.contains("[ 1.00 s ]")).is_true();
+        // The file's rate, not the built-in thirty.
+        assert_that!(screen.contains("[ 24 fps ]")).is_true();
+        // The two switches are button pairs rather than a value in brackets, so both answers
+        // are on the row and the lit one is the state in force.
+        assert_that!(screen.matches("Yes").count()).is_equal_to(2);
+        assert_that!(screen.matches("No").count()).is_equal_to(2);
+
+        // Act: open the speed dropdown.
+        app.activate_preview_setting();
+        let open = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: the field marker turns, and every speed is listed under it with the one in
+        // force marked — the same tree-guide children every other dropdown draws.
+        assert_that!(open.contains("▿")).is_true();
+        for speed in ["0.25x", "0.5x", "0.75x", "1.25x", "1.5x", "2x"] {
+            assert_that!(open.contains(speed)).is_true();
+        }
+        assert_that!(open.contains("> 1x")).is_true();
+        assert_that!(open.contains("└──")).is_true();
+
+        // Act: choose a different speed, then a different rate. The lists run fastest and
+        // highest first, so one step *down* from the value in force is the slower answer.
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        let changed = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: the new values are shown, and the rate row moved off the file's answer.
+        assert_that!(changed.contains("[ 0.75x ]")).is_true();
+        assert_that!(changed.contains("[ 5 fps ]")).is_true();
+
+        // Act / Assert: the dialog raised without its popup state draws the page rather than
+        // panicking on an unwrap — the guard every settings renderer opens with.
+        app.preview_settings_popup = None;
+        let bare = draw(&mut app, 140, 40).join(" ");
+        assert_that!(bare.contains("Preview settings")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The lit button carries the row's own style, so which answer is true and which row the
+    /// cursor is on both read at a glance. Asserted on the styled spans rather than on the
+    /// text, because every state of this row draws the same two words.
+    #[test]
+    fn a_toggle_row_should_light_the_answer_in_force_and_dim_the_other() {
+        // Act / Assert: unselected and unchanged — the lit button is plain white, the other
+        // dimmed.
+        let plain = toggle_line("Loop", true, false, false);
+        assert_that!(style_of(&plain, " Yes ").fg).is_equal_to(Some(Color::White));
+        assert_that!(style_of(&plain, " No ").fg).is_equal_to(Some(Color::DarkGray));
+
+        // Act / Assert: the answer flips with the value, not with the cursor.
+        let no = toggle_line("Loop", false, false, false);
+        assert_that!(style_of(&no, " Yes ").fg).is_equal_to(Some(Color::DarkGray));
+        assert_that!(style_of(&no, " No ").fg).is_equal_to(Some(Color::White));
+
+        // Act / Assert: focused, and focused-and-changed, take the shared field styles the
+        // dropdown rows use — so a toggle does not read as a different kind of row.
+        let focused = toggle_line("Loop", true, true, false);
+        assert_that!(style_of(&focused, " Yes ")).is_equal_to(focused_style(false));
+        let focused_changed = toggle_line("Loop", true, true, true);
+        assert_that!(style_of(&focused_changed, " Yes ")).is_equal_to(focused_style(true));
+
+        // Act / Assert: changed but not focused is the changed style, which is what makes a
+        // setting left on stand out from the rows around it.
+        let changed = toggle_line("Loop", true, false, true);
+        assert_that!(style_of(&changed, " Yes ")).is_equal_to(changed_style());
+        assert_that!(style_of(&changed, " No ").fg).is_equal_to(Some(Color::DarkGray));
+    }
+
+    /// The style of the span holding `text`, for asserting on a row whose every state draws
+    /// the same words.
+    fn style_of(line: &Line<'static>, text: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content == text)
+            .unwrap_or_else(|| panic!("the row should hold a {text} span"))
+            .style
+    }
+
+    /// A playback that will run at half speed, silently, is not something the user should
+    /// have to open a popup to find out about — but nor should an untouched page grow
+    /// furniture. The badge appears only because the user made it appear.
+    #[test]
+    fn the_preview_pane_should_name_only_the_settings_that_differ_from_the_config_file() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("preview-badge", vec![sync_cue(0, 2000, "a")]);
+
+        // Act / Assert: nothing added to an untouched page.
+        let plain = draw(&mut app, 140, 40).join(" ");
+        assert_that!(plain.contains("Preview")).is_true();
+        assert_that!(plain.contains("Preview ·")).is_false();
+
+        // Act: half speed, looping, muted. The speed list runs fastest first, so half is the
+        // second row from the *end*.
+        app.open_preview_settings();
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.move_preview_settings_cursor(-1);
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        let badged = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: all three named, and the padding and rate left out — they change what a
+        // playback costs rather than what it looks like.
+        assert_that!(badged.contains("0.5x")).is_true();
+        assert_that!(badged.contains("loop")).is_true();
+        assert_that!(badged.contains("muted")).is_true();
+
+        // Act / Assert: and turning them back off takes the badge away again.
+        app.open_preview_settings();
+        app.reset_preview_settings();
+        app.escape_preview_settings();
+        assert_that!(draw(&mut app, 140, 40).join(" ").contains("Preview ·")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A config file that turned something *on* makes that the unchanged state, so the badge
+    /// has to name the setting when the user turns it back off — a badge keyed on "is this
+    /// the built-in default" would stay silent exactly when it mattered.
+    #[test]
+    fn the_badge_should_name_a_setting_turned_off_against_a_config_that_turned_it_on() {
+        // Arrange: defaults that already loop and already mute.
+        let settings = crate::app::PreviewSettings {
+            playback_loop: true,
+            playback_muted: true,
+            ..crate::app::PreviewSettings::default()
+        };
+
+        // Act / Assert: matching the defaults says nothing.
+        assert_that!(playback_settings_badge(settings, settings)).is_none();
+
+        // Act / Assert: and going against them names both, in the words of what is now true.
+        let changed = crate::app::PreviewSettings {
+            playback_loop: false,
+            playback_muted: false,
+            ..settings
+        };
+        assert_that!(playback_settings_badge(changed, settings))
+            .is_equal_to(Some("once · sound".to_string()));
+    }
+
     /// The playback takes the pane while it runs, and the still frame is what is left when
     /// it stops. Before its first frame — while the span decodes, and for the moment
     /// between the sound starting and the device's first callback — the still one stays,
@@ -13168,10 +13570,15 @@ mod tests {
                     picker,
                 },
                 10,
+                crate::preview::PlaybackSpeed::NORMAL,
                 std::time::Duration::from_secs(1),
                 Vec::new(),
             ),
-            Box::new(crate::audio::SilentOutput::new()),
+            Box::new(crate::audio::DeviceSource::new(
+                crate::audio::OutputFormat::FALLBACK,
+                std::sync::Arc::new(Vec::new()),
+            )),
+            false,
         );
         app.advance_playback();
         let playing = drawn(80, 24, |frame| render(frame, &mut app));
@@ -13286,10 +13693,15 @@ mod tests {
                     picker,
                 },
                 10,
+                crate::preview::PlaybackSpeed::NORMAL,
                 std::time::Duration::from_secs(8),
                 Vec::new(),
             ),
-            Box::new(crate::audio::SilentOutput::new()),
+            Box::new(crate::audio::DeviceSource::new(
+                crate::audio::OutputFormat::FALLBACK,
+                std::sync::Arc::new(Vec::new()),
+            )),
+            false,
         );
         app.advance_playback();
         let playing = drawn(80, 24, |frame| render(frame, &mut app))

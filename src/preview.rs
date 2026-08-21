@@ -412,7 +412,14 @@ pub struct PlaybackRequest {
     pub span_start: Duration,
     pub span_end: Duration,
     /// Frames a second, already reduced to what [`affordable_fps`] allows.
+    ///
+    /// Frames of *output*, not of media: under a speed other than normal the span is
+    /// stretched or squeezed first, so this many frames a second come out for however long
+    /// the stretched span lasts.
     pub fps: u32,
+    /// How fast the span plays. Applied by the decode itself, to both the picture and the
+    /// sound, so nothing downstream has to keep two timelines in step.
+    pub speed: PlaybackSpeed,
     /// The exact size each frame is rendered at. Exact, not a bound: the output is raw
     /// `rgb24` sliced by `width * height * 3`, so a picture one row shorter than expected
     /// does not crop the playback, it shears every frame after the first.
@@ -467,6 +474,10 @@ pub struct PlaybackFrames {
     pub cells: Size,
     pub fps: u32,
     pub picker: Picker,
+    /// How fast the span was decoded to play. Frames are `1 / fps` apart in *output* time,
+    /// so this is the factor that turns a playhead into a position in the media — see
+    /// `sync::Playback::position`.
+    pub speed: PlaybackSpeed,
     /// Where in the media frame zero sits, for the playhead the timeline draws.
     pub span_start: Duration,
     /// The span's sound as interleaved floats, at whatever the device asked for. Empty for
@@ -479,6 +490,7 @@ impl PlaybackFrames {
         bytes: Vec<u8>,
         shape: SpanShape,
         fps: u32,
+        speed: PlaybackSpeed,
         span_start: Duration,
         samples: Vec<f32>,
     ) -> Self {
@@ -493,6 +505,7 @@ impl PlaybackFrames {
             cells,
             fps,
             picker,
+            speed,
             span_start,
             samples,
         }
@@ -503,8 +516,11 @@ impl PlaybackFrames {
     /// Taken rather than borrowed because it is handed to the audio device, which owns what
     /// it plays for the life of the stream — and because a span's samples are megabytes
     /// that nothing else ever looks at again.
-    pub fn take_samples(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.samples)
+    ///
+    /// Shared rather than owned outright, because a looping playback opens a fresh device
+    /// each time round and every repeat would otherwise copy the whole buffer.
+    pub fn take_samples(&mut self) -> Arc<Vec<f32>> {
+        Arc::new(std::mem::take(&mut self.samples))
     }
 
     /// How many bytes one frame occupies. Zero for a degenerate size, which is what makes
@@ -951,17 +967,104 @@ pub const PLAYBACK_BUDGET: u64 = 384 * 1024 * 1024;
 /// cannot be watched is not.
 pub const MIN_PLAYBACK_FPS: u32 = 5;
 
+/// How fast a scrub playback runs, as a percentage of real time.
+///
+/// Percent in a `u16` rather than a fraction in an `f64` for two reasons. `PreviewSettings`
+/// — where the session's chosen speed lives — derives `Eq`, which a float field forbids;
+/// and the speeds on offer are a fixed list rather than a range, because the question the
+/// page answers is whether a line lands with the speech, and half speed answers it where
+/// 0.47 would only be harder to say out loud.
+///
+/// Applied entirely inside `ffmpeg` — `setpts` on the picture, `atempo` on the sound — so
+/// the two come out of one decode already stretched together and the sound remains the
+/// clock. See [`playback_command`]; `crate::audio` never learns that speeds exist.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PlaybackSpeed(u16);
+
+impl PlaybackSpeed {
+    /// Real time, and the speed a playback runs at unless the user says otherwise. At
+    /// exactly this speed no filter is emitted at all, so the default command is the one
+    /// this feature was built on top of, byte for byte.
+    pub const NORMAL: Self = Self(100);
+
+    /// The ends of the range, named because the rest of this module reasons about them:
+    /// [`atempo_chain`] chains filters because of the first and needs no upward half because
+    /// of the second.
+    ///
+    /// A quarter is the floor because below it the picture stops reading as motion at any
+    /// frame rate; double is the ceiling because speech past it is no longer something a
+    /// line can be judged against.
+    pub const SLOWEST: Self = Self(25);
+    pub const FASTEST: Self = Self(200);
+
+    /// Half speed — the archetypal use of this feature, and the one to reach for when a line
+    /// looks like it might be a syllable out.
+    pub const HALF: Self = Self(50);
+
+    /// Every speed the preview-settings popup offers, **fastest first**.
+    ///
+    /// Descending because the popup lists them descending, and one order for both is what
+    /// stops the list and the cursor disagreeing about which end is which.
+    pub const STEPS: [Self; 7] = [
+        Self::FASTEST,
+        Self(150),
+        Self(125),
+        Self::NORMAL,
+        Self(75),
+        Self::HALF,
+        Self::SLOWEST,
+    ];
+
+    /// The multiplier `ffmpeg` is given, and what the page multiplies output time by to get
+    /// back to media time.
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.0) / 100.0
+    }
+
+    pub fn is_normal(self) -> bool {
+        self == Self::NORMAL
+    }
+}
+
+impl Default for PlaybackSpeed {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+/// `1x`, `0.5x`, `1.25x` — trailing zeros trimmed, because a settings row reads as a value
+/// rather than as a measurement.
+impl std::fmt::Display for PlaybackSpeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let whole = self.0 / 100;
+        match self.0 % 100 {
+            0 => write!(formatter, "{whole}x"),
+            tenths if tenths % 10 == 0 => write!(formatter, "{whole}.{}x", tenths / 10),
+            hundredths => write!(formatter, "{whole}.{hundredths:02}x"),
+        }
+    }
+}
+
 /// The frame rate this span can afford at this size, never above `fps`.
 ///
 /// The same shape as `SubtitleSyncState::window_radius`: a ceiling the user asked for,
 /// lowered to fit a budget, floored at the point where lowering it further defeats the
 /// feature.
-pub fn affordable_fps(fps: u32, span: Duration, pixels: (u32, u32)) -> u32 {
+///
+/// `speed` is not a detail the budget can ignore. `setpts` stretches a span to
+/// `span / speed`, so a half-speed playback holds twice the frames of the same stretch of
+/// media and costs twice the memory. Charging the media span rather than the stretched one
+/// would let a slow playback quietly overshoot [`PLAYBACK_BUDGET`] by the speed factor.
+pub fn affordable_fps(fps: u32, span: Duration, speed: PlaybackSpeed, pixels: (u32, u32)) -> u32 {
     let (width, height) = pixels;
     let stride = u64::from(width) * u64::from(height) * 3;
     // Rounded up, so a span of a few milliseconds is still charged for the frame it holds
     // rather than dividing by nothing.
-    let seconds = span.as_millis().div_ceil(1000).max(1) as u64;
+    let seconds = span
+        .div_f64(speed.as_f64())
+        .as_millis()
+        .div_ceil(1000)
+        .max(1) as u64;
     let per_second = stride.saturating_mul(seconds);
     if per_second == 0 {
         return fps;
@@ -1597,6 +1700,7 @@ fn decoded(
             picker: picker.clone(),
         },
         request.fps,
+        request.speed,
         request.span_start,
         // Read back off disk rather than off a second pipe: `ffmpeg` writes both outputs
         // concurrently, and two pipes into one process is a deadlock waiting for whichever
@@ -1655,7 +1759,6 @@ fn played(run: RunOutcome) -> SpanOutcome {
 /// legible at a size where a scaled-down overlay would not be. `fps` before `scale`, so the
 /// frames thrown away are thrown away before they are resized rather than after.
 fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> Command {
-    let (width, height) = request.pixels;
     let mut command = Command::new("ffmpeg");
     command
         .current_dir(&request.source.workspace)
@@ -1666,10 +1769,7 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> 
         .arg("-i")
         .arg(&request.source.media)
         .args(["-map", "0:v:0", "-an", "-vf"])
-        .arg(format!(
-            "subtitles={staged},fps={},scale={width}:{height}",
-            request.fps
-        ))
+        .arg(video_filters(request, staged))
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
     // A second output, from the same seek and the same decode — which is what makes the
     // sound and the picture describe the same stretch of media by construction rather than
@@ -1687,10 +1787,69 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> 
             .args(["-map", "0:a:0", "-vn", "-f", "f32le", "-ar"])
             .arg(audio.sample_rate.to_string())
             .arg("-ac")
-            .arg(audio.channels.to_string())
-            .arg(AUDIO_FILE);
+            .arg(audio.channels.to_string());
+        // Pitch-preserving, which is the whole reason speech at half speed is still speech
+        // and a line can still be judged against it. A resample would drop it an octave.
+        if !request.speed.is_normal() {
+            command.args(["-af", &atempo_chain(request.speed)]);
+        }
+        command.arg(AUDIO_FILE);
     }
     command
+}
+
+/// The video filter chain: burn the cue in, retime, decimate, resize — in that order.
+///
+/// `setpts` sits between the burn and the `fps` filter deliberately. Ahead of `fps`, so the
+/// rate filter samples the stretched timeline and yields `fps` frames for every second of
+/// *output* rather than `fps × speed` of them. Behind `subtitles`, because libass lays the
+/// text out against the source's own timestamps and a retimed stream would move the cue out
+/// from under the frames it belongs on.
+///
+/// At normal speed no `setpts` is emitted at all, so the command is byte-identical to the
+/// one this feature was added to — which is what keeps the default path free of a filter it
+/// would only ever be a no-op in.
+fn video_filters(request: &PlaybackRequest, staged: &str) -> String {
+    let (width, height) = request.pixels;
+    let mut filters = format!("subtitles={staged}");
+    if !request.speed.is_normal() {
+        filters.push_str(&format!(",setpts=PTS/{}", request.speed.as_f64()));
+    }
+    filters.push_str(&format!(",fps={},scale={width}:{height}", request.fps));
+    filters
+}
+
+/// The narrowest and widest ratio one `atempo` is reliable over.
+///
+/// FFmpeg has widened the accepted range over the years, but chaining is what every version
+/// agrees on — and the floor is what a quarter speed needs regardless.
+const ATEMPO_MIN: f64 = 0.5;
+const ATEMPO_MAX: f64 = 2.0;
+
+/// One or more `atempo` filters whose product is `speed`.
+///
+/// A single filter cannot halve a span twice, so a quarter speed comes out as
+/// `atempo=0.5,atempo=0.5`. Written as a loop rather than as a special case for the one
+/// speed that needs it, so that lowering [`PlaybackSpeed::STEPS`]'s floor later cannot
+/// silently produce a filter `ffmpeg` refuses.
+///
+/// **Only the floor is chained.** [`PlaybackSpeed::FASTEST`] is exactly [`ATEMPO_MAX`], which
+/// one filter takes, so there is no upwards case to write — and an unreachable one would be
+/// a branch no test could ever exercise. Raising that ceiling means adding the mirror of the
+/// loop below, not merely adding a step.
+fn atempo_chain(speed: PlaybackSpeed) -> String {
+    debug_assert!(
+        speed.as_f64() <= ATEMPO_MAX,
+        "raising the speed ceiling needs the upwards half of this chain"
+    );
+    let mut remaining = speed.as_f64();
+    let mut filters = Vec::new();
+    while remaining < ATEMPO_MIN {
+        filters.push(format!("atempo={ATEMPO_MIN}"));
+        remaining /= ATEMPO_MIN;
+    }
+    filters.push(format!("atempo={remaining}"));
+    filters.join(",")
 }
 
 /// The span's sound, staged in the page's workspace beside its cue.
@@ -4969,7 +5128,12 @@ mod tests {
     #[test]
     fn a_span_too_large_to_hold_should_be_decoded_at_a_lower_rate() {
         // Arrange: an ordinary three-second span on a modest pane, well inside budget.
-        let ordinary = affordable_fps(30, Duration::from_secs(3), (640, 360));
+        let ordinary = affordable_fps(
+            30,
+            Duration::from_secs(3),
+            PlaybackSpeed::NORMAL,
+            (640, 360),
+        );
 
         // Act / Assert: nothing is taken away from it.
         assert_that!(ordinary).is_equal_to(30);
@@ -4978,7 +5142,7 @@ mod tests {
         // own pixels — a 1136x680 pane is 2.3 MB a frame, and seven seconds of it at 30 fps
         // is past the budget. The rate comes down, and what comes back does fit.
         let span = Duration::from_secs(7);
-        let squeezed = affordable_fps(30, span, (1136, 680));
+        let squeezed = affordable_fps(30, span, PlaybackSpeed::NORMAL, (1136, 680));
         assert_that!(squeezed < 30).is_true();
         assert_that!(squeezed > MIN_PLAYBACK_FPS).is_true();
         assert_that!(u64::from(squeezed) * 7 * 1136 * 680 * 3 <= PLAYBACK_BUDGET).is_true();
@@ -4991,12 +5155,23 @@ mod tests {
     #[test]
     fn a_playback_should_never_be_slowed_past_the_point_of_being_watchable() {
         // Act / Assert: a span nothing could hold.
-        assert_that!(affordable_fps(30, Duration::from_secs(600), (1920, 1080)))
-            .is_equal_to(MIN_PLAYBACK_FPS);
+        assert_that!(affordable_fps(
+            30,
+            Duration::from_secs(600),
+            PlaybackSpeed::NORMAL,
+            (1920, 1080)
+        ))
+        .is_equal_to(MIN_PLAYBACK_FPS);
 
         // Act / Assert: and a user who asked for less than the floor gets what they asked
         // for — this lowers a rate, it never raises one.
-        assert_that!(affordable_fps(2, Duration::from_secs(1), (16, 16))).is_equal_to(2);
+        assert_that!(affordable_fps(
+            2,
+            Duration::from_secs(1),
+            PlaybackSpeed::NORMAL,
+            (16, 16)
+        ))
+        .is_equal_to(2);
     }
 
     /// A pane the renderer has not measured yet has no pixels to charge for, and dividing
@@ -5004,10 +5179,210 @@ mod tests {
     #[test]
     fn a_span_with_no_size_should_be_charged_nothing_rather_than_divided_by_it() {
         // Act / Assert
-        assert_that!(affordable_fps(30, Duration::from_secs(7), (0, 0))).is_equal_to(30);
+        assert_that!(affordable_fps(
+            30,
+            Duration::from_secs(7),
+            PlaybackSpeed::NORMAL,
+            (0, 0)
+        ))
+        .is_equal_to(30);
         // A span of no length is still charged for the one frame it holds, rather than
         // dividing by zero seconds.
-        assert_that!(affordable_fps(30, Duration::ZERO, (200, 120))).is_equal_to(30);
+        assert_that!(affordable_fps(
+            30,
+            Duration::ZERO,
+            PlaybackSpeed::NORMAL,
+            (200, 120)
+        ))
+        .is_equal_to(30);
+    }
+
+    /// A slowed span is a *longer* span: `setpts` stretches it, so half speed comes back
+    /// with twice the frames and costs twice the memory. Charging the media span rather than
+    /// the stretched one would let a slow playback overshoot the budget by the speed factor
+    /// — invisibly, because every count, key and command line still looks right.
+    #[test]
+    fn a_slowed_span_should_be_charged_for_the_frames_it_actually_holds() {
+        // Arrange: a span and a size that sit just inside the budget at normal speed.
+        let span = Duration::from_secs(7);
+        let pixels = (1136, 680);
+        let ordinary = affordable_fps(30, span, PlaybackSpeed::NORMAL, pixels);
+
+        // Act: the same span at half speed, which yields twice the frames.
+        let slowed = affordable_fps(30, span, PlaybackSpeed::HALF, pixels);
+
+        // Assert: the rate comes down further, and what comes back still fits — charged
+        // against the fourteen seconds of output rather than the seven of media.
+        assert_that!(slowed < ordinary).is_true();
+        assert_that!(u64::from(slowed) * 14 * 1136 * 680 * 3 <= PLAYBACK_BUDGET).is_true();
+
+        // Act / Assert: and in the other direction a squeezed span is cheaper, so a rate the
+        // budget had lowered can come back up.
+        assert_that!(affordable_fps(30, span, PlaybackSpeed::FASTEST, pixels) > ordinary).is_true();
+    }
+
+    /// The speeds are offered fastest first, because that is the order the popup lists them
+    /// in — one order for the list and the cursor is what stops the two disagreeing about
+    /// which end is which.
+    #[test]
+    fn every_speed_should_read_as_a_value_and_be_offered_fastest_first() {
+        // Act / Assert: the list, in the order a reader sees it.
+        let labels: Vec<String> = PlaybackSpeed::STEPS
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_that!(labels).is_equal_to(vec![
+            "2x".to_string(),
+            "1.5x".to_string(),
+            "1.25x".to_string(),
+            "1x".to_string(),
+            "0.75x".to_string(),
+            "0.5x".to_string(),
+            "0.25x".to_string(),
+        ]);
+
+        // Assert: the named speeds are the ends and the middle of that list, so the constants
+        // the rest of the module reasons about cannot drift from what is offered.
+        assert_that!(PlaybackSpeed::STEPS[0]).is_equal_to(PlaybackSpeed::FASTEST);
+        assert_that!(PlaybackSpeed::STEPS[6]).is_equal_to(PlaybackSpeed::SLOWEST);
+        assert_that!(PlaybackSpeed::STEPS.contains(&PlaybackSpeed::NORMAL)).is_true();
+        assert_that!(PlaybackSpeed::STEPS.contains(&PlaybackSpeed::HALF)).is_true();
+
+        // Assert: normal speed says so, and the multiplier is the fraction it reads as.
+        assert_that!(PlaybackSpeed::NORMAL.is_normal()).is_true();
+        assert_that!(PlaybackSpeed::HALF.is_normal()).is_false();
+        assert_that!(PlaybackSpeed::default()).is_equal_to(PlaybackSpeed::NORMAL);
+        assert_that!(PlaybackSpeed::HALF.as_f64()).is_equal_to(0.5);
+        assert_that!(PlaybackSpeed::SLOWEST.as_f64()).is_equal_to(0.25);
+        assert_that!(PlaybackSpeed::FASTEST.as_f64()).is_equal_to(2.0);
+    }
+
+    /// The picture and the sound are retimed by the *same* decode, which is what keeps them
+    /// describing the same stretch of media — and what leaves `crate::audio` knowing nothing
+    /// about speeds at all.
+    #[test]
+    fn a_speed_should_retime_both_the_picture_and_the_sound() {
+        // Arrange
+        let directory = PathBuf::from("/tmp/reel-tui-preview/playback-speed");
+        let mut request = playback_request_at(
+            Path::new("/media/show.mkv"),
+            &directory,
+            cue(2000, 3000, "line"),
+            PlaybackSpeed::HALF,
+        );
+        request.audio = Some(crate::audio::OutputFormat::FALLBACK);
+
+        // Act
+        let arguments = arguments_of(&playback_command(
+            &request,
+            Duration::from_secs(3),
+            "playback.srt",
+        ));
+
+        // Assert: `setpts` sits between the burn and the rate filter — behind `subtitles`,
+        // so libass still lays the text out against the source's own timestamps, and ahead
+        // of `fps`, so ten frames come out per second of *output*.
+        let filters = filter_graph(&arguments);
+        assert_that!(filters.as_str())
+            .is_equal_to("subtitles=playback.srt,setpts=PTS/0.5,fps=10,scale=320:240");
+
+        // Assert: the sound is stretched to match, pitch-preserving, in the same pass.
+        assert_that!(argument_after(&arguments, "-af")).is_equal_to(Some("atempo=0.5".to_string()));
+
+        // Act / Assert: at normal speed neither filter is emitted at all, so the ordinary
+        // command is the one this feature was built on top of.
+        request.speed = PlaybackSpeed::NORMAL;
+        let ordinary = arguments_of(&playback_command(
+            &request,
+            Duration::from_secs(3),
+            "playback.srt",
+        ));
+        assert_that!(filter_graph(&ordinary).as_str())
+            .is_equal_to("subtitles=playback.srt,fps=10,scale=320:240");
+        assert_that!(ordinary.iter().any(|argument| argument == "-af")).is_false();
+    }
+
+    /// One `atempo` cannot halve a span twice, so a quarter speed has to come out as two of
+    /// them. A single `atempo=0.25` is not merely wrong — `ffmpeg` refuses it, and the
+    /// playback fails with a message about a filter rather than about a speed.
+    #[test]
+    fn a_quarter_speed_should_chain_the_filters_one_atempo_cannot_do_alone() {
+        // Act / Assert
+        assert_that!(atempo_chain(PlaybackSpeed::SLOWEST).as_str())
+            .is_equal_to("atempo=0.5,atempo=0.5");
+        assert_that!(atempo_chain(PlaybackSpeed::HALF).as_str()).is_equal_to("atempo=0.5");
+        assert_that!(atempo_chain(PlaybackSpeed::FASTEST).as_str()).is_equal_to("atempo=2");
+        assert_that!(atempo_chain(PlaybackSpeed::STEPS[2]).as_str()).is_equal_to("atempo=1.25");
+
+        // Assert: every speed on offer produces a chain `ffmpeg` will take — each link
+        // inside the range one filter is reliable over, and their product the speed asked
+        // for.
+        for speed in PlaybackSpeed::STEPS {
+            let links: Vec<f64> = atempo_chain(speed)
+                .split(',')
+                .map(|link| {
+                    link.strip_prefix("atempo=")
+                        .expect("every link should be an atempo")
+                        .parse()
+                        .expect("every link should carry a number")
+                })
+                .collect();
+            for link in &links {
+                assert_that!(*link >= ATEMPO_MIN && *link <= ATEMPO_MAX).is_true();
+            }
+            let product: f64 = links.iter().product();
+            assert_that!((product - speed.as_f64()).abs() < 1e-9).is_true();
+        }
+    }
+
+    /// Muting is asked for by wanting no sound rather than by turning a device down, which
+    /// puts a muted playback on exactly the path media with no audio track already takes.
+    #[test]
+    fn a_muted_playback_should_ask_ffmpeg_for_no_sound_at_all() {
+        // Arrange: a request carrying no audio format, which is what muting produces.
+        let directory = PathBuf::from("/tmp/reel-tui-preview/playback-muted");
+        let request = playback_request_at(
+            Path::new("/media/show.mkv"),
+            &directory,
+            cue(2000, 3000, "line"),
+            PlaybackSpeed::HALF,
+        );
+
+        // Act
+        let arguments = arguments_of(&playback_command(
+            &request,
+            Duration::from_secs(3),
+            "playback.srt",
+        ));
+
+        // Assert: no second output at all — not a silenced one.
+        assert_that!(arguments.iter().any(|argument| argument == "0:a:0")).is_false();
+        assert_that!(arguments.iter().any(|argument| argument == "-af")).is_false();
+        assert_that!(arguments.iter().any(|argument| argument == AUDIO_FILE)).is_false();
+
+        // Assert: and the picture is still retimed, so muting costs the sound and nothing
+        // else.
+        assert_that!(filter_graph(&arguments).contains("setpts=PTS/0.5")).is_true();
+    }
+
+    fn arguments_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn filter_graph(arguments: &[String]) -> String {
+        arguments
+            .iter()
+            .find(|argument| argument.starts_with("subtitles="))
+            .expect("the filter graph should burn the staged cue in")
+            .clone()
+    }
+
+    fn argument_after(arguments: &[String], flag: &str) -> Option<String> {
+        let position = arguments.iter().position(|argument| argument == flag)?;
+        arguments.get(position + 1).cloned()
     }
 
     /// The span is one buffer and the frames are read out of it by arithmetic, so the
@@ -5031,6 +5406,7 @@ mod tests {
                 picker: test_picker(),
             },
             10,
+            PlaybackSpeed::NORMAL,
             Duration::from_secs(5),
             Vec::new(),
         );
@@ -5062,6 +5438,7 @@ mod tests {
                 picker: test_picker(),
             },
             0,
+            PlaybackSpeed::NORMAL,
             Duration::ZERO,
             Vec::new(),
         );
@@ -5087,6 +5464,7 @@ mod tests {
                 picker: test_picker(),
             },
             25,
+            PlaybackSpeed::NORMAL,
             Duration::from_secs(9),
             vec![0.5; 8],
         );
@@ -5125,6 +5503,15 @@ mod tests {
     }
 
     fn playback_request(media: &Path, workspace: &Path, cue: Cue) -> PlaybackRequest {
+        playback_request_at(media, workspace, cue, PlaybackSpeed::NORMAL)
+    }
+
+    fn playback_request_at(
+        media: &Path,
+        workspace: &Path,
+        cue: Cue,
+        speed: PlaybackSpeed,
+    ) -> PlaybackRequest {
         let cells = Size::new(32, 12);
         PlaybackRequest {
             generation: 1,
@@ -5134,6 +5521,7 @@ mod tests {
             span_start: Duration::from_secs(1),
             span_end: Duration::from_secs(4),
             fps: 10,
+            speed,
             pixels: playback_pixels(cells, test_picker().font_size()),
             cells,
             audio: None,

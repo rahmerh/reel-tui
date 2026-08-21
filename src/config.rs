@@ -65,8 +65,12 @@ const DEFAULT_PLAYBACK_FPS: u32 = 30;
 /// The floor and ceiling a mistyped rate is held between. Five is where consecutive frames
 /// stop reading as motion at all; sixty is past what any terminal keeps up with, and
 /// nothing above it would be drawn anyway.
-const MIN_PLAYBACK_FPS: u32 = 5;
-const MAX_PLAYBACK_FPS: u32 = 60;
+///
+/// Public because the timing page's preview-settings popup adjusts the same value for the
+/// session, and it must stop at exactly the limits a config file is held to rather than at
+/// a second copy of them that can drift.
+pub const MIN_PLAYBACK_FPS: u32 = 5;
+pub const MAX_PLAYBACK_FPS: u32 = 60;
 
 /// How much of the media either side of the cue a scrub playback covers.
 ///
@@ -82,7 +86,11 @@ const DEFAULT_PLAYBACK_PAD: Duration = Duration::from_secs(1);
 
 /// A pad of zero is meaningful — play exactly the cue and nothing else — so only the top
 /// is capped. Ten seconds either side is already a twenty-second span.
-const MAX_PLAYBACK_PAD: f64 = 10.0;
+///
+/// A `Duration` rather than the seconds it is read from, so the popup and the config loader
+/// share one number instead of one holding a float and the other a conversion of it. The
+/// loader converts *to* seconds at the single point it compares against a parsed float.
+pub const MAX_PLAYBACK_PAD: Duration = Duration::from_secs(10);
 
 /// A typo'd or malicious huge value in the config file must not spawn an unreasonable
 /// number of threads.
@@ -236,7 +244,9 @@ impl Config {
                 // `try_from_secs_f64` rather than `from_secs_f64`, which panics outright on
                 // a negative — which a hand-written config file can perfectly well hold,
                 // and which must not take the process down at launch.
-                .and_then(|pad| Duration::try_from_secs_f64(pad.min(MAX_PLAYBACK_PAD)).ok())
+                .and_then(|pad| {
+                    Duration::try_from_secs_f64(pad.min(MAX_PLAYBACK_PAD.as_secs_f64())).ok()
+                })
                 .unwrap_or(defaults.playback_pad),
         }
     }
@@ -512,7 +522,7 @@ mod tests {
         );
         assert_eq!(
             load(b"[preview.playback]\npad = 600.0\n").playback_pad,
-            Duration::from_secs_f64(MAX_PLAYBACK_PAD)
+            MAX_PLAYBACK_PAD
         );
 
         // Act / Assert: and a negative or a non-finite pad, both of which `from_secs_f64`
