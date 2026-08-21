@@ -299,19 +299,12 @@ impl Playback {
 
     /// One frame's pixels as something the terminal can draw.
     ///
-    /// `Halfblocks::new` directly rather than `Picker::new_protocol`: the picker's
-    /// halfblocks font size is an arbitrary 1:2 placeholder, so `Resize::Scale` would blow
-    /// the frame up to that font's idea of the pane and `Halfblocks` would immediately
-    /// resample it back down to the cell grid — two passes, the expensive one wasted. The
-    /// frame is decoded at the cell grid's own pixels
-    /// ([`crate::preview::playback_pixels`]), so when the pane has not moved there is
-    /// nothing to scale at all; when it has, this is the single pass that absorbs it.
-    ///
     /// The frame is drawn as pixels, through whatever image protocol the terminal offered
     /// — which is the only way a burned-in subtitle is *readable* rather than merely
-    /// present. The span was decoded at `preview::playback_pixels` for this very picker, so
-    /// `Resize::Scale` has nothing left to scale and the picture reaches the terminal
-    /// untouched.
+    /// present. The span was decoded at [`crate::preview::playback_pixels`] for this very
+    /// picker, so when the pane has not moved `Resize::Scale` has nothing left to scale and
+    /// the picture reaches the terminal untouched; when it has, this is the single pass
+    /// that absorbs it.
     ///
     /// There is no halfblocks case because there is no halfblocks *page*: `drawing_picker`
     /// refuses that terminal at startup, and the timing page says why instead of rendering
@@ -327,7 +320,6 @@ impl Playback {
         let protocol = self
             .frames
             .picker
-            .clone()
             .new_protocol(image, self.cells, Resize::Scale(Some(FilterType::Triangle)))
             .ok()?;
         Some(Box::new(protocol))

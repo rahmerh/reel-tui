@@ -2693,7 +2693,7 @@ impl App {
         // present exactly when the frame worker is, so binding it here asks the same
         // question `draws_frames` did and leaves nothing to unwrap further down. It decides
         // how many pixels a cell is worth, which is what makes a burned-in line readable
-        // rather than a coloured smear — see `preview::playback_subcell`.
+        // rather than a coloured smear — see `preview::playback_pixels`.
         let Some(picker) = self
             .preview
             .as_ref()
