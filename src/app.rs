@@ -30,7 +30,7 @@ use crate::{
     framecache,
     preview::{
         CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackOutcome, PlaybackRequest,
-        PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles, WarmRequest,
+        PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -48,6 +48,12 @@ use crate::{
 ///
 /// Resolved by `main` from `config.toml` and from whether the directory sits on a network
 /// mount, so `App` holds one answer rather than re-deriving the policy at each decision.
+///
+/// The playback half of it is also **adjustable for the session** from the timing page's
+/// preview-settings popup (`:`), which mutates this in place and never writes to disk —
+/// `config.toml` stays the defaults, and `App::preview_defaults` keeps a copy of them so a
+/// field can be put back. The cache half is not adjustable: a background pass is already
+/// running against the policy it was started under.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreviewSettings {
     /// Whether opening a page renders every cue's frame in the background.
@@ -63,6 +69,17 @@ pub struct PreviewSettings {
     pub playback_fps: u32,
     /// How much of the media either side of the cue a scrub playback covers.
     pub playback_pad: Duration,
+    /// How fast a scrub playback runs. Session-only — there is no config key for it,
+    /// because the speed you want depends on the line you are looking at.
+    pub playback_speed: PlaybackSpeed,
+    /// Whether a span starts again when it reaches its end instead of stopping.
+    pub playback_loop: bool,
+    /// Whether the span plays without its sound.
+    ///
+    /// Muting asks for no audio output from the decode at all, which puts the playback on
+    /// exactly the path media with no audio track already takes: no samples, a
+    /// `SilentOutput`, and a slideshow at the right rate.
+    pub playback_muted: bool,
 }
 
 impl Default for PreviewSettings {
@@ -74,9 +91,129 @@ impl Default for PreviewSettings {
             cache_tracks: defaults.preview_cache_tracks,
             playback_fps: defaults.playback_fps,
             playback_pad: defaults.playback_pad,
+            playback_speed: PlaybackSpeed::NORMAL,
+            playback_loop: false,
+            playback_muted: false,
         }
     }
 }
+
+/// Where the preview-settings popup's cursor is, and whether a dropdown is open under it.
+///
+/// The values themselves live in [`PreviewSettings`], not here: the popup is a view onto the
+/// session's settings, so closing and re-opening it shows what is in force rather than what
+/// was last typed into it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreviewSettingsPopup {
+    pub field: PreviewSettingsField,
+    pub mode: PreviewSettingsMode,
+    /// Which row of the open dropdown the cursor is on. Seeded from the value in force when
+    /// the dropdown opens, so `Enter` `Enter` is a no-op rather than a change to whatever
+    /// happens to be first in the list. Meaningless in [`PreviewSettingsMode::Summary`].
+    pub cursor: usize,
+}
+
+/// Whether the popup's cursor is walking its fields or the choices of one open dropdown.
+///
+/// The same two-level shape the container, audio, video and subtitle popups use, so `Enter`
+/// opens and commits and `Esc` backs out one level at a time everywhere in the application.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewSettingsMode {
+    #[default]
+    Summary,
+    Dropdown,
+}
+
+impl PreviewSettingsPopup {
+    /// The same popup with its cursor on row `row` — a field, or a choice of the open
+    /// dropdown, depending on which the cursor is currently walking.
+    ///
+    /// Returned rather than assigned in place because reading how many rows there are needs
+    /// `&App` while writing the cursor needs `&mut App`; handing back a whole `Copy` popup
+    /// keeps the two apart without a re-borrow whose failure case could never happen.
+    fn at_row(self, row: usize) -> Self {
+        match self.mode {
+            PreviewSettingsMode::Dropdown => Self {
+                cursor: row,
+                ..self
+            },
+            PreviewSettingsMode::Summary => Self {
+                field: PreviewSettingsField::ORDER[row],
+                ..self
+            },
+        }
+    }
+}
+
+/// The rows of the preview-settings popup, in the order they are drawn.
+///
+/// Ordered by how often a playback wants them changed rather than by what they cost: speed
+/// is the reason the popup exists, and padding and frame rate are usually set once.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewSettingsField {
+    #[default]
+    Speed,
+    Loop,
+    Sound,
+    Padding,
+    FrameRate,
+}
+
+impl PreviewSettingsField {
+    pub const ORDER: [Self; 5] = [
+        Self::Speed,
+        Self::Loop,
+        Self::Sound,
+        Self::Padding,
+        Self::FrameRate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Speed => "Speed",
+            Self::Loop => "Loop",
+            Self::Sound => "Sound",
+            Self::Padding => "Padding",
+            Self::FrameRate => "Frame rate",
+        }
+    }
+
+    /// Whether this row is a yes/no button pair rather than a dropdown.
+    ///
+    /// Two states do not want a list to open over them — the answer is already on screen,
+    /// and `Enter` on a pair of buttons is one keypress where a dropdown is three.
+    pub fn is_toggle(self) -> bool {
+        matches!(self, Self::Loop | Self::Sound)
+    }
+}
+
+/// The paddings the popup offers, largest first.
+///
+/// A curated list rather than every quarter-second between the floor and the ceiling: a
+/// dropdown of forty rows is a worse way to pick a number than a dropdown of eight, and the
+/// paddings anyone actually wants are coarse — none, a beat, a second, or enough run-up to
+/// hear the line before last. A value the config file asked for that is not on this list is
+/// merged in by [`App::playback_pad_choices`] rather than being unreachable.
+///
+/// Descending, like every other list in this popup: the values that cost the most sit at the
+/// top, so walking down a list always means asking for less.
+const PLAYBACK_PAD_CHOICES: [Duration; 8] = [
+    Duration::from_secs(5),
+    Duration::from_secs(3),
+    Duration::from_secs(2),
+    Duration::from_millis(1_500),
+    Duration::from_secs(1),
+    Duration::from_millis(500),
+    Duration::from_millis(250),
+    Duration::ZERO,
+];
+
+/// The frame rates the popup offers, highest first.
+///
+/// The film and video rates plus the two ends `config` clamps to, rather than every multiple
+/// of five: the reason to lower this is a terminal that cannot keep up, and that is answered
+/// by dropping to a named rate rather than by trying 35 and then 30.
+const PLAYBACK_FPS_CHOICES: [u32; 7] = [60, 48, 30, 24, 15, 10, 5];
 
 /// How long the event loop blocks waiting for a key when nothing is playing.
 ///
@@ -494,6 +631,10 @@ pub enum Dialog {
     AudioSettings,
     VideoSettings,
     SubtitleSettings,
+    /// How the timing page's scrub playback is done, for this session only — speed, loop,
+    /// sound, padding and frame rate. Opened with `:` from the timing page; see
+    /// `App::open_preview_settings`.
+    PreviewSettings,
     /// A confirm-cancel prompt over whichever processing view is showing
     /// (`Dialog::BatchProcessing`, one item or many) — see `App::request_cancel_edit`.
     ConfirmCancel,
@@ -1149,6 +1290,11 @@ pub struct App {
     /// and from whether the directory is on a network mount. Set by `main` beside the
     /// worker handles; the default is what a test or a library consumer gets.
     preview_settings: PreviewSettings,
+    /// The same, as `main` first supplied it — what `r`/`R` in the preview-settings popup
+    /// put a field back to. The *config file's* answer rather than the hard-coded one, so
+    /// resetting agrees with what the user would get by restarting.
+    preview_defaults: PreviewSettings,
+    pub preview_settings_popup: Option<PreviewSettingsPopup>,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1292,6 +1438,8 @@ impl App {
             playback_live: false,
             audio_format: crate::audio::OutputFormat::FALLBACK,
             preview_settings: PreviewSettings::default(),
+            preview_defaults: PreviewSettings::default(),
+            preview_settings_popup: None,
             preview: None,
             container_target: None,
             container_metadata: None,
@@ -1354,6 +1502,21 @@ impl App {
     /// `config.toml` and the mount the directory is on.
     pub fn set_preview_settings(&mut self, settings: PreviewSettings) {
         self.preview_settings = settings;
+        // Snapshotted here rather than re-read from `Config` when a reset happens, because
+        // this is the only place the file's answer is known — `App` never learns where the
+        // settings came from, and a second read could disagree with the first if the file
+        // changed under a running session.
+        self.preview_defaults = settings;
+    }
+
+    /// What a playback would be done with right now, for the popup and the status row.
+    pub fn preview_settings(&self) -> PreviewSettings {
+        self.preview_settings
+    }
+
+    /// The settings a playback would be done with had the popup never been opened.
+    pub fn preview_defaults(&self) -> PreviewSettings {
+        self.preview_defaults
     }
 
     /// Records what the audio device wants, so a span's sound is emitted as exactly that.
@@ -2497,10 +2660,17 @@ impl App {
                         PlaybackOutcome::Ready(mut frames) => {
                             // The sound leaves the span here and is owned by the device for
                             // as long as the stream lives, which is what makes dropping the
-                            // page the one thing that stops it.
+                            // page the one thing that stops it. Handed over as somewhere it
+                            // *can* be opened rather than as an open device, so a looping
+                            // playback can open another when it comes round.
                             let sound = frames.take_samples();
-                            let output = crate::audio::open(self.audio_format, sound);
-                            state.begin_playback(cue_index, frames, output);
+                            let source = crate::audio::DeviceSource::new(self.audio_format, sound);
+                            state.begin_playback(
+                                cue_index,
+                                frames,
+                                Box::new(source),
+                                self.preview_settings.playback_loop,
+                            );
                         }
                         PlaybackOutcome::Failed(message) => {
                             state.fail_playback(cue_index, message);
@@ -2710,7 +2880,11 @@ impl App {
         // fails the whole run, and the optional `0:a:0?` form leaves an output file with no
         // streams in it, which fails just as hard. So the question is settled before the
         // command is built, and a video with no sound plays as a silent slideshow.
-        let audio = self.has_audio_track().then_some(self.audio_format);
+        // Muting is asked for here, by not asking for sound at all, rather than by turning
+        // a device down later: no `-map 0:a:0`, no samples, and the page takes the same path
+        // media with no audio track already takes.
+        let audio =
+            (!settings.playback_muted && self.has_audio_track()).then_some(self.audio_format);
         let request = {
             let Some(state) = self.subtitle_sync.as_mut() else {
                 return;
@@ -2739,12 +2913,15 @@ impl App {
                 span_start,
                 span_end,
                 // Lowered from what the user asked for only when the span at this size
-                // would not fit in memory — see `preview::affordable_fps`.
+                // would not fit in memory — see `preview::affordable_fps`, which is charged
+                // the *stretched* span and so knows that a slow playback holds more frames.
                 fps: crate::preview::affordable_fps(
                     settings.playback_fps,
                     span_end.saturating_sub(span_start),
+                    settings.playback_speed,
                     pixels,
                 ),
+                speed: settings.playback_speed,
                 pixels,
                 cells,
                 audio,
@@ -2754,6 +2931,325 @@ impl App {
         self.playback_live = true;
         if let Some(preview) = self.preview.as_ref() {
             preview.request_playback(request);
+        }
+    }
+
+    /// Whether a dialog raised now would be drawn over a picture the terminal is repainting.
+    ///
+    /// **A popup cannot be layered over a playback, and this is not a drawing bug to be
+    /// fixed.** A playback places pixels through the terminal's own image protocol on every
+    /// step, and those pixels are not part of the cell buffer a dialog is drawn into — so a
+    /// dialog raised over a running span is painted once and wiped by the next frame,
+    /// leaving a popup that is open, taking every key, and invisible. The span being
+    /// decoded counts too: it is about to start, and a popup opened a moment before it does
+    /// is in exactly the same position a moment later.
+    ///
+    /// The answer is therefore to keep the two apart rather than to order them. A dialog the
+    /// user asked for is refused (`:` and `?` on the timing page); one that raises itself —
+    /// the conflict notice — stops the playback instead, since it cannot be refused.
+    pub fn playback_in_progress(&self) -> bool {
+        self.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_active() || state.preparing_playback().is_some())
+    }
+
+    /// Opens the preview-settings popup over the timing page.
+    ///
+    /// Only from that page, only when nothing else is up — the same two gates every other
+    /// settings popup applies — and only when nothing is playing, for the reason
+    /// [`Self::playback_in_progress`] gives. There is nothing to seed from: the popup reads
+    /// `preview_settings` directly, so what it shows is always what a playback would
+    /// actually be done with rather than a copy taken when it opened.
+    pub fn open_preview_settings(&mut self) {
+        if self.layer != Layer::SubtitleSync || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        self.preview_settings_popup = Some(PreviewSettingsPopup::default());
+        self.notice = None;
+        self.dialog = Some(Dialog::PreviewSettings);
+    }
+
+    /// Backs out one level: an open dropdown first, then the popup itself.
+    ///
+    /// One level at a time, like every other settings dialog — `Esc` out of a list the user
+    /// opened by mistake should not also take the popup away. Closing the popup discards
+    /// nothing, because every change took effect the moment it was made: that is what lets
+    /// the user open it, pick a speed and see the next playback use it without a round trip
+    /// through a confirm button.
+    pub fn escape_preview_settings(&mut self) {
+        let Some(popup) = self.preview_settings_popup.as_mut() else {
+            return;
+        };
+        if popup.mode == PreviewSettingsMode::Dropdown {
+            popup.mode = PreviewSettingsMode::Summary;
+            return;
+        }
+        self.preview_settings_popup = None;
+        self.dialog = None;
+    }
+
+    /// The values the focused field can take, as the dropdown lists them.
+    ///
+    /// A value in force that is not one of the offered ones is merged in rather than being
+    /// unreachable — a config file holding `fps = 25` must be able to get back to 25 after
+    /// the user tries 30, and a list that silently dropped it would make `r` the only way
+    /// back. The value the config file asked for is merged for the same reason.
+    pub fn preview_choices(&self, field: PreviewSettingsField) -> Vec<String> {
+        match field {
+            PreviewSettingsField::Speed => PlaybackSpeed::STEPS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            PreviewSettingsField::Loop | PreviewSettingsField::Sound => {
+                vec!["Yes".to_string(), "No".to_string()]
+            }
+            PreviewSettingsField::Padding => self
+                .playback_pad_choices()
+                .iter()
+                .map(|pad| format!("{:.2} s", pad.as_secs_f64()))
+                .collect(),
+            PreviewSettingsField::FrameRate => self
+                .playback_fps_choices()
+                .iter()
+                .map(|fps| format!("{fps} fps"))
+                .collect(),
+        }
+    }
+
+    fn playback_pad_choices(&self) -> Vec<Duration> {
+        merged_choices(
+            &PLAYBACK_PAD_CHOICES,
+            [
+                self.preview_settings.playback_pad,
+                self.preview_defaults.playback_pad,
+            ],
+        )
+    }
+
+    fn playback_fps_choices(&self) -> Vec<u32> {
+        merged_choices(
+            &PLAYBACK_FPS_CHOICES,
+            [
+                self.preview_settings.playback_fps,
+                self.preview_defaults.playback_fps,
+            ],
+        )
+    }
+
+    /// Which row of the focused field's dropdown holds the value in force.
+    ///
+    /// Always found, because [`Self::preview_choices`] merges the value in force into the
+    /// list it offers — so this seeds the cursor rather than guessing at it, and `Enter`
+    /// `Enter` changes nothing.
+    pub fn preview_choice_cursor(&self, field: PreviewSettingsField) -> usize {
+        let settings = self.preview_settings;
+        match field {
+            PreviewSettingsField::Speed => PlaybackSpeed::STEPS
+                .iter()
+                .position(|speed| *speed == settings.playback_speed),
+            PreviewSettingsField::Loop => Some(usize::from(!settings.playback_loop)),
+            PreviewSettingsField::Sound => Some(usize::from(settings.playback_muted)),
+            PreviewSettingsField::Padding => self
+                .playback_pad_choices()
+                .iter()
+                .position(|pad| *pad == settings.playback_pad),
+            PreviewSettingsField::FrameRate => self
+                .playback_fps_choices()
+                .iter()
+                .position(|fps| *fps == settings.playback_fps),
+        }
+        .unwrap_or_default()
+    }
+
+    /// `Enter`: opens the focused dropdown, commits the open one, or flips a toggle.
+    ///
+    /// A toggle has no list to open — the two states are both on screen as buttons — so one
+    /// keypress does what three would in a dropdown.
+    pub fn activate_preview_setting(&mut self) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        match popup.mode {
+            // `Yes` is row 0 and `No` is row 1, so flipping means choosing the row the
+            // answer is *not* on: currently yes picks 1, currently no picks 0.
+            PreviewSettingsMode::Summary if popup.field.is_toggle() => {
+                self.set_preview_choice(popup.field, usize::from(self.toggle_is_yes(popup.field)));
+            }
+            PreviewSettingsMode::Summary => {
+                let cursor = self.preview_choice_cursor(popup.field);
+                if let Some(popup) = self.preview_settings_popup.as_mut() {
+                    popup.mode = PreviewSettingsMode::Dropdown;
+                    popup.cursor = cursor;
+                }
+            }
+            PreviewSettingsMode::Dropdown => {
+                self.set_preview_choice(popup.field, popup.cursor);
+                if let Some(popup) = self.preview_settings_popup.as_mut() {
+                    popup.mode = PreviewSettingsMode::Summary;
+                }
+            }
+        }
+    }
+
+    /// `h`/`l` on a toggle row: pick the left button or the right one.
+    ///
+    /// Bound only for the two switches. On a dropdown row a value is chosen from a list, the
+    /// way it is in every other settings popup — but a pair of buttons sits on one row with
+    /// the left one left and the right one right, so moving between them sideways is the
+    /// obvious gesture and nothing else on the row wants those keys.
+    ///
+    /// Sets rather than flips, so holding `l` lands on `No` and stays there instead of
+    /// oscillating at the key-repeat rate.
+    pub fn set_preview_toggle(&mut self, yes: bool) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        if popup.mode != PreviewSettingsMode::Summary || !popup.field.is_toggle() {
+            return;
+        }
+        self.set_preview_choice(popup.field, usize::from(!yes));
+    }
+
+    /// Whether a toggle row's `Yes` button is the lit one.
+    fn toggle_is_yes(&self, field: PreviewSettingsField) -> bool {
+        match field {
+            // Phrased as sound rather than as muting, so `Yes` is the ordinary state on this
+            // row the way it is on the one above it.
+            PreviewSettingsField::Sound => !self.preview_settings.playback_muted,
+            _ => self.preview_settings.playback_loop,
+        }
+    }
+
+    /// Puts the `index`th of a field's offered values into force.
+    ///
+    /// Out-of-range indexes leave the setting alone rather than clamping into a neighbouring
+    /// value: the only way to reach one is a list that changed under a cursor, and silently
+    /// applying the wrong speed is worse than applying none.
+    fn set_preview_choice(&mut self, field: PreviewSettingsField, index: usize) {
+        match field {
+            PreviewSettingsField::Speed => {
+                if let Some(speed) = PlaybackSpeed::STEPS.get(index) {
+                    self.preview_settings.playback_speed = *speed;
+                }
+            }
+            PreviewSettingsField::Loop => self.preview_settings.playback_loop = index == 0,
+            PreviewSettingsField::Sound => self.preview_settings.playback_muted = index != 0,
+            PreviewSettingsField::Padding => {
+                if let Some(pad) = self.playback_pad_choices().get(index) {
+                    self.preview_settings.playback_pad = *pad;
+                }
+            }
+            PreviewSettingsField::FrameRate => {
+                if let Some(fps) = self.playback_fps_choices().get(index) {
+                    self.preview_settings.playback_fps = *fps;
+                }
+            }
+        }
+    }
+
+    pub fn move_preview_settings_cursor(&mut self, direction: isize) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        let moved = move_cursor(
+            self.preview_row(popup),
+            self.preview_row_count(popup),
+            direction,
+            |_| true,
+        );
+        self.preview_settings_popup = Some(popup.at_row(moved));
+    }
+
+    pub fn move_preview_settings_to_endpoint(&mut self, end: bool) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        // Arithmetic rather than `cursor_endpoint`, which answers `None` for an empty list:
+        // neither list here can be empty — the fields are a fixed five and the shortest
+        // dropdown is the two buttons of a toggle — so the `None` would be a branch nothing
+        // could reach. Nothing in these lists is ever disabled either, which is the other
+        // thing that helper is for.
+        let position = if end {
+            self.preview_row_count(popup).saturating_sub(1)
+        } else {
+            0
+        };
+        self.preview_settings_popup = Some(popup.at_row(position));
+    }
+
+    /// How many rows the popup's cursor can be on: its fields, or one dropdown's choices.
+    fn preview_row_count(&self, popup: PreviewSettingsPopup) -> usize {
+        match popup.mode {
+            PreviewSettingsMode::Dropdown => self.preview_choices(popup.field).len(),
+            PreviewSettingsMode::Summary => PreviewSettingsField::ORDER.len(),
+        }
+    }
+
+    /// Which of those rows it is on now.
+    fn preview_row(&self, popup: PreviewSettingsPopup) -> usize {
+        match popup.mode {
+            PreviewSettingsMode::Dropdown => popup.cursor,
+            PreviewSettingsMode::Summary => PreviewSettingsField::ORDER
+                .iter()
+                .position(|field| *field == popup.field)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Puts the focused setting back to what the config file asked for.
+    pub fn reset_preview_setting(&mut self) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        let defaults = self.preview_defaults;
+        let settings = &mut self.preview_settings;
+        match popup.field {
+            PreviewSettingsField::Speed => settings.playback_speed = defaults.playback_speed,
+            PreviewSettingsField::Loop => settings.playback_loop = defaults.playback_loop,
+            PreviewSettingsField::Sound => settings.playback_muted = defaults.playback_muted,
+            PreviewSettingsField::Padding => settings.playback_pad = defaults.playback_pad,
+            PreviewSettingsField::FrameRate => settings.playback_fps = defaults.playback_fps,
+        }
+        self.reseed_preview_cursor();
+    }
+
+    /// Puts every playback setting back to what the config file asked for.
+    ///
+    /// Only the playback half: the cache policy the rest of `PreviewSettings` holds is not
+    /// something the popup ever changed, and a background pass is already running under it.
+    pub fn reset_preview_settings(&mut self) {
+        if self.preview_settings_popup.is_none() {
+            return;
+        }
+        let defaults = self.preview_defaults;
+        let settings = &mut self.preview_settings;
+        settings.playback_speed = defaults.playback_speed;
+        settings.playback_loop = defaults.playback_loop;
+        settings.playback_muted = defaults.playback_muted;
+        settings.playback_pad = defaults.playback_pad;
+        settings.playback_fps = defaults.playback_fps;
+        self.reseed_preview_cursor();
+    }
+
+    /// Moves an open dropdown's cursor back onto the value now in force.
+    ///
+    /// Only a reset needs this: everything else that changes a value does so *from* the
+    /// cursor. Without it, `r` inside an open dropdown would restore the setting and leave
+    /// the highlight on the value it just discarded, so `Enter` would put it straight back.
+    fn reseed_preview_cursor(&mut self) {
+        // Filtered rather than checked in two steps, so a reset in `Summary` — the ordinary
+        // case, where there is no cursor to move — leaves through the same door as a reset
+        // with no popup at all.
+        let Some(popup) = self
+            .preview_settings_popup
+            .filter(|popup| popup.mode == PreviewSettingsMode::Dropdown)
+        else {
+            return;
+        };
+        let cursor = self.preview_choice_cursor(popup.field);
+        if let Some(popup) = self.preview_settings_popup.as_mut() {
+            popup.cursor = cursor;
         }
     }
 
@@ -6842,6 +7338,10 @@ impl App {
         if self.dialog.is_some() || self.conflicting_paths().is_empty() {
             return false;
         }
+        // This notice raises itself, so unlike `:` and `?` it cannot be refused while a span
+        // is playing — the playback gives way instead, or the notice would be drawn once and
+        // wiped by the next frame. See `playback_in_progress`.
+        self.stop_playback();
         self.conflict_scroll = 0;
         self.conflict_opened_at = Some(Instant::now());
         self.dialog = Some(Dialog::ResolveConflicts);
@@ -7096,7 +7596,7 @@ impl App {
     }
 
     pub fn show_keybindings(&mut self) {
-        if self.dialog.is_none() {
+        if self.dialog.is_none() && !self.playback_in_progress() {
             self.keybindings_scroll = 0;
             self.keybindings_max_scroll = 0;
             self.keybindings_search.clear();
@@ -7832,6 +8332,24 @@ fn move_cursor(
             return position;
         }
     }
+}
+
+/// The values a dropdown offers, with any that are in force but not on the list merged in.
+///
+/// A config file can hold a value the popup does not offer — `fps = 25`, say — and a list
+/// that quietly dropped it would make the value unreachable the moment the user tried
+/// another, leaving `r` as the only way back. Sorted, so a merged value sits where a reader
+/// expects it rather than at the end.
+fn merged_choices<T: Copy + Ord>(offered: &[T], in_force: [T; 2]) -> Vec<T> {
+    let mut choices = offered.to_vec();
+    for value in in_force {
+        if !choices.contains(&value) {
+            choices.push(value);
+        }
+    }
+    // Descending, matching the order every list in this popup is offered in.
+    choices.sort_unstable_by(|left, right| right.cmp(left));
+    choices
 }
 
 fn cursor_endpoint(length: usize, end: bool, enabled: impl Fn(usize) -> bool) -> Option<usize> {
@@ -20796,6 +21314,7 @@ mod tests {
                 picker: ratatui_image::picker::Picker::halfblocks(),
             },
             request.fps,
+            request.speed,
             request.span_start,
             Vec::new(),
         )
@@ -20892,6 +21411,468 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup is a view onto the settings in force, not a form with its own copy, so
+    /// what it changes has to reach the very next request — speed, padding, rate and sound
+    /// all at once.
+    #[test]
+    fn the_session_settings_should_decide_how_the_next_span_is_decoded() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.open_preview_settings();
+
+        // Act: half speed, looping, silent, no padding, and a lower rate.
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        pick(&mut app, PreviewSettingsField::Loop, "Yes");
+        pick(&mut app, PreviewSettingsField::Sound, "No");
+        pick(&mut app, PreviewSettingsField::Padding, "0.00 s");
+        pick(&mut app, PreviewSettingsField::FrameRate, "24 fps");
+        app.escape_preview_settings();
+        app.toggle_playback();
+
+        // Assert: the span is the cue itself with no run-up, at half speed, and the rate is
+        // the one asked for.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.speed).is_equal_to(PlaybackSpeed::HALF);
+        assert_that!(request.span_start).is_equal_to(Duration::from_secs(5));
+        assert_that!(request.span_end).is_equal_to(Duration::from_secs(7));
+        assert_that!(request.fps).is_equal_to(24);
+        // Muting asks for no sound at all rather than for silenced sound, which is what puts
+        // it on the same path as media with no audio track.
+        assert_that!(request.audio).is_none();
+        assert_that!(app.preview_settings().playback_loop).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Chooses a named value for a field the way the keys do: walk to the row, `Enter` to
+    /// open the dropdown (or to flip a toggle), walk to the value, `Enter` to commit.
+    ///
+    /// By label rather than by index, so a test says which speed it wanted and a changed
+    /// list fails loudly instead of quietly selecting its neighbour.
+    fn pick(app: &mut App, field: PreviewSettingsField, value: &str) {
+        app.move_preview_settings_to_endpoint(false);
+        while app
+            .preview_settings_popup
+            .expect("the popup should be open")
+            .field
+            != field
+        {
+            app.move_preview_settings_cursor(1);
+        }
+        let choices = app.preview_choices(field);
+        let index = choices
+            .iter()
+            .position(|choice| choice == value)
+            .unwrap_or_else(|| panic!("{field:?} should offer {value}, got {choices:?}"));
+        if field.is_toggle() {
+            // Two buttons and no list: `Enter` flips, so it is pressed only when the value
+            // asked for is not the one already lit.
+            if app.preview_choice_cursor(field) != index {
+                app.activate_preview_setting();
+            }
+            return;
+        }
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(false);
+        for _ in 0..index {
+            app.move_preview_settings_cursor(1);
+        }
+        app.activate_preview_setting();
+    }
+
+    /// The popup needs no media and no workers — it edits settings, and the page it belongs
+    /// to is only a gate on opening it. Returns the scratch directory to clean up with.
+    fn preview_settings_app() -> (App, PathBuf) {
+        let app = test_app(media(
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        ));
+        let directory = app.directory.clone();
+        (app, directory)
+    }
+
+    /// A dropdown opens on the value in force and commits the one under the cursor, so
+    /// `Enter` `Enter` must change nothing — a list that opened at the top would quietly
+    /// hand back its first entry to anyone who glanced at it and pressed on.
+    #[test]
+    fn a_preview_dropdown_should_open_on_the_value_in_force_and_commit_the_one_chosen() {
+        // Arrange
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleSync;
+        app.open_preview_settings();
+
+        // Act / Assert: opening and committing without moving changes nothing.
+        let settled = app.preview_settings();
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Dropdown));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(3));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings()).is_equal_to(settled);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+
+        // Act / Assert: the cursor stops at both ends of an open list rather than wrapping.
+        app.activate_preview_setting();
+        for _ in 0..20 {
+            app.move_preview_settings_cursor(-1);
+        }
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(0));
+        for _ in 0..20 {
+            app.move_preview_settings_cursor(1);
+        }
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(6));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::SLOWEST);
+
+        // Act / Assert: Esc closes an open list without closing the popup — one level at a
+        // time, like every other settings dialog — and leaves the value alone.
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(-1);
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::SLOWEST);
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_none();
+
+        // Act / Assert: the two toggles flip on Enter rather than opening anything, and
+        // `Sound` reads as sound rather than as muting.
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Loop, "Yes");
+        assert_that!(app.preview_settings().playback_loop).is_true();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_loop).is_false();
+        pick(&mut app, PreviewSettingsField::Sound, "No");
+        assert_that!(app.preview_settings().playback_muted).is_true();
+        pick(&mut app, PreviewSettingsField::Sound, "Yes");
+        assert_that!(app.preview_settings().playback_muted).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// Each field offers the values it should, and a value the config file asked for that is
+    /// not one of them is merged in rather than being unreachable — otherwise a user who set
+    /// `fps = 25` could try 30 and never get back without `r`.
+    #[test]
+    fn a_preview_dropdown_should_offer_its_values_and_whatever_the_config_file_asked_for() {
+        // Arrange: a config holding a rate and a padding the popup does not offer.
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleSync;
+        app.set_preview_settings(PreviewSettings {
+            playback_fps: 25,
+            playback_pad: Duration::from_millis(750),
+            ..PreviewSettings::default()
+        });
+        app.open_preview_settings();
+
+        // Act / Assert: the offered lists, with the config's own values merged into place
+        // rather than appended to the end.
+        assert_that!(app.preview_choices(PreviewSettingsField::Speed)).is_equal_to(vec![
+            "2x".to_string(),
+            "1.5x".to_string(),
+            "1.25x".to_string(),
+            "1x".to_string(),
+            "0.75x".to_string(),
+            "0.5x".to_string(),
+            "0.25x".to_string(),
+        ]);
+        assert_that!(app.preview_choices(PreviewSettingsField::Loop))
+            .is_equal_to(vec!["Yes".to_string(), "No".to_string()]);
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "60 fps".to_string(),
+            "48 fps".to_string(),
+            "30 fps".to_string(),
+            "25 fps".to_string(),
+            "24 fps".to_string(),
+            "15 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+        assert_that!(app.preview_choices(PreviewSettingsField::Padding)).is_equal_to(vec![
+            "5.00 s".to_string(),
+            "3.00 s".to_string(),
+            "2.00 s".to_string(),
+            "1.50 s".to_string(),
+            "1.00 s".to_string(),
+            "0.75 s".to_string(),
+            "0.50 s".to_string(),
+            "0.25 s".to_string(),
+            "0.00 s".to_string(),
+        ]);
+
+        // Act / Assert: and the merged value is still reachable after moving off it.
+        pick(&mut app, PreviewSettingsField::FrameRate, "60 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(60);
+        pick(&mut app, PreviewSettingsField::FrameRate, "25 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(25);
+
+        // Act / Assert: every offered value is one the config loader would also accept, so
+        // the popup cannot put the session somewhere a restart could not.
+        for fps in app.playback_fps_choices() {
+            assert_that!(
+                (crate::config::MIN_PLAYBACK_FPS..=crate::config::MAX_PLAYBACK_FPS).contains(&fps)
+            )
+            .is_true();
+        }
+        for pad in app.playback_pad_choices() {
+            assert_that!(pad <= crate::config::MAX_PLAYBACK_PAD).is_true();
+        }
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// A reset restores what `config.toml` asked for, not what the code's own defaults are —
+    /// otherwise `r` on a user who set `fps = 24` would hand them 30 and look like a bug.
+    #[test]
+    fn a_reset_should_restore_the_config_files_answer_rather_than_the_built_in_one() {
+        // Arrange: a config that differs from the built-in defaults.
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleSync;
+        app.set_preview_settings(PreviewSettings {
+            playback_fps: 24,
+            playback_pad: Duration::from_millis(1_500),
+            ..PreviewSettings::default()
+        });
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Speed, "0.75x");
+        pick(&mut app, PreviewSettingsField::FrameRate, "30 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+
+        // Act: reset the focused field only.
+        app.reset_preview_setting();
+
+        // Assert: the file's rate is back, and the speed is left as it was.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::STEPS[4]);
+
+        // Act / Assert: every field resets on its own, not only the one the reset-all path
+        // happens to reach — `r` is per-field, and a row that quietly ignored it would look
+        // exactly like a row whose value was already the default. From a clean slate, so
+        // that each field is the only thing differing when its turn comes.
+        app.reset_preview_settings();
+        for (field, value) in [
+            (PreviewSettingsField::Speed, "2x"),
+            (PreviewSettingsField::Loop, "Yes"),
+            (PreviewSettingsField::Sound, "No"),
+            (PreviewSettingsField::Padding, "3.00 s"),
+            (PreviewSettingsField::FrameRate, "60 fps"),
+        ] {
+            pick(&mut app, field, value);
+            assert_that!(app.preview_settings() != app.preview_defaults()).is_true();
+            app.reset_preview_setting();
+            assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+        }
+
+        // Act / Assert: a reset inside an open list moves the highlight back onto the value
+        // it restored, so `Enter` commits what is now in force rather than putting the
+        // discarded value straight back.
+        pick(&mut app, PreviewSettingsField::FrameRate, "60 fps");
+        app.activate_preview_setting();
+        app.reset_preview_setting();
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+
+        // Act: reset the lot.
+        pick(&mut app, PreviewSettingsField::Speed, "1.5x");
+        app.reset_preview_settings();
+
+        // Assert: every playback field is back to the file's answer.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_pad).is_equal_to(Duration::from_millis(1_500));
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::NORMAL);
+        assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// A popup cannot be layered over a playback: the span's pixels reach the terminal
+    /// through its image protocol rather than through the cell buffer the dialog is drawn
+    /// into, so a dialog raised over one is painted once and wiped by the next frame —
+    /// leaving a popup that is open, swallowing every key, and invisible.
+    ///
+    /// Asserted for the span being *decoded* as well as the one playing: a popup opened a
+    /// moment before the span starts is in exactly the same position a moment later.
+    #[test]
+    fn no_dialog_should_open_over_a_playback() {
+        // Arrange: a page with a span on the way.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(app.playback_in_progress()).is_true();
+
+        // Act / Assert: neither popup opens while the span is still decoding.
+        app.open_preview_settings();
+        app.show_keybindings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Arrange: and now the span is actually playing.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                cue_index: request.cue_index,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.playback_active()).is_true();
+
+        // Act / Assert: still refused.
+        app.open_preview_settings();
+        app.show_keybindings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Act / Assert: and once the playback is stopped, both open again — the gate is the
+        // playback, not the page.
+        app.toggle_playback();
+        assert_that!(app.playback_in_progress()).is_false();
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        app.escape_preview_settings();
+        app.show_keybindings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The conflict notice raises itself, so it cannot be refused the way `:` and `?` are —
+    /// a staged file changing on disk is not something to hold back until the user happens
+    /// to stop watching a two-second span. The playback gives way instead.
+    #[test]
+    fn a_self_raising_dialog_should_stop_a_playback_rather_than_be_refused() {
+        // Arrange: a page with a span playing, and a staged file that has changed under it.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                cue_index: request.cue_index,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.playback_active()).is_true();
+        let path = app.directory.join("movie.mkv");
+        let mut edit = staged_edit(
+            crate::files::FileFingerprint {
+                length: 1,
+                modified: None,
+            },
+            vec![0, 1],
+        );
+        edit.conflict_groups.insert("subtitle");
+        app.staged_edits.insert(path, edit);
+
+        // Act
+        let opened = app.maybe_open_conflict_dialog();
+
+        // Assert: the notice is up and the playback has gone, rather than the notice being
+        // drawn under a span that is still repainting over it.
+        assert_that!(opened).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ResolveConflicts));
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.playback_in_progress()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup belongs to the timing page, and every settings popup in the application
+    /// refuses to open over another one.
+    #[test]
+    fn the_preview_settings_popup_should_open_only_from_the_timing_page() {
+        // Arrange
+        let (mut app, settings_directory) = preview_settings_app();
+
+        // Act / Assert: not from the file list.
+        app.layer = Layer::Files;
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Act / Assert: not over another dialog.
+        app.layer = Layer::SubtitleSync;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Act / Assert: and from the page itself, it opens on the first field.
+        app.dialog = None;
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::Speed));
+
+        // Act / Assert: the cursor walks the fields and stops at both ends.
+        app.move_preview_settings_cursor(-1);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::Speed));
+        app.move_preview_settings_to_endpoint(true);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::FrameRate));
+        app.move_preview_settings_cursor(1);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::FrameRate));
+        app.move_preview_settings_to_endpoint(false);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::Speed));
+
+        // Act / Assert: closing leaves the settings in force — there is nothing to discard.
+        pick(&mut app, PreviewSettingsField::Speed, "0.75x");
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::STEPS[4]);
+
+        // Act / Assert: and with no popup open, every one of its actions is inert rather
+        // than reaching into the settings from wherever the user actually is.
+        let settled = app.preview_settings();
+        app.move_preview_settings_cursor(1);
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        app.set_preview_toggle(true);
+        app.reset_preview_setting();
+        app.reset_preview_settings();
+        assert_that!(app.preview_settings()).is_equal_to(settled);
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
     }
 
     /// The same key is the way in and the way out, including during the second or two a

@@ -170,6 +170,41 @@ pub trait AudioOutput: Send + std::fmt::Debug {
     fn position(&self, now: Instant) -> Option<Duration>;
 }
 
+/// Somewhere a span's sound can be sent, as many times as it is asked for.
+///
+/// A `cpal` stream plays its buffer once and is then finished, so a looping playback needs a
+/// *new* output each time round. `sync::Playback` therefore holds one of these rather than
+/// one already-open [`AudioOutput`], and a repeat costs a device open rather than another
+/// `ffmpeg` run — the frames and the samples are already in memory.
+///
+/// The trait is the same seam [`AudioOutput`] is: it lets the page's own tests drive a
+/// playback, and a loop of one, on a machine with no sound card.
+pub trait AudioSource: Send + std::fmt::Debug {
+    fn open(&self) -> Box<dyn AudioOutput>;
+}
+
+/// The production [`AudioSource`]: the default device, and one span's samples.
+///
+/// The samples are shared rather than copied, so going round again is a refcount bump
+/// instead of another megabyte or two.
+#[derive(Debug)]
+pub struct DeviceSource {
+    format: OutputFormat,
+    samples: Arc<Vec<f32>>,
+}
+
+impl DeviceSource {
+    pub fn new(format: OutputFormat, samples: Arc<Vec<f32>>) -> Self {
+        Self { format, samples }
+    }
+}
+
+impl AudioSource for DeviceSource {
+    fn open(&self) -> Box<dyn AudioOutput> {
+        open(self.format, Arc::clone(&self.samples))
+    }
+}
+
 /// Playback with nothing to play it: no device, or media with no audio track.
 ///
 /// **Production code, not a test double.** A user whose machine has no working output still
@@ -255,7 +290,7 @@ const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
 /// `samples` are interleaved floats at `format`, which is what `ffmpeg` was told to emit —
 /// so the callback copies rather than resamples, and the one thread that must never be late
 /// does no work beyond a memcpy.
-pub fn open(format: OutputFormat, samples: Vec<f32>) -> Box<dyn AudioOutput> {
+pub fn open(format: OutputFormat, samples: Arc<Vec<f32>>) -> Box<dyn AudioOutput> {
     if samples.is_empty() {
         // No audio track in this media. The silent path is the same one a machine with no
         // device takes, which is why it is production code rather than a fallback.
@@ -290,7 +325,7 @@ pub fn device_format() -> OutputFormat {
 
 impl CpalOutput {
     /// Opens a device and starts playing, or `None` if there is nothing to play through.
-    fn open(format: OutputFormat, samples: Vec<f32>) -> Option<Self> {
+    fn open(format: OutputFormat, samples: Arc<Vec<f32>>) -> Option<Self> {
         let clock = Arc::new(PlaybackClock::new());
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<bool>();
@@ -333,7 +368,7 @@ impl CpalOutput {
 /// multiply in the same loop as the copy.
 fn start(
     format: OutputFormat,
-    samples: Vec<f32>,
+    samples: Arc<Vec<f32>>,
     clock: &Arc<PlaybackClock>,
 ) -> Option<cpal::Stream> {
     use cpal::SampleFormat;
@@ -380,7 +415,7 @@ fn stream_of<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     format: OutputFormat,
-    samples: Vec<f32>,
+    samples: Arc<Vec<f32>>,
     clock: &Arc<PlaybackClock>,
 ) -> Option<cpal::Stream>
 where
@@ -676,7 +711,7 @@ mod tests {
     #[test]
     fn a_span_with_no_sound_should_not_open_a_device_at_all() {
         // Act
-        let output = open(OutputFormat::FALLBACK, Vec::new());
+        let output = open(OutputFormat::FALLBACK, Arc::new(Vec::new()));
 
         // Assert
         assert_that!(format!("{output:?}").as_str()).contains("SilentOutput");
@@ -721,7 +756,7 @@ mod tests {
             .collect();
 
         // Act
-        let output = open(format, samples);
+        let output = open(format, Arc::new(samples));
 
         // Assert: a device may or may not exist here, so what is asserted is the contract
         // both paths share — and the one the picture depends on.

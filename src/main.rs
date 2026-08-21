@@ -70,6 +70,9 @@ fn run(target_dir: PathBuf) -> Result<()> {
         cache_tracks: app_config.preview_cache_tracks,
         playback_fps: app_config.playback_fps,
         playback_pad: app_config.playback_pad,
+        // Session-only, and so not in the config file: these start where a fresh run starts
+        // and are changed from the timing page's preview-settings popup (`:`).
+        ..PreviewSettings::default()
     });
     let mut input = InputState::default();
 

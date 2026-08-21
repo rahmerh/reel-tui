@@ -15,7 +15,7 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
-use crate::audio::{AudioOutput, frame_index_at};
+use crate::audio::{AudioOutput, AudioSource, frame_index_at};
 use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
 use crate::preview::{
     CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, seek_for,
@@ -198,6 +198,14 @@ pub struct Playback {
     /// Where the sound is, which is the only clock here — see [`crate::audio`]. Held so
     /// that dropping the page stops the device, whichever way the page was left.
     output: Box<dyn AudioOutput>,
+    /// Where [`Self::output`] came from, kept so a looping playback can open another.
+    ///
+    /// A device plays its buffer once, so going round again means a new output rather than
+    /// a rewound one. It costs a device open and nothing else: the frames and the samples
+    /// are already in memory, and no `ffmpeg` runs a second time.
+    source: Box<dyn AudioSource>,
+    /// Whether running off the end starts the span again instead of ending it.
+    looping: bool,
     /// Which frame [`Self::drawn`] holds, so a step inside one frame period re-draws
     /// nothing.
     shown: Option<usize>,
@@ -224,12 +232,20 @@ pub enum PlaybackStep {
 }
 
 impl Playback {
-    pub fn new(cue_index: usize, frames: PlaybackFrames, output: Box<dyn AudioOutput>) -> Self {
+    pub fn new(
+        cue_index: usize,
+        frames: PlaybackFrames,
+        source: Box<dyn AudioSource>,
+        looping: bool,
+    ) -> Self {
         let cells = frames.cells;
+        let output = source.open();
         Self {
             cue_index,
             frames,
             output,
+            source,
+            looping,
             shown: None,
             cells,
             drawn: None,
@@ -245,6 +261,11 @@ impl Playback {
     /// Derived from the frame on screen rather than from the clock directly, so the picture
     /// and the playhead in one drawn frame describe the same instant — a playhead read
     /// straight off the clock would sit up to a frame period ahead of the picture beside it.
+    /// Multiplied by the span's speed, because frames are `1 / fps` apart in *output* time
+    /// and this answers in *media* time. At half speed the hundredth frame is fifty frames'
+    /// worth into the media, not a hundred — without the factor the playhead would crawl
+    /// along the timeline at the speed the picture is playing at and read as the cue being
+    /// mistimed, which is the one thing this page must never say wrongly.
     pub fn position(&self) -> Option<Duration> {
         let shown = self.shown?;
         if self.frames.fps == 0 {
@@ -252,7 +273,9 @@ impl Playback {
         }
         Some(
             self.frames.span_start
-                + Duration::from_secs_f64(shown as f64 / f64::from(self.frames.fps)),
+                + Duration::from_secs_f64(
+                    shown as f64 / f64::from(self.frames.fps) * self.frames.speed.as_f64(),
+                ),
         )
     }
 
@@ -277,9 +300,19 @@ impl Playback {
             // the error the clock exists to prevent.
             return PlaybackStep::Unchanged;
         };
-        let index = frame_index_at(position, self.frames.fps);
+        let mut index = frame_index_at(position, self.frames.fps);
         if index >= self.frames.count() {
-            return PlaybackStep::Finished;
+            if !self.looping {
+                return PlaybackStep::Finished;
+            }
+            // Round again, from a *fresh* output: a device plays its buffer once, so there
+            // is nothing to rewind. Clearing `shown` is what makes the fall-through below
+            // encode frame zero rather than decide nothing has changed since the last frame
+            // of the pass that just ended.
+            self.output = self.source.open();
+            self.shown = None;
+            self.drawn = None;
+            index = 0;
         }
         if self.shown == Some(index) && self.cells == cells {
             return PlaybackStep::Unchanged;
@@ -802,14 +835,18 @@ impl SubtitleSyncState {
     }
 
     /// Starts playing a decoded span.
+    ///
+    /// Takes somewhere the sound can be sent rather than an output already open, so that a
+    /// looping playback can open another when it comes round — see [`Playback`].
     pub fn begin_playback(
         &mut self,
         cue_index: usize,
         frames: PlaybackFrames,
-        output: Box<dyn AudioOutput>,
+        source: Box<dyn AudioSource>,
+        looping: bool,
     ) {
         self.playback_error = None;
-        self.playback = PlaybackState::Playing(Playback::new(cue_index, frames, output));
+        self.playback = PlaybackState::Playing(Playback::new(cue_index, frames, source, looping));
     }
 
     /// Records why a span could not be played, and stops waiting for it.
@@ -965,6 +1002,7 @@ mod tests {
 
     use super::*;
     use crate::audio::SilentOutput;
+    use crate::preview::PlaybackSpeed;
 
     fn cue(start: u64, end: u64, text: &str) -> Cue {
         Cue {
@@ -1853,6 +1891,12 @@ mod tests {
     /// A span of `count` frames, each a solid colour naming its index, so a test can tell
     /// which one is on screen from the picture rather than from a counter beside it.
     fn span(count: usize, cells: Size, fps: u32) -> PlaybackFrames {
+        span_at(count, cells, fps, PlaybackSpeed::NORMAL)
+    }
+
+    /// The same, at a chosen speed — which changes nothing about the frames themselves and
+    /// everything about what a playhead over them means in media time.
+    fn span_at(count: usize, cells: Size, fps: u32, speed: PlaybackSpeed) -> PlaybackFrames {
         let pixels = crate::preview::playback_pixels(cells, test_font());
         let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
         let mut bytes = Vec::with_capacity(stride * count);
@@ -1863,6 +1907,7 @@ mod tests {
             bytes,
             test_shape(cells),
             fps,
+            speed,
             Duration::from_secs(10),
             Vec::new(),
         )
@@ -1893,17 +1938,38 @@ mod tests {
     /// on the first draw. The height is generous so the fit is decided by the width, which
     /// makes the drawn cell area exactly the one the span was built with.
     fn play(state: &mut SubtitleSyncState, cue_index: usize, frames: PlaybackFrames) {
-        play_through(state, cue_index, frames, Box::new(SilentOutput::new()));
+        play_through(state, cue_index, frames, Box::new(SilentSource));
     }
 
     fn play_through(
         state: &mut SubtitleSyncState,
         cue_index: usize,
         frames: PlaybackFrames,
-        output: Box<dyn AudioOutput>,
+        source: Box<dyn AudioSource>,
+    ) {
+        play_looping(state, cue_index, frames, source, false);
+    }
+
+    fn play_looping(
+        state: &mut SubtitleSyncState,
+        cue_index: usize,
+        frames: PlaybackFrames,
+        source: Box<dyn AudioSource>,
+        looping: bool,
     ) {
         state.set_preview_cells(Size::new(frames.cells.width, frames.cells.height * 4));
-        state.begin_playback(cue_index, frames, output);
+        state.begin_playback(cue_index, frames, source, looping);
+    }
+
+    /// The silent path, asked for by name — the same `SilentOutput` a machine with no sound
+    /// card gets, opened fresh each time the way a real source is.
+    #[derive(Debug)]
+    struct SilentSource;
+
+    impl AudioSource for SilentSource {
+        fn open(&self) -> Box<dyn AudioOutput> {
+            Box::new(SilentOutput::new())
+        }
     }
 
     fn playing(state: &mut SubtitleSyncState) -> &Playback {
@@ -1925,7 +1991,7 @@ mod tests {
             &mut state,
             0,
             span(10, Size::new(4, 2), 10),
-            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+            Box::new(SharedSource::of(&clock)),
         );
 
         // Act / Assert: nothing is drawn before the device has said where it is. Holding
@@ -1970,6 +2036,36 @@ mod tests {
         }
     }
 
+    /// A source handing out that same shared clock every time it is asked, and counting how
+    /// often it was asked — which is how a loop's repeat is told apart from a playback that
+    /// simply never ended.
+    #[derive(Debug)]
+    struct SharedSource {
+        clock: std::sync::Arc<SteppedOutput>,
+        opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SharedSource {
+        fn of(clock: &std::sync::Arc<SteppedOutput>) -> Self {
+            Self {
+                clock: std::sync::Arc::clone(clock),
+                opens: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+            std::sync::Arc::clone(&self.opens)
+        }
+    }
+
+    impl AudioSource for SharedSource {
+        fn open(&self) -> Box<dyn AudioOutput> {
+            self.opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::new(SharedOutput(std::sync::Arc::clone(&self.clock)))
+        }
+    }
+
     /// A playback that reached its last frame is finished with, not paused on it: the next
     /// `p` should replay the span rather than having to stop it first. The device goes back
     /// at the same moment, which is what stops a page left open holding one open forever.
@@ -1982,7 +2078,7 @@ mod tests {
             &mut state,
             0,
             span(3, Size::new(4, 2), 10),
-            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+            Box::new(SharedSource::of(&clock)),
         );
         assert_that!(state.advance_playback()).is_true();
         assert_that!(state.playback_active()).is_true();
@@ -1999,6 +2095,104 @@ mod tests {
         assert_that!(state.advance_playback()).is_false();
     }
 
+    /// A looping playback going round again is a *new device*, not a rewound one — a stream
+    /// plays its buffer once. Asserting on the frame alone would pass for a playback that
+    /// silently kept the finished device and drew a picture with no sound under it, so what
+    /// is checked is that the source was asked for another output.
+    #[test]
+    fn a_looping_playback_should_start_again_instead_of_ending() {
+        // Arrange: three frames at ten a second, so the span lasts 300 ms, with the picture
+        // settled on the last of them.
+        let mut state = ready(3);
+        let clock = SteppedOutput::at(Some(Duration::from_millis(250)));
+        let source = SharedSource::of(&clock);
+        let opens = source.counter();
+        play_looping(
+            &mut state,
+            0,
+            span(3, Size::new(4, 2), 10),
+            Box::new(source),
+            true,
+        );
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(2));
+        assert_that!(opens.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(1);
+
+        // Act: past the last frame, which for a playback that did not loop is the end.
+        clock.set(Duration::from_millis(300));
+        let dirty = state.advance_playback();
+
+        // Assert: still playing, back on the first frame, and holding a second device. The
+        // frame is drawn in the same pass that noticed the end, so the picture never blanks
+        // between passes.
+        assert_that!(dirty).is_true();
+        assert_that!(state.playback_active()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(0));
+        assert_that!(state.playback_frame().is_some()).is_true();
+        assert_that!(opens.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(2);
+
+        // Act / Assert: the repeat plays on its new device's clock rather than re-opening on
+        // every step — a second round that opened a device per frame would still draw the
+        // right pictures.
+        clock.set(Duration::from_millis(100));
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(1));
+        assert_that!(opens.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(2);
+
+        // Act / Assert: and it goes round a third time rather than only once.
+        clock.set(Duration::from_millis(300));
+        assert_that!(state.advance_playback()).is_true();
+        assert_that!(state.playback_active()).is_true();
+        assert_that!(opens.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(3);
+    }
+
+    /// A span whose frames cannot be read must still end, looping or not — otherwise the
+    /// page opens a device per iteration of the event loop, forever.
+    #[test]
+    fn a_looping_playback_with_no_frames_should_still_end() {
+        // Arrange: a span of no frames at all, asked to loop.
+        let mut state = ready(3);
+        let cells = Size::new(4, 2);
+        play_looping(
+            &mut state,
+            0,
+            span(0, cells, 10),
+            Box::new(SilentSource),
+            true,
+        );
+
+        // Act
+        state.advance_playback();
+
+        // Assert
+        assert_that!(state.playback_active()).is_false();
+    }
+
+    /// The playhead answers in media time while the frames are spaced in output time, so a
+    /// speed other than normal is a factor between them. Without it the mark on the timeline
+    /// would crawl at the speed the picture is playing at and read as the cue being
+    /// mistimed — which is the one thing this page must never say wrongly.
+    #[test]
+    fn the_playhead_should_answer_in_media_time_at_any_speed() {
+        // Arrange: a span starting ten seconds in, at ten frames a second, half speed.
+        let mut state = ready(3);
+        let clock = SteppedOutput::at(Some(Duration::from_millis(800)));
+        play_through(
+            &mut state,
+            0,
+            span_at(30, Size::new(4, 2), 10, PlaybackSpeed::HALF),
+            Box::new(SharedSource::of(&clock)),
+        );
+
+        // Act: eight tenths of a second of *sound* have gone by, which is frame eight.
+        assert_that!(state.advance_playback()).is_true();
+
+        // Assert: frame eight is eight tenths into the output and four into the media.
+        assert_that!(playing(&mut state).shown).is_equal_to(Some(8));
+        assert_that!(state.playback_position())
+            .is_equal_to(Some(Duration::from_secs(10) + Duration::from_millis(400)));
+    }
+
     /// The playhead is read off the frame on screen rather than off the clock, so the
     /// picture and the mark on the timeline in one drawn frame describe the same instant.
     /// Straight off the clock it would sit up to a frame period ahead of the picture.
@@ -2011,7 +2205,7 @@ mod tests {
             &mut state,
             0,
             span(30, Size::new(4, 2), 10),
-            Box::new(SharedOutput(std::sync::Arc::clone(&clock))),
+            Box::new(SharedSource::of(&clock)),
         );
 
         // Act: the picture is settled on frame 23, and *then* the sound moves on — which is
@@ -2079,7 +2273,8 @@ mod tests {
         state.begin_playback(
             0,
             span(30, Size::new(8, 4), 10),
-            Box::new(SilentOutput::new()),
+            Box::new(SilentSource),
+            false,
         );
         assert_that!(state.advance_playback()).is_true();
         assert_that!(state.playback_frame().map(|frame| frame.size()))
@@ -2118,10 +2313,12 @@ mod tests {
                 vec![0; frame_bytes(cells) * 3],
                 test_shape(cells),
                 10,
+                PlaybackSpeed::NORMAL,
                 Duration::from_secs(10),
                 Vec::new(),
             ),
-            Box::new(SilentOutput::new()),
+            Box::new(SilentSource),
+            false,
         );
         let font = test_font();
         let (span_width, span_height) = crate::preview::playback_pixels(cells, font);
@@ -2168,10 +2365,12 @@ mod tests {
                 vec![120; stride * 3],
                 test_shape(cells),
                 10,
+                PlaybackSpeed::NORMAL,
                 Duration::from_secs(1),
                 Vec::new(),
             ),
-            Box::new(SilentOutput::new()),
+            Box::new(SilentSource),
+            false,
         );
 
         // Act
@@ -2206,10 +2405,12 @@ mod tests {
                 vec![0; frame_bytes(cells) * 2],
                 test_shape(cells),
                 0,
+                PlaybackSpeed::NORMAL,
                 Duration::from_secs(7),
                 Vec::new(),
             ),
-            Box::new(SilentOutput::new()),
+            Box::new(SilentSource),
+            false,
         );
 
         // Act / Assert
@@ -2227,7 +2428,8 @@ mod tests {
         state.begin_playback(
             0,
             span(4, Size::new(4, 2), 10),
-            Box::new(SilentOutput::new()),
+            Box::new(SilentSource),
+            false,
         );
 
         // Act / Assert
