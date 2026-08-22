@@ -4354,25 +4354,25 @@ fn preview_field_help_title(field: PreviewSettingsField) -> String {
 ///
 /// Says the trade rather than the mechanism: what a setting is *for* is the thing a reader
 /// cannot work out from the row itself, while what it does to the ffmpeg command is
-/// something they never see. Each also names the one surprise that catches people out —
-/// that these last only for the session, that a slower playback holds more frames, that a
-/// longer span is charged for twice over.
+/// something they never see. Kept short, because this is the shortest dialog in the
+/// application and the panel beside it is no taller — the entries that do run to a second
+/// paragraph earn it by naming a surprise, such as a slow speed lowering the frame rate.
 fn preview_field_help_text(field: PreviewSettingsField) -> Text<'static> {
     let description = match field {
         PreviewSettingsField::Speed => {
-            "How fast the playback runs, from a quarter of real time up to double.\n\nSlowing it down is how you tell a line that lands a syllable late from one that lands on time. The sound is stretched with it and keeps its pitch, so speech at half speed is still speech.\n\nThe frame rate below follows this, since a second of a slowed playback covers less of the media and so has fewer of its frames to draw on."
+            "How fast the preview runs, from a quarter of real time up to double. Sound is stretched with it and keeps its pitch, so speech at half speed is still speech.\n\nA slower preview holds more frames for the same stretch of media, so a long span at a low speed may be given a lower frame rate than the one set below."
         }
         PreviewSettingsField::Loop => {
-            "Whether the span starts again when it reaches its end, instead of stopping.\n\nRepeating is what makes a marginal cue judgeable: the same two seconds round after round, until you are sure. Going round again costs nothing — the frames are already decoded.\n\nPress p or Esc to stop a playback that is looping."
+            "Whether the span starts again when it reaches its end, instead of stopping.\n\nPress p or Esc to stop a preview that is looping."
         }
         PreviewSettingsField::Sound => {
-            "Whether the playback has sound.\n\nThe sound is what a subtitle's timing is judged against, so this is normally left on. Turn it off to scrub through a track quietly, or when the speech is not what you are checking.\n\nA silent playback still runs at the right speed, and so does one whose media has no audio track at all."
+            "The sound is what a subtitle's timing is judged against, so this is normally left on. Turn it off to scrub through a track quietly, or when the speech is not what you are checking."
         }
         PreviewSettingsField::Padding => {
-            "How much of the media either side of the cue the playback covers.\n\nRun-up is what lets you hear the speech start before the line is due, and hear it finish after — which is the judgement being made. None is a real answer: play exactly the cue and nothing else.\n\nThe span's length multiplies its cost, and padding is added at both ends, so every step here adds twice its own value."
+            "How much of the media either side of the cue the preview covers. Most useful to be kept short, for quick preview playbacks."
         }
         PreviewSettingsField::FrameRate => {
-            "How many frames a second the playback aims for.\n\nA ceiling, not a promise. Lower it when the picture stutters rather than plays — over ssh, or inside tmux, the frames have further to travel and a terminal that cannot keep up is better served by a chunkier playback than a late one.\n\nOnly rates this track can actually deliver at the speed above are offered, since asking a 24 fps film for 60 would only duplicate frames — and at half speed it has twelve to give. A span too large to hold in memory is decoded lower still."
+            "How many frames a second the preview aims for. A ceiling, not a promise."
         }
     };
     help_paragraphs(vec![(
@@ -13659,7 +13659,7 @@ mod tests {
 
         // Assert: titled for the focused row, and explaining that row rather than the popup.
         assert_that!(screen.contains("Information about Speed")).is_true();
-        assert_that!(screen.contains("How fast the playback runs")).is_true();
+        assert_that!(screen.contains("How fast the preview runs")).is_true();
 
         // Act / Assert: it follows the cursor rather than staying on the row it opened over.
         app.move_preview_settings_cursor(1);
