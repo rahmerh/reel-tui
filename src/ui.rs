@@ -143,6 +143,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // Read before the page is borrowed, because `App`'s accessors take the whole of it
     // while `subtitle_sync` is held mutably below.
     let badge = playback_settings_badge(app.preview_settings(), app.preview_defaults());
+    let dialog_open = app.dialog.is_some();
     let Some(state) = app.subtitle_sync.as_mut() else {
         return;
     };
@@ -208,7 +209,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
-    render_sync_preview(frame, state, columns[0], badge.as_deref());
+    render_sync_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
     render_sync_cues(frame, state, columns[1]);
     render_sync_timeline(frame, state, rows[1]);
     if let Some((message, color)) = status {
@@ -328,6 +329,7 @@ fn render_sync_preview(
     state: &mut SubtitleSyncState,
     area: Rect,
     badge: Option<&str>,
+    dialog_open: bool,
 ) {
     let title = match badge {
         Some(badge) => format!(" Preview · {badge} "),
@@ -348,6 +350,28 @@ fn render_sync_preview(
             Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
             inner,
         );
+        return;
+    }
+
+    // **The picture is left out for as long as a dialog is up, and that is a correctness
+    // fix rather than a matter of taste.**
+    //
+    // A frame reaches the terminal through its own image protocol, not through the cell
+    // buffer: the widget writes the escape sequence into the pane's first cell and marks
+    // every other cell it covers *skipped*, and the diff that decides what to redraw never
+    // emits a skipped cell. A dialog drawn over the pane paints ordinary cells on top of
+    // that, and when it *shrinks* — a dropdown closing, the help panel going away — the
+    // cells it gives back are skipped once more and nothing is ever written over them. The
+    // border it drew stays on screen, under and around the smaller dialog, which is the
+    // popup drawn twice at two sizes that this exists to stop.
+    //
+    // Opening and closing one was already safe, and only by accident: `dim_backdrop`
+    // restyles the cell the escape sequence lives in, which makes the diff re-send the
+    // picture. Leaving it out for the dialog's whole life extends that to every shape the
+    // dialog takes in between — while one is up the pane is ordinary cells, and ordinary
+    // cells redraw correctly. The same reasoning as `App::playback_in_progress`: pixels and
+    // a dialog cannot share a region, so they are kept apart rather than ordered.
+    if dialog_open {
         return;
     }
 
@@ -12437,6 +12461,64 @@ mod tests {
         let shades = image_shades(&painted);
         assert_that!(shades.is_empty()).is_false();
         assert_that!(shades.len() > 1).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A dialog and the picture cannot share the pane, so the picture stands down for as
+    /// long as one is up.
+    ///
+    /// The frame is not drawn into the cell buffer — the image widget puts an escape
+    /// sequence in the pane's first cell and marks the rest *skipped*, and a skipped cell is
+    /// never re-emitted. So a dialog that shrinks while it is open — a dropdown closing, the
+    /// help panel going away — gives back cells that nothing will ever paint over, and its
+    /// old border stays on screen: the popup drawn twice, at two sizes, one inside the
+    /// other.
+    ///
+    /// Asserted on the halfblocks protocol, which is the one a `TestBackend` can see. The
+    /// skipping is what makes the artifact invisible to a real terminal's buffer, so what
+    /// this test can check is the rule that prevents it: while a dialog is up, the pane
+    /// contributes no image cells at all, and when the dialog goes the picture comes back.
+    #[test]
+    fn a_dialog_over_the_preview_should_take_the_picture_down_rather_than_sit_on_it() {
+        // Arrange: a page with a frame on screen.
+        let (mut app, directory) =
+            sync_page_app("sync-frame-dialog", vec![sync_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        app.subtitle_sync
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: the popup takes the picture down with it, so everything it draws
+        // over is an ordinary cell the diff can redraw when the popup changes shape.
+        app.open_preview_settings();
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+        assert_that!(image_shades(&painted).is_empty()).is_true();
+
+        // Act / Assert: including once a dropdown has grown it — the shape that produced
+        // the doubled border.
+        app.activate_preview_setting();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_true();
+
+        // Act / Assert: and the picture is back the moment the dialog is gone. It is not
+        // discarded, only left undrawn.
+        app.dialog = None;
+        app.preview_settings_popup = None;
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
 
         // Cleanup
         drop(app);
