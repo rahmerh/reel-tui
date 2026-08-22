@@ -61,7 +61,7 @@ pub const FRAME_EXTENSION: &str = "jpg";
 /// units. Without it a change of format or encoder leaves files whose names still collide
 /// with live keys — the PNG-to-JPEG switch did exactly that, because a key does not encode
 /// the format, and the leftovers had to be swept by hand. Bump this instead.
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Records when a media directory was last *used*, by its own mtime.
 ///

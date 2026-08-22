@@ -2966,9 +2966,8 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     let state = app.app.subtitle_sync.as_ref().unwrap();
     let cues = state.cues.clone();
     assert_eq!(cues.len(), 2, "the sidecar holds two cues");
-    let keys: Vec<PathBuf> = cues
-        .iter()
-        .map(|cue| frame_path(&state.frames.key(cue)))
+    let keys: Vec<PathBuf> = (0..cues.len())
+        .map(|index| cached_frame(state, index))
         .collect();
     for (cue, path) in cues.iter().zip(&keys) {
         assert!(
@@ -3022,11 +3021,11 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
         "the page should re-read the sidecar it was opened on"
     );
     assert_eq!(
-        frame_path(&state.frames.key(&retyped[0])),
+        cached_frame(state, 0),
         keys[0],
         "the cue that did not change should reuse the frame already rendered for it"
     );
-    let rewritten = frame_path(&state.frames.key(&retyped[1]));
+    let rewritten = cached_frame(state, 1);
     assert_ne!(
         rewritten, keys[1],
         "a rewritten cue should not be served the frame of the line it replaced"
@@ -3090,10 +3089,8 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
     wait_for_frames(&mut app);
 
     let state = app.app.subtitle_sync.as_ref().unwrap();
-    let paths: Vec<PathBuf> = state
-        .cues
-        .iter()
-        .map(|cue| frame_path(&state.frames.key(cue)))
+    let paths: Vec<PathBuf> = (0..state.cues.len())
+        .map(|index| cached_frame(state, index))
         .collect();
     assert_eq!(paths.len(), 4, "the sidecar holds four cues");
     let rendered: Vec<SystemTime> = paths
@@ -3264,8 +3261,9 @@ fn the_background_pass_should_render_every_cue_with_its_own_line_burned_in() {
     let frames: Vec<Vec<u8>> = state
         .cues
         .iter()
-        .map(|cue| {
-            let path = frame_path(&state.frames.key(cue));
+        .enumerate()
+        .map(|(index, cue)| {
+            let path = cached_frame(state, index);
             fs::read(&path).unwrap_or_else(|error| {
                 panic!("the pass should have cached {:?}: {error}", cue.text)
             })
@@ -3391,10 +3389,8 @@ fn render_sidecar_track(app: &mut Harness, file: &str) -> Vec<PathBuf> {
     open_sidecar_timing_page(app);
     wait_for_frames(app);
     let state = app.app.subtitle_sync.as_ref().unwrap();
-    let paths = state
-        .cues
-        .iter()
-        .map(|cue| frame_path(&state.frames.key(cue)))
+    let paths = (0..state.cues.len())
+        .map(|index| cached_frame(state, index))
         .collect();
     // Back out to the file panel: Esc leaves the timing page for the track list, and
     // again for the files, which is where the next `open` starts from.
@@ -3606,8 +3602,8 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
     // Render the whole track, then compare the two cues' frames.
     wait_for_frames(&mut app);
     let state = app.app.subtitle_sync.as_ref().unwrap();
-    let first = frame_path(&state.frames.key(&state.cues[0]));
-    let second = frame_path(&state.frames.key(&state.cues[1]));
+    let first = cached_frame(state, 0);
+    let second = cached_frame(state, 1);
     assert_ne!(
         first, second,
         "two cues that draw differently must not share a cache entry"
@@ -3638,6 +3634,127 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
     );
 }
 
+/// One visible line spread across events that share a moment — a karaoke or typeset track,
+/// reduced to the smallest shape that has the defect.
+///
+/// The first cue is alone. The second says exactly the same words in exactly the same style
+/// for exactly as long, but has a third cue drawn over it. The video is a constant black
+/// frame, so the two moments are the same picture apart from what the subtitles put there.
+const OVERLAPPING_ASS: &str = "[Script Info]\n\
+     ScriptType: v4.00+\n\
+     PlayResX: 320\n\
+     PlayResY: 240\n\
+     \n\
+     [V4+ Styles]\n\
+     Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+     Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\
+     Style: Sign,Arial,48,&H0000CCFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,10,10,10,1\n\
+     \n\
+     [Events]\n\
+     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+     Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,SHARED WORDS\n\
+     Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,SHARED WORDS\n\
+     Dialogue: 0,0:00:03.00,0:00:03.80,Sign,,0,0,0,,{\\pos(160,20)}OVERLAY\n";
+
+/// A cue's frame shows everything on screen with it, not that cue with the rest deleted.
+///
+/// The case this exists for is the one the page is worst at: a typeset or karaoke line is
+/// routinely a dozen `Dialogue:` events sharing a moment, each drawing part of one effect.
+/// Burning the selected one alone draws a fraction of a picture the viewer never sees — and
+/// on the one page whose whole job is judging a subtitle against the picture, that is not a
+/// degraded preview, it is the wrong answer.
+///
+/// **Asserted on rendered bytes, because nothing else would notice.** Both halves would pass
+/// against the broken code otherwise: the cue list is the same either way, the cache holds a
+/// frame per cue either way, and the commands differ only inside a staged file. Two things
+/// are compared, and each fails on its own:
+///
+/// - the lone cue against the identical one with an overlay over it — the same words, style
+///   and duration over the same black frame, so the *only* thing that can differ is whether
+///   the overlay reached the picture;
+/// - the two cues that share a moment against each other — they are one picture, so their
+///   frames must be identical. Before this they were complements: words in one, overlay in
+///   the other, neither showing what a viewer would see.
+#[test]
+fn a_cues_frame_should_show_everything_on_screen_with_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "a_cues_frame_should_show_everything_on_screen_with_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-overlap");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.ass"), OVERLAPPING_ASS).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // Arrange: find the three cues by what they say and when, rather than by position —
+    // two of them start at the same instant and nothing here should depend on which of
+    // those the parse's sort put first.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 3, "all three cues should parse");
+    let index_of = |start_ms: u64, text: &str| {
+        state
+            .cues
+            .iter()
+            .position(|cue| cue.start == Duration::from_millis(start_ms) && cue.text == text)
+            .unwrap_or_else(|| panic!("no cue saying {text:?} at {start_ms} ms: {:?}", state.cues))
+    };
+    let lone = index_of(1000, "SHARED WORDS");
+    let accompanied = index_of(3000, "SHARED WORDS");
+    let overlay = index_of(3000, "OVERLAY");
+
+    // Act: render the whole track.
+    wait_for_frames(&mut app);
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let lone_frame = fs::read(cached_frame(state, lone))
+        .unwrap_or_else(|error| panic!("the lone cue should have rendered: {error}"));
+    let accompanied_frame = fs::read(cached_frame(state, accompanied))
+        .unwrap_or_else(|error| panic!("the accompanied cue should have rendered: {error}"));
+    let overlay_frame = fs::read(cached_frame(state, overlay))
+        .unwrap_or_else(|error| panic!("the overlay cue should have rendered: {error}"));
+
+    // Assert: the overlay reached the accompanied cue's picture. `assert!` rather than
+    // `assert_ne!`, which would print two whole JPEGs.
+    assert!(
+        lone_frame != accompanied_frame,
+        "two cues with the same words, style and duration over the same black frame drew the \
+         same picture, so the line over the second one never reached it — the preview is \
+         burning in the selected cue instead of what is on screen; both frames are {} bytes",
+        lone_frame.len()
+    );
+
+    // Assert: and the two cues sharing that moment are one picture, so their frames match.
+    assert!(
+        accompanied_frame == overlay_frame,
+        "two cues on screen together should draw the same picture, and these differ by {} \
+         bytes against {} — each is being drawn without the other",
+        accompanied_frame.len().abs_diff(overlay_frame.len()),
+        accompanied_frame.len()
+    );
+
+    // Assert: and the page really draws it, so this is the live path rather than the cache.
+    app.wait_until("a frame for the selected cue", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    assert!(
+        app.preview_shades().len() > 1,
+        "the preview should hold a decoded image:\n{}",
+        app.screen()
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
@@ -3649,6 +3766,18 @@ fn frames_root() -> PathBuf {
 /// keeps or evicts.
 fn track_dir(media_key: &str) -> PathBuf {
     frames_root().join(media_key)
+}
+
+/// Where the page's cached frame for one cue lives.
+///
+/// Through `frame_target` rather than by keying the cue directly, because a frame is a
+/// picture of the whole screen: the key covers every cue burned into it, and asking the page
+/// is the only way to get the same answer the worker did.
+fn cached_frame(state: &reel_tui::sync::SubtitleSyncState, cue_index: usize) -> PathBuf {
+    let target = state
+        .frame_target(cue_index)
+        .unwrap_or_else(|| panic!("cue {cue_index} should have a target"));
+    frame_path(&state.frames.key(&target.cue, &target.on_screen))
 }
 
 /// Where a cached frame lives.

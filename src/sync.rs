@@ -740,14 +740,20 @@ impl SubtitleSyncState {
     /// What the frame worker needs in order to draw the cue at `cue_index`.
     pub fn frame_target(&self, cue_index: usize) -> Option<FrameTarget> {
         let cue = self.cues.get(cue_index)?;
+        // `seek_for` rather than the midpoint outright: a cue running to the end of the
+        // media has to be held back from the very last instant, and the background pass has
+        // to make exactly the same decision — a disagreement would have the two writing
+        // different pictures under one cache key.
+        let seek = seek_for(cue, self.duration);
         Some(FrameTarget {
             cue_index,
             cue: cue.clone(),
-            // `seek_for` rather than the midpoint outright: a cue running to the end of
-            // the media has to be held back from the very last instant, and the background
-            // pass has to make exactly the same decision — a disagreement would have the
-            // two writing different pictures under one cache key.
-            seek: seek_for(cue, self.duration),
+            // Everything on screen at that instant, not this cue alone: a typeset or
+            // karaoke line is often a dozen cues sharing a moment, and any one of them on
+            // its own is a fraction of the picture the viewer gets. See
+            // [`crate::cue::on_screen_at`].
+            on_screen: crate::cue::on_screen_at(&self.cues, cue_index, seek),
+            seek,
         })
     }
 
@@ -1504,6 +1510,55 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .is_equal_to(vec![0]);
+
+        // Cleanup
+        drop(state);
+    }
+
+    /// A frame is a picture of the whole screen, so what the page asks the worker to burn in
+    /// is every cue on screen at the moment being grabbed — not the selected one alone.
+    ///
+    /// This is what a typeset or karaoke track needs to preview at all: one visible line is
+    /// routinely a dozen events sharing a moment, and any one of them drawn by itself is a
+    /// fraction of a picture the viewer never sees.
+    #[test]
+    fn a_frame_target_should_carry_every_cue_on_screen_with_the_one_it_is_for() {
+        // Arrange: a line with two effect cues over its middle, and an unrelated cue after.
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(2000, 3000, "under"),
+                cue(2400, 2600, "effect one"),
+                cue(2400, 2600, "effect two"),
+                cue(8000, 9000, "elsewhere"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        let target = state.frame_target(0).expect("the first cue has a target");
+
+        // Assert: the grab lands in the middle of the first cue, where all three are up.
+        assert_that!(target.seek).is_equal_to(Duration::from_millis(2500));
+        assert_that!(
+            target
+                .on_screen
+                .iter()
+                .map(|cue| cue.text.clone())
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![
+            "under".to_string(),
+            "effect one".to_string(),
+            "effect two".to_string(),
+        ]);
+        // Still filed against the cue the cursor is on, whatever else is in the picture.
+        assert_that!(target.cue_index).is_equal_to(0);
+        assert_that!(target.cue.text.as_str()).is_equal_to("under");
+
+        // Act / Assert: the unrelated cue's own frame carries only itself.
+        let apart = state.frame_target(3).expect("the last cue has a target");
+        assert_that!(apart.on_screen.len()).is_equal_to(1);
 
         // Cleanup
         drop(state);
