@@ -52,6 +52,50 @@ impl Cue {
     }
 }
 
+/// Every cue that is on the screen at `instant`, `cue` among them, in file order.
+///
+/// **A cue is not what the viewer sees; the cues on screen together are.** A typeset or
+/// karaoke line is routinely one visible line split across a dozen `Dialogue:` events that
+/// share a timing and differ only in their override tags — each drawing part of an effect,
+/// with the picture being the sum of all of them. Burning one of those on its own draws a
+/// tenth of a picture nobody will ever see, on the page whose whole job is judging a
+/// subtitle against the picture. The same holds, less dramatically, for a sign over a line
+/// of dialogue: leave the sign out and the frame is missing something the viewer has.
+///
+/// Half-open on purpose (`start <= instant < end`), matching every other timing comparison
+/// on this page: a cue that ends exactly as the grab lands is off the screen, not on it.
+///
+/// `cue` itself is included whether or not it passes that test, and that is not belt and
+/// braces — [`crate::preview::seek_for`] holds a seek back from the very end of the media,
+/// so a cue running to the last frame is grabbed at an instant just outside itself. Leaving
+/// it to the filter would burn every cue on screen *except* the one being previewed.
+/// `at` is a **position in `cues`**, not a [`Cue::index`]. The two agree for a parsed track
+/// and the field would read better here, but every caller has the position already, and a
+/// list whose indices had drifted would silently burn in every cue sharing the anchor's
+/// index instead of the anchor.
+pub fn on_screen_at(cues: &[Cue], at: usize, instant: Duration) -> Vec<Cue> {
+    cues.iter()
+        .enumerate()
+        .filter(|(position, cue)| *position == at || (cue.start <= instant && instant < cue.end))
+        .map(|(_, cue)| cue.clone())
+        .collect()
+}
+
+/// Every cue that is on the screen at some point during `start..end`, `cue` among them, in
+/// file order.
+///
+/// The span form of [`on_screen_at`], for the scrub playback: a playback runs from before
+/// the cue to after it, so the question is not what is on screen at one instant but what
+/// appears at any point in the stretch being watched. Standard half-open overlap — a cue
+/// ending exactly as the span begins never appears in it.
+pub fn on_screen_between(cues: &[Cue], at: usize, start: Duration, end: Duration) -> Vec<Cue> {
+    cues.iter()
+        .enumerate()
+        .filter(|(position, cue)| *position == at || (cue.start < end && cue.end > start))
+        .map(|(_, cue)| cue.clone())
+        .collect()
+}
+
 /// Parses SubRip text into cues, discarding anything it cannot make sense of.
 ///
 /// Returns a `Vec` rather than a `Result` on purpose. SubRip is a lenient, widely
@@ -644,6 +688,117 @@ mod tests {
 
     fn texts(cues: &[Cue]) -> Vec<&str> {
         cues.iter().map(|cue| cue.text.as_str()).collect()
+    }
+
+    /// The cue list a typeset or karaoke line really produces: one visible line spread
+    /// across several events that share a moment, plus ordinary cues either side of it.
+    fn overlapping_track() -> Vec<Cue> {
+        let named = |start, end, text: &str| Cue {
+            text: text.to_string(),
+            ..cue(start, end)
+        };
+        vec![
+            named(0, 1000, "before"),
+            named(2000, 3000, "under"),
+            named(2400, 2600, "effect one"),
+            named(2400, 2600, "effect two"),
+            named(4000, 5000, "after"),
+        ]
+    }
+
+    /// The point of previewing at all: what a viewer sees at one moment is every cue on
+    /// screen at it, and a karaoke or typeset line is routinely a dozen events sharing that
+    /// moment. Burning one of them would draw a fraction of a picture nobody ever sees.
+    #[test]
+    fn what_is_on_screen_at_a_moment_should_be_every_cue_covering_it() {
+        // Arrange
+        let cues = overlapping_track();
+
+        // Act / Assert: the anchor's own frame carries the effect lines over it, in file
+        // order, and nothing from either side of them.
+        assert_that!(texts(&on_screen_at(&cues, 1, milliseconds(2500)))).is_equal_to(vec![
+            "under",
+            "effect one",
+            "effect two",
+        ]);
+
+        // Act / Assert: and asking from one of the effect lines gives the same picture —
+        // which is what makes the row you are sitting on a matter of *filing* rather than
+        // of what gets drawn.
+        assert_that!(texts(&on_screen_at(&cues, 2, milliseconds(2500)))).is_equal_to(vec![
+            "under",
+            "effect one",
+            "effect two",
+        ]);
+
+        // Act / Assert: half-open, like every other timing comparison on this page. At the
+        // effect lines' end instant they are already gone.
+        assert_that!(texts(&on_screen_at(&cues, 1, milliseconds(2600)))).is_equal_to(vec!["under"]);
+        assert_that!(texts(&on_screen_at(&cues, 1, milliseconds(2400)))).is_equal_to(vec![
+            "under",
+            "effect one",
+            "effect two",
+        ]);
+    }
+
+    /// `seek_for` holds a grab back from the very last instant of the media, so a cue
+    /// running to the end of the file is sampled at a moment just outside itself. Filtering
+    /// on the instant alone would then burn in every cue on screen *except* the one being
+    /// previewed — a blank preview for the last line of every track.
+    #[test]
+    fn the_cue_being_previewed_should_be_on_screen_even_when_the_instant_is_not_inside_it() {
+        // Arrange
+        let cues = overlapping_track();
+
+        // Act / Assert: nothing covers 3.5 s, and the anchor is still there.
+        assert_that!(texts(&on_screen_at(&cues, 0, milliseconds(3500))))
+            .is_equal_to(vec!["before"]);
+
+        // Act / Assert: and it keeps its place in file order rather than being appended.
+        assert_that!(texts(&on_screen_at(&cues, 4, milliseconds(2500)))).is_equal_to(vec![
+            "under",
+            "effect one",
+            "effect two",
+            "after",
+        ]);
+    }
+
+    /// A playback runs from before the cue to after it, so the question is not what is on
+    /// screen at one instant but everything that appears during the stretch being watched.
+    #[test]
+    fn what_appears_in_a_span_should_be_every_cue_overlapping_it() {
+        // Arrange
+        let cues = overlapping_track();
+
+        // Act / Assert: a second of padding either side of the middle cue pulls in the
+        // effect lines over it, and nothing else.
+        assert_that!(texts(&on_screen_between(
+            &cues,
+            1,
+            milliseconds(1000),
+            milliseconds(4000)
+        )))
+        .is_equal_to(vec!["under", "effect one", "effect two"]);
+
+        // Act / Assert: half-open at both ends — a cue ending exactly as the span opens
+        // never appears in it, and one starting exactly as it closes has not arrived.
+        assert_that!(texts(&on_screen_between(
+            &cues,
+            1,
+            milliseconds(1000),
+            milliseconds(4001)
+        )))
+        .is_equal_to(vec!["under", "effect one", "effect two", "after"]);
+
+        // Act / Assert: and the anchor is kept even for a span that has left it behind,
+        // for the same reason `on_screen_at` keeps it.
+        assert_that!(texts(&on_screen_between(
+            &cues,
+            0,
+            milliseconds(4000),
+            milliseconds(5000)
+        )))
+        .is_equal_to(vec!["before", "after"]);
     }
 
     /// The shape `ffmpeg`'s own ASS muxer writes, which is what an extracted track looks

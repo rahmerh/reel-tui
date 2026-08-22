@@ -258,42 +258,84 @@ impl CueStyle {
         }
     }
 
-    /// The whole subtitle file to hand libass, holding this one cue and nothing else.
+    /// The whole subtitle file to hand libass, holding every cue on screen at the moment
+    /// being grabbed — see [`crate::cue::on_screen_at`] for why that is more than one.
     ///
-    /// Retimed to cover the entire grab in both formats, for the reason [`one_cue_srt`]
-    /// explains: `-ss` before `-i` resets output timestamps to about zero, so a cue left
-    /// at its original time is a coin toss on exactly the boundary frames this page exists
-    /// to inspect.
-    fn stage(&self, cue: &Cue) -> String {
-        self.stage_between(cue, Duration::ZERO, BURN_WINDOW)
+    /// Every one of them is retimed to cover the entire grab, for the reason [`srt_of`]
+    /// explains: `-ss` before `-i` resets output timestamps to about zero, so a cue left at
+    /// its original time is a coin toss on exactly the boundary frames this page exists to
+    /// inspect. They are all on screen at the instant sampled, so a window that holds all of
+    /// them for all of it draws exactly what the viewer would see there.
+    ///
+    /// The cost is that an *animated* line is frozen at whatever phase a window this long
+    /// puts it in: a `\t` transform or a `\fad` runs against its own line's start and end,
+    /// and those have been rewritten. That was already true of the one cue this used to
+    /// stage, and it is the price of a still being a still — the scrub playback is where an
+    /// effect is judged, and [`Self::stage_span`] leaves its timings alone.
+    fn stage(&self, cues: &[Cue]) -> String {
+        self.staged(
+            cues.iter()
+                .map(|cue| (cue, Duration::ZERO, BURN_WINDOW))
+                .collect(),
+        )
     }
 
-    /// The same file, with the cue placed at `start..end` rather than covering everything.
+    /// The same file for a stretch of media rather than an instant, with every cue left at
+    /// its own place inside the span.
     ///
-    /// What [`Self::stage`] wants is a cue that is *always* on screen, because a still is
+    /// What [`Self::stage`] wants is cues that are *always* on screen, because a still is
     /// grabbed at one instant and the burn must not be a coin toss on the rounding. The
     /// scrub playback wants the exact opposite: the span runs from before the cue to after
-    /// it, and watching the line appear and disappear against the picture is the whole
-    /// point of playing it. So the times are handed in, measured from the start of the
-    /// span — which is where `-ss` before `-i` puts the output's timestamps.
-    pub fn stage_between(&self, cue: &Cue, start: Duration, end: Duration) -> String {
+    /// it, and watching the line appear and disappear against the picture is the whole point
+    /// of playing it.
+    ///
+    /// So each cue keeps its own timing, measured from the start of the span — which is
+    /// where `-ss` before `-i` puts the output's timestamps. Relative offsets survive that
+    /// subtraction, which is what makes an effect built from a dozen staggered lines play as
+    /// the effect rather than as a dozen lines arriving at once. A cue that began before the
+    /// span is clamped to its start, since an ASS timestamp cannot be negative; it is on
+    /// screen from the first frame, which is what the viewer would see too.
+    pub fn stage_span(&self, cues: &[Cue], span_start: Duration) -> String {
+        self.staged(
+            cues.iter()
+                .map(|cue| {
+                    (
+                        cue,
+                        cue.start.saturating_sub(span_start),
+                        cue.end.saturating_sub(span_start),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The file itself, once every cue has been given the times it should carry in it.
+    ///
+    /// One function for both, because the two differ only in those times and the header,
+    /// numbering and `Format:` line must not drift apart between them.
+    fn staged(&self, timed: Vec<(&Cue, Duration, Duration)>) -> String {
         match self {
-            Self::SubRip => one_cue_srt(&cue.text, start, end),
+            Self::SubRip => srt_of(&timed),
             Self::Ass {
                 header,
                 events_format,
             } => {
-                let events = cue
-                    .dialogue
-                    .as_deref()
-                    .and_then(|line| retimed_dialogue(events_format, line, start, end))
-                    .unwrap_or_default();
-                // No `Dialogue:` line at all when the cue arrived without one — a state
-                // `parse_ass` cannot produce, since it emits a cue only for a line it
-                // could read and `retimed_dialogue` re-reads it by the same rules. Staging
-                // SubRip text under an `.ass` name instead would fail the grab on a good
-                // track to guard a case that does not occur.
-                format!("{header}\n\n[Events]\n{events_format}\n{events}\n")
+                let events: Vec<String> = timed
+                    .iter()
+                    .filter_map(|(cue, start, end)| {
+                        // A cue with no `Dialogue:` line is dropped rather than staged as
+                        // its stripped text: `parse_ass` cannot produce one, since it emits
+                        // a cue only for a line it could read and `retimed_dialogue` re-reads
+                        // it by the same rules. Staging SubRip text under an `.ass` name
+                        // instead would fail the grab on a good track to guard a case that
+                        // does not occur.
+                        retimed_dialogue(events_format, cue.dialogue.as_deref()?, *start, *end)
+                    })
+                    .collect();
+                format!(
+                    "{header}\n\n[Events]\n{events_format}\n{}\n",
+                    events.join("\n")
+                )
             }
         }
     }
@@ -314,9 +356,9 @@ impl FrameSource {
         })
     }
 
-    /// The subtitle file this cue is burned from, for this track's format and styling.
-    pub fn stage(&self, cue: &Cue) -> String {
-        self.style.stage(cue)
+    /// The subtitle file these cues are burned from, for this track's format and styling.
+    pub fn stage(&self, cues: &[Cue]) -> String {
+        self.style.stage(cues)
     }
 
     /// The filename the staged cue must be written under, distinct per renderer.
@@ -324,20 +366,28 @@ impl FrameSource {
         slot.file(&self.style)
     }
 
-    /// Both halves of one cue's cache path, for the callers that need them together.
+    /// Both halves of one frame's cache path, for the callers that need them together.
     ///
-    /// Stages the cue to key it, because the staged file is what the key covers — see
+    /// Stages the cues to key them, because the staged file is what the key covers — see
     /// [`framecache::cue_key`]. That builds a short string per lookup even when the answer
     /// is a cache hit, which is a few kilobytes of transient allocation against an
     /// `ffmpeg` seek, and buys a key that cannot describe a picture it did not produce.
-    pub fn key(&self, cue: &Cue) -> (String, String) {
-        (self.media_key(), framecache::cue_key(cue, &self.stage(cue)))
+    ///
+    /// `cue` is the one the frame is filed under and `on_screen` is everything burned into
+    /// it. Both matter: the timing comes from the first, and the picture from all of them —
+    /// so two cues sharing a moment and a staged file still get their own frames, and one
+    /// cue gets a different frame when the company it keeps changes.
+    pub fn key(&self, cue: &Cue, on_screen: &[Cue]) -> (String, String) {
+        (
+            self.media_key(),
+            framecache::cue_key(cue, &self.stage(on_screen)),
+        )
     }
 
-    /// The subtitle file for a cue that has to come and go inside a span — the scrub
-    /// playback's staging. See [`CueStyle::stage_between`].
-    pub fn stage_between(&self, cue: &Cue, start: Duration, end: Duration) -> String {
-        self.style.stage_between(cue, start, end)
+    /// The subtitle file for cues that have to come and go inside a span — the scrub
+    /// playback's staging. See [`CueStyle::stage_span`].
+    pub fn stage_span(&self, cues: &[Cue], span_start: Duration) -> String {
+        self.style.stage_span(cues, span_start)
     }
 }
 
@@ -352,6 +402,12 @@ pub struct FrameTarget {
     /// has moved on can be filed against the cue it actually belongs to.
     pub cue_index: usize,
     pub cue: Cue,
+    /// Every cue on screen at [`seek`](Self::seek), this one among them, in file order.
+    ///
+    /// What gets burned in. The frame is still *filed* under `cue` — this is the picture
+    /// that cue sits in, not a list of cues sharing one frame. See
+    /// [`crate::cue::on_screen_at`].
+    pub on_screen: Vec<Cue>,
     /// Where to grab the frame, already clamped inside the media by the caller.
     pub seek: Duration,
 }
@@ -407,8 +463,14 @@ pub struct PlaybackRequest {
     /// cursor has moved on can be discarded rather than played under the wrong line.
     pub cue_index: usize,
     pub cue: Cue,
+    /// Every cue that appears at some point in the span, this one among them, in file order.
+    ///
+    /// What gets burned in, so the playback shows the stretch of media as a viewer would
+    /// see it rather than with everything but one line removed. See
+    /// [`crate::cue::on_screen_between`].
+    pub on_screen: Vec<Cue>,
     /// Where the span starts in the media, which is also where its timestamps are reset to
-    /// by `-ss` — so the cue is staged relative to it.
+    /// by `-ss` — so the cues are staged relative to it.
     pub span_start: Duration,
     pub span_end: Duration,
     /// Frames a second, already reduced to what [`affordable_fps`] allows.
@@ -1411,13 +1473,7 @@ fn frame_window(
     }
     if let Some(target) = request.wanted.as_ref() {
         let outcome = drawn(
-            png(
-                &request.source,
-                &target.cue,
-                target.seek,
-                CueSlot::Interactive,
-                abandoned,
-            ),
+            png(&request.source, target, CueSlot::Interactive, abandoned),
             picker,
             request.cells,
         );
@@ -1452,7 +1508,7 @@ fn nearby(
         if abandoned() {
             return true;
         }
-        let (media, cue) = request.source.key(&target.cue);
+        let (media, cue) = request.source.key(&target.cue, &target.on_screen);
         let Some(bytes) = framecache::read(&media, &cue) else {
             continue;
         };
@@ -1518,16 +1574,15 @@ enum PngOutcome {
 /// overwriting each other's subtitle — see [`CueSlot`].
 fn png(
     source: &FrameSource,
-    cue: &Cue,
-    seek: Duration,
+    target: &FrameTarget,
     slot: CueSlot,
     abandoned: Abandoned<'_>,
 ) -> PngOutcome {
-    let key = source.key(cue);
+    let key = source.key(&target.cue, &target.on_screen);
     if let Some(bytes) = framecache::read(&key.0, &key.1) {
         return PngOutcome::Ready(bytes);
     }
-    render(source, cue, seek, slot, &key.0, &key.1, abandoned)
+    render(source, target, slot, &key.0, &key.1, abandoned)
 }
 
 /// What the background pass made of one cue.
@@ -1550,31 +1605,34 @@ enum CacheOutcome {
 /// at a thousand cues is hundreds of megabytes of pointless I/O.
 fn cache_frame(
     source: &FrameSource,
-    cue: &Cue,
-    seek: Duration,
+    target: &FrameTarget,
     slot: CueSlot,
     abandoned: Abandoned<'_>,
 ) -> CacheOutcome {
-    let key = source.key(cue);
+    let key = source.key(&target.cue, &target.on_screen);
     if framecache::is_cached(&key.0, &key.1) {
         return CacheOutcome::Cached;
     }
-    match render(source, cue, seek, slot, &key.0, &key.1, abandoned) {
+    match render(source, target, slot, &key.0, &key.1, abandoned) {
         PngOutcome::Ready(_) => CacheOutcome::Rendered,
         PngOutcome::Abandoned => CacheOutcome::Abandoned,
         PngOutcome::Failed(_) => CacheOutcome::Failed,
     }
 }
 
-/// Stages the cue and grabs its frame, caching whatever comes back.
+/// Stages the cues on screen and grabs their frame, caching whatever comes back.
 ///
 /// The staged file is the track's own format and styling, not always a bare `.srt` — see
 /// [`CueStyle::stage`]. Its *name* comes from the same place, because libass picks its
 /// reader from the extension.
+///
+/// Takes the whole [`FrameTarget`] rather than its parts, so the interactive grab and the
+/// background pass cannot hand this different things for the same cue: what is burned in
+/// and where the frame is seeked from are one value, decided once, and the cache key is
+/// taken from that same value by the callers above.
 fn render(
     source: &FrameSource,
-    cue: &Cue,
-    seek: Duration,
+    target: &FrameTarget,
     slot: CueSlot,
     media_key: &str,
     cue_key: &str,
@@ -1582,12 +1640,12 @@ fn render(
 ) -> PngOutcome {
     let staged = source.staged_name(slot);
     let path = source.workspace.join(&staged);
-    if let Err(error) = std::fs::write(&path, source.stage(cue)) {
+    if let Err(error) = std::fs::write(&path, source.stage(&target.on_screen)) {
         return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
     }
     let mut command = frame_command(
         &source.media,
-        seek,
+        target.seek,
         source.pixels,
         &source.workspace,
         &staged,
@@ -1708,17 +1766,15 @@ fn decoded(
         return None;
     }
     let span = request.span_end.saturating_sub(request.span_start);
-    // The cue's own times, measured from the start of the span — which is where `-ss`
-    // before `-i` resets the output's timestamps to. Staging it at its original times
-    // instead would put the line minutes past the end of a span a few seconds long, and
-    // the playback would show a silent picture with no subtitle in it at all.
+    // Every cue in the span, at its own times measured from the start of it — which is where
+    // `-ss` before `-i` resets the output's timestamps to. Staging them at their original
+    // times instead would put the lines minutes past the end of a span a few seconds long,
+    // and the playback would show a silent picture with no subtitle in it at all.
     let staged = request.source.staged_name(CueSlot::Playback);
     let path = request.source.workspace.join(&staged);
-    let text = request.source.stage_between(
-        &request.cue,
-        request.cue.start.saturating_sub(request.span_start),
-        request.cue.end.saturating_sub(request.span_start),
-    );
+    let text = request
+        .source
+        .stage_span(&request.on_screen, request.span_start);
     if let Err(error) = std::fs::write(&path, text) {
         return Some(PlaybackOutcome::Failed(format!(
             "Could not stage the cue to burn in: {error}"
@@ -2004,8 +2060,14 @@ fn warm_track(
         for (worker, cues) in request.cues.chunks(per_worker).enumerate() {
             let progress = &progress;
             let done = &done;
+            let slice = WarmSlice {
+                cues,
+                // Where this slice starts in the track, which `chunks` does not report.
+                offset: worker * per_worker,
+                worker,
+            };
             scope.spawn(move || {
-                warm_slice(request, cues, worker, abandoned, events, progress, done);
+                warm_slice(request, slice, abandoned, events, progress, done);
             });
         }
     });
@@ -2030,6 +2092,20 @@ fn warm_track(
         .publish(events, total)
 }
 
+/// One worker's share of a track: which cues it renders, and where they sit in the whole.
+///
+/// `offset` is what makes the slice locatable. A worker renders a contiguous run of cues,
+/// but what each cue is burned *with* comes from the entire cue list — the lines sharing its
+/// moment are wherever the file put them, which may be on the other side of a slice
+/// boundary. Without the offset the worker could only say "the third cue I was given",
+/// which names a different cue in every worker.
+#[derive(Clone, Copy)]
+struct WarmSlice<'a> {
+    cues: &'a [Cue],
+    offset: usize,
+    worker: usize,
+}
+
 /// One worker's contiguous slice of the track.
 ///
 /// The slot is [`CueSlot::Warm`] for this worker and nothing else. Two workers sharing one
@@ -2038,28 +2114,34 @@ fn warm_track(
 /// nothing downstream could ever notice. It is the single most important thing here.
 fn warm_slice(
     request: &WarmRequest,
-    cues: &[Cue],
-    worker: usize,
+    slice: WarmSlice<'_>,
     abandoned: Abandoned<'_>,
     events: &Sender<PreviewEvent>,
     progress: &Mutex<WarmProgress>,
     done: &AtomicUsize,
 ) {
-    let slot = CueSlot::Warm(worker);
+    let slot = CueSlot::Warm(slice.worker);
     let mut failures = 0;
-    for cue in cues {
+    for (position, cue) in slice.cues.iter().enumerate() {
+        let position = slice.offset + position;
         if abandoned() {
             return;
         }
+        // Built here rather than handed in, from the track's *whole* cue list rather than
+        // this worker's slice: the cues sharing a moment with this one are wherever the file
+        // put them, and a slice boundary falling between them would have this worker render
+        // a different picture from the one the interactive grab produces — under the same
+        // cache key, so whichever ran first would win and nothing downstream could notice.
+        let seek = seek_for(cue, request.duration);
+        let target = FrameTarget {
+            cue_index: position,
+            cue: cue.clone(),
+            on_screen: crate::cue::on_screen_at(&request.cues, position, seek),
+            seek,
+        };
         // Checked per cue as the pass reaches it, rather than filtered up front, because
         // the interactive worker may have rendered this very cue since the pass started.
-        match cache_frame(
-            &request.source,
-            cue,
-            seek_for(cue, request.duration),
-            slot,
-            abandoned,
-        ) {
+        match cache_frame(&request.source, &target, slot, abandoned) {
             CacheOutcome::Cached | CacheOutcome::Rendered => failures = 0,
             CacheOutcome::Abandoned => return,
             CacheOutcome::Failed => {
@@ -2120,20 +2202,31 @@ impl WarmProgress {
     }
 }
 
-/// The selected cue, alone, retimed to cover the whole grab.
+/// A SubRip file holding the cues to burn, each at the times it was given.
 ///
-/// `-ss` before `-i` resets output timestamps to about zero, so a cue starting at zero and
-/// running far past the single frame that emerges is burned in whatever the frame rounding
-/// or the container's `start_time` turns out to be. Handing libass the original file and
-/// original timings instead makes the burn a coin toss on exactly the boundary frames a
-/// timing page exists to inspect.
-fn one_cue_srt(text: &str, start: Duration, end: Duration) -> String {
-    format!(
-        "1\n{} --> {}\n{}\n\n",
-        format_srt_timestamp(start),
-        format_srt_timestamp(end),
-        text.trim_end()
-    )
+/// `-ss` before `-i` resets output timestamps to about zero, which is why a still's cues
+/// arrive here starting at zero and running far past the single frame that emerges: left at
+/// their original times they would be burned in or not depending on the frame rounding and
+/// the container's `start_time`, making the grab a coin toss on exactly the boundary frames
+/// a timing page exists to inspect.
+///
+/// Numbered from one in the order handed in. SubRip's counter is advisory — `parse_srt`
+/// ignores it for that reason — but a file whose blocks all claim to be block 1 is the kind
+/// of thing a reader trips over, and libass has no reason to be handed one.
+fn srt_of(timed: &[(&Cue, Duration, Duration)]) -> String {
+    timed
+        .iter()
+        .enumerate()
+        .map(|(position, (cue, start, end))| {
+            format!(
+                "{}\n{} --> {}\n{}\n\n",
+                position + 1,
+                format_srt_timestamp(*start),
+                format_srt_timestamp(*end),
+                cue.text.trim_end()
+            )
+        })
+        .collect()
 }
 
 /// Grabs one frame with the staged cue burned into it, scaled to the cache's fixed size.
@@ -2408,7 +2501,7 @@ mod tests {
         let style = ass_style();
 
         // Act
-        let staged = style.stage(&script.cues[0]);
+        let staged = style.stage(&script.cues[..1]);
 
         // Assert: a whole script, not a line.
         assert_that!(staged.as_str()).contains("[Script Info]");
@@ -2464,13 +2557,16 @@ mod tests {
 
         // Act / Assert: the same media, so the same directory — but not the same frame.
         let sign = &script.cues[0];
-        assert_that!(styled.key(sign).0.as_str()).is_equal_to(restyled.key(sign).0.as_str());
-        assert_that!(styled.key(sign).1.as_str()).is_not_equal_to(restyled.key(sign).1.as_str());
+        assert_that!(key_alone(&styled, sign).0.as_str())
+            .is_equal_to(key_alone(&restyled, sign).0.as_str());
+        assert_that!(key_alone(&styled, sign).1.as_str())
+            .is_not_equal_to(key_alone(&restyled, sign).1.as_str());
 
         // Act / Assert: and a SubRip source of the same words keys apart from both, since
         // it stages an entirely different file.
         let plain = cue(1000, 2000, "a sign");
-        assert_that!(source.key(&plain).1.as_str()).is_not_equal_to(styled.key(sign).1.as_str());
+        assert_that!(key_alone(&source, &plain).1.as_str())
+            .is_not_equal_to(key_alone(&styled, sign).1.as_str());
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -2622,6 +2718,24 @@ mod tests {
         }
     }
 
+    /// A target for a cue that shares its moment with nothing else, which is what all but a
+    /// handful of the tests here are about. The ones that do care about the company a cue
+    /// keeps build [`FrameTarget::on_screen`] themselves.
+    fn alone(cue_index: usize, cue: Cue, seek: Duration) -> FrameTarget {
+        FrameTarget {
+            cue_index,
+            on_screen: vec![cue.clone()],
+            cue,
+            seek,
+        }
+    }
+
+    /// The cache path for a cue with nothing else on screen, which is how the helpers below
+    /// seed, read and forget frames.
+    fn key_alone(source: &FrameSource, cue: &Cue) -> (String, String) {
+        source.key(cue, std::slice::from_ref(cue))
+    }
+
     /// A source whose key is unique to the caller, so tests sharing the one cache
     /// directory cannot collide on a key or read each other's frames.
     fn source(media: &Path, workspace: &Path) -> FrameSource {
@@ -2639,11 +2753,7 @@ mod tests {
         FrameRequest {
             generation: 1,
             source: source(media, workspace),
-            wanted: Some(FrameTarget {
-                cue_index: 0,
-                cue: cue(0, 1000, "BURNED IN"),
-                seek,
-            }),
+            wanted: Some(alone(0, cue(0, 1000, "BURNED IN"), seek)),
             nearby: Vec::new(),
             cells: Size::new(20, 10),
         }
@@ -2698,7 +2808,7 @@ mod tests {
     }
 
     fn forget(source: &FrameSource, cue: &Cue) {
-        let (media, cue_key) = source.key(cue);
+        let (media, cue_key) = key_alone(source, cue);
         if let Some(path) = framecache::path(&media, &cue_key) {
             let _ = std::fs::remove_file(path);
         }
@@ -2706,13 +2816,13 @@ mod tests {
 
     /// `framecache::store` for a source and cue, which is how every test seeds the cache.
     fn seed(source: &FrameSource, cue: &Cue, bytes: &[u8]) -> bool {
-        let (media, cue_key) = source.key(cue);
+        let (media, cue_key) = key_alone(source, cue);
         framecache::store(&media, &cue_key, bytes)
     }
 
     /// `framecache::is_cached` for a source and cue.
     fn cached(source: &FrameSource, cue: &Cue) -> bool {
-        let (media, cue_key) = source.key(cue);
+        let (media, cue_key) = key_alone(source, cue);
         framecache::is_cached(&media, &cue_key)
     }
 
@@ -3252,11 +3362,59 @@ mod tests {
         let cue = cue(725_000, 727_000, "Hello\nthere\n");
 
         // Act
-        let staged = CueStyle::SubRip.stage(&cue);
+        let staged = CueStyle::SubRip.stage(std::slice::from_ref(&cue));
 
         // Assert
         assert_that!(staged.as_str())
             .is_equal_to("1\n00:00:00,000 --> 00:10:00,000\nHello\nthere\n\n");
+    }
+
+    /// Everything on screen at the grabbed instant goes into the file, not the selected cue
+    /// alone — the frame is meant to be what a viewer would see there.
+    ///
+    /// Numbered in order, because a SubRip file whose blocks all claim to be block 1 is the
+    /// kind of thing a reader trips over even where a parser does not.
+    #[test]
+    fn a_grab_should_stage_every_cue_on_screen_rather_than_the_selected_one() {
+        // Arrange: a line with two effect cues over it, as a karaoke or typeset track has.
+        let cues = vec![cue(2000, 3000, "under"), cue(2400, 2600, "over")];
+
+        // Act
+        let staged = CueStyle::SubRip.stage(&cues);
+
+        // Assert: both lines, both covering the whole grab, so the picture cannot turn on
+        // how the seek rounded.
+        assert_that!(staged.as_str()).is_equal_to(
+            "1\n00:00:00,000 --> 00:10:00,000\nunder\n\n\
+             2\n00:00:00,000 --> 00:10:00,000\nover\n\n",
+        );
+    }
+
+    /// The same for ASS, where it matters most: a typeset line is routinely a dozen events
+    /// sharing a moment, each drawing part of one effect, and any one of them alone is a
+    /// fraction of a picture the viewer never sees.
+    #[test]
+    fn an_ass_grab_should_stage_every_cue_on_screen_with_its_own_styling() {
+        // Arrange: the fixture's sign, plus a second event over it in the other style.
+        let script = crate::cue::parse_ass(ASS);
+        let mut second = script.cues[0].clone();
+        second.dialogue = Some(
+            "Dialogue: 0,0:00:01.20,0:00:01.80,Default,,0,0,0,,{\\fad(100,100)}and a line"
+                .to_string(),
+        );
+        let cues = vec![script.cues[0].clone(), second];
+
+        // Act
+        let staged = ass_style().stage(&cues);
+
+        // Assert: one script, one `[Events]` section, both lines in it, each keeping its own
+        // style name and overrides and each retimed to cover the grab.
+        assert_that!(staged.matches("[Events]").count()).is_equal_to(1);
+        assert_that!(staged.as_str())
+            .contains("Dialogue: 0,0:00:00.00,0:10:00.00,Sign,,0,0,0,,{\\pos(320,10)}a sign");
+        assert_that!(staged.as_str()).contains(
+            "Dialogue: 0,0:00:00.00,0:10:00.00,Default,,0,0,0,,{\\fad(100,100)}and a line",
+        );
     }
 
     /// The scrub playback wants the exact opposite of the grab: the span runs from before
@@ -3269,14 +3427,51 @@ mod tests {
         let cue = cue(12_000, 14_500, "Hello");
 
         // Act
-        let staged = CueStyle::SubRip.stage_between(
-            &cue,
-            Duration::from_millis(2000),
-            Duration::from_millis(4500),
-        );
+        let staged =
+            CueStyle::SubRip.stage_span(std::slice::from_ref(&cue), Duration::from_secs(10));
 
         // Assert
         assert_that!(staged.as_str()).is_equal_to("1\n00:00:02,000 --> 00:00:04,500\nHello\n\n");
+    }
+
+    /// **Relative offsets have to survive the rebase**, or an effect built from staggered
+    /// lines plays as several lines arriving at once instead of as the effect. Each cue is
+    /// moved by the same amount — the span's start — rather than each being placed
+    /// somewhere, which is what keeps the gaps between them intact.
+    #[test]
+    fn a_span_should_keep_the_gaps_between_the_cues_it_stages() {
+        // Arrange: three cues a quarter of a second apart, in a span starting at 10 s.
+        let cues = vec![
+            cue(11_000, 12_000, "first"),
+            cue(11_250, 12_000, "second"),
+            cue(11_500, 12_000, "third"),
+        ];
+
+        // Act
+        let staged = CueStyle::SubRip.stage_span(&cues, Duration::from_secs(10));
+
+        // Assert: one second, then 1.25, then 1.5 — the same quarter-second steps.
+        assert_that!(staged.as_str()).is_equal_to(
+            "1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n\
+             2\n00:00:01,250 --> 00:00:02,000\nsecond\n\n\
+             3\n00:00:01,500 --> 00:00:02,000\nthird\n\n",
+        );
+    }
+
+    /// A cue that began before the span is clamped to its start rather than dropped or
+    /// given a negative time, which an ASS timestamp cannot hold. It is on screen from the
+    /// first frame, which is what the viewer would see too.
+    #[test]
+    fn a_cue_already_on_screen_when_a_span_opens_should_start_with_it() {
+        // Arrange: a cue running 8–11 s, in a span starting at 10 s.
+        let cues = vec![cue(8_000, 11_000, "already here")];
+
+        // Act
+        let staged = CueStyle::SubRip.stage_span(&cues, Duration::from_secs(10));
+
+        // Assert
+        assert_that!(staged.as_str())
+            .is_equal_to("1\n00:00:00,000 --> 00:00:01,000\nalready here\n\n");
     }
 
     /// An ASS cue is retimed the same way, through the file's own `Format:` line — and
@@ -3287,16 +3482,13 @@ mod tests {
         // Arrange
         let script = crate::cue::parse_ass(ASS);
 
-        // Act
-        let staged = ass_style().stage_between(
-            &script.cues[0],
-            Duration::from_millis(2000),
-            Duration::from_millis(3000),
-        );
+        // Act: the cue runs 1.0–2.0 s and the span starts half a second before it, so it
+        // should land at 0.5–1.5 s inside the span.
+        let staged = ass_style().stage_span(&script.cues[..1], Duration::from_millis(500));
 
         // Assert
         assert_that!(staged.as_str())
-            .contains("Dialogue: 0,0:00:02.00,0:00:03.00,Sign,,0,0,0,,{\\pos(320,10)}a sign");
+            .contains("Dialogue: 0,0:00:00.50,0:00:01.50,Sign,,0,0,0,,{\\pos(320,10)}a sign");
         assert_that!(staged.as_str()).contains("PlayResX: 384");
         assert_that!(staged.as_str()).contains("Style: Sign,Impact,40,8");
     }
@@ -3523,11 +3715,11 @@ mod tests {
         // directly in `a_queue_of_frame_requests_should_collapse_to_the_newest`.
         handles.abandon(1);
         handles.request_frame(FrameRequest {
-            wanted: Some(FrameTarget {
-                cue_index: 3,
-                cue: cue(0, 1000, "BURNED IN"),
-                seek: Duration::from_millis(2500),
-            }),
+            wanted: Some(alone(
+                3,
+                cue(0, 1000, "BURNED IN"),
+                Duration::from_millis(2500),
+            )),
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         });
 
@@ -3750,16 +3942,8 @@ mod tests {
         let request = FrameRequest {
             generation: 1,
             source: source.clone(),
-            wanted: Some(FrameTarget {
-                cue_index: 7,
-                cue: cues[0].clone(),
-                seek: Duration::ZERO,
-            }),
-            nearby: vec![FrameTarget {
-                cue_index: 8,
-                cue: cues[1].clone(),
-                seek: Duration::from_millis(2500),
-            }],
+            wanted: Some(alone(7, cues[0].clone(), Duration::ZERO)),
+            nearby: vec![alone(8, cues[1].clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
 
@@ -3802,11 +3986,7 @@ mod tests {
         let media = video(&directory);
         let uncached = cue(4000, 5000, "not rendered yet");
         let request = FrameRequest {
-            nearby: vec![FrameTarget {
-                cue_index: 1,
-                cue: uncached.clone(),
-                seek: Duration::from_millis(4500),
-            }],
+            nearby: vec![alone(1, uncached.clone(), Duration::from_millis(4500))],
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         };
         forget(&request.source, wanted(&request));
@@ -3847,16 +4027,8 @@ mod tests {
         let request = FrameRequest {
             generation: 1,
             source: source.clone(),
-            wanted: Some(FrameTarget {
-                cue_index: 0,
-                cue: selected.clone(),
-                seek: Duration::ZERO,
-            }),
-            nearby: vec![FrameTarget {
-                cue_index: 1,
-                cue: corrupt.clone(),
-                seek: Duration::from_millis(2500),
-            }],
+            wanted: Some(alone(0, selected.clone(), Duration::ZERO)),
+            nearby: vec![alone(1, corrupt.clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
 
@@ -3897,11 +4069,7 @@ mod tests {
             nearby: cues
                 .iter()
                 .enumerate()
-                .map(|(cue_index, one)| FrameTarget {
-                    cue_index,
-                    cue: one.clone(),
-                    seek: Duration::ZERO,
-                })
+                .map(|(cue_index, one)| alone(cue_index, one.clone(), Duration::ZERO))
                 .collect(),
             cells: Size::new(20, 10),
         };
@@ -3945,11 +4113,7 @@ mod tests {
         let ahead = cue(4000, 5000, "the cue behind it");
         seed(&source(&media, &directory), &ahead, &frame_bytes(64, 48));
         let request = FrameRequest {
-            nearby: vec![FrameTarget {
-                cue_index: 1,
-                cue: ahead.clone(),
-                seek: Duration::from_millis(4500),
-            }],
+            nearby: vec![alone(1, ahead.clone(), Duration::from_millis(4500))],
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         };
         forget(&request.source, wanted(&request));
@@ -3999,11 +4163,7 @@ mod tests {
             nearby: cues
                 .iter()
                 .enumerate()
-                .map(|(cue_index, one)| FrameTarget {
-                    cue_index,
-                    cue: one.clone(),
-                    seek: Duration::ZERO,
-                })
+                .map(|(cue_index, one)| alone(cue_index, one.clone(), Duration::ZERO))
                 .collect(),
             cells: Size::new(20, 10),
         };
@@ -4047,11 +4207,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
-            nearby: vec![FrameTarget {
-                cue_index: 1,
-                cue: ahead.clone(),
-                seek: Duration::ZERO,
-            }],
+            nearby: vec![alone(1, ahead.clone(), Duration::ZERO)],
             cells: Size::new(20, 10),
         };
         let (events_tx, events) = mpsc::channel();
@@ -4083,11 +4239,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
-            nearby: vec![FrameTarget {
-                cue_index: 4,
-                cue: ahead.clone(),
-                seek: Duration::from_millis(2500),
-            }],
+            nearby: vec![alone(4, ahead.clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
 
@@ -4161,7 +4313,7 @@ mod tests {
         let directory = scratch("frame-format");
         let media = video(&directory);
         let request = frame_request(&media, &directory, Duration::from_millis(2500));
-        let key = request.source.key(wanted(&request));
+        let key = key_alone(&request.source, wanted(&request));
         forget(&request.source, wanted(&request));
 
         // Act
@@ -4219,6 +4371,42 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A cue's frame is a picture of the whole screen, so the key has to cover the company
+    /// the cue keeps as well as the cue itself.
+    ///
+    /// Both halves matter and they fail in opposite directions. Keying on the staged file
+    /// alone would give two cues sharing a moment one frame between them, and the second one
+    /// selected would be filed under the first's name. Keying on the cue alone — which is
+    /// what this did before anything but the selected cue was burned in — would serve a
+    /// picture drawn without the lines over it, and no test of counts, files or command
+    /// lines would notice.
+    #[test]
+    fn a_cues_frame_should_be_keyed_on_the_company_it_keeps() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("frame-company");
+        let source = source(&directory.join("clip.mkv"), &directory);
+        let under = cue(2000, 3000, "under");
+        let over = cue(2400, 2600, "over");
+        let together = vec![under.clone(), over.clone()];
+
+        // Act / Assert: the same cue keys differently once something else shares its frame.
+        assert_that!(source.key(&under, std::slice::from_ref(&under)).1.as_str())
+            .is_not_equal_to(source.key(&under, &together).1.as_str());
+
+        // Act / Assert: and the two cues sharing that one picture still get a frame each,
+        // since the key covers which of them the frame is *for* as well as what is in it.
+        assert_that!(source.key(&under, &together).1.as_str())
+            .is_not_equal_to(source.key(&over, &together).1.as_str());
+
+        // Act / Assert: all of it in the one media directory, whatever is on screen.
+        assert_that!(source.key(&under, &together).0.as_str())
+            .is_equal_to(source.key(&over, std::slice::from_ref(&over)).0.as_str());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// A cache key covers one cue's text and timing, so a track whose cues differ cannot
     /// share a frame between them — which is what would show the wrong line burned in.
     ///
@@ -4230,15 +4418,16 @@ mod tests {
         let _guard = cache_guard();
         let directory = scratch("frame-per-cue");
         let source = source(&directory.join("clip.mkv"), &directory);
-        let first = source.key(&cue(0, 1000, "first"));
+        let first = key_alone(&source, &cue(0, 1000, "first"));
 
         // Act / Assert
         assert_that!(first.1.as_str())
-            .is_not_equal_to(source.key(&cue(0, 1000, "second")).1.as_str());
+            .is_not_equal_to(key_alone(&source, &cue(0, 1000, "second")).1.as_str());
         assert_that!(first.1.as_str())
-            .is_not_equal_to(source.key(&cue(500, 1000, "first")).1.as_str());
+            .is_not_equal_to(key_alone(&source, &cue(500, 1000, "first")).1.as_str());
         // The same directory for all three, whatever the cue says.
-        assert_that!(first.0.as_str()).is_equal_to(source.key(&cue(500, 1000, "first")).0.as_str());
+        assert_that!(first.0.as_str())
+            .is_equal_to(key_alone(&source, &cue(500, 1000, "first")).0.as_str());
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -4561,7 +4750,7 @@ mod tests {
         let in_parallel: Vec<Vec<u8>> = cues
             .iter()
             .map(|cue| {
-                let (media_key, cue_key) = request.source.key(cue);
+                let (media_key, cue_key) = key_alone(&request.source, cue);
                 framecache::read(&media_key, &cue_key)
                     .unwrap_or_else(|| panic!("the pass should have cached {:?}", cue.text))
             })
@@ -4571,16 +4760,18 @@ mod tests {
         for cue in &cues {
             forget(&request.source, cue);
         }
-        let alone: Vec<Vec<u8>> = cues
+        let serially: Vec<Vec<u8>> = cues
             .iter()
-            .map(|cue| {
-                match png(
-                    &request.source,
-                    cue,
-                    seek_for(cue, request.duration),
-                    CueSlot::Interactive,
-                    &|| false,
-                ) {
+            .enumerate()
+            .map(|(position, cue)| {
+                let seek = seek_for(cue, request.duration);
+                let target = FrameTarget {
+                    cue_index: position,
+                    cue: cue.clone(),
+                    on_screen: crate::cue::on_screen_at(&request.cues, position, seek),
+                    seek,
+                };
+                match png(&request.source, &target, CueSlot::Interactive, &|| false) {
                     PngOutcome::Ready(bytes) => bytes,
                     PngOutcome::Abandoned => panic!("nothing abandoned {:?}", cue.text),
                     PngOutcome::Failed(why) => {
@@ -4591,7 +4782,7 @@ mod tests {
             .collect();
 
         // Assert
-        for ((cue, parallel), serial) in cues.iter().zip(&in_parallel).zip(&alone) {
+        for ((cue, parallel), serial) in cues.iter().zip(&in_parallel).zip(&serially) {
             assert_that!(parallel.as_slice() == serial.as_slice()).is_true();
             assert_that!(parallel.is_empty()).is_false();
             // Named in the failure message, since the bytes themselves say nothing.
@@ -4764,11 +4955,11 @@ mod tests {
         forget(&source, &second);
 
         // Act
-        let cached = cache_frame(&source, &first, Duration::ZERO, CueSlot::Warm(0), &|| false);
-        let missing = cache_frame(&source, &second, Duration::ZERO, CueSlot::Warm(0), &|| {
-            false
-        });
-        let abandoned = cache_frame(&source, &second, Duration::ZERO, CueSlot::Warm(0), &|| true);
+        let hit = alone(0, first.clone(), Duration::ZERO);
+        let miss = alone(1, second.clone(), Duration::ZERO);
+        let cached = cache_frame(&source, &hit, CueSlot::Warm(0), &|| false);
+        let missing = cache_frame(&source, &miss, CueSlot::Warm(0), &|| false);
+        let abandoned = cache_frame(&source, &miss, CueSlot::Warm(0), &|| true);
 
         // Assert
         assert_that!(cached).is_equal_to(CacheOutcome::Cached);
@@ -5619,6 +5810,7 @@ mod tests {
             generation: 1,
             source: source(media, workspace),
             cue_index: 0,
+            on_screen: vec![cue.clone()],
             cue,
             span_start: Duration::from_secs(1),
             span_end: Duration::from_secs(4),

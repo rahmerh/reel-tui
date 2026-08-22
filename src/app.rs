@@ -2795,7 +2795,7 @@ impl App {
         // by construction, and returning here would strand them behind the expensive one,
         // which is exactly the round trip the ready window exists to remove.
         let held_back = selected.as_ref().is_some_and(|target| {
-            let (media, cue) = state.frames.key(&target.cue);
+            let (media, cue) = state.frames.key(&target.cue, &target.on_screen);
             !framecache::is_cached(&media, &cue) && !state.frame_request_due()
         });
         let wanted = if held_back { None } else { selected };
@@ -2916,13 +2916,21 @@ impl App {
             let pixels = crate::preview::playback_pixels(cells, picker.font_size());
             let (span_start, span_end) =
                 crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
+            // Every cue that appears anywhere in the span, not this one alone. A span that
+            // burned in only the selected line would play the stretch of media with
+            // everything else stripped out of it — and for a typeset or karaoke line, whose
+            // cues share a moment and each draw part of one effect, the selected line on its
+            // own is a fraction of a picture nobody will ever see.
             let cue_index = state.selected;
+            let on_screen =
+                crate::cue::on_screen_between(&state.cues, cue_index, span_start, span_end);
             state.prepare_playback(cue_index);
             PlaybackRequest {
                 generation: self.playback_generation.wrapping_add(1),
                 source: state.frames.clone(),
                 cue_index,
                 cue,
+                on_screen,
                 span_start,
                 span_end,
                 // Lowered from what the user asked for only when the span at this size
@@ -20760,7 +20768,8 @@ mod tests {
         // The second cue's picture is on disk, as it would be once the background pass
         // had walked past it.
         let state = app.subtitle_sync.as_ref().unwrap();
-        let key = state.frames.key(&state.cues[1]);
+        let target = state.frame_target(1).expect("the second cue has a target");
+        let key = state.frames.key(&target.cue, &target.on_screen);
         crate::framecache::store(&key.0, &key.1, b"stand-in for a rendered frame");
 
         // Act: the selection moves and the dispatch runs immediately, with none of the
@@ -21501,6 +21510,68 @@ mod tests {
         app.toggle_playback();
         let request = playbacks.try_recv().expect("a span should be asked for");
         assert_that!(request.audio).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span is a stretch of the film, so what is burned into it is everything that appears
+    /// in that stretch — not the selected line with the rest of the screen deleted.
+    ///
+    /// It matters most for the tracks this page is hardest on: a typeset or karaoke line is
+    /// routinely a dozen events sharing a moment, each drawing part of one effect, so playing
+    /// the selected one alone plays a fraction of a picture nobody will ever see.
+    #[test]
+    fn a_span_should_burn_in_every_cue_that_appears_in_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_sync();
+        let cue = |index: usize, start: u64, end: u64, text: &str| crate::cue::Cue {
+            index,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            text: text.into(),
+            dialogue: None,
+        };
+        let state = app.subtitle_sync.as_mut().unwrap();
+        // The selected line, two effect cues over its middle, and one far enough away that
+        // even a second of padding either side cannot reach it.
+        state.apply_prepared(
+            vec![
+                cue(0, 4000, 6000, "under"),
+                cue(1, 4400, 4600, "effect one"),
+                cue(2, 4400, 4600, "effect two"),
+                cue(3, 20_000, 21_000, "elsewhere"),
+            ],
+            CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+
+        // Act
+        app.toggle_playback();
+
+        // Assert
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(
+            request
+                .on_screen
+                .iter()
+                .map(|cue| cue.text.clone())
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![
+            "under".to_string(),
+            "effect one".to_string(),
+            "effect two".to_string(),
+        ]);
+        // Still the span *for* the selected cue, whatever else plays inside it.
+        assert_that!(request.cue_index).is_equal_to(0);
+        assert_that!(request.cue.text.as_str()).is_equal_to("under");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
