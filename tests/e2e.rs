@@ -3593,8 +3593,8 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
     assert!(
         state.cues[1]
             .dialogue
-            .as_deref()
-            .is_some_and(|line| line.contains("Sign") && line.contains("\\pos(160,20)")),
+            .iter()
+            .any(|line| line.contains("Sign") && line.contains("\\pos(160,20)")),
         "the styled cue should keep its own Dialogue line: {:?}",
         state.cues[1].dialogue
     );
@@ -3751,6 +3751,144 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
     assert!(
         app.preview_shades().len() > 1,
         "the preview should hold a decoded image:\n{}",
+        app.screen()
+    );
+}
+
+/// A karaoke effect as a file really carries it: one visible line spread over four
+/// `Dialogue:` events that share a timing and a set of words, each scaling the text a little
+/// further so that together they animate. Plus one ordinary line over the top of them, whose
+/// timing differs.
+const KARAOKE_ASS: &str = "[Script Info]\n\
+     ScriptType: v4.00+\n\
+     PlayResX: 320\n\
+     PlayResY: 240\n\
+     \n\
+     [V4+ Styles]\n\
+     Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+     Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\
+     \n\
+     [Events]\n\
+     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+     Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,fu\n\
+     Dialogue: 0,0:00:03.00,0:00:03.60,Default,,0,0,0,,{\\pos(60,60)}wo\n\
+     Dialogue: 0,0:00:03.00,0:00:03.60,Default,,0,0,0,,{\\pos(120,60)}wo\n\
+     Dialogue: 0,0:00:03.00,0:00:03.60,Default,,0,0,0,,{\\pos(180,60)}wo\n\
+     Dialogue: 0,0:00:03.00,0:00:03.60,Default,,0,0,0,,{\\pos(240,60)}wo\n";
+
+/// One visible line is one row on the page, however many events draw it.
+///
+/// The complaint this answers: a karaoke or typeset track filled the cue list with rows that
+/// were identical in every way a reader can see — same words, same timing — each previewing
+/// a fraction of the picture, with no way to tell which was which or why there were ten.
+///
+/// Asserted the whole way through, because the fold has to reach every part of the page at
+/// once: the list shows one row, the timeline packs one block, the frame under the cursor is
+/// the *whole* line rather than a quarter of it, and `p` plays that one span. A fold that
+/// only reached the list would leave the cursor sitting on a row whose preview and playback
+/// still belonged to one of the four events.
+#[test]
+fn events_that_draw_one_line_should_be_one_row_end_to_end() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "events_that_draw_one_line_should_be_one_row_end_to_end";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-karaoke");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(6.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.ass"), KARAOKE_ASS).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // Assert: two rows for five events, and the folded one keeps the timing all four of its
+    // events shared.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(
+        state.cues.len(),
+        2,
+        "the four events that draw one line should be one row: {:?}",
+        state.cues
+    );
+    assert_eq!(state.cues[1].text, "wo");
+    assert_eq!(state.cues[1].start, Duration::from_millis(3000));
+    assert_eq!(state.cues[1].end, Duration::from_millis(3600));
+    assert_eq!(
+        state.cues[1].dialogue.len(),
+        4,
+        "the row should keep every line that draws it"
+    );
+
+    // Assert: the list shows it once. Four rows would put four identical timestamps on
+    // screen, which is the thing being complained about.
+    let screen = app.screen();
+    assert_eq!(
+        screen.matches("00:00:03.0").count(),
+        1,
+        "the folded line should appear once in the cue list:\n{screen}"
+    );
+
+    // Assert: and the frame under it is the whole line. All four events are on screen at the
+    // moment it is grabbed, so a preview of one of them would be a quarter of the picture —
+    // compared against a deliberately rebuilt one-event frame, since nothing but the pixels
+    // would notice.
+    wait_for_frames(&mut app);
+    app.press(key(KeyCode::Char('j')));
+    app.wait_until("the folded row's frame", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.selected == 1 && state.frame().is_some())
+    });
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let whole = fs::read(cached_frame(state, 1))
+        .unwrap_or_else(|error| panic!("the folded row should have rendered: {error}"));
+    let mut one_event = state.cues[1].clone();
+    one_event.dialogue.truncate(1);
+    let quarter = frame_path(
+        &state
+            .frames
+            .key(&one_event, std::slice::from_ref(&one_event)),
+    );
+    assert!(
+        !quarter.is_file() || fs::read(&quarter).unwrap() != whole,
+        "the folded row drew the same picture as one of its four events, so three of them \
+         never reached the frame"
+    );
+
+    // Assert: the timeline packs one block for it rather than four stacked lanes.
+    assert_eq!(
+        state.layout.lane_count, 1,
+        "one line should occupy one lane, not one per event"
+    );
+
+    // Act / Assert: and `p` plays that one span, burning all four events into it.
+    app.press(key(KeyCode::Char('p')));
+    app.wait_until("the span to start playing", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let position = state
+        .playback_position()
+        .expect("a playing span knows where it is");
+    assert!(
+        position < Duration::from_millis(3600),
+        "the span should be the folded row's own, and it started at {position:?}"
+    );
+    // A shade rather than several: the span opens a second before the cue, where the
+    // fixture's video is solid black and nothing is burned in yet.
+    assert!(
+        !app.preview_shades().is_empty(),
+        "the playback should be drawn:\n{}",
         app.screen()
     );
 }

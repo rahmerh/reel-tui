@@ -37,8 +37,14 @@ pub struct Cue {
     /// would be showing something the user will never see, on the one page whose entire
     /// job is comparing subtitles against the picture.
     ///
-    /// `None` for every other format, where the text is the whole cue.
-    pub dialogue: Option<String>,
+    /// Empty for every other format, where the text is the whole cue.
+    ///
+    /// **More than one line when several events were folded into this cue** — see
+    /// [`collapse`]. A typeset or karaoke line is routinely a dozen `Dialogue:` events
+    /// sharing a timing and a set of words, differing only in their override tags; they are
+    /// one line to the reader and one row on the page, so they are one cue here, and all of
+    /// their lines are staged together.
+    pub dialogue: Vec<String>,
 }
 
 impl Cue {
@@ -94,6 +100,57 @@ pub fn on_screen_between(cues: &[Cue], at: usize, start: Duration, end: Duration
         .filter(|(position, cue)| *position == at || (cue.start < end && cue.end > start))
         .map(|(_, cue)| cue.clone())
         .collect()
+}
+
+/// The tail every parse ends with: sort by time, fold the runs that are one line, number
+/// what is left.
+///
+/// One function so the two parsers cannot disagree about what a cue list is. The order
+/// matters: [`collapse`] folds *consecutive* cues, so the sort has to have brought the
+/// candidates together first, and the numbering has to come last or it would number rows
+/// that no longer exist.
+fn ordered(mut cues: Vec<Cue>) -> Vec<Cue> {
+    // Stable, so cues sharing a timing keep the order the file put them in — which is the
+    // order libass draws them in, and the order `collapse` folds them in.
+    cues.sort_by_key(|cue| (cue.start, cue.end));
+    let mut cues = collapse(cues);
+    for (index, cue) in cues.iter_mut().enumerate() {
+        cue.index = index;
+    }
+    cues
+}
+
+/// Folds each run of cues that are the same line into one cue carrying all of their
+/// `Dialogue:` lines.
+///
+/// **One visible line is often many events.** A typeset or karaoke line is routinely a dozen
+/// `Dialogue:` events sharing a timing and a set of words, each carrying a different
+/// override tag so that together they animate; the reader sees one line, and the timing page
+/// showed a dozen identical rows, each previewing a fraction of the picture. Folding them
+/// makes the row match what is on the screen: one entry, one frame, one span to play.
+///
+/// **The test is deliberately dumb: identical start, identical end, identical text, and
+/// adjacent in the file.** Rows that are indistinguishable to the reader become one row, and
+/// nothing else is touched. Anything looser starts guessing which events belong to one line
+/// — real karaoke gives each syllable its own timing, and merging those would hide the very
+/// differences the page exists to show.
+///
+/// The folded cue's own timing needs no thought precisely because of that test: every member
+/// shares it. What is kept from each of them is its `Dialogue:` line, since that is the only
+/// thing they differ in, and staging all of them is what draws the whole line.
+fn collapse(cues: Vec<Cue>) -> Vec<Cue> {
+    let mut collapsed: Vec<Cue> = Vec::with_capacity(cues.len());
+    for cue in cues {
+        match collapsed.last_mut() {
+            Some(last)
+                if last.start == cue.start && last.end == cue.end && last.text == cue.text =>
+            {
+                last.dialogue.extend(cue.dialogue);
+            }
+            _ => collapsed.push(cue),
+        }
+    }
+    collapsed
 }
 
 /// Parses SubRip text into cues, discarding anything it cannot make sense of.
@@ -153,15 +210,11 @@ pub fn parse_srt(source: &str) -> Vec<Cue> {
             // entire reason this view exists.
             end: end.max(start),
             text: text_lines.join("\n"),
-            dialogue: None,
+            dialogue: Vec::new(),
         });
     }
 
-    cues.sort_by_key(|cue| (cue.start, cue.end));
-    for (index, cue) in cues.iter_mut().enumerate() {
-        cue.index = index;
-    }
-    cues
+    ordered(cues)
 }
 
 /// Reads and parses a `.srt` file.
@@ -267,14 +320,11 @@ pub fn parse_ass(source: &str) -> AssScript {
             start,
             end: end.max(start),
             text,
-            dialogue: Some(line.to_string()),
+            dialogue: vec![line.to_string()],
         });
     }
 
-    cues.sort_by_key(|cue| (cue.start, cue.end));
-    for (index, cue) in cues.iter_mut().enumerate() {
-        cue.index = index;
-    }
+    let cues = ordered(cues);
     AssScript {
         header: header.trim_end().to_string(),
         events_format,
@@ -682,12 +732,115 @@ mod tests {
             start: milliseconds(start),
             end: milliseconds(end),
             text: String::new(),
-            dialogue: None,
+            dialogue: Vec::new(),
         }
     }
 
     fn texts(cues: &[Cue]) -> Vec<&str> {
         cues.iter().map(|cue| cue.text.as_str()).collect()
+    }
+
+    /// The shape a karaoke or typeset effect really has in a file: one visible line spread
+    /// over several `Dialogue:` events that share a timing and a set of words, each carrying
+    /// a different override tag so that together they animate.
+    const ANIMATED_ASS: &str = "[Script Info]\n\
+         ScriptType: v4.00+\n\
+         \n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, Alignment\n\
+         Style: Default,Arial,16,2\n\
+         \n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,0:00:29.30,0:00:30.10,Default,,0,0,0,,fu\n\
+         Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(0,100,\\fscx120)}wo\n\
+         Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(100,200,\\fscx140)}wo\n\
+         Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(200,300,\\fscx160)}wo\n";
+
+    /// One visible line is one row, however many events draw it.
+    ///
+    /// The complaint this answers: a track like `ANIMATED_ASS` filled the cue list with
+    /// identical rows — same words, same timing, no way to tell them apart — each previewing
+    /// a fraction of the picture. They are one line to a reader, so they are one cue here.
+    #[test]
+    fn events_that_are_one_line_should_collapse_into_one_cue() {
+        // Act
+        let script = parse_ass(ANIMATED_ASS);
+
+        // Assert: two rows, not four — and the odd one out is left alone, because its timing
+        // differs and a difference in timing is exactly what this page exists to show.
+        assert_that!(texts(&script.cues)).is_equal_to(vec!["fu", "wo"]);
+        assert_that!(script.cues[1].start).is_equal_to(milliseconds(29_500));
+        assert_that!(script.cues[1].end).is_equal_to(milliseconds(29_800));
+
+        // Assert: every line that drew it is kept, in file order. Dropping any of them would
+        // preview a fraction of the effect, which is the whole reason they are folded rather
+        // than filtered.
+        assert_that!(script.cues[1].dialogue.len()).is_equal_to(3);
+        for (position, scale) in ["fscx120", "fscx140", "fscx160"].iter().enumerate() {
+            assert_that!(script.cues[1].dialogue[position].as_str()).contains(*scale);
+        }
+        assert_that!(script.cues[0].dialogue.len()).is_equal_to(1);
+
+        // Assert: and the numbering describes the list that is left, so nothing downstream
+        // can address a row that no longer exists.
+        assert_that!(script.cues[0].index).is_equal_to(0);
+        assert_that!(script.cues[1].index).is_equal_to(1);
+    }
+
+    /// The test is deliberately dumb, and these are the cases it must *not* fold: anything a
+    /// reader could tell apart stays its own row.
+    #[test]
+    fn cues_that_differ_in_any_way_should_stay_their_own_rows() {
+        // Arrange: same words at a different time, same time with different words, and the
+        // same line either side of an interloper that shares its timing.
+        let differing = ANIMATED_ASS
+            .replace(
+                "Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(100,200,\\fscx140)}wo",
+                "Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,ka",
+            )
+            .replace(
+                "Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(200,300,\\fscx160)}wo\n",
+                "Dialogue: 0,0:00:29.50,0:00:29.80,Default,,0,0,0,,{\\t(200,300,\\fscx160)}wo\n\
+                 Dialogue: 0,0:00:31.00,0:00:31.50,Default,,0,0,0,,wo\n",
+            );
+
+        // Act
+        let script = parse_ass(&differing);
+
+        // Assert: nothing folds at all. The two `wo`s at 29.5 share a timing and their words
+        // but the `ka` between them broke the run, and a rule that reached past its
+        // neighbours would start deciding which of a file's events belong together — which
+        // it has no business doing. The last `wo` says the same thing at a different time,
+        // and a difference in timing is the one thing this page must never hide.
+        assert_that!(texts(&script.cues)).is_equal_to(vec!["fu", "wo", "ka", "wo", "wo"]);
+        assert_that!(script.cues[4].start).is_equal_to(milliseconds(31_000));
+        assert_that!(
+            script
+                .cues
+                .iter()
+                .map(|cue| cue.dialogue.len())
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![1, 1, 1, 1, 1]);
+    }
+
+    /// The rule is about cues, not about formats: a SubRip file that repeats a line at the
+    /// same moment shows it once, for the same reason.
+    #[test]
+    fn a_subrip_line_repeated_at_the_same_moment_should_collapse_too() {
+        // Act
+        let cues = parse_srt(
+            "1\n00:00:01,000 --> 00:00:02,000\nsame\n\n\
+             2\n00:00:01,000 --> 00:00:02,000\nsame\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nsame\n\n",
+        );
+
+        // Assert: two rows — the repeat folds, the later one stands.
+        assert_that!(texts(&cues)).is_equal_to(vec!["same", "same"]);
+        assert_that!(cues[1].start).is_equal_to(milliseconds(3000));
+        // Nothing to keep from a SubRip cue but its text, which the fold already has.
+        assert_that!(cues[0].dialogue.is_empty()).is_true();
     }
 
     /// The cue list a typeset or karaoke line really produces: one visible line spread
@@ -846,8 +999,12 @@ mod tests {
         // The second cue is the whole point — its override block is markup rather than
         // words, and its text contains the comma that a naive split would cut it at.
         assert_that!(texts(&script.cues)).is_equal_to(vec!["first line", "a sign, with a comma"]);
-        assert_that!(script.cues[1].dialogue.as_deref().unwrap()).is_equal_to(
-            "Dialogue: 0,0:00:03.00,0:00:04.50,Sign,,0,0,0,,{\\pos(320,10)}a sign, with a comma",
+        assert_that!(script.cues[1].dialogue.as_slice()).is_equal_to(
+            [
+                "Dialogue: 0,0:00:03.00,0:00:04.50,Sign,,0,0,0,,{\\pos(320,10)}a sign, with a comma"
+                    .to_string(),
+            ]
+            .as_slice(),
         );
     }
 
@@ -949,7 +1106,7 @@ mod tests {
     fn retiming_a_dialogue_line_should_move_only_its_two_time_columns() {
         // Arrange
         let script = parse_ass(ASS);
-        let sign = script.cues[1].dialogue.clone().unwrap();
+        let sign = script.cues[1].dialogue[0].clone();
 
         // Act
         let retimed = retimed_dialogue(
