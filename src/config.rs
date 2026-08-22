@@ -32,7 +32,8 @@ pub struct Config {
     /// inside tmux, the bytes for a halfblocks frame have further to travel than they do
     /// locally, and lowering this is what turns a playback that stutters into one that is
     /// merely chunky. A ceiling rather than a promise — a span too large to hold in memory
-    /// at this rate is decoded at a lower one.
+    /// at this rate is decoded at a lower one, and so is one whose source holds fewer frames
+    /// a second than this (see `preview::source_capped_fps`).
     pub playback_fps: u32,
     /// How much of the media either side of the cue that playback covers.
     pub playback_pad: Duration,

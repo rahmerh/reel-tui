@@ -1045,6 +1045,44 @@ impl std::fmt::Display for PlaybackSpeed {
     }
 }
 
+/// The frame rate worth asking a source for, never above `fps`.
+///
+/// **The `fps` filter duplicates frames to reach a rate the source does not hold.** Asking a
+/// 24 fps film for 60 does not make it smoother; it decodes 60 frames a second of which 36
+/// are copies, and the span costs two and a half times the memory for exactly the same
+/// picture. Since a playback holds its whole span decoded, that waste comes straight out of
+/// [`PLAYBACK_BUDGET`] and pushes [`affordable_fps`] into lowering a rate that was never
+/// buying anything.
+///
+/// **Scaled by the speed, because that is how many source frames a second of *output*
+/// covers.** At half speed one output second spans half a second of media, so a 24 fps
+/// source has twelve distinct frames to give it; at double speed, forty-eight. Dropping the
+/// factor would cap a slowed playback at the source's own rate and leave it asking for twice
+/// the frames it can show — which is the case where the budget is already tightest.
+///
+/// Rounded up, so a 23.976 fps source is asked for 24 rather than 23. `None` means ffprobe
+/// would not say what the source holds, and then nothing is capped: guessing a rate here
+/// would make a playback choppier for a file we simply failed to read.
+pub fn source_capped_fps(fps: u32, source: Option<f64>, speed: PlaybackSpeed) -> u32 {
+    fps.min(source_frame_ceiling(source, speed).unwrap_or(fps))
+}
+
+/// The most frames a second this source can put into a second of output, or `None` when
+/// ffprobe would not say what it holds.
+///
+/// Split from [`source_capped_fps`] because the popup needs the ceiling itself: a dropdown
+/// that offers a 23.976 fps track sixty frames a second is offering a rate that cannot
+/// happen, and there is no way for a reader to tell that from the row.
+pub fn source_frame_ceiling(source: Option<f64>, speed: PlaybackSpeed) -> Option<u32> {
+    let source = source.filter(|rate| rate.is_finite() && *rate > 0.0)?;
+    let distinct = (source * speed.as_f64()).ceil();
+    // Through `u32::try_from` rather than `as`, which saturates silently: a nonsense rate out
+    // of a malformed file should cap nothing, not wrap to one frame a second.
+    let distinct = u32::try_from(distinct as u64).ok()?;
+    // Floored at one, so a source of stills still yields a frame rather than nothing.
+    Some(distinct.max(1))
+}
+
 /// The frame rate this span can afford at this size, never above `fps`.
 ///
 /// The same shape as `SubtitleSyncState::window_radius`: a ceiling the user asked for,
@@ -1686,6 +1724,15 @@ fn decoded(
             "Could not stage the cue to burn in: {error}"
         )));
     }
+    // **Cleared before the run, not after it.** Every playback of this page writes its sound
+    // to the same name in the same workspace, and a run that asks for no sound — a muted
+    // playback, or media with no audio track — writes nothing at all. Left in place, the
+    // previous span's file is still sitting there when the samples are read back, and the
+    // page plays the *last* cue's sound under this one's picture. A failure to remove it is
+    // not worth refusing the playback over; the read below is gated on having asked for
+    // sound, which is the same guarantee arrived at from the other side.
+    let audio_path = request.source.workspace.join(AUDIO_FILE);
+    let _ = std::fs::remove_file(&audio_path);
     let mut command = playback_command(request, span, &staged);
     let pixels = match played(run_cancellable(&mut command, abandoned)) {
         SpanOutcome::Abandoned => return None,
@@ -1706,7 +1753,15 @@ fn decoded(
         // concurrently, and two pipes into one process is a deadlock waiting for whichever
         // reader falls behind. The file is a few hundred kilobytes in the workspace that
         // the page deletes when it closes.
-        read_samples(&request.source.workspace.join(AUDIO_FILE)),
+        //
+        // Only when this run asked for sound. A muted playback writes no such file, so
+        // reading unconditionally hands it whatever the last unmuted playback of this page
+        // left behind — the previous cue's sound, under this cue's picture, from a page the
+        // user has just told to be silent.
+        match request.audio {
+            Some(_) => read_samples(&audio_path),
+            None => Vec::new(),
+        },
     );
     // A run that succeeded without writing a whole frame is what seeking past the end of
     // the media looks like, and it is the one case the slicing arithmetic cannot represent
@@ -5197,6 +5252,53 @@ mod tests {
         .is_equal_to(30);
     }
 
+    /// The `fps` filter duplicates frames to reach a rate the source does not hold, so a
+    /// 24 fps film asked for 60 comes back two and a half times the size for exactly the
+    /// same picture — memory that comes straight out of the playback budget. Nothing about
+    /// the command, the frame count or the cache would look wrong; only the picture would
+    /// fail to be any smoother.
+    #[test]
+    fn a_source_should_never_be_asked_for_frames_it_does_not_hold() {
+        // Act / Assert: film asked for more than it has, at normal speed.
+        assert_that!(source_capped_fps(60, Some(24.0), PlaybackSpeed::NORMAL)).is_equal_to(24);
+        // Rounded up, so 23.976 is asked for 24 rather than 23.
+        assert_that!(source_capped_fps(
+            60,
+            Some(24_000.0 / 1_001.0),
+            PlaybackSpeed::NORMAL
+        ))
+        .is_equal_to(24);
+
+        // Act / Assert: a rate the source can meet is left alone — this only ever lowers.
+        assert_that!(source_capped_fps(24, Some(60.0), PlaybackSpeed::NORMAL)).is_equal_to(24);
+        assert_that!(source_capped_fps(30, Some(30.0), PlaybackSpeed::NORMAL)).is_equal_to(30);
+
+        // Act / Assert: scaled by the speed, because that is how many source frames a second
+        // of *output* covers. Half speed halves what the source can give; double doubles it.
+        assert_that!(source_capped_fps(60, Some(24.0), PlaybackSpeed::HALF)).is_equal_to(12);
+        assert_that!(source_capped_fps(60, Some(24.0), PlaybackSpeed::FASTEST)).is_equal_to(48);
+        assert_that!(source_capped_fps(30, Some(24.0), PlaybackSpeed::FASTEST)).is_equal_to(30);
+
+        // Act / Assert: a source ffprobe would not describe caps nothing — guessing a rate
+        // would make a playback choppier for a file that was merely unreadable.
+        assert_that!(source_capped_fps(30, None, PlaybackSpeed::NORMAL)).is_equal_to(30);
+        assert_that!(source_capped_fps(30, Some(0.0), PlaybackSpeed::NORMAL)).is_equal_to(30);
+        assert_that!(source_capped_fps(30, Some(f64::NAN), PlaybackSpeed::NORMAL)).is_equal_to(30);
+        assert_that!(source_capped_fps(
+            30,
+            Some(f64::INFINITY),
+            PlaybackSpeed::NORMAL
+        ))
+        .is_equal_to(30);
+        // And a rate too large to be a `u32` leaves the user's own ceiling alone rather than
+        // wrapping to something small.
+        assert_that!(source_capped_fps(30, Some(1e30), PlaybackSpeed::NORMAL)).is_equal_to(30);
+
+        // Act / Assert: a source slower than one frame a second still yields one, so a
+        // slideshow of stills plays rather than decoding nothing at all.
+        assert_that!(source_capped_fps(30, Some(0.2), PlaybackSpeed::NORMAL)).is_equal_to(1);
+    }
+
     /// A slowed span is a *longer* span: `setpts` stretches it, so half speed comes back
     /// with twice the frames and costs twice the memory. Charging the media span rather than
     /// the stretched one would let a slow playback overshoot the budget by the speed factor
@@ -5889,6 +5991,87 @@ mod tests {
     /// instant a tone starts — so the two streams carry the same event and the decoded span
     /// can be asked where each of them put it.
     ///
+    /// Every playback of a page writes its sound to the same name in the same workspace, and
+    /// a muted one writes nothing at all — so reading that file back unconditionally hands
+    /// the page whatever the *last* unmuted playback left there. The user turns the sound
+    /// off, presses play, and hears the previous cue under the new picture.
+    ///
+    /// Reproduced in the order that causes it: an unmuted run, then a muted one against the
+    /// same workspace. A muted run on its own passes either way, which is why this asserts on
+    /// the second of two.
+    #[test]
+    fn a_muted_playback_should_not_inherit_the_sound_of_the_one_before_it() {
+        // Arrange: a second of audible media, and a workspace both runs share.
+        require_ffmpeg("a_muted_playback_should_not_inherit_the_sound_of_the_one_before_it");
+        let directory = scratch("playback-muted-stale");
+        let media = directory.join("clip.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc='0.5*sin(2*PI*440*t)':d=3:s=48000",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&media)
+            .output()
+            .expect("ffmpeg should be runnable");
+        assert!(
+            built.status.success(),
+            "failed to build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let cells = Size::new(16, 8);
+        let mut request = playback_request(&media, &directory, cue(0, 1000, "X"));
+        request.span_start = Duration::ZERO;
+        request.span_end = Duration::from_secs(2);
+        request.fps = 10;
+        request.cells = cells;
+        request.pixels = playback_pixels(cells, test_picker().font_size());
+        request.audio = Some(crate::audio::OutputFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        });
+        let never = || false;
+
+        // Arrange: an ordinary playback first, which leaves its sound in the workspace.
+        let outcome = decoded(&request, &test_picker(), &never).expect("the first run reports");
+        let PlaybackOutcome::Ready(mut frames) = outcome else {
+            panic!("the fixture should decode");
+        };
+        assert_that!(frames.take_samples().is_empty()).is_false();
+        assert_that!(directory.join(AUDIO_FILE).exists()).is_true();
+
+        // Act: the same page, muted.
+        request.audio = None;
+        let outcome = decoded(&request, &test_picker(), &never).expect("the second run reports");
+        let PlaybackOutcome::Ready(mut frames) = outcome else {
+            panic!("the muted run should decode");
+        };
+
+        // Assert: silent, and the stale file is gone rather than waiting for the next one.
+        assert_that!(frames.take_samples().is_empty()).is_true();
+        assert_that!(directory.join(AUDIO_FILE).exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// Measured at 0.1 ms on the machine this was written on. The tolerance is one frame
     /// period, which is the finest the picture can resolve anyway.
     #[test]

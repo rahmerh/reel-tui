@@ -195,6 +195,44 @@ fn object_array(value: Option<Value>) -> Vec<BTreeMap<String, Value>> {
     }
 }
 
+/// How many frames a second a video stream actually holds, or `None` when ffprobe will not
+/// say.
+///
+/// Reported as a rational (`24000/1001`, `25/1`), which is why this exists rather than a
+/// field read. `avg_frame_rate` first and `r_frame_rate` only as a fallback: for
+/// variable-rate content `r_frame_rate` is the tick rate the timestamps are expressed in —
+/// often 1000 or 90000 — where `avg_frame_rate` is the rate the file really averages.
+///
+/// `None` for the cases ffprobe cannot answer: `0/0`, which is what audio streams and some
+/// attached pictures carry, and anything that will not parse. Callers must treat that as
+/// "unknown", never as zero.
+pub fn stream_frame_rate(stream: &BTreeMap<String, Value>) -> Option<f64> {
+    let rate = stream
+        .get("avg_frame_rate")
+        .and_then(Value::as_str)
+        .and_then(parse_frame_rate)
+        .or_else(|| {
+            stream
+                .get("r_frame_rate")
+                .and_then(Value::as_str)
+                .and_then(parse_frame_rate)
+        })?;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
+/// One `numerator/denominator` frame rate as a number. Shared with `ui`, which formats the
+/// same strings for the stream-details panel — one parser, so the panel and the playback
+/// cannot disagree about what a file's rate is.
+pub(crate) fn parse_frame_rate(rate: &str) -> Option<f64> {
+    let (numerator, denominator) = rate.split_once('/')?;
+    let numerator: f64 = numerator.parse().ok()?;
+    let denominator: f64 = denominator.parse().ok()?;
+    if denominator == 0.0 {
+        return None;
+    }
+    Some(numerator / denominator)
+}
+
 pub(crate) fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {
     stream
         .get("disposition")
@@ -954,6 +992,48 @@ mod tests {
         assert_eq!(network_info.streams.len(), local_info.streams.len());
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// ffprobe reports frame rates as rationals, and reports two of them. `avg_frame_rate`
+    /// is what the file averages; `r_frame_rate` is the tick rate its timestamps are
+    /// expressed in, which for variable-rate content is often 1000 or 90000 and would be a
+    /// nonsense answer to "how many frames a second does this hold".
+    #[test]
+    fn a_streams_frame_rate_should_come_from_its_average_rather_than_its_tick_rate() {
+        let rate = |stream: serde_json::Value| {
+            let Value::Object(object) = stream else {
+                unreachable!("the fixture is an object")
+            };
+            stream_frame_rate(&object.into_iter().collect())
+        };
+
+        // Act / Assert: the ordinary rationals, including the NTSC one.
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "25/1"}))).is_equal_to(Some(25.0));
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "24000/1001"})))
+            .is_equal_to(Some(24_000.0 / 1_001.0));
+
+        // Act / Assert: the average wins over the tick rate when both are there.
+        assert_that!(rate(
+            serde_json::json!({"avg_frame_rate": "30/1", "r_frame_rate": "90000/1"})
+        ))
+        .is_equal_to(Some(30.0));
+
+        // Act / Assert: and the tick rate is the fallback when the average is missing or is
+        // the `0/0` ffprobe uses for "no meaningful rate".
+        assert_that!(rate(serde_json::json!({"r_frame_rate": "50/1"}))).is_equal_to(Some(50.0));
+        assert_that!(rate(
+            serde_json::json!({"avg_frame_rate": "0/0", "r_frame_rate": "50/1"})
+        ))
+        .is_equal_to(Some(50.0));
+
+        // Act / Assert: nothing usable is `None`, never zero — a caller that took zero for
+        // an answer would cap a playback to no frames at all.
+        assert_that!(rate(serde_json::json!({}))).is_none();
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "0/0"}))).is_none();
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "0/25"}))).is_none();
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "25"}))).is_none();
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": "many/1"}))).is_none();
+        assert_that!(rate(serde_json::json!({"avg_frame_rate": 25}))).is_none();
     }
 
     #[test]

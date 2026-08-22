@@ -189,6 +189,10 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                 input.reset_sequence();
                 app.move_preview_settings_cursor(-1);
             }
+            (KeyCode::Char('K'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                input.reset_sequence();
+                app.toggle_preview_help();
+            }
             // Only the two switches answer these, and only in the summary: their buttons sit
             // side by side on the row, so `h` is the left one and `l` the right one. A
             // dropdown row ignores them — a value there is chosen from a list, the way it is
@@ -3558,6 +3562,28 @@ mod tests {
             .is_equal_to(Some(crate::app::PreviewSettingsMode::Summary));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         assert_that!(app.preview_settings().playback_loop).is_false();
+
+        // Act / Assert: `K` opens the panel explaining the focused row, whether or not the
+        // terminal reports the shift that produced the capital, and leaves the settings
+        // alone. It stays open while the cursor moves.
+        for shifted in [
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('K')),
+        ] {
+            handle_key(&mut app, &mut input, shifted);
+            assert_that!(app.preview_settings_popup.map(|popup| popup.help_visible))
+                .is_equal_to(Some(true));
+            handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+            assert_that!(app.preview_settings_popup.map(|popup| popup.help_visible))
+                .is_equal_to(Some(true));
+            handle_key(&mut app, &mut input, shifted);
+            assert_that!(app.preview_settings_popup.map(|popup| popup.help_visible))
+                .is_equal_to(Some(false));
+            handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        }
+        assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::Loop));
 
         // Act / Assert: `h` and `l` pick the left button and the right one, and *set* rather
         // than flip — holding one down lands on an answer and stays there.
