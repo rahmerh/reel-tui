@@ -1408,7 +1408,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     app.pump();
     let helped = app.screen();
     assert!(
-        helped.contains("Information about Speed") && helped.contains("How fast the playback runs"),
+        helped.contains("Information about Speed") && helped.contains("How fast the preview runs"),
         "`K` should explain the focused row:\n{helped}"
     );
     app.press(key(KeyCode::Char('K')));
