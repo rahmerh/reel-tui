@@ -64,8 +64,10 @@ pub struct PreviewSettings {
     /// How many media files' frames the cache may hold before the least recently used is
     /// dropped whole.
     pub cache_tracks: usize,
-    /// How many frames a second the scrub playback aims for. A ceiling: a span too large
-    /// to hold at this rate is decoded at a lower one — see `preview::affordable_fps`.
+    /// How many frames a second the scrub playback aims for. A ceiling, lowered by two
+    /// things that know better: a source holding fewer frames than this *at the speed in
+    /// force* (`preview::source_capped_fps`) and a span too large to hold at this rate
+    /// (`preview::affordable_fps`).
     pub playback_fps: u32,
     /// How much of the media either side of the cue a scrub playback covers.
     pub playback_pad: Duration,
@@ -107,6 +109,9 @@ impl Default for PreviewSettings {
 pub struct PreviewSettingsPopup {
     pub field: PreviewSettingsField,
     pub mode: PreviewSettingsMode,
+    /// Whether `K` has opened the panel explaining the focused field, as it does on the
+    /// container, audio, video and subtitle popups.
+    pub help_visible: bool,
     /// Which row of the open dropdown the cursor is on. Seeded from the value in force when
     /// the dropdown opens, so `Enter` `Enter` is a no-op rather than a change to whatever
     /// happens to be first in the list. Meaningless in [`PreviewSettingsMode::Summary`].
@@ -2885,6 +2890,14 @@ impl App {
         // media with no audio track already takes.
         let audio =
             (!settings.playback_muted && self.has_audio_track()).then_some(self.audio_format);
+        // Read before the page is borrowed, and applied before the memory budget sees the
+        // rate: the budget should be charged for the frames the source can actually give,
+        // not for copies the `fps` filter would manufacture to reach a rate it does not hold.
+        //
+        // Through `effective_playback_fps` rather than a second `source_capped_fps` call, so
+        // the rate the popup's Frame rate row shows and the rate the span is decoded at are
+        // provably the same answer rather than two computations that agree today.
+        let capped_fps = self.effective_playback_fps();
         let request = {
             let Some(state) = self.subtitle_sync.as_mut() else {
                 return;
@@ -2916,7 +2929,7 @@ impl App {
                 // would not fit in memory — see `preview::affordable_fps`, which is charged
                 // the *stretched* span and so knows that a slow playback holds more frames.
                 fps: crate::preview::affordable_fps(
-                    settings.playback_fps,
+                    capped_fps,
                     span_end.saturating_sub(span_start),
                     settings.playback_speed,
                     pixels,
@@ -3027,7 +3040,58 @@ impl App {
         )
     }
 
+    /// The frame rate a playback of the open track would actually be decoded at.
+    ///
+    /// The setting is one ceiling and the source at the speed in force is the other, so this
+    /// is the lower of the two — and it is what the popup shows, because a row reading
+    /// `60 fps` over a 23.976 fps track states a rate that cannot happen.
+    ///
+    /// **The speed belongs in here, not only in the request.** A second of playback covers
+    /// `speed` seconds of media, so half speed leaves a 24 fps source twelve distinct frames
+    /// to give each second of it and everything above that is the `fps` filter duplicating
+    /// pictures. Showing 30 there would name a rate the user cannot have and give them no
+    /// way to tell — the same defect as offering 60 on a 24 fps film, one level down.
+    ///
+    /// The *setting* is left alone: it survives both a slower speed and a track that cannot
+    /// meet it, so going to quarter speed shows 6 and coming back shows the 30 again.
+    pub fn effective_playback_fps(&self) -> u32 {
+        crate::preview::source_capped_fps(
+            self.preview_settings.playback_fps,
+            self.source_frame_rate(),
+            self.preview_settings.playback_speed,
+        )
+    }
+
+    /// The rates the popup offers for the open track: the curated list, plus whatever is in
+    /// force, minus anything this source at this speed cannot deliver.
+    ///
+    /// The list shortens as the speed drops — a 24 fps film offers 24/15/10/5 at normal
+    /// speed and 6/5 at a quarter of it — which is the honest signal rather than a side
+    /// effect. Leaving the rows there would offer four choices that all play identically.
+    ///
+    /// [`Self::effective_playback_fps`] is merged in rather than only filled in for an empty
+    /// list, because the ceiling is rarely one of the curated values (quarter speed on a
+    /// 24 fps film tops out at 6) and it is what the row will play at, so it has to be
+    /// selectable — and [`Self::preview_choice_cursor`] has to be able to find it.
     fn playback_fps_choices(&self) -> Vec<u32> {
+        let ceiling = crate::preview::source_frame_ceiling(
+            self.source_frame_rate(),
+            self.preview_settings.playback_speed,
+        );
+        let mut choices = self.offered_fps_choices();
+        if let Some(ceiling) = ceiling {
+            choices.retain(|fps| *fps <= ceiling);
+            let effective = self.effective_playback_fps();
+            if !choices.contains(&effective) {
+                choices.push(effective);
+                // Descending, matching `merged_choices` and every other list in this popup.
+                choices.sort_unstable_by(|left, right| right.cmp(left));
+            }
+        }
+        choices
+    }
+
+    fn offered_fps_choices(&self) -> Vec<u32> {
         merged_choices(
             &PLAYBACK_FPS_CHOICES,
             [
@@ -3054,10 +3118,13 @@ impl App {
                 .playback_pad_choices()
                 .iter()
                 .position(|pad| *pad == settings.playback_pad),
+            // The *effective* rate, not the setting: on a source too slow to meet it the
+            // setting is not one of the rows, and the cursor would open on the fastest
+            // instead of on the rate this track will actually play at.
             PreviewSettingsField::FrameRate => self
                 .playback_fps_choices()
                 .iter()
-                .position(|fps| *fps == settings.playback_fps),
+                .position(|fps| *fps == self.effective_playback_fps()),
         }
         .unwrap_or_default()
     }
@@ -3089,6 +3156,16 @@ impl App {
                     popup.mode = PreviewSettingsMode::Summary;
                 }
             }
+        }
+    }
+
+    /// `K`: opens or closes the panel explaining the focused field.
+    ///
+    /// Stays open across moves and changes, like every other settings popup's — it is a
+    /// panel you leave up while you read down the rows, not a per-field prompt.
+    pub fn toggle_preview_help(&mut self) {
+        if let Some(popup) = self.preview_settings_popup.as_mut() {
+            popup.help_visible = !popup.help_visible;
         }
     }
 
@@ -3251,6 +3328,22 @@ impl App {
         if let Some(popup) = self.preview_settings_popup.as_mut() {
             popup.cursor = cursor;
         }
+    }
+
+    /// How many frames a second the media the page is previewing against actually holds.
+    ///
+    /// From the probe that opened the file, and from the *first* video stream — the one a
+    /// frame is grabbed from and the one a span is decoded from. For a sidecar track that is
+    /// the companion video, which is the file the page was opened on either way, the same
+    /// reasoning [`Self::has_audio_track`] uses.
+    ///
+    /// `None` when ffprobe would not say, which leaves the user's own ceiling uncapped.
+    fn source_frame_rate(&self) -> Option<f64> {
+        self.media_info()?
+            .streams
+            .iter()
+            .find(|stream| stream_kind(stream) == Some("video"))
+            .and_then(crate::probe::stream_frame_rate)
     }
 
     /// Whether the media the page is previewing against has any sound in it.
@@ -21699,6 +21792,220 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// The frame-rate setting is a ceiling, and the source is the other one. Asking a 24 fps
+    /// film for 30 decodes 30 frames a second of which six are copies the `fps` filter made,
+    /// costing a quarter more memory for exactly the same picture — and every assertion
+    /// short of the request's own rate still passes.
+    #[test]
+    fn a_span_should_not_be_asked_for_more_frames_than_its_source_holds() {
+        // Arrange: a 24 fps source, against the default thirty-a-second ceiling.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24/1"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert: the source's own rate, not the setting's.
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(24);
+        app.toggle_playback();
+
+        // Act / Assert: at half speed one output second covers half a second of media, so
+        // there are only twelve distinct frames to ask for — which is exactly the case where
+        // the memory budget is tightest, since a slowed span holds twice as many.
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        app.escape_preview_settings();
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(12);
+        app.toggle_playback();
+
+        // Act / Assert: and a setting below what the source holds is still honoured — this
+        // only ever lowers a rate.
+        app.open_preview_settings();
+        app.reset_preview_settings();
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        app.escape_preview_settings();
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup must not offer a rate the open track cannot deliver. Capping only the
+    /// request left `60 fps` selectable on a 23.976 fps film — a row stating a rate that
+    /// cannot happen, with nothing on screen to say so.
+    #[test]
+    fn the_frame_rate_dropdown_should_offer_only_what_the_source_can_deliver() {
+        // Arrange: the NTSC film rate, which is the case that reads worst — 23.976 must
+        // offer 24 rather than being rounded down out of its own list.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24000/1001"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleSync;
+        app.open_preview_settings();
+
+        // Act / Assert: nothing above the source's own rate is on the list.
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "24 fps".to_string(),
+            "15 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+
+        // Act / Assert: and the row shows what the track will play at rather than the
+        // thirty the config file asked for — but is not marked as a value the *user*
+        // changed, because they did not.
+        assert_that!(app.effective_playback_fps()).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::FrameRate)).is_equal_to(0);
+
+        // Act / Assert: choosing from the list still sets the session's own ceiling.
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(10);
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same defect one level down: a 24 fps film at quarter speed has six distinct
+    /// frames to give each second of playback, so offering 24/15/10/5 there is offering four
+    /// rows that play identically. The list has to follow the speed, not just the source.
+    #[test]
+    fn the_frame_rate_dropdown_should_follow_the_speed_as_well_as_the_source() {
+        // Arrange: the NTSC film rate again, and the config file's default of thirty.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24000/1001"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleSync;
+        app.open_preview_settings();
+
+        // Act / Assert: half speed halves the ceiling. Twelve is on no curated list, but it
+        // is what the row will play at, so it has to be offered and the cursor has to find
+        // it.
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "12 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(12);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::FrameRate)).is_equal_to(0);
+
+        // Act / Assert: and quarter speed leaves two rows, both of them real.
+        pick(&mut app, PreviewSettingsField::Speed, "0.25x");
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate))
+            .is_equal_to(vec!["6 fps".to_string(), "5 fps".to_string()]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(6);
+
+        // Act / Assert: none of that wrote over the setting. The thirty the config file
+        // asked for is still there, so coming back reads twenty-four rather than the six the
+        // detour went through.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+        pick(&mut app, PreviewSettingsField::Speed, "1x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(24);
+
+        // Act / Assert: a rate the user picks *below* the ceiling stays theirs when the
+        // speed drops — the escape hatch for a terminal that cannot keep up is not something
+        // slowing a playback down is allowed to take away. The speed only ever lowers a
+        // rate; it never chooses one.
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+        pick(&mut app, PreviewSettingsField::Speed, "0.25x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(6);
+        pick(&mut app, PreviewSettingsField::Speed, "1x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A source slower than anything on offer still gets a list — its own rate — rather than
+    /// an empty dropdown with nothing to put the cursor on.
+    #[test]
+    fn a_source_slower_than_every_offered_rate_should_still_offer_its_own() {
+        // Arrange: a timelapse at two frames a second.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "2/1"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleSync;
+        app.open_preview_settings();
+
+        // Act / Assert
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate))
+            .is_equal_to(vec!["2 fps".to_string()]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Media whose frame rate ffprobe will not describe caps nothing: guessing a rate would
+    /// make a playback choppier for a file that was merely unreadable.
+    #[test]
+    fn a_source_with_no_stated_frame_rate_should_leave_the_setting_alone() {
+        // Arrange: the ordinary fixture, whose streams carry no frame rate at all.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.toggle_playback();
+
+        // Assert
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(30);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// A popup cannot be layered over a playback: the span's pixels reach the terminal

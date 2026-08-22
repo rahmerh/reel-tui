@@ -1380,6 +1380,21 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
             .is_some_and(|state| state.frame().is_some())
     });
 
+    // Arrange: an ordinary playback first, so the muted one below follows a run that left
+    // its sound in the page's workspace — the order that made a muted playback inherit the
+    // previous cue's audio. The silence itself is asserted where it is observable, in
+    // `preview::tests::a_muted_playback_should_not_inherit_the_sound_of_the_one_before_it`:
+    // the page takes a span's samples the moment it arrives, so by the time a scenario can
+    // look at one, every playback holds none.
+    app.press(key(KeyCode::Char('p')));
+    app.wait_until("a first, unmuted span to play", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+
     // Act: open the popup and set half speed, no sound, and no padding.
     app.press(key(KeyCode::Char(':')));
     app.pump();
@@ -1388,6 +1403,21 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
         screen.contains("Preview settings") && screen.contains("Speed"),
         "`:` should open the preview settings popup:\n{screen}"
     );
+    // `K` explains the row under the cursor, in the panel every other settings popup uses.
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    let helped = app.screen();
+    assert!(
+        helped.contains("Information about Speed") && helped.contains("How fast the playback runs"),
+        "`K` should explain the focused row:\n{helped}"
+    );
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    assert!(
+        !app.screen().contains("Information about"),
+        "`K` again should put the explanation away"
+    );
+
     // Speed: Enter opens the list, G walks to its slowest entry, k steps back up to half,
     // Enter commits — the lists run fastest first, so the slow end is the bottom. Assert the
     // list is really on screen first, since a dropdown that opened into nothing would still
@@ -1402,6 +1432,17 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     app.press(key(KeyCode::Char('G')));
     app.press(key(KeyCode::Char('k')));
     app.press(key(KeyCode::Enter));
+    app.pump();
+    // The Frame rate row follows the speed, and only end to end does that mean anything: the
+    // fixture is a 10 fps source, so at half speed it has five distinct frames to give each
+    // second of playback and the row has to say so. The config file asked for thirty; before
+    // the speed was folded into the cap this row read `10 fps`, naming a rate the decode
+    // below would never produce.
+    let capped = app.screen();
+    assert!(
+        capped.contains("5 fps") && !capped.contains("10 fps"),
+        "the frame rate row should follow the speed, not just the source:\n{capped}"
+    );
     // Sound: a toggle, so `l` picks the right-hand button where a dropdown would need three
     // keys.
     app.press(key(KeyCode::Char('j')));
@@ -1448,9 +1489,14 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     );
 
     // Assert: and the playhead crosses the media at about half the wall clock.
+    //
+    // Sampled over a couple of seconds rather than a fraction of one. The playhead moves a
+    // frame at a time, and the fixture is a 10 fps source played at half speed — which
+    // `source_capped_fps` correctly asks for five frames a second of — so a short window
+    // would measure mostly the gap to the next frame.
     let sampling = Instant::now();
     let mut moved = Duration::ZERO;
-    while sampling.elapsed() < Duration::from_millis(1_200) {
+    while sampling.elapsed() < Duration::from_millis(2_000) {
         app.pump();
         let Some(state) = app.app.subtitle_sync.as_ref() else {
             break;

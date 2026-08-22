@@ -2221,7 +2221,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "K",
-        "Explain the highlighted container, video, audio, or subtitle field",
+        "Explain the highlighted container, video, audio, subtitle, or preview field",
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
@@ -4293,6 +4293,41 @@ fn setting_line(
 /// this is the plainest use of the shared [`SettingsDialog`] in the application. A value
 /// differing from what `config.toml` asked for is drawn as *changed*, which is what makes
 /// "did I leave the speed at half?" answerable at a glance.
+fn preview_field_help_title(field: PreviewSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+/// What each row of the preview-settings popup does, and what it costs.
+///
+/// Says the trade rather than the mechanism: what a setting is *for* is the thing a reader
+/// cannot work out from the row itself, while what it does to the ffmpeg command is
+/// something they never see. Each also names the one surprise that catches people out —
+/// that these last only for the session, that a slower playback holds more frames, that a
+/// longer span is charged for twice over.
+fn preview_field_help_text(field: PreviewSettingsField) -> Text<'static> {
+    let description = match field {
+        PreviewSettingsField::Speed => {
+            "How fast the playback runs, from a quarter of real time up to double.\n\nSlowing it down is how you tell a line that lands a syllable late from one that lands on time. The sound is stretched with it and keeps its pitch, so speech at half speed is still speech.\n\nThe frame rate below follows this, since a second of a slowed playback covers less of the media and so has fewer of its frames to draw on."
+        }
+        PreviewSettingsField::Loop => {
+            "Whether the span starts again when it reaches its end, instead of stopping.\n\nRepeating is what makes a marginal cue judgeable: the same two seconds round after round, until you are sure. Going round again costs nothing — the frames are already decoded.\n\nPress p or Esc to stop a playback that is looping."
+        }
+        PreviewSettingsField::Sound => {
+            "Whether the playback has sound.\n\nThe sound is what a subtitle's timing is judged against, so this is normally left on. Turn it off to scrub through a track quietly, or when the speech is not what you are checking.\n\nA silent playback still runs at the right speed, and so does one whose media has no audio track at all."
+        }
+        PreviewSettingsField::Padding => {
+            "How much of the media either side of the cue the playback covers.\n\nRun-up is what lets you hear the speech start before the line is due, and hear it finish after — which is the judgement being made. None is a real answer: play exactly the cue and nothing else.\n\nThe span's length multiplies its cost, and padding is added at both ends, so every step here adds twice its own value."
+        }
+        PreviewSettingsField::FrameRate => {
+            "How many frames a second the playback aims for.\n\nA ceiling, not a promise. Lower it when the picture stutters rather than plays — over ssh, or inside tmux, the frames have further to travel and a terminal that cannot keep up is better served by a chunkier playback than a late one.\n\nOnly rates this track can actually deliver at the speed above are offered, since asking a 24 fps film for 60 would only duplicate frames — and at half speed it has twelve to give. A span too large to hold in memory is decoded lower still."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
 fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
     let Some(popup) = app.preview_settings_popup.as_ref() else {
         return;
@@ -4322,8 +4357,12 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
                 format!("{:.2} s", settings.playback_pad.as_secs_f64()),
                 settings.playback_pad != defaults.playback_pad,
             ),
+            // The rate this track will actually be decoded at, which on a source slower than
+            // the setting is the source's. The *changed* marker still compares the settings,
+            // so a row lowered by the media rather than by the user is not marked as one the
+            // user touched.
             PreviewSettingsField::FrameRate => (
-                format!("{} fps", settings.playback_fps),
+                format!("{} fps", app.effective_playback_fps()),
                 settings.playback_fps != defaults.playback_fps,
             ),
         };
@@ -4371,7 +4410,12 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
             text: padded_popup_text(Text::from(lines)),
             title: " Preview settings ".to_string(),
             focus_line,
-            help: None,
+            help: popup.help_visible.then(|| {
+                (
+                    preview_field_help_text(popup.field),
+                    preview_field_help_title(popup.field),
+                )
+            }),
             min_height: 10,
         },
     );
@@ -5578,13 +5622,7 @@ fn format_sample_rate(hertz: f64) -> String {
 }
 
 fn format_frame_rate(rate: &str) -> Option<String> {
-    let (numerator, denominator) = rate.split_once('/')?;
-    let numerator: f64 = numerator.parse().ok()?;
-    let denominator: f64 = denominator.parse().ok()?;
-    if denominator == 0.0 {
-        return None;
-    }
-    let fps = numerator / denominator;
+    let fps = crate::probe::parse_frame_rate(rate)?;
     if (fps - fps.round()).abs() < 0.01 {
         Some(format!("{fps:.0}"))
     } else {
@@ -10979,7 +11017,7 @@ mod tests {
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted container, video, audio, or subtitle field",
+            "Explain the highlighted container, video, audio, subtitle, or preview field",
             "i",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
@@ -11628,6 +11666,23 @@ mod tests {
             let help = subtitle_field_help_text(&app, popup);
             fits(format!("{field:?}"), &help, &|frame| {
                 render_subtitle_settings_dialog(frame, &app)
+            });
+        }
+        app.subtitle_settings_popup = None;
+
+        // Act / Assert: every preview field. This popup is five rows where the others are
+        // eight or more, so its panel is the shortest in the application and the one a long
+        // explanation overruns first.
+        for field in PreviewSettingsField::ORDER {
+            app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup {
+                field,
+                mode: crate::app::PreviewSettingsMode::Summary,
+                help_visible: true,
+                cursor: 0,
+            });
+            let help = preview_field_help_text(field);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_preview_settings_dialog(frame, &app)
             });
         }
 
@@ -13413,6 +13468,58 @@ mod tests {
         app.preview_settings_popup = None;
         let bare = draw(&mut app, 140, 40).join(" ");
         assert_that!(bare.contains("Preview settings")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `K` explains the row under the cursor, and keeps explaining as the cursor moves — it
+    /// is a panel you leave up while reading down the rows, not a per-field prompt.
+    #[test]
+    fn the_preview_help_panel_should_explain_whichever_row_the_cursor_is_on() {
+        // Arrange
+        let (mut app, directory) = sync_page_app("preview-help", vec![sync_cue(0, 2000, "a")]);
+        app.open_preview_settings();
+
+        // Act / Assert: nothing until asked for.
+        assert_that!(
+            draw(&mut app, 160, 40)
+                .join(" ")
+                .contains("Information about")
+        )
+        .is_false();
+
+        // Act
+        app.toggle_preview_help();
+        let screen = draw(&mut app, 160, 40).join(" ");
+
+        // Assert: titled for the focused row, and explaining that row rather than the popup.
+        assert_that!(screen.contains("Information about Speed")).is_true();
+        assert_that!(screen.contains("How fast the playback runs")).is_true();
+
+        // Act / Assert: it follows the cursor rather than staying on the row it opened over.
+        app.move_preview_settings_cursor(1);
+        let moved = draw(&mut app, 160, 40).join(" ");
+        assert_that!(moved.contains("Information about Loop")).is_true();
+        assert_that!(moved.contains("Information about Speed")).is_false();
+
+        // Act / Assert: and every row has something to say, with its own title.
+        for field in PreviewSettingsField::ORDER {
+            let title = preview_field_help_title(field);
+            assert_that!(title.contains(field.label())).is_true();
+            let text = preview_field_help_text(field);
+            assert_that!(text.lines.len() > 1).is_true();
+        }
+
+        // Act / Assert: `K` again puts it away.
+        app.toggle_preview_help();
+        assert_that!(
+            draw(&mut app, 160, 40)
+                .join(" ")
+                .contains("Information about")
+        )
+        .is_false();
 
         // Cleanup
         drop(app);
