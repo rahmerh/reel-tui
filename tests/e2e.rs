@@ -3836,6 +3836,18 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
         "the folded line should appear once in the cue list:\n{screen}"
     );
 
+    // Assert: and it says how many entries it stands for, so the fold is visible rather than
+    // a list that quietly has fewer rows than the file has events. The row that stands on its
+    // own says nothing.
+    assert!(
+        screen.contains("×4"),
+        "the folded row should say how many events drew it:\n{screen}"
+    );
+    assert!(
+        !screen.contains("×1"),
+        "an ordinary row should carry no count:\n{screen}"
+    );
+
     // Assert: and the frame under it is the whole line. All four events are on screen at the
     // moment it is grabbed, so a preview of one of them would be a quarter of the picture —
     // compared against a deliberately rebuilt one-event frame, since nothing but the pixels

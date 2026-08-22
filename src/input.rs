@@ -3417,6 +3417,7 @@ mod tests {
                 end: std::time::Duration::from_secs(6),
                 text: "line".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             crate::preview::CueStyle::SubRip,
         );
@@ -3494,6 +3495,7 @@ mod tests {
                 end: std::time::Duration::from_secs(6),
                 text: "line".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             crate::preview::CueStyle::SubRip,
         );
@@ -3537,6 +3539,7 @@ mod tests {
                     end: std::time::Duration::from_secs(index as u64 * 4 + 2),
                     text: "line".into(),
                     dialogue: Vec::new(),
+                    events: 1,
                 })
                 .collect(),
             crate::preview::CueStyle::SubRip,
