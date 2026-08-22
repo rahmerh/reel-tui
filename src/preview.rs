@@ -322,14 +322,22 @@ impl CueStyle {
             } => {
                 let events: Vec<String> = timed
                     .iter()
-                    .filter_map(|(cue, start, end)| {
-                        // A cue with no `Dialogue:` line is dropped rather than staged as
-                        // its stripped text: `parse_ass` cannot produce one, since it emits
-                        // a cue only for a line it could read and `retimed_dialogue` re-reads
-                        // it by the same rules. Staging SubRip text under an `.ass` name
-                        // instead would fail the grab on a good track to guard a case that
-                        // does not occur.
-                        retimed_dialogue(events_format, cue.dialogue.as_deref()?, *start, *end)
+                    .flat_map(|(cue, start, end)| {
+                        // Every line the cue carries, because a folded cue carries the
+                        // several events that draw one line together — see
+                        // [`crate::cue::collapse`]. Retimed as a group, so they keep the one
+                        // timing they shared before the fold.
+                        //
+                        // A line that will not re-read is dropped rather than staged as the
+                        // cue's stripped text: `parse_ass` cannot produce one, since it
+                        // emits a cue only for a line it could read and `retimed_dialogue`
+                        // re-reads it by the same rules. Staging SubRip text under an `.ass`
+                        // name instead would fail the grab on a good track to guard a case
+                        // that does not occur.
+                        cue.dialogue
+                            .iter()
+                            .filter_map(|line| retimed_dialogue(events_format, line, *start, *end))
+                            .collect::<Vec<_>>()
                     })
                     .collect();
                 format!(
@@ -2714,7 +2722,7 @@ mod tests {
             start: Duration::from_millis(start),
             end: Duration::from_millis(end),
             text: text.to_string(),
-            dialogue: None,
+            dialogue: Vec::new(),
         }
     }
 
@@ -3017,8 +3025,8 @@ mod tests {
         assert_that!(cues[0].text.as_str()).is_equal_to("a sign");
 
         // Assert: and the line the renderer needs, alongside the header that draws it.
-        assert_that!(cues[0].dialogue.as_deref().unwrap()).contains("{\\pos(320,10)}");
-        assert_that!(cues[0].dialogue.as_deref().unwrap()).contains("Sign");
+        assert_that!(cues[0].dialogue[0].as_str()).contains("{\\pos(320,10)}");
+        assert_that!(cues[0].dialogue[0].as_str()).contains("Sign");
         let CueStyle::Ass {
             header,
             events_format,
@@ -3398,10 +3406,10 @@ mod tests {
         // Arrange: the fixture's sign, plus a second event over it in the other style.
         let script = crate::cue::parse_ass(ASS);
         let mut second = script.cues[0].clone();
-        second.dialogue = Some(
+        second.dialogue = vec![
             "Dialogue: 0,0:00:01.20,0:00:01.80,Default,,0,0,0,,{\\fad(100,100)}and a line"
                 .to_string(),
-        );
+        ];
         let cues = vec![script.cues[0].clone(), second];
 
         // Act
@@ -3432,6 +3440,35 @@ mod tests {
 
         // Assert
         assert_that!(staged.as_str()).is_equal_to("1\n00:00:02,000 --> 00:00:04,500\nHello\n\n");
+    }
+
+    /// A folded cue is several events that draw one line, so staging it stages all of them.
+    ///
+    /// Dropping any would preview a fraction of the effect — which is the whole reason
+    /// `cue::collapse` folds them rather than discarding the duplicates it finds.
+    #[test]
+    fn a_folded_cue_should_stage_every_line_that_draws_it() {
+        // Arrange: the shape a karaoke effect really has — one cue, three events.
+        let mut folded = crate::cue::parse_ass(ASS).cues[0].clone();
+        folded.dialogue = vec![
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\fscx120}wo".to_string(),
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\fscx140}wo".to_string(),
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\fscx160}wo".to_string(),
+        ];
+
+        // Act
+        let staged = ass_style().stage(std::slice::from_ref(&folded));
+
+        // Assert: all three, all retimed alike, in the order the file had them.
+        let events: Vec<&str> = staged
+            .lines()
+            .filter(|line| line.starts_with("Dialogue:"))
+            .collect();
+        assert_that!(events.len()).is_equal_to(3);
+        for (event, scale) in events.iter().zip(["fscx120", "fscx140", "fscx160"]) {
+            assert_that!(*event).contains(scale);
+            assert_that!(*event).contains("0:00:00.00,0:10:00.00");
+        }
     }
 
     /// **Relative offsets have to survive the rebase**, or an effect built from staggered

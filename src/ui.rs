@@ -12192,7 +12192,7 @@ mod tests {
                 start: std::time::Duration::from_millis(62_300),
                 end: std::time::Duration::from_millis(64_000),
                 text: "Hello there".to_string(),
-                dialogue: None,
+                dialogue: Vec::new(),
             }],
             crate::preview::CueStyle::SubRip,
         );
@@ -12280,7 +12280,7 @@ mod tests {
             start: std::time::Duration::from_millis(start),
             end: std::time::Duration::from_millis(end),
             text: text.to_string(),
-            dialogue: None,
+            dialogue: Vec::new(),
         }
     }
 

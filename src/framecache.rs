@@ -393,7 +393,7 @@ mod tests {
             start: Duration::from_millis(start),
             end: Duration::from_millis(end),
             text: text.to_string(),
-            dialogue: None,
+            dialogue: Vec::new(),
         }
     }
 
