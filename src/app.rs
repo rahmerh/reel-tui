@@ -20343,6 +20343,7 @@ mod tests {
                     end: Duration::from_secs(2),
                     text: "one".into(),
                     dialogue: Vec::new(),
+                    events: 1,
                 },
                 crate::cue::Cue {
                     index: 1,
@@ -20350,6 +20351,7 @@ mod tests {
                     end: Duration::from_secs(4),
                     text: "two".into(),
                     dialogue: Vec::new(),
+                    events: 1,
                 },
             ],
             CueStyle::SubRip,
@@ -20385,6 +20387,7 @@ mod tests {
                 end: Duration::from_secs(index as u64 + 1),
                 text: format!("line {index}"),
                 dialogue: Vec::new(),
+                events: 1,
             })
             .collect();
         app.subtitle_sync
@@ -20538,6 +20541,7 @@ mod tests {
                         end: Duration::from_secs(2),
                         text: "one".into(),
                         dialogue: Vec::new(),
+                        events: 1,
                     }],
                 },
             })
@@ -20601,6 +20605,7 @@ mod tests {
                 end: Duration::from_secs(2),
                 text: "stale".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
         };
 
@@ -20646,6 +20651,7 @@ mod tests {
                     end: Duration::from_secs(3),
                     text: "one".into(),
                     dialogue: Vec::new(),
+                    events: 1,
                 },
                 crate::cue::Cue {
                     index: 1,
@@ -20653,6 +20659,7 @@ mod tests {
                     end: Duration::from_secs(7),
                     text: "two".into(),
                     dialogue: Vec::new(),
+                    events: 1,
                 },
             ],
             CueStyle::SubRip,
@@ -20727,6 +20734,7 @@ mod tests {
                 end: Duration::from_secs(12),
                 text: "past the end".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             CueStyle::SubRip,
         );
@@ -20873,6 +20881,7 @@ mod tests {
                 end: Duration::from_secs(3),
                 text: "alone".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             CueStyle::SubRip,
         );
@@ -21008,6 +21017,7 @@ mod tests {
                 end: Duration::from_secs(2),
                 text: "one".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             CueStyle::SubRip,
         );
@@ -21162,6 +21172,7 @@ mod tests {
                 end: Duration::from_secs(3),
                 text: "one".into(),
                 dialogue: Vec::new(),
+                events: 1,
             },
             crate::cue::Cue {
                 index: 1,
@@ -21169,6 +21180,7 @@ mod tests {
                 end: Duration::from_secs(7),
                 text: "two".into(),
                 dialogue: Vec::new(),
+                events: 1,
             },
         ];
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -21349,6 +21361,7 @@ mod tests {
                             end: Duration::from_secs(3),
                             text: "one".into(),
                             dialogue: Vec::new(),
+                            events: 1,
                         },
                         crate::cue::Cue {
                             index: 1,
@@ -21356,6 +21369,7 @@ mod tests {
                             end: Duration::from_secs(7),
                             text: "two".into(),
                             dialogue: Vec::new(),
+                            events: 1,
                         },
                     ],
                 },
@@ -21537,6 +21551,7 @@ mod tests {
             end: Duration::from_millis(end),
             text: text.into(),
             dialogue: Vec::new(),
+            events: 1,
         };
         let state = app.subtitle_sync.as_mut().unwrap();
         // The selected line, two effect cues over its middle, and one far enough away that
@@ -22342,6 +22357,7 @@ mod tests {
                 end: Duration::from_secs(3),
                 text: "one".into(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             CueStyle::SubRip,
         );

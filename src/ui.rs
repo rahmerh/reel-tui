@@ -455,35 +455,64 @@ fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect
     }
 }
 
-/// One cue as a block: its timing on the top border, its text inside.
+/// One cue as a block: its timing on the top border, its text inside, and how many of the
+/// file's entries it stands for on the right of that border when it stands for more than one.
 ///
 /// The selected one is filled solid rather than outlined — its border is painted the same
 /// cyan as its background, so the block reads as one shape and needs no marker character
 /// to say which cue the cursor is on.
+///
+/// **The count is what stops the fold being silent.** A row standing for four events looks
+/// exactly like a row standing for one, so without it the list simply has fewer rows than
+/// the file has entries and nothing on screen says why — see `cue::collapse`. Absent at one,
+/// because `×1` on every ordinary row would be noise on every track with no effects in it at
+/// all.
+///
+/// Right-aligned on the same border rather than appended to the timing, and **dropped
+/// outright when the two would not both fit**. Ratatui does not arbitrate between two titles
+/// that overlap: the right-aligned one simply paints over the left, so a wide enough count on
+/// a narrow enough panel would eat a digit off the end time and leave a plausible, wrong
+/// timestamp on screen. The timestamps are what this page is for; the count is a note about
+/// how the row was built, so it is the one that gives way. At the sizes the panel is actually
+/// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
+/// fits, with the two titles' decorative spaces sharing the column where they meet.
 fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, area: Rect) {
     let timing = format!(
         " {} → {} ",
         format_timestamp(cue.start),
         format_timestamp(cue.end)
     );
+    let folded = (cue.events > 1)
+        .then(|| format!(" ×{} ", cue.events))
+        // Measured on what the two titles *say*, plus one column between them, rather than on
+        // the strings themselves: both carry a decorative space at the edge they meet on, and
+        // those two spaces landing in the same column costs nothing. Anything past that eats
+        // a digit off the end time.
+        .filter(|folded| {
+            timing.trim().chars().count() + folded.trim().chars().count()
+                < usize::from(area.width).saturating_sub(2)
+        });
     let (block, text_style) = if selected {
         let fill = Style::default().bg(Color::Cyan).fg(Color::White);
-        (
-            Block::bordered()
-                .style(fill)
-                // Border painted in the fill's own colour so it disappears into it: the
-                // block reads as one solid shape rather than an outline round a fill.
-                .border_style(Style::default().bg(Color::Cyan).fg(Color::Cyan))
-                .title(Line::styled(timing, fill.bold())),
-            fill,
-        )
+        let mut block = Block::bordered()
+            .style(fill)
+            // Border painted in the fill's own colour so it disappears into it: the
+            // block reads as one solid shape rather than an outline round a fill.
+            .border_style(Style::default().bg(Color::Cyan).fg(Color::Cyan))
+            .title(Line::styled(timing, fill.bold()));
+        if let Some(folded) = folded {
+            block = block.title(Line::styled(folded, fill).right_aligned());
+        }
+        (block, fill)
     } else {
-        (
-            Block::bordered()
-                .border_style(Style::default().fg(Color::White))
-                .title(Line::styled(timing, Style::default().fg(Color::DarkGray))),
-            Style::default().fg(Color::Gray),
-        )
+        let mut block = Block::bordered()
+            .border_style(Style::default().fg(Color::White))
+            .title(Line::styled(timing, Style::default().fg(Color::DarkGray)));
+        if let Some(folded) = folded {
+            block = block
+                .title(Line::styled(folded, Style::default().fg(Color::DarkGray)).right_aligned());
+        }
+        (block, Style::default().fg(Color::Gray))
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -12193,6 +12222,7 @@ mod tests {
                 end: std::time::Duration::from_millis(64_000),
                 text: "Hello there".to_string(),
                 dialogue: Vec::new(),
+                events: 1,
             }],
             crate::preview::CueStyle::SubRip,
         );
@@ -12274,6 +12304,56 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A folded row says so, and a row that stands on its own says nothing.
+    ///
+    /// Without the count the fold is invisible: a row standing for four events is drawn
+    /// exactly like one standing for one, so the list simply has fewer rows than the file has
+    /// entries with nothing on screen to explain it. `×1` on every ordinary row would be the
+    /// opposite mistake — noise on every track with no effects in it at all.
+    #[test]
+    fn a_row_standing_for_several_entries_should_say_how_many() {
+        // Arrange: one ordinary cue and one folded from four events.
+        let mut folded = sync_cue(2000, 3000, "wo");
+        folded.events = 4;
+        let (mut app, directory) =
+            sync_page_app("sync-count", vec![sync_cue(0, 1000, "fu"), folded]);
+
+        // Act
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert: the count is on the folded row and nowhere else.
+        assert_that!(screen.contains("×4")).is_true();
+        assert_that!(screen.contains("×1")).is_false();
+
+        // Act / Assert: and it survives the row being selected, which repaints the whole
+        // block in the fill's own colours.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        let selected = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(selected.contains("×4")).is_true();
+
+        // Act / Assert: at the narrowest the cue panel is ever drawn — thirty columns, on
+        // the smallest terminal the page will open on — both still fit.
+        let narrow = drawn(50, 20, |frame| render(frame, &mut app));
+        assert_that!(narrow.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(narrow.contains("×4")).is_true();
+
+        // Act / Assert: and a count too wide to sit beside the timing gives way rather than
+        // painting over the end time. Ratatui does not arbitrate between overlapping titles,
+        // so without this the row would read a plausible, wrong timestamp.
+        app.subtitle_sync.as_mut().unwrap().cues[1].events = 100_000;
+        let crowded = drawn(50, 20, |frame| render(frame, &mut app));
+        assert_that!(crowded.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(crowded.contains("×100000")).is_false();
+        // Room again once the panel is wide enough for both.
+        let roomy = drawn(120, 20, |frame| render(frame, &mut app));
+        assert_that!(roomy.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(roomy.contains("×100000")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn sync_cue(start: u64, end: u64, text: &str) -> crate::cue::Cue {
         crate::cue::Cue {
             index: 0,
@@ -12281,6 +12361,7 @@ mod tests {
             end: std::time::Duration::from_millis(end),
             text: text.to_string(),
             dialogue: Vec::new(),
+            events: 1,
         }
     }
 

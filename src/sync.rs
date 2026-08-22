@@ -1017,6 +1017,7 @@ mod tests {
             end: Duration::from_millis(end),
             text: text.to_string(),
             dialogue: Vec::new(),
+            events: 1,
         }
     }
 

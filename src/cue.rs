@@ -45,6 +45,15 @@ pub struct Cue {
     /// one line to the reader and one row on the page, so they are one cue here, and all of
     /// their lines are staged together.
     pub dialogue: Vec<String>,
+    /// How many of the file's entries were folded into this cue — one for a cue that stands
+    /// on its own. ASS calls them events and SubRip calls them blocks.
+    ///
+    /// Counted rather than read off [`dialogue`](Self::dialogue), which holds a line only for
+    /// ASS: a SubRip cue folded from two blocks has no lines to count and is still a row
+    /// standing for two entries. The page puts it on the row so a fold is visible rather than
+    /// silent — the alternative is a list that quietly has fewer rows than the file has
+    /// entries, with nothing on screen to say so.
+    pub events: usize,
 }
 
 impl Cue {
@@ -146,6 +155,7 @@ fn collapse(cues: Vec<Cue>) -> Vec<Cue> {
                 if last.start == cue.start && last.end == cue.end && last.text == cue.text =>
             {
                 last.dialogue.extend(cue.dialogue);
+                last.events += cue.events;
             }
             _ => collapsed.push(cue),
         }
@@ -211,6 +221,7 @@ pub fn parse_srt(source: &str) -> Vec<Cue> {
             end: end.max(start),
             text: text_lines.join("\n"),
             dialogue: Vec::new(),
+            events: 1,
         });
     }
 
@@ -321,6 +332,7 @@ pub fn parse_ass(source: &str) -> AssScript {
             end: end.max(start),
             text,
             dialogue: vec![line.to_string()],
+            events: 1,
         });
     }
 
@@ -733,6 +745,7 @@ mod tests {
             end: milliseconds(end),
             text: String::new(),
             dialogue: Vec::new(),
+            events: 1,
         }
     }
 
