@@ -568,6 +568,33 @@ pub fn format_clock(at: Duration, with_hours: bool) -> String {
     }
 }
 
+/// Renders a cue time for a block that has no room for [`format_timestamp`]: `5:05.0` or
+/// `1:05:05.0`.
+///
+/// Between the other two formats in what it spends: it keeps the tenth of a second, which
+/// is the digit this page is actually read for, and gives up the leading zeroes and the
+/// hours field a short file never needs. Two of these plus an arrow fit inside a cue panel
+/// split in half, where one [`format_timestamp`] alone does not.
+///
+/// `with_hours` is the caller's decision for the same reason it is in [`format_clock`]: a
+/// list that mixed `59:05.0` with `1:00:05.0` would change width halfway down, and the
+/// caller has already had to size a block against the widest reading it will draw.
+pub fn format_compact(at: Duration, with_hours: bool) -> String {
+    let seconds = at.as_secs();
+    let tenths = at.subsec_millis() / 100;
+    if with_hours {
+        format!(
+            "{}:{:02}:{:02}.{}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60,
+            tenths
+        )
+    } else {
+        format!("{}:{:02}.{}", seconds / 60, seconds % 60, tenths)
+    }
+}
+
 /// Renders a cue time the way SubRip writes one, to the millisecond.
 ///
 /// The comma is not a stylistic choice: `ffmpeg`'s SubRip demuxer is what reads the file
@@ -647,6 +674,69 @@ pub fn pack_lanes(cues: &[Cue], max_lanes: usize) -> LaneLayout {
         lanes,
         overflowed,
     }
+}
+
+/// A run of cues that are on screen together, as a slice of the cue list.
+///
+/// `len` is never zero: every cue belongs to exactly one group, and a cue overlapping
+/// nothing is a group of one. That is the ordinary case on a dialogue track, which is why
+/// the cue panel draws a group of one exactly as it drew a lone cue before groups existed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CueGroup {
+    /// Position in the cue list of the group's first cue.
+    pub first: usize,
+    /// How many consecutive cues the group holds.
+    pub len: usize,
+}
+
+impl CueGroup {
+    /// One past the group's last cue, for slicing and for range checks.
+    pub fn end(&self) -> usize {
+        self.first + self.len
+    }
+
+    /// Whether the cue at this position in the list belongs to the group.
+    pub fn holds(&self, cue: usize) -> bool {
+        cue >= self.first && cue < self.end()
+    }
+}
+
+/// Splits the cue list into runs of cues that share the screen.
+///
+/// A cue joins the run it is next to when it starts before the run's *furthest* end so far,
+/// not merely before its predecessor's. A sign that covers a whole scene and the four lines
+/// of dialogue under it are one group, which is what the reader sees, where pairing cues off
+/// against their immediate neighbour would split them into four.
+///
+/// `<` rather than `<=`, the same boundary [`pack_lanes`] draws for the same reason: a cue
+/// starting exactly where the last one ended is never on screen with it, and treating it as
+/// though it were would group most of an ordinary dialogue track into one run.
+///
+/// Assumes the start-ordered list both parsers produce (`ordered`). Given an unsorted list
+/// it still returns a partition of every cue into groups of at least one — nothing panics
+/// or is dropped — but the runs it finds are not meaningful.
+pub fn group_overlaps(cues: &[Cue]) -> Vec<CueGroup> {
+    let mut groups: Vec<CueGroup> = Vec::new();
+    let mut reach = Duration::ZERO;
+
+    for (position, cue) in cues.iter().enumerate() {
+        match groups.last_mut() {
+            // The run reaches past this cue's start, so the two are on screen together.
+            Some(group) if cue.start < reach => {
+                group.len += 1;
+                reach = reach.max(cue.end);
+            }
+            _ => {
+                groups.push(CueGroup {
+                    first: position,
+                    len: 1,
+                });
+                reach = cue.end;
+            }
+        }
+    }
+
+    groups
 }
 
 /// How much of the timeline the track shows at once.
@@ -1687,6 +1777,115 @@ mod tests {
         // Assert
         assert_that!(layout.lane_count).is_equal_to(1);
         assert_that!(layout.lanes).is_empty();
+    }
+
+    #[test]
+    fn group_overlaps_should_give_every_cue_of_a_clean_track_its_own_group() {
+        // Arrange: the ordinary dialogue track, where nothing shares the screen.
+        let cues = [cue(0, 1000), cue(2000, 3000), cue(4000, 5000)];
+
+        // Act
+        let groups = group_overlaps(&cues);
+
+        // Assert
+        assert_that!(groups).contains_exactly_in_given_order([
+            CueGroup { first: 0, len: 1 },
+            CueGroup { first: 1, len: 1 },
+            CueGroup { first: 2, len: 1 },
+        ]);
+    }
+
+    /// The same boundary `pack_lanes` draws: a cue starting exactly where the last one
+    /// ended is never on screen with it. Getting this wrong would collapse most of an
+    /// ordinary track into one enormous group.
+    #[test]
+    fn group_overlaps_should_not_group_a_cue_that_starts_exactly_where_the_last_one_ended() {
+        // Arrange
+        let cues = [cue(0, 1000), cue(1000, 2000)];
+
+        // Act
+        let groups = group_overlaps(&cues);
+
+        // Assert
+        assert_that!(groups).contains_exactly_in_given_order([
+            CueGroup { first: 0, len: 1 },
+            CueGroup { first: 1, len: 1 },
+        ]);
+    }
+
+    #[test]
+    fn group_overlaps_should_collect_a_run_of_cues_that_share_the_screen() {
+        // Arrange: a lone line, then three that overlap in a chain, then a lone line.
+        let cues = [
+            cue(0, 1000),
+            cue(2000, 5000),
+            cue(3000, 6000),
+            cue(4000, 7000),
+            cue(8000, 9000),
+        ];
+
+        // Act
+        let groups = group_overlaps(&cues);
+
+        // Assert
+        assert_that!(groups).contains_exactly_in_given_order([
+            CueGroup { first: 0, len: 1 },
+            CueGroup { first: 1, len: 3 },
+            CueGroup { first: 4, len: 1 },
+        ]);
+    }
+
+    /// The run is measured against its furthest end, not its last cue's. A sign covering a
+    /// whole scene keeps every line spoken under it in one group, which is what the reader
+    /// sees — pairing each cue off against its immediate predecessor would split them.
+    #[test]
+    fn group_overlaps_should_reach_from_the_runs_furthest_end_rather_than_its_last_cue() {
+        // Arrange: the sign runs 0–10s; neither line under it overlaps the other.
+        let cues = [cue(0, 10_000), cue(1000, 2000), cue(3000, 4000)];
+
+        // Act
+        let groups = group_overlaps(&cues);
+
+        // Assert
+        assert_that!(groups).contains_exactly_in_given_order([CueGroup { first: 0, len: 3 }]);
+    }
+
+    #[test]
+    fn group_overlaps_should_report_nothing_for_an_empty_track() {
+        // Act / Assert
+        assert_that!(group_overlaps(&[])).is_empty();
+    }
+
+    #[test]
+    fn cue_group_should_report_its_end_and_which_cues_it_holds() {
+        // Arrange
+        let group = CueGroup { first: 2, len: 3 };
+
+        // Act / Assert
+        assert_that!(group.end()).is_equal_to(5);
+        assert_that!(group.holds(1)).is_false();
+        assert_that!(group.holds(2)).is_true();
+        assert_that!(group.holds(4)).is_true();
+        assert_that!(group.holds(5)).is_false();
+    }
+
+    #[test]
+    fn format_compact_should_drop_the_hours_field_when_the_caller_says_to() {
+        // Act / Assert
+        assert_that!(format_compact(Duration::ZERO, false).as_str()).is_equal_to("0:00.0");
+        assert_that!(format_compact(milliseconds(62_300), false).as_str()).is_equal_to("1:02.3");
+        // Past the hour without hours: the minutes carry on counting rather than wrapping,
+        // so the reading stays truthful even where the caller sized the block wrongly.
+        assert_that!(format_compact(milliseconds(3_723_999), false).as_str())
+            .is_equal_to("62:03.9");
+    }
+
+    #[test]
+    fn format_compact_should_keep_the_hours_field_when_the_caller_asks_for_it() {
+        // Act / Assert
+        assert_that!(format_compact(Duration::ZERO, true).as_str()).is_equal_to("0:00:00.0");
+        assert_that!(format_compact(milliseconds(3_723_999), true).as_str())
+            .is_equal_to("1:02:03.9");
     }
 
     #[test]

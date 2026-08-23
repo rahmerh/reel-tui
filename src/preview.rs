@@ -928,7 +928,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
             let frame_events = event_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(request) = frame_rx.recv() {
-                    let request = newest(request, &frame_rx);
+                    let request = newest_frame(request, &frame_rx);
                     if !frame(&request, &picker, &frame_generation, &frame_events) {
                         break;
                     }
@@ -976,6 +976,34 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
 fn newest<T>(request: T, receiver: &Receiver<T>) -> T {
     let mut request = request;
     while let Ok(newer) = receiver.try_recv() {
+        request = newer;
+    }
+    request
+}
+
+/// [`newest`] for frame requests, which must not drop a grab on the floor.
+///
+/// A plain coalesce loses the selected cue's frame outright, and nothing asks for it again:
+/// the page clears its request the moment it hands one over, so a `wanted` discarded here is
+/// a preview pane that stays empty until the cursor happens to move. Two quick presses of
+/// `l` across an overlap group reproduce it — the answers to the first request set
+/// `refill_nearby`, whose dispatch carries no `wanted` of its own and lands behind the
+/// second press's grab.
+///
+/// So the newest request's `wanted` falls back to the newest discarded one's. That is only
+/// ever reached when the newest carries none, which is precisely the case where the page
+/// believes the grab it made earlier is still on its way — so the cue adopted is the one
+/// under the cursor, not a stale one. A move to another cue always produces a `wanted` of
+/// its own ([`crate::sync::SubtitleSyncState::request_frame`]), which wins here.
+///
+/// Generations must match, or a request for a page the user has left could resurrect a grab
+/// the page it belongs to would only discard.
+fn newest_frame(request: FrameRequest, receiver: &Receiver<FrameRequest>) -> FrameRequest {
+    let mut request = request;
+    while let Ok(mut newer) = receiver.try_recv() {
+        if newer.wanted.is_none() && newer.generation == request.generation {
+            newer.wanted = request.wanted.take();
+        }
         request = newer;
     }
     request
@@ -3870,6 +3898,69 @@ mod tests {
         // Assert
         assert_that!(request).is_equal_to(4);
         assert_that!(newest(5, &receiver)).is_equal_to(5);
+    }
+
+    /// Coalescing must not throw a grab away. The page clears its request the moment it
+    /// hands one over, so a `wanted` dropped here is a preview pane that stays empty until
+    /// the cursor happens to move again — which two quick presses of `l` across an overlap
+    /// group reproduce, the first request's answers queueing a neighbours-only refill
+    /// behind the second press's grab.
+    #[test]
+    fn coalescing_frame_requests_should_carry_a_discarded_grab_forward() {
+        // Arrange: a grab, then a refill that carries none.
+        let (sender, receiver) = mpsc::channel();
+        let request = |wanted: Option<usize>| FrameRequest {
+            generation: 7,
+            source: source(Path::new("/media.mkv"), Path::new("/workspace")),
+            wanted: wanted.map(|index| {
+                alone(
+                    index,
+                    cue(index as u64 * 1000, index as u64 * 1000 + 500, "line"),
+                    Duration::from_millis(index as u64 * 1000),
+                )
+            }),
+            nearby: Vec::new(),
+            cells: Size::new(40, 20),
+        };
+        sender.send(request(None)).unwrap();
+
+        // Act
+        let coalesced = newest_frame(request(Some(3)), &receiver);
+
+        // Assert: the refill won, but it is carrying the grab the page is still waiting on.
+        assert_that!(coalesced.wanted.map(|target| target.cue_index)).is_equal_to(Some(3));
+    }
+
+    /// A newer grab is the cursor having moved, and wins outright — adopting the older one
+    /// too would render a cue nobody is looking at.
+    #[test]
+    fn coalescing_frame_requests_should_prefer_the_newest_grab() {
+        // Arrange
+        let (sender, receiver) = mpsc::channel();
+        let request = |generation: u64, wanted: Option<usize>| FrameRequest {
+            generation,
+            source: source(Path::new("/media.mkv"), Path::new("/workspace")),
+            wanted: wanted.map(|index| {
+                alone(
+                    index,
+                    cue(index as u64 * 1000, index as u64 * 1000 + 500, "line"),
+                    Duration::from_millis(index as u64 * 1000),
+                )
+            }),
+            nearby: Vec::new(),
+            cells: Size::new(40, 20),
+        };
+        sender.send(request(7, Some(5))).unwrap();
+
+        // Act / Assert
+        let coalesced = newest_frame(request(7, Some(3)), &receiver);
+        assert_that!(coalesced.wanted.map(|target| target.cue_index)).is_equal_to(Some(5));
+
+        // Act / Assert: and a grab is never carried across generations, which would
+        // resurrect one for a page the user has already left.
+        sender.send(request(8, None)).unwrap();
+        let coalesced = newest_frame(request(7, Some(3)), &receiver);
+        assert_that!(coalesced.wanted.is_none()).is_true();
     }
 
     /// The protocol is built on the worker thread, off the event loop — a kitty protocol

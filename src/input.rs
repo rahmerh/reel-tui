@@ -981,6 +981,21 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.open_preview_settings();
         }
+        // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
+        // move between rows and these move between the cues sharing one. Ahead of the
+        // generic `h`/`l` arms below, which are about horizontal choices on other layers.
+        (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE)
+            if app.layer == Layer::SubtitleSync =>
+        {
+            input.reset_sequence();
+            app.move_sync_cue_within_group(-1);
+        }
+        (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE)
+            if app.layer == Layer::SubtitleSync =>
+        {
+            input.reset_sequence();
+            app.move_sync_cue_within_group(1);
+        }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.move_selected_stream(-1);
@@ -3462,6 +3477,67 @@ mod tests {
             KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
         );
         assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cue list's second axis: `j`/`k` move between rows and `h`/`l` move between the
+    /// cues sharing one. Bound on this page only — everywhere else `h`/`l` change a
+    /// horizontal choice, and on the streams layer `h` is also the way back.
+    #[test]
+    fn h_and_l_should_move_between_overlapping_cues_only_on_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: on the streams layer, neither key is the cue list's — `h` still goes
+        // back, and the arrows are the subtitle columns'.
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        app.layer = Layer::Streams;
+
+        // Arrange: the timing page, holding a lone cue and then two that overlap.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        let state = app.subtitle_sync.as_mut().unwrap();
+        state.apply_prepared(
+            [(0, 2), (4, 8), (6, 10)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (start, end))| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(start),
+                    end: std::time::Duration::from_secs(end),
+                    text: "line".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+
+        // Act / Assert: sideways does nothing on the lone cue, which has no company.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+
+        // Act / Assert: `j` into the group, then `l` and `h` across it.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(2);
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(2);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Act / Assert: and the page is still left by `Esc`, not by `h`.
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
 
         // Cleanup
         drop(app);

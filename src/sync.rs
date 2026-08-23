@@ -16,7 +16,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
 use crate::audio::{AudioOutput, AudioSource, frame_index_at};
-use crate::cue::{Cue, LaneLayout, MAX_LANES, pack_lanes};
+use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes};
 use crate::preview::{
     CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, seek_for,
 };
@@ -42,6 +42,29 @@ pub const FRAME_DEBOUNCE: Duration = Duration::from_millis(120);
 /// `Protocol` holds the picture encoded for the pane, and a full-screen preview is several
 /// megabytes each.
 pub const NEARBY_FRAMES: usize = 2;
+
+/// How many cues of one overlap group the panel draws side by side.
+///
+/// **Two is forced by the width, not chosen.** The cue panel is thirty to forty-eight
+/// columns (`SYNC_CUE_PANEL_WIDTH`), so two blocks get fourteen to twenty-three each and a
+/// third would leave ten to sixteen — which cannot hold a timing at all, and a block with no
+/// timing on this page is a block with nothing worth reading on it. Members past the two are
+/// reached with `h`/`l`, and the panel marks that they are there.
+pub const GROUP_COLUMNS: usize = 2;
+
+/// Rows one cue's block occupies: two borders with a line of text between them.
+pub const SYNC_BLOCK_ROWS: usize = 3;
+
+/// Rows a group of overlapping cues occupies: a block, plus the row the later-starting
+/// member is dropped by.
+pub const SYNC_GROUP_ROWS: usize = SYNC_BLOCK_ROWS + 1;
+
+/// Rows the fork at the head of a group costs: its crossbar, and the arrows down into each
+/// member.
+pub const SYNC_FORK_ROWS: usize = 2;
+
+/// Rows the `↓` between one row of the panel and the next costs.
+pub const SYNC_CONNECTOR_ROWS: usize = 1;
 
 /// How far the background pass has got in rendering the track's frames.
 ///
@@ -407,10 +430,32 @@ pub struct SubtitleSyncState {
     pub warm: WarmState,
     pub cues: Vec<Cue>,
     pub layout: LaneLayout,
+    /// The cue list split into runs that share the screen, parallel to nothing — each cue
+    /// is in exactly one group and the ordinary cue is a group of one.
+    ///
+    /// The cue panel draws a group as its unit rather than a cue, so this is what its
+    /// scrolling and its `j`/`k` movement are measured in.
+    pub groups: Vec<CueGroup>,
     pub selected: usize,
-    /// First cue row drawn, moved only to keep `selected` on screen.
+    /// Which page of the selected group's members the panel is showing, counted in pages of
+    /// [`GROUP_COLUMNS`] from the group's first member.
+    ///
+    /// Kept rather than derived from `selected`, because the two cues on screen do not
+    /// partition the group: the last page backs up to keep two blocks drawn, so a middle
+    /// member belongs to the page before it *and* the one after, and which of them the
+    /// reader is looking at is a fact about how they got there. Deriving it made `h` from
+    /// the right-hand block of a backed-up page turn the page instead of moving to the
+    /// block beside it, which is the one thing paging exists to avoid.
+    ///
+    /// Reset to zero wherever the cursor enters a group from outside it — every such move
+    /// lands on the group's first member, which is on page zero by construction.
+    group_page: usize,
+    /// First group drawn, moved only to keep `selected` on screen.
+    ///
+    /// Counted in groups rather than cues, because a group is one row of the panel however
+    /// many cues it holds.
     pub list_scroll: usize,
-    /// Rows the cue list can show, measured by the renderer.
+    /// Groups the cue list can show, measured by the renderer.
     pub list_rows: usize,
     /// Size of the preview pane in terminal cells, measured by the renderer.
     ///
@@ -485,7 +530,9 @@ impl SubtitleSyncState {
             warm: WarmState::Off,
             cues: Vec::new(),
             layout: LaneLayout::default(),
+            groups: Vec::new(),
             selected: 0,
+            group_page: 0,
             list_scroll: 0,
             list_rows: 0,
             preview_cells: Size::new(0, 0),
@@ -540,12 +587,17 @@ impl SubtitleSyncState {
     /// Lanes are packed once, here, rather than per frame: the packing is over the whole
     /// track, so doing it while rendering would both repeat the work every draw and let
     /// the track's height change as the user scrolls through denser regions.
+    ///
+    /// Overlap groups are found here for the same reason, and because the panel's cursor
+    /// moves in groups: a grouping recomputed per draw could change under a keypress that
+    /// had already been resolved against the old one.
     pub fn apply_prepared(&mut self, cues: Vec<Cue>, style: CueStyle) {
         // Onto the frame source, because that is what every renderer is handed and the
         // style is as much a part of drawing a cue as the cue is. It arrives only now:
         // an ASS script's styles come out of the file in the same pass as its cues.
         self.frames.style = Arc::new(style);
         self.layout = pack_lanes(&cues, MAX_LANES);
+        self.groups = group_overlaps(&cues);
         self.status = if cues.is_empty() {
             SyncStatus::Empty
         } else {
@@ -553,6 +605,7 @@ impl SubtitleSyncState {
         };
         self.cues = cues;
         self.selected = 0;
+        self.group_page = 0;
         self.list_scroll = 0;
         self.select_cue();
     }
@@ -564,6 +617,7 @@ impl SubtitleSyncState {
         self.warm = WarmState::Off;
         self.cues.clear();
         self.layout = LaneLayout::default();
+        self.groups.clear();
         self.encoded.clear();
         self.frame_pending_since = None;
         self.refill_nearby = false;
@@ -939,22 +993,112 @@ impl SubtitleSyncState {
         self.status == SyncStatus::Preparing
     }
 
-    /// Moves the cue cursor, reporting whether it actually moved.
+    /// Which group holds the cue at this position in the list.
+    ///
+    /// Zero for a list with no groups at all, which is the empty track — every caller here
+    /// has already established that there are cues, and `groups` is built with them.
+    pub fn group_of(&self, cue: usize) -> usize {
+        self.groups
+            .partition_point(|group| group.end() <= cue)
+            .min(self.groups.len().saturating_sub(1))
+    }
+
+    /// The group the cursor is in.
+    pub fn selected_group(&self) -> usize {
+        self.group_of(self.selected)
+    }
+
+    /// Which members of a group the panel has room to draw, as a position and a count.
+    ///
+    /// **The window is a page rather than a sliding pair**: the group is cut into runs of
+    /// `GROUP_COLUMNS` from its first member, and the window is whichever run the cursor's
+    /// page ([`Self::group_page`]) names. So `l` from a page's left member moves the
+    /// highlight to the one beside it with the row standing still, and only the press after
+    /// that turns the page — the reader gets to compare the two cues in front of them
+    /// before the list changes under the cursor, where a window that slid on every press
+    /// moved both cues every time and never let a pair settle.
+    ///
+    /// The last page backs up to keep two members drawn, since a page holding one would
+    /// leave half the row empty next to the cue the cursor is on.
+    ///
+    /// A group the cursor is not in shows its first members, since there is nothing there
+    /// to anchor the window on.
+    pub fn group_window(&self, group: CueGroup) -> (usize, usize) {
+        let shown = group.len.min(GROUP_COLUMNS);
+        if !group.holds(self.selected) {
+            return (group.first, shown);
+        }
+        let start = (group.first + self.group_page * GROUP_COLUMNS)
+            .min(group.end().saturating_sub(shown))
+            .max(group.first);
+        (start, shown)
+    }
+
+    /// Moves the cue cursor by whole groups, reporting whether it actually moved.
+    ///
+    /// A group is one stop: `j` from the cue above a pair lands on the pair's first member,
+    /// and `j` again leaves for the cue below it rather than visiting the second member.
+    /// `k` re-enters on that same first member, so the two directions agree and there is no
+    /// "which one was I on" to remember. Moving *within* a group is `h`/`l`
+    /// ([`Self::select_within_group`]).
     ///
     /// The return value is what stops a held-down `j` at the end of the list from
-    /// re-requesting the same preview frame on every repeat.
+    /// re-requesting the same preview frame on every repeat — including the case that only
+    /// grouping creates, where the cursor is on a later member of the last group and there
+    /// is no group left to move to. Landing on that group's first member would be a jump
+    /// backwards in answer to `j`, so it is refused instead.
     pub fn select(&mut self, delta: isize) -> bool {
-        if self.cues.is_empty() {
+        if self.groups.is_empty() {
             return false;
         }
-        let last = self.cues.len() - 1;
+        let last = self.groups.len() - 1;
+        let current = self.selected_group();
         let next = if delta < 0 {
-            self.selected.saturating_sub(delta.unsigned_abs())
+            current.saturating_sub(delta.unsigned_abs())
         } else {
-            self.selected.saturating_add(delta as usize).min(last)
+            current.saturating_add(delta as usize).min(last)
+        };
+        if next == current {
+            return false;
+        }
+        self.selected = self.groups[next].first;
+        self.group_page = 0;
+        self.select_cue();
+        true
+    }
+
+    /// Moves the cursor between the cues of the group it is already in, for `h` and `l`.
+    ///
+    /// Stops at the group's ends rather than spilling into the next one: a group is a
+    /// closed unit and `j`/`k` are the way in and out of it. Without that, `l` held down
+    /// would walk the whole track sideways and the two axes would stop meaning different
+    /// things.
+    ///
+    /// **The page turns only when the cursor leaves it**, and the page it turns to is the
+    /// one the cue falls in counting from the group's first member. A cue that is already
+    /// on screen is simply moved to, whichever of the two blocks it is in — including the
+    /// left-hand block of a page that backed up, which is the case a page derived from the
+    /// selection alone gets wrong.
+    pub fn select_within_group(&mut self, delta: isize) -> bool {
+        if self.groups.is_empty() {
+            return false;
+        }
+        let group = self.groups[self.selected_group()];
+        let next = if delta < 0 {
+            self.selected
+                .saturating_sub(delta.unsigned_abs())
+                .max(group.first)
+        } else {
+            self.selected
+                .saturating_add(delta as usize)
+                .min(group.end() - 1)
         };
         if next == self.selected {
             return false;
+        }
+        let (start, shown) = self.group_window(group);
+        if next < start || next >= start + shown {
+            self.group_page = (next - group.first) / GROUP_COLUMNS;
         }
         self.selected = next;
         self.select_cue();
@@ -966,39 +1110,115 @@ impl SubtitleSyncState {
             return false;
         }
         self.selected = 0;
+        self.group_page = 0;
         self.select_cue();
         true
     }
 
+    /// The bottom of the list, which is the last *group's* first member rather than the
+    /// last cue — the same place `j` would land on arriving there, so `G` and a held `j`
+    /// agree about where the end is.
     pub fn select_last(&mut self) -> bool {
-        if self.cues.is_empty() {
+        let Some(group) = self.groups.last() else {
+            return false;
+        };
+        if self.selected == group.first {
             return false;
         }
-        let last = self.cues.len() - 1;
-        if self.selected == last {
-            return false;
-        }
-        self.selected = last;
+        self.selected = group.first;
+        self.group_page = 0;
         self.select_cue();
         true
+    }
+
+    /// Rows one group costs the panel, not counting the `↓` above it.
+    ///
+    /// A lone cue is its block and nothing else. A group carries its own fork, rather than
+    /// the fork being the connector into it, so that the fork is drawn at every scroll
+    /// position — including when the group is the first thing on screen and has nothing
+    /// above it. The markers saying a group reaches past its two visible members live on the
+    /// fork's crossbar, and a marker that vanished when the list happened to scroll would be
+    /// worse than none.
+    ///
+    /// The blocks are charged four rows rather than three because the later-starting member
+    /// is drawn one row lower — and charged it whether or not that step is actually taken.
+    /// Two members starting at the same instant are drawn level and leave the fourth row
+    /// blank, which keeps a group's footprint the same as `h` and `l` move through it. A
+    /// list that reflowed under a sideways keypress would be harder to read than one blank
+    /// row is to spend.
+    pub fn group_height(&self, group: usize) -> usize {
+        match self.groups.get(group) {
+            Some(group) if group.len > 1 => SYNC_FORK_ROWS + SYNC_GROUP_ROWS,
+            _ => SYNC_BLOCK_ROWS,
+        }
+    }
+
+    /// How many groups fit in `height` rows starting from this one.
+    ///
+    /// At least one, so the shortest panel the layout can produce still shows the group
+    /// under the cursor rather than nothing at all — a group that does not fit whole is
+    /// clipped from the bottom, exactly as an over-tall cue block always was.
+    fn groups_fitting(&self, from: usize, height: usize) -> usize {
+        let mut used = self.group_height(from);
+        let mut count = 1;
+        for group in from + 1..self.groups.len() {
+            let next = used + SYNC_CONNECTOR_ROWS + self.group_height(group);
+            if next > height {
+                break;
+            }
+            used = next;
+            count += 1;
+        }
+        count
+    }
+
+    /// The furthest the list can scroll before it starts showing blank rows under the last
+    /// group. Walked backwards from the end, because that is the direction the constraint
+    /// comes from.
+    fn max_scroll(&self, height: usize) -> usize {
+        // Saturating rather than guarded: an empty track never reaches here — `sync_scroll`
+        // has already returned — and if it did, the loop below is empty and the answer is
+        // the zero it should be.
+        let last = self.groups.len().saturating_sub(1);
+        let mut used = self.group_height(last);
+        let mut scroll = last;
+        for group in (0..last).rev() {
+            let next = used + SYNC_CONNECTOR_ROWS + self.group_height(group);
+            if next > height {
+                break;
+            }
+            used = next;
+            scroll = group;
+        }
+        scroll
     }
 
     /// Scrolls the cue list just far enough to keep the selection visible.
     ///
-    /// Called from the renderer, which is the only place that knows how many rows the
-    /// list actually got — the same arrangement `sync_batch_scroll` uses for the batch
-    /// dialog.
-    pub fn sync_scroll(&mut self, rows: usize) {
-        self.list_rows = rows;
-        if rows == 0 {
+    /// Called from the renderer, which is the only place that knows how many rows the list
+    /// actually got — the same arrangement `sync_batch_scroll` uses for the batch dialog.
+    ///
+    /// Takes a height in rows and works out the groups itself, where this used to take a
+    /// count the renderer had divided out. It cannot be a division any more: a lone cue and
+    /// a pair are different heights, so how many rows a screenful costs depends on which
+    /// groups are in it.
+    pub fn sync_scroll(&mut self, height: usize) {
+        if height == 0 || self.groups.is_empty() {
+            self.list_rows = 0;
+            self.list_scroll = 0;
             return;
         }
-        if self.selected < self.list_scroll {
-            self.list_scroll = self.selected;
-        } else if self.selected >= self.list_scroll + rows {
-            self.list_scroll = self.selected + 1 - rows;
+        let selected = self.selected_group();
+        if selected < self.list_scroll {
+            self.list_scroll = selected;
         }
-        self.list_scroll = self.list_scroll.min(self.cues.len().saturating_sub(rows));
+        // Upwards one group at a time rather than by arithmetic: the answer depends on the
+        // heights of the groups being skipped, so there is nothing to solve in closed form.
+        while selected >= self.list_scroll + self.groups_fitting(self.list_scroll, height) {
+            self.list_scroll += 1;
+        }
+        self.list_scroll = self.list_scroll.min(self.max_scroll(height));
+        self.list_rows = self.groups_fitting(self.list_scroll, height);
     }
 }
 
@@ -1211,18 +1431,245 @@ mod tests {
         assert_that!(state.select_first()).is_false();
     }
 
+    /// A track whose middle three cues share the screen: `a`, then the group `b`/`c`/`d`,
+    /// then `e`. Cue positions and group indices deliberately differ, so a test that
+    /// confused the two would fail rather than pass by coincidence.
+    fn grouped() -> SubtitleSyncState {
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "a"),
+                cue(2000, 5000, "b"),
+                cue(3000, 6000, "c"),
+                cue(4000, 7000, "d"),
+                cue(8000, 9000, "e"),
+            ],
+            CueStyle::SubRip,
+        );
+        state
+    }
+
+    #[test]
+    fn j_should_step_over_a_whole_group_rather_than_through_it() {
+        // Arrange
+        let mut state = grouped();
+
+        // Act / Assert: into the group at its first member, then straight out of it.
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(4);
+        assert_that!(state.select(1)).is_false();
+    }
+
+    /// `k` re-enters a group on the same member `j` enters it on, so the two directions
+    /// agree about where a group is and nothing has to be remembered between them.
+    #[test]
+    fn k_should_re_enter_a_group_on_the_member_j_would_have_landed_on() {
+        // Arrange
+        let mut state = grouped();
+        state.select(2);
+        assert_that!(state.selected).is_equal_to(4);
+
+        // Act / Assert
+        assert_that!(state.select(-1)).is_true();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.select(-1)).is_true();
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    /// A `j` that would land *behind* the cursor is refused rather than obeyed. Only
+    /// grouping creates the case: sitting on a later member of the last group, the group
+    /// step has nowhere to go, and moving to the group's first member would answer "down"
+    /// by going up.
+    #[test]
+    fn j_should_do_nothing_from_a_later_member_of_the_last_group() {
+        // Arrange: a track that ends in its group, with the cursor on the last member.
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "a"),
+                cue(2000, 5000, "b"),
+                cue(3000, 6000, "c"),
+            ],
+            CueStyle::SubRip,
+        );
+        state.select(1);
+        state.select_within_group(1);
+        assert_that!(state.selected).is_equal_to(2);
+
+        // Act / Assert
+        assert_that!(state.select(1)).is_false();
+        assert_that!(state.selected).is_equal_to(2);
+    }
+
+    #[test]
+    fn h_and_l_should_move_between_the_cues_of_a_group_and_stop_at_its_ends() {
+        // Arrange
+        let mut state = grouped();
+        state.select(1);
+
+        // Act / Assert: along the group, then held against its far end.
+        assert_that!(state.select_within_group(1)).is_true();
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.select_within_group(1)).is_true();
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.select_within_group(1)).is_false();
+        assert_that!(state.selected).is_equal_to(3);
+
+        // Act / Assert: and back, held against the near end.
+        assert_that!(state.select_within_group(-2)).is_true();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.select_within_group(-1)).is_false();
+        assert_that!(state.selected).is_equal_to(1);
+    }
+
+    /// The common case, and the one that makes `h`/`l` safe to hold down: a cue that
+    /// overlaps nothing has nowhere sideways to go.
+    #[test]
+    fn h_and_l_should_do_nothing_on_a_cue_that_overlaps_nothing() {
+        // Arrange
+        let mut state = grouped();
+
+        // Act / Assert
+        assert_that!(state.select_within_group(1)).is_false();
+        assert_that!(state.select_within_group(-1)).is_false();
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    #[test]
+    fn moving_within_a_group_should_do_nothing_on_a_track_with_no_cues() {
+        // Arrange
+        let mut state = state();
+
+        // Act / Assert
+        assert_that!(state.select_within_group(1)).is_false();
+        assert_that!(state.select(1)).is_false();
+        assert_that!(state.select_last()).is_false();
+    }
+
+    /// `G` lands where a held `j` would have stopped, rather than on the very last cue —
+    /// otherwise the two disagree about where the end of the list is.
+    #[test]
+    fn select_last_should_land_on_the_final_groups_first_member() {
+        // Arrange: a track ending in a group.
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "a"),
+                cue(2000, 5000, "b"),
+                cue(3000, 6000, "c"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act / Assert
+        assert_that!(state.select_last()).is_true();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.select_last()).is_false();
+    }
+
+    /// The window is a page rather than a sliding pair, so the first `l` crosses the two
+    /// cues on screen without moving them and the next turns the page — backing up at the
+    /// group's end so two members are still shown, which is the one place the selected
+    /// member is the right-hand block.
+    #[test]
+    fn the_group_window_should_page_and_back_up_at_the_end() {
+        // Arrange
+        let mut state = grouped();
+        let group = state.groups[1];
+        state.select(1);
+
+        // Act / Assert
+        assert_that!(state.group_window(group)).is_equal_to((1, 2));
+        // Across the page: the cursor moves, the pair does not.
+        state.select_within_group(1);
+        assert_that!(state.group_window(group)).is_equal_to((1, 2));
+        assert_that!(state.selected).is_equal_to(2);
+        // The page turns, and backs up rather than running off the end: the cursor is on
+        // the second of the two.
+        state.select_within_group(1);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+        assert_that!(state.selected).is_equal_to(3);
+    }
+
+    /// A group of three ends on a page that backed up to keep two blocks drawn, so its
+    /// middle member is the *left* block there and the *right* block one page earlier.
+    /// Deriving the page from the selection alone made `h` from the right-hand block turn
+    /// the page rather than move to the block beside it: the cue the reader was pointing at
+    /// jumped off the row on its way to being selected.
+    #[test]
+    fn moving_onto_a_cue_already_on_screen_should_not_turn_the_page() {
+        // Arrange: the cursor at the far end of a group of three, on the backed-up page.
+        let mut state = grouped();
+        let group = state.groups[1];
+        state.select(1);
+        state.select_within_group(2);
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act: back onto the cue in the block beside it.
+        state.select_within_group(-1);
+
+        // Assert: the pair on screen is untouched — only the highlight moved.
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act / Assert: the press after that is the one that turns the page.
+        state.select_within_group(-1);
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.group_window(group)).is_equal_to((1, 2));
+    }
+
+    /// A group the cursor is not in has nothing to anchor a window on, so it shows its
+    /// first members — including when the cursor is in a *different* group, which is the
+    /// case that would otherwise leak one group's cursor into another's window.
+    #[test]
+    fn the_group_window_should_show_the_first_members_of_a_group_the_cursor_is_not_in() {
+        // Arrange
+        let mut state = grouped();
+        state.select(1);
+        state.select_within_group(2);
+        assert_that!(state.selected).is_equal_to(3);
+
+        // Act / Assert
+        assert_that!(state.group_window(state.groups[0])).is_equal_to((0, 1));
+        assert_that!(state.group_window(state.groups[2])).is_equal_to((4, 1));
+    }
+
+    #[test]
+    fn group_of_should_answer_for_every_cue_and_tolerate_an_empty_track() {
+        // Arrange
+        let grouped = grouped();
+        let empty = state();
+
+        // Act / Assert
+        let found: Vec<usize> = (0..grouped.cues.len())
+            .map(|cue| grouped.group_of(cue))
+            .collect();
+        assert_that!(found).contains_exactly_in_given_order([0, 1, 1, 1, 2]);
+        assert_that!(empty.group_of(0)).is_equal_to(0);
+    }
+
+    /// Rows a panel needs to show this many groups of a `ready` track, where every cue
+    /// overlaps nothing and so is a lone block with a `↓` between one and the next.
+    fn rows_for(groups: usize) -> usize {
+        SYNC_BLOCK_ROWS + groups.saturating_sub(1) * (SYNC_CONNECTOR_ROWS + SYNC_BLOCK_ROWS)
+    }
+
     #[test]
     fn sync_scroll_should_follow_the_selection_down_past_the_last_visible_row() {
         // Arrange
         let mut state = ready(10);
-        state.sync_scroll(4);
+        state.sync_scroll(rows_for(4));
 
         // Act
         state.select(5);
-        state.sync_scroll(4);
+        state.sync_scroll(rows_for(4));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(2);
+        assert_that!(state.list_rows).is_equal_to(4);
     }
 
     #[test]
@@ -1230,11 +1677,11 @@ mod tests {
         // Arrange
         let mut state = ready(10);
         state.select(9);
-        state.sync_scroll(4);
+        state.sync_scroll(rows_for(4));
 
         // Act
         state.select(-9);
-        state.sync_scroll(4);
+        state.sync_scroll(rows_for(4));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(0);
@@ -1245,14 +1692,62 @@ mod tests {
         // Arrange: scrolled to the bottom, then given a taller pane.
         let mut state = ready(6);
         state.select(5);
-        state.sync_scroll(2);
+        state.sync_scroll(rows_for(2));
         assert_that!(state.list_scroll).is_equal_to(4);
 
         // Act
-        state.sync_scroll(6);
+        state.sync_scroll(rows_for(6));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(0);
+    }
+
+    /// A group costs twice what a lone cue does — its fork and the row its second member
+    /// is dropped by — so a screenful is no longer a division. A panel holding three lone
+    /// cues holds only two rows once the middle one is a group.
+    #[test]
+    fn sync_scroll_should_charge_a_group_for_the_rows_it_actually_takes() {
+        // Arrange: cue 1 and cue 2 overlap, so the track is three groups, the middle of
+        // them a pair.
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "a"),
+                cue(2000, 4000, "b"),
+                cue(3000, 5000, "c"),
+                cue(6000, 7000, "d"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act / Assert: a lone cue and the group is all that fits in the rows three lone
+        // cues would have taken.
+        state.sync_scroll(rows_for(3));
+        assert_that!(state.list_rows).is_equal_to(2);
+
+        // Act / Assert: one row short of the group is one row short of showing it.
+        state.sync_scroll(SYNC_BLOCK_ROWS + SYNC_CONNECTOR_ROWS + SYNC_FORK_ROWS + SYNC_GROUP_ROWS);
+        assert_that!(state.list_rows).is_equal_to(2);
+        state.sync_scroll(
+            SYNC_BLOCK_ROWS + SYNC_CONNECTOR_ROWS + SYNC_FORK_ROWS + SYNC_GROUP_ROWS - 1,
+        );
+        assert_that!(state.list_rows).is_equal_to(1);
+    }
+
+    /// A panel too short for even one row still shows the group under the cursor rather
+    /// than nothing at all — the renderer clips it from the bottom.
+    #[test]
+    fn sync_scroll_should_always_keep_one_group_on_screen() {
+        // Arrange
+        let mut state = ready(10);
+        state.select(9);
+
+        // Act
+        state.sync_scroll(1);
+
+        // Assert
+        assert_that!(state.list_rows).is_equal_to(1);
+        assert_that!(state.list_scroll).is_equal_to(9);
     }
 
     #[test]
@@ -1263,6 +1758,22 @@ mod tests {
 
         // Act
         state.sync_scroll(0);
+
+        // Assert
+        assert_that!(state.list_rows).is_equal_to(0);
+        assert_that!(state.list_scroll).is_equal_to(0);
+    }
+
+    /// A page holding no cues is still rendered — `cues` is public and a track can be
+    /// emptied under one — so a panel with rows to give and nothing to put in them has to
+    /// answer rather than divide by an empty list.
+    #[test]
+    fn sync_scroll_should_tolerate_a_track_with_no_cues_in_a_pane_with_rows() {
+        // Arrange
+        let mut state = state();
+
+        // Act
+        state.sync_scroll(20);
 
         // Assert
         assert_that!(state.list_rows).is_equal_to(0);

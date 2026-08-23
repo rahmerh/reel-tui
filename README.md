@@ -58,3 +58,5 @@ reel /path/to/media
 ## Future planned
 
 - **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
+- **Track importing and exporting**: Importing and exporting of any track, using a file picker.
+- **Automatic subtitle syncing**: Automatic syncing of subtitles to an audio track, maybe using AI?
