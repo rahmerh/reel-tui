@@ -251,6 +251,45 @@ pub fn store_in(directory: &Path, media: &str, cue: &str, bytes: &[u8]) -> bool 
     true
 }
 
+/// Moves a media's whole directory of frames from one key to another.
+///
+/// The one place anything is *claimed* about two keys naming the same pictures, and the
+/// claim is the caller's: [`media_key`] covers the file's length and mtime precisely so that
+/// a file rewritten in place cannot serve its old frames, and a remux rewrites the file. But
+/// this application's remux copies the video stream through untouched, so the frames it
+/// grabbed are still the frames the new file would give — the container moved, the pictures
+/// did not. Without this, saving a one-word cue edit throws away every rendered frame of a
+/// feature-length track and the page spends the next several minutes rendering them again.
+///
+/// Deliberately not an equivalence baked into the key. Keying on something that survives a
+/// remux would mean guessing which rewrites preserve the picture; moving the directory means
+/// only the caller that *performed* the rewrite gets to say so, for the one file it just
+/// wrote. `App::frames_survive_edit` is where that is decided.
+///
+/// Best-effort, like everything else here: a failure is a page that renders again, which is
+/// exactly where it was without this.
+pub fn migrate(from: &str, to: &str) -> bool {
+    directory().is_some_and(|directory| migrate_in(&directory, from, to))
+}
+
+pub fn migrate_in(directory: &Path, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let source = directory.join(from);
+    if !source.is_dir() {
+        return false;
+    }
+    let destination = directory.join(to);
+    if destination.exists() {
+        // The new file already has frames of its own — rendered before this landed, or by
+        // another `reel`. They are the same pictures, so the older set is simply stale disk;
+        // dropping it here is what keeps a run of saves from leaving a directory apiece.
+        return fs::remove_dir_all(&source).is_ok();
+    }
+    fs::rename(&source, &destination).is_ok()
+}
+
 /// Deletes least-recently-used media directories until at most `tracks` remain, never the
 /// one named by `open`.
 ///
@@ -912,6 +951,77 @@ mod tests {
         assert_that!(touch(MEDIA)).is_true();
         // Nothing open, so the one track there is goes.
         prune(0, None);
+        assert_that!(is_cached(MEDIA, "frame")).is_false();
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A save rewrites the container around a video stream it copied through untouched, so
+    /// the file's key moves while its pictures do not. The frames go with the key, whole
+    /// track at a time, or the page re-renders every one of them after every save.
+    #[test]
+    fn migrating_a_track_should_carry_its_whole_directory_to_the_new_key() {
+        // Arrange: a track's frames, and its used marker.
+        let _guard = one_key();
+        let directory = scratch("migrate");
+        assert!(store_in(&directory, "before", "one", &[1u8; 64]));
+        assert!(store_in(&directory, "before", "two", &[2u8; 64]));
+        assert!(touch_in(&directory, "before"));
+
+        // Act
+        assert_that!(migrate_in(&directory, "before", "after")).is_true();
+
+        // Assert: every frame is there under the new key, and nothing under the old one.
+        assert_that!(read_in(&directory, "after", "one")).is_equal_to(Some(vec![1u8; 64]));
+        assert_that!(read_in(&directory, "after", "two")).is_equal_to(Some(vec![2u8; 64]));
+        assert_that!(directory.join("after").join(USED_MARKER).exists()).is_true();
+        assert_that!(directory.join("before").exists()).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cases that are not a move: nothing to move, a key that did not change, and a
+    /// destination that already holds the same pictures — which is stale disk to drop
+    /// rather than a reason to keep two directories of one track.
+    #[test]
+    fn migrating_should_answer_for_a_key_that_did_not_move_or_has_nothing_behind_it() {
+        // Arrange
+        let _guard = one_key();
+        let directory = scratch("migrate-edges");
+        assert!(store_in(&directory, "here", "one", &[3u8; 64]));
+
+        // Act / Assert
+        assert_that!(migrate_in(&directory, "here", "here")).is_true();
+        assert_that!(read_in(&directory, "here", "one")).is_equal_to(Some(vec![3u8; 64]));
+        assert_that!(migrate_in(&directory, "missing", "elsewhere")).is_false();
+        assert_that!(directory.join("elsewhere").exists()).is_false();
+
+        // A destination that already exists keeps its own frames and loses the old set.
+        assert!(store_in(&directory, "newer", "one", &[4u8; 64]));
+        assert_that!(migrate_in(&directory, "here", "newer")).is_true();
+        assert_that!(read_in(&directory, "newer", "one")).is_equal_to(Some(vec![4u8; 64]));
+        assert_that!(directory.join("here").exists()).is_false();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The directory-resolving half of the move, which is the one production calls.
+    #[test]
+    fn the_resolved_migration_should_move_frames_inside_the_real_cache_directory() {
+        // Arrange
+        let _guard = whole_directory();
+        let directory = directory().expect("the test binary always has a cache directory");
+        let _ = fs::remove_dir_all(&directory);
+        assert_that!(store(MEDIA, "frame", &[9u8; 32])).is_true();
+
+        // Act
+        assert_that!(migrate(MEDIA, "moved")).is_true();
+
+        // Assert
+        assert_that!(read("moved", "frame")).is_equal_to(Some(vec![9u8; 32]));
         assert_that!(is_cached(MEDIA, "frame")).is_false();
 
         // Cleanup

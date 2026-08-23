@@ -22,12 +22,12 @@ use crate::{
         SaveDestination, VideoCodec, VideoMetadata, VideoResolution, VideoRotation, VideoSettings,
         audio_bitrate_kbps, audio_requires_transcode, audio_stream_title,
         container_conflict_streams, container_conflicts, effective_audio_codec,
-        imported_subtitle_conflicts, plan_requires_transcode, stream_channels, stream_disposition,
-        stream_index, stream_rotation, subtitle_metadata_conflicts, validate_edit,
-        video_stream_title,
+        imported_subtitle_conflicts, plan_requires_transcode, primary_video_resolution,
+        stream_channels, stream_disposition, stream_index, stream_rotation,
+        subtitle_metadata_conflicts, validate_edit, video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
-    framecache,
+    framecache::{self, FrameKeyParts},
     preview::{
         CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackOutcome, PlaybackRequest,
         PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles, WarmRequest,
@@ -35,11 +35,11 @@ use crate::{
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
-        FormatChoice, LanguageChoice, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat,
-        SubtitleMetadata, SubtitleSource, ToolCapabilities, canonical_language_code,
-        common_language_choices, language_choice, partition_sidecars, path_extension, stream_cc,
-        stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
-        stream_original, stream_title,
+        CueTextEdit, FormatChoice, LanguageChoice, SidecarEntry, SubtitleChange, SubtitleFlag,
+        SubtitleFormat, SubtitleMetadata, SubtitleSource, ToolCapabilities,
+        canonical_language_code, common_language_choices, language_choice, partition_sidecars,
+        path_extension, stream_cc, stream_commentary, stream_forced, stream_hearing_impaired,
+        stream_language, stream_original, stream_title,
     },
     sync::{PreviewSupport, PreviewWorkspace, SubtitleSyncState, WarmState},
 };
@@ -97,6 +97,59 @@ impl Default for PreviewSettings {
             playback_loop: false,
             playback_muted: false,
         }
+    }
+}
+
+/// The timing page's cue editor: one cue's text, being rewritten.
+///
+/// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
+/// single line with a single cursor: a SubRip cue is routinely two lines, and how the text
+/// is broken across them is part of the cue — it is what the viewer will see. A field that
+/// could not hold a line break would quietly make every two-line cue a one-line cue.
+///
+/// The cursor is a row and a column in *characters*, not bytes, because the column is also
+/// where the caret is drawn and subtitle text is full of multi-byte characters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueEditor {
+    /// Which subtitle track's cue this is, so an edit staged here cannot be applied to a
+    /// track the page has since moved on from.
+    pub source: SubtitleSource,
+    /// The cue's position in the page's parsed list, which is how the edit is addressed all
+    /// the way to the file — see [`crate::subtitle::CueTextEdit`].
+    pub cue: usize,
+    /// What the cue said when the editor opened. Both the "has anything changed" test and
+    /// the check the writer makes against the file on disk.
+    pub original: String,
+    pub lines: Vec<String>,
+    pub row: usize,
+    pub column: usize,
+}
+
+impl CueEditor {
+    /// The buffer as one string, which is what a cue's text is.
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Whether the reader has actually changed anything, which is what makes leaving safe
+    /// without asking.
+    pub fn is_modified(&self) -> bool {
+        self.text() != self.original
+    }
+
+    /// The cursor clamped onto the buffer, for after any edit that can shorten it.
+    fn clamp(&mut self) {
+        self.row = self.row.min(self.lines.len().saturating_sub(1));
+        self.column = self.column.min(self.lines[self.row].chars().count());
+    }
+
+    /// The byte offset the character cursor stands at, for the row it is on.
+    fn offset(&self) -> usize {
+        self.lines[self.row]
+            .char_indices()
+            .nth(self.column)
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.lines[self.row].len())
     }
 }
 
@@ -640,6 +693,11 @@ pub enum Dialog {
     /// sound, padding and frame rate. Opened with `:` from the timing page; see
     /// `App::open_preview_settings`.
     PreviewSettings,
+    /// The timing page's cue editor, opened with `i` — see `App::open_cue_editor`.
+    EditCue,
+    /// "Leaving discards them" before walking off the timing page with staged cue text
+    /// that has not been written yet — see `App::request_leave_subtitle_sync`.
+    ConfirmLeaveCues,
     /// A confirm-cancel prompt over whichever processing view is showing
     /// (`Dialog::BatchProcessing`, one item or many) — see `App::request_cancel_edit`.
     ConfirmCancel,
@@ -697,6 +755,34 @@ pub enum ResetChoice {
     #[default]
     KeepEdits,
     ResetEdits,
+}
+
+/// The two-option cursor for `Dialog::ConfirmLeaveCues`, defaulting to the safe half: a bare
+/// `Enter` on a question about unsaved work keeps the reader where their work is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LeaveCuesChoice {
+    #[default]
+    StayHere,
+    DiscardEdits,
+}
+
+/// A timing page to open again on the far side of a save.
+///
+/// Writing a cue edit rewrites the file the page is about, which moves its fingerprint, so
+/// the page has to close and the file has to be re-probed before anything can be drawn from
+/// it again. Ejecting the reader to the track list at that point answers "I saved" with "you
+/// are somewhere else now" — on the one page where a save is something you do repeatedly,
+/// between edits, rather than once at the end.
+///
+/// So the page is remembered rather than the layer: which track it was about, and which cue
+/// the cursor was on. `media` is what the file *became* — a container conversion renames it
+/// — and is checked before the page is opened again, so a reader who moved to another file
+/// while the save ran is not dragged back to this one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyncReopen {
+    media: PathBuf,
+    source: SubtitleSource,
+    cue: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1266,6 +1352,13 @@ pub struct App {
     /// that dropping it — on `back`, on a file change, on quit — is what releases the
     /// page's scratch directory, instead of every exit path having to remember to.
     pub subtitle_sync: Option<SubtitleSyncState>,
+    /// The timing page a save was started from, to be opened again once the file it
+    /// rewrote has been re-probed. See [`Self::reopen_subtitle_sync`].
+    pending_sync_reopen: Option<SyncReopen>,
+    /// Where each in-flight edit's cached preview frames live now, for the files whose
+    /// pictures the edit will not change. Consumed by `finish_batch_if_done`, which moves
+    /// them onto the rewritten file's key. See [`Self::frames_survive_edit`].
+    pending_frame_moves: HashMap<PathBuf, (String, (u32, u32))>,
     /// Bumped for each page opening, so a worker result that arrives after the user has
     /// moved on can be recognised as stale and dropped.
     sync_generation: u64,
@@ -1300,6 +1393,10 @@ pub struct App {
     /// resetting agrees with what the user would get by restarting.
     preview_defaults: PreviewSettings,
     pub preview_settings_popup: Option<PreviewSettingsPopup>,
+    /// The timing page's open cue editor, if `i` has raised one.
+    pub cue_editor: Option<CueEditor>,
+    /// Which answer the "discard the unwritten cue edits?" prompt is pointing at.
+    pub leave_cues_choice: LeaveCuesChoice,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1438,6 +1535,8 @@ impl App {
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
             subtitle_sync: None,
+            pending_sync_reopen: None,
+            pending_frame_moves: HashMap::new(),
             sync_generation: 0,
             playback_generation: 0,
             playback_live: false,
@@ -1445,6 +1544,8 @@ impl App {
             preview_settings: PreviewSettings::default(),
             preview_defaults: PreviewSettings::default(),
             preview_settings_popup: None,
+            cue_editor: None,
+            leave_cues_choice: LeaveCuesChoice::default(),
             preview: None,
             container_target: None,
             container_metadata: None,
@@ -2111,6 +2212,9 @@ impl App {
                 self.loading = false;
                 self.selected_stream = 0;
                 self.load_staged_or_reset();
+                // The answer a page owed after a save was waiting for. Nothing is owed in
+                // the ordinary case and this costs a `None` check.
+                self.reopen_subtitle_sync();
             }
         }
         if disk_cache_dirty {
@@ -2411,8 +2515,26 @@ impl App {
                 BatchItemStatus::Completed | BatchItemStatus::Failed(_)
             )
         });
+        // What each item became, for the frame-cache move below. Read off the batch before
+        // it is dropped, and only for the items that actually completed: a failed or
+        // cancelled edit leaves the file where it was, so its frames are already filed
+        // under the right key.
+        let rewritten: Vec<(PathBuf, PathBuf)> = batch
+            .items
+            .iter()
+            .filter(|item| item.status == BatchItemStatus::Completed)
+            .map(|item| {
+                (
+                    item.path.clone(),
+                    item.output_path
+                        .clone()
+                        .unwrap_or_else(|| item.path.clone()),
+                )
+            })
+            .collect();
         self.active_batch = None;
         self.dialog = None;
+        self.move_frame_cache(&rewritten);
         if needs_rescan && let Ok(files) = scan_directory(&self.directory) {
             self.reconcile_files(files);
         }
@@ -2439,10 +2561,118 @@ impl App {
         self.notice = Some(notice);
         if !needs_rescan
             || expected_selection
-                .is_some_and(|path| self.selected_file().is_some_and(|file| file.path == path))
+                .as_ref()
+                .is_some_and(|path| self.selected_file().is_some_and(|file| file.path == *path))
         {
             self.layer = Layer::Streams;
         }
+        // The page a save was started from goes back up, once the file it rewrote has been
+        // re-probed — which for a cached outcome has already happened here, and otherwise
+        // happens when `receive_probe_results` drains the answer. Pointed at whatever the
+        // file became: a container conversion renames it, and the page has to follow.
+        if let Some(reopen) = self.pending_sync_reopen.as_mut() {
+            match expected_selection {
+                Some(path) => reopen.media = path,
+                None => self.pending_sync_reopen = None,
+            }
+        }
+        self.reopen_subtitle_sync();
+    }
+
+    /// Carries each rewritten file's cached preview frames over to the file it became.
+    ///
+    /// A save rewrites the container, which moves the file's length and mtime, which are in
+    /// the frame cache's media key — so without this every frame the timing page rendered is
+    /// orphaned by the save that page's own edit started, and re-opening it re-renders the
+    /// whole track. On a feature-length film that is minutes of `ffmpeg` seeks for a change
+    /// that altered one line of text.
+    ///
+    /// Only the files `frames_survive_edit` accepted are in `pending_frame_moves`, and the
+    /// map is emptied either way: an entry left behind would move a later, different edit's
+    /// frames. See [`framecache::migrate`].
+    fn move_frame_cache(&mut self, rewritten: &[(PathBuf, PathBuf)]) {
+        let moves = std::mem::take(&mut self.pending_frame_moves);
+        for (source, output) in rewritten {
+            let Some((from, pixels)) = moves.get(source) else {
+                continue;
+            };
+            let Ok(fingerprint) = crate::files::FileFingerprint::for_path(output) else {
+                continue;
+            };
+            framecache::migrate(
+                from,
+                &framecache::media_key(FrameKeyParts {
+                    media: output,
+                    media_length: fingerprint.length,
+                    media_modified: fingerprint.modified,
+                    pixels: *pixels,
+                }),
+            );
+        }
+    }
+
+    /// Opens the timing page again after the save that closed it, if one is owed.
+    ///
+    /// Owed and *possible* are different questions, and the second is asked here: the file
+    /// has to be the one the page was about, its probe has to have landed, and the track has
+    /// to still be there. Any of those failing drops the request rather than deferring it —
+    /// a page owed forever would spring open on some unrelated file later on.
+    fn reopen_subtitle_sync(&mut self) {
+        let Some(reopen) = self.pending_sync_reopen.as_ref() else {
+            return;
+        };
+        if self.subtitle_sync.is_some() {
+            // A page is already up — the save never closed this one, or the reader opened
+            // another. Either way there is nothing owed, and holding the request would
+            // spring a page open later on something unrelated.
+            self.pending_sync_reopen = None;
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        if !self
+            .selected_file()
+            .is_some_and(|file| file.path == reopen.media)
+        {
+            self.pending_sync_reopen = None;
+            return;
+        }
+        if self.loading || self.media_info().is_none() {
+            // The probe for this file is still out; try again when its answer lands.
+            return;
+        }
+        let reopen = self.pending_sync_reopen.take().expect("checked above");
+        let Some(row) = self.track_row_of(&reopen.source) else {
+            return;
+        };
+        // Through the ordinary opening rather than around it: the page checks the track's
+        // format and the tools it needs, and a save can have changed either. Refused, it
+        // leaves the reader on the track list with a notice saying why, which is where the
+        // cursor already is.
+        self.layer = Layer::Streams;
+        self.selected_stream = row;
+        self.open_subtitle_sync();
+        if let Some(state) = self.subtitle_sync.as_mut() {
+            // Where the cursor was, restored once the cues have been read back — the list
+            // is rebuilt from the rewritten file, so there is nothing to select yet.
+            state.restore_selection(reopen.cue);
+        }
+    }
+
+    /// Which row of the track list a subtitle source sits on, for putting the cursor back on
+    /// it. `None` once the track is gone, which a save can do.
+    fn track_row_of(&self, source: &SubtitleSource) -> Option<usize> {
+        self.track_rows()
+            .iter()
+            .position(|track| match (track, source) {
+                (TrackRef::Embedded(index), SubtitleSource::Embedded(wanted)) => index == wanted,
+                (TrackRef::Sidecar(index), SubtitleSource::Sidecar(path)) => self
+                    .sidecars
+                    .get(*index)
+                    .is_some_and(|sidecar| sidecar.path == *path),
+                _ => false,
+            })
     }
 
     pub fn enter(&mut self) {
@@ -3000,6 +3230,313 @@ impl App {
         self.dialog = Some(Dialog::PreviewSettings);
     }
 
+    /// Opens the cue editor on the selected cue, for `i`.
+    ///
+    /// Refused rather than queued while a playback runs, for the reason every dialog on this
+    /// page is: a span's pixels reach the terminal through its own image protocol rather than
+    /// the cell buffer, so a popup raised over one is painted once and then wiped.
+    ///
+    /// **SubRip only, and the refusal says so.** An ASS cue names a style and positions
+    /// itself against the script rather than carrying its own appearance, so editing the
+    /// stripped text the list shows would either throw the styling away or need an editor
+    /// that understands override tags. Saying that is better than an editor that quietly
+    /// ruins a typeset line.
+    pub fn open_cue_editor(&mut self) {
+        if self.layer != Layer::SubtitleSync || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        let Some(state) = self.subtitle_sync.as_ref() else {
+            return;
+        };
+        if self.subtitle_source_format(&state.source) != Some(SubtitleFormat::SubRip) {
+            self.notice =
+                Some("Only SubRip cues can be edited here; this track is another format.".into());
+            return;
+        }
+        let Some(cue) = state.selected_cue() else {
+            return;
+        };
+        let original = cue.text.clone();
+        let lines: Vec<String> = original.split('\n').map(str::to_string).collect();
+        // The caret starts at the end of the text, the way the application's other text
+        // fields do: the common edit is adding to a line or fixing its tail, and a caret at
+        // the start would have to be walked past the whole cue to get there.
+        let editor = CueEditor {
+            source: state.source.clone(),
+            cue: state.selected,
+            row: lines.len() - 1,
+            column: lines[lines.len() - 1].chars().count(),
+            lines,
+            original,
+        };
+        self.cue_editor = Some(editor);
+        self.notice = None;
+        self.dialog = Some(Dialog::EditCue);
+    }
+
+    /// Stages what the editor holds and closes it.
+    ///
+    /// **Leaving the editor keeps the typing** rather than discarding it, the way leaving
+    /// vim's insert mode does: staging costs nothing and is reversible by editing again,
+    /// where a popup that threw work away on `Esc` would have to ask before closing — a
+    /// second dialog over the one page that cannot hold two.
+    pub fn close_cue_editor(&mut self) {
+        let Some(editor) = self.cue_editor.take() else {
+            return;
+        };
+        self.dialog = None;
+        if editor.is_modified() {
+            self.stage_cue_text(&editor);
+        }
+    }
+
+    /// Puts one cue's rewritten text into the staged edit for the open file, and onto the
+    /// page so the list and the preview show it at once.
+    ///
+    /// The edit's `original` is the *file's* text rather than what the editor opened with,
+    /// so editing the same cue twice still checks against what is on disk — see
+    /// [`crate::subtitle::CueTextEdit`].
+    fn stage_cue_text(&mut self, editor: &CueEditor) {
+        let text = editor.text();
+        let Some(format) = self.subtitle_source_format(&editor.source) else {
+            return;
+        };
+        let mut change = self.subtitle_change(&editor.source, format);
+        let original = change
+            .cue_text
+            .get(&editor.cue)
+            .map(|staged| staged.original.clone())
+            .unwrap_or_else(|| editor.original.clone());
+        if text == original {
+            change.cue_text.remove(&editor.cue);
+        } else {
+            change.cue_text.insert(
+                editor.cue,
+                CueTextEdit {
+                    original,
+                    text: text.clone(),
+                },
+            );
+        }
+        self.store_subtitle_change(editor.source.clone(), change);
+        if let Some(state) = self.subtitle_sync.as_mut() {
+            state.edit_cue_text(editor.cue, text);
+        }
+    }
+
+    /// Whether the open file is carrying cue edits that have not been written to disk yet,
+    /// which is what makes leaving the timing page worth asking about.
+    pub fn has_unsaved_cue_edits(&self) -> bool {
+        !self.staged_cue_edits().is_empty()
+    }
+
+    /// Which cues of the *open timing page's* track have been rewritten and not yet written
+    /// out, for the count on the cue panel's border and the mark on each edited row.
+    ///
+    /// Positions rather than a count, because the panel needs both and a count cannot be
+    /// recovered from a number. Gathered for that one track rather than the whole file: the
+    /// panel is that track's cue list, and a mark on it that included another track's edits
+    /// would be about something not on screen. With the page closed there is no track to
+    /// gather for, which is the empty set every caller outside it sees.
+    pub fn staged_cue_edits(&self) -> BTreeSet<usize> {
+        self.subtitle_sync
+            .as_ref()
+            .and_then(|state| self.subtitle_changes.get(&state.source))
+            .map(|change| change.cue_text.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// `Esc` on the timing page: leave, or ask first when cue edits would be thrown away.
+    ///
+    /// This page is where cue edits are made and the only place they are visible, so
+    /// leaving it is where they end. The question is asked because the answer is
+    /// destructive, not to offer a way of carrying unwritten cues around the application:
+    /// a reader who left with edits still staged would have no way of seeing them again
+    /// short of coming back here, and every Ctrl+S from anywhere else would write words
+    /// they had stopped thinking about.
+    pub fn request_leave_subtitle_sync(&mut self) {
+        if self.has_unsaved_cue_edits() {
+            self.dialog = Some(Dialog::ConfirmLeaveCues);
+            return;
+        }
+        self.leave_subtitle_sync();
+    }
+
+    /// Closes the page and puts the cursor back on the track list.
+    fn leave_subtitle_sync(&mut self) {
+        self.close_subtitle_sync();
+        self.layer = Layer::Streams;
+    }
+
+    /// Answers the "discard the unwritten cue edits?" prompt.
+    pub fn resolve_leave_subtitle_sync(&mut self, leave: bool) {
+        if self.dialog != Some(Dialog::ConfirmLeaveCues) {
+            return;
+        }
+        self.dialog = None;
+        self.leave_cues_choice = LeaveCuesChoice::default();
+        if leave {
+            self.discard_cue_edits();
+            self.leave_subtitle_sync();
+        }
+    }
+
+    /// Throws away the open track's staged cue text, leaving every other staged edit on the
+    /// file alone.
+    ///
+    /// Only the cue text goes: a track can be carrying a format conversion, a language tag
+    /// or an export at the same time, and those were staged from the track list rather than
+    /// here. `store_subtitle_change` drops the change outright when nothing is left of it,
+    /// so a track edited only on this page comes out of `staged_edits` entirely rather than
+    /// lingering as an empty entry that makes the file look modified.
+    fn discard_cue_edits(&mut self) {
+        let Some(source) = self
+            .subtitle_sync
+            .as_ref()
+            .map(|state| state.source.clone())
+        else {
+            return;
+        };
+        let Some(mut change) = self.subtitle_changes.get(&source).cloned() else {
+            return;
+        };
+        change.cue_text.clear();
+        self.store_subtitle_change(source, change);
+    }
+
+    /// Moves the prompt's cursor between keeping the edits and discarding them.
+    pub fn choose_leave_subtitle_sync(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmLeaveCues) || direction == 0 {
+            return;
+        }
+        self.leave_cues_choice = if direction.is_positive() {
+            LeaveCuesChoice::DiscardEdits
+        } else {
+            LeaveCuesChoice::StayHere
+        };
+    }
+
+    /// Takes whichever answer the cursor is on.
+    pub fn activate_leave_subtitle_sync(&mut self) {
+        self.resolve_leave_subtitle_sync(self.leave_cues_choice == LeaveCuesChoice::DiscardEdits);
+    }
+
+    /// Types a character into the open cue editor.
+    pub fn cue_editor_insert(&mut self, character: char) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        editor.lines[editor.row].insert(offset, character);
+        editor.column += 1;
+    }
+
+    /// Breaks the line at the cursor, which is how a cue becomes two lines.
+    pub fn cue_editor_newline(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        let tail = editor.lines[editor.row].split_off(offset);
+        editor.lines.insert(editor.row + 1, tail);
+        editor.row += 1;
+        editor.column = 0;
+    }
+
+    /// Deletes the character before the cursor, joining two lines when it is at the start.
+    pub fn cue_editor_backspace(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        if editor.column > 0 {
+            let offset = editor.offset();
+            let previous = editor.lines[editor.row][..offset]
+                .chars()
+                .next_back()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+            editor.lines[editor.row].replace_range(offset - previous..offset, "");
+            editor.column -= 1;
+            return;
+        }
+        if editor.row == 0 {
+            return;
+        }
+        let line = editor.lines.remove(editor.row);
+        editor.row -= 1;
+        editor.column = editor.lines[editor.row].chars().count();
+        editor.lines[editor.row].push_str(&line);
+    }
+
+    /// Deletes the character under the cursor, pulling the next line up at the line's end.
+    pub fn cue_editor_delete(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        if offset < editor.lines[editor.row].len() {
+            let width = editor.lines[editor.row][offset..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+            editor.lines[editor.row].replace_range(offset..offset + width, "");
+            return;
+        }
+        if editor.row + 1 >= editor.lines.len() {
+            return;
+        }
+        let next = editor.lines.remove(editor.row + 1);
+        editor.lines[editor.row].push_str(&next);
+    }
+
+    /// Moves the caret by a column and a row, wrapping between lines at their ends.
+    ///
+    /// Wrapping rather than stopping: the buffer is one cue's text and the reader thinks of
+    /// it as one string that happens to be broken, so `Left` at the start of the second line
+    /// belongs at the end of the first.
+    pub fn move_cue_editor_cursor(&mut self, columns: isize, rows: isize) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        if rows != 0 {
+            editor.row = editor
+                .row
+                .saturating_add_signed(rows)
+                .min(editor.lines.len() - 1);
+            editor.clamp();
+            return;
+        }
+        let width = editor.lines[editor.row].chars().count();
+        // A step of nothing falls through both arms and leaves the caret where it is.
+        match columns {
+            ..=-1 if editor.column > 0 => editor.column -= 1,
+            ..=-1 if editor.row > 0 => {
+                editor.row -= 1;
+                editor.column = editor.lines[editor.row].chars().count();
+            }
+            1.. if editor.column < width => editor.column += 1,
+            1.. if editor.row + 1 < editor.lines.len() => {
+                editor.row += 1;
+                editor.column = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Jumps the caret to the start or the end of its line, for `Home`/`End`.
+    pub fn move_cue_editor_home(&mut self, end: bool) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        editor.column = if end {
+            editor.lines[editor.row].chars().count()
+        } else {
+            0
+        };
+    }
+
     /// Backs out one level: an open dropdown first, then the popup itself.
     ///
     /// One level at a time, like every other settings dialog — `Esc` out of a list the user
@@ -3459,8 +3996,11 @@ impl App {
                 if self.stop_playback() {
                     return true;
                 }
-                self.close_subtitle_sync();
-                self.layer = Layer::Streams;
+                // Asks before leaving cue edits behind, which is a third peeled layer: the
+                // edits are not lost by going, but this page is the only place they are
+                // visible, so walking out silently is how a reader comes to believe they
+                // were written.
+                self.request_leave_subtitle_sync();
                 true
             }
             Layer::Files => false,
@@ -5256,6 +5796,7 @@ impl App {
             .get(&source)
             .cloned()
             .unwrap_or(SubtitleChange {
+                cue_text: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -5385,6 +5926,7 @@ impl App {
             .get(source)
             .cloned()
             .unwrap_or(SubtitleChange {
+                cue_text: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -7134,6 +7676,15 @@ impl App {
             return;
         }
         let paths: Vec<PathBuf> = self.staged_edits.keys().cloned().collect();
+        // Noted before anything is dispatched, because the page is about to be closed by
+        // the rescan the save's own output triggers. `media` is filled in by
+        // `finish_batch_if_done`, which is the first point that knows what the file
+        // became. See `SyncReopen`.
+        self.pending_sync_reopen = self.subtitle_sync.as_ref().map(|state| SyncReopen {
+            media: state.media().to_path_buf(),
+            source: state.source.clone(),
+            cue: state.selected,
+        });
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut items = Vec::new();
         for path in paths {
@@ -7176,6 +7727,30 @@ impl App {
                 &staged.audio_settings,
                 &staged.video_settings,
             );
+            // Where this file's rendered preview frames are filed, before the edit moves
+            // the file underneath them. Only for an edit that leaves the pictures alone —
+            // see `frames_survive_edit`, and `framecache::migrate` for why this is decided
+            // here rather than by the cache key.
+            if frames_survive_edit(info, &stream_order, &staged.video_settings) {
+                let pixels = crate::preview::target_pixels(
+                    primary_video_resolution(info).and_then(|(width, height)| {
+                        Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+                    }),
+                );
+                let fingerprint = staged.fingerprint;
+                self.pending_frame_moves.insert(
+                    path.clone(),
+                    (
+                        framecache::media_key(FrameKeyParts {
+                            media: &path,
+                            media_length: fingerprint.length,
+                            media_modified: fingerprint.modified,
+                            pixels,
+                        }),
+                        pixels,
+                    ),
+                );
+            }
             let request = EditRequest {
                 path: path.clone(),
                 destination: SaveDestination::ReplaceOriginal,
@@ -8552,6 +9127,41 @@ fn is_default(stream: &std::collections::BTreeMap<String, serde_json::Value>) ->
         .and_then(|disposition| disposition.get("default"))
         .and_then(serde_json::Value::as_i64)
         == Some(1)
+}
+
+/// Whether an edit leaves the pictures a preview frame is grabbed from exactly as they are,
+/// so that the frames already rendered for this file still describe the file it becomes.
+///
+/// A save here is a remux: the video stream is copied through byte for byte and only the
+/// container around it is rewritten. So the answer is yes for the ordinary edit — a subtitle
+/// imported, a track reordered, a cue's words rewritten — and no for the two that touch the
+/// picture: a video track re-encoded (`video_settings`, which changes the pixels themselves),
+/// and a video track removed or reordered against another (which changes *which* stream a
+/// grab reads).
+///
+/// Conservative by construction: a wrong "yes" serves one file's pictures for another's,
+/// which on this page is the worst thing that can happen, and a wrong "no" costs a re-render
+/// the user was paying for anyway. Everything not recognised is a "no".
+fn frames_survive_edit(
+    info: &MediaInfo,
+    stream_order: &[u64],
+    video_settings: &BTreeMap<u64, VideoSettings>,
+) -> bool {
+    if !video_settings.is_empty() {
+        return false;
+    }
+    let video: Vec<u64> = info
+        .streams
+        .iter()
+        .filter(|stream| stream_kind(stream) == Some("video"))
+        .filter_map(stream_index)
+        .collect();
+    let kept: Vec<u64> = stream_order
+        .iter()
+        .copied()
+        .filter(|index| video.contains(index))
+        .collect();
+    kept == video
 }
 
 /// Free-function core of `App::original_subtitle_metadata` — see
@@ -11137,6 +11747,7 @@ mod tests {
         subtitles.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -11169,6 +11780,7 @@ mod tests {
         staged.original_stream_order = vec![0, 1, 2];
         let change = |source: SubtitleSource, embedded_target, export_target, import_into_media| {
             SubtitleChange {
+                cue_text: Default::default(),
                 source,
                 source_format: SubtitleFormat::SubRip,
                 embedded_target,
@@ -11256,6 +11868,7 @@ mod tests {
         staged.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -11310,6 +11923,7 @@ mod tests {
         edit.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::SubRip),
@@ -12182,6 +12796,7 @@ mod tests {
         edit.subtitle_changes.insert(
             SubtitleSource::Sidecar(sidecar_path.clone()),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar_path),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -13543,6 +14158,7 @@ mod tests {
             BTreeMap::from([(
                 source.clone(),
                 SubtitleChange {
+                    cue_text: Default::default(),
                     source,
                     source_format: SubtitleFormat::SubRip,
                     embedded_target: None,
@@ -15610,6 +16226,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -16014,6 +16631,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -17136,6 +17754,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -17178,6 +17797,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -20416,6 +21036,544 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A timing page with two cues on it, for the cue editor's tests.
+    fn sync_cue_at(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+        crate::cue::Cue {
+            index: 0,
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+            text: text.into(),
+            dialogue: Vec::new(),
+            events: 1,
+        }
+    }
+
+    fn cue_editing_app() -> (App, PathBuf) {
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![
+                sync_cue_at(1, 2, "First line"),
+                sync_cue_at(3, 4, "Second line"),
+            ],
+            CueStyle::SubRip,
+        );
+        (app, directory)
+    }
+
+    /// The editor is a text buffer, so every key that reaches it has to do the obvious
+    /// thing to a two-line cue — including the two that only a multi-line buffer has:
+    /// `Enter` splitting a line and `Backspace` joining one back.
+    #[test]
+    fn the_cue_editor_should_edit_text_across_lines() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+
+        // Act: type at the end, break the line, and type on the new one.
+        app.cue_editor_insert('>');
+        app.cue_editor_newline();
+        app.cue_editor_insert('t');
+        app.cue_editor_insert('w');
+        app.cue_editor_insert('o');
+
+        // Assert
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!(editor.text().as_str()).is_equal_to("First line>\ntwo");
+        assert_that!(editor.is_modified()).is_true();
+
+        // Act / Assert: backspace at the start of a line joins it to the one above.
+        app.move_cue_editor_home(false);
+        app.cue_editor_backspace();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str())
+            .is_equal_to("First line>two");
+
+        // Act / Assert: and delete takes the character under the caret.
+        app.move_cue_editor_home(false);
+        app.cue_editor_delete();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("irst line>two");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The caret walks the buffer as one string that happens to be broken, so `Left` at the
+    /// start of the second line belongs at the end of the first — and every move stays
+    /// inside the text however far it is pushed.
+    #[test]
+    fn the_cue_editor_caret_should_wrap_between_lines_and_stay_inside_the_text() {
+        // Arrange: a two-line cue.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.move_cue_editor_home(true);
+        app.cue_editor_newline();
+        app.cue_editor_insert('a');
+
+        // Act / Assert: left off the start of the second line lands at the end of the first.
+        app.move_cue_editor_home(false);
+        app.move_cue_editor_cursor(-1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((0, "First line".len()));
+
+        // Act / Assert: right off the end goes back down.
+        app.move_cue_editor_cursor(1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((1, 0));
+
+        // Act / Assert: neither end runs off the buffer, and a step of nothing moves
+        // nothing.
+        app.move_cue_editor_cursor(0, -1);
+        app.move_cue_editor_home(false);
+        app.move_cue_editor_cursor(-1, 0);
+        app.move_cue_editor_cursor(0, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((0, 0));
+        app.move_cue_editor_cursor(0, 5);
+        app.move_cue_editor_cursor(1, 0);
+        app.move_cue_editor_cursor(1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((1, 1));
+
+        // Act / Assert: and moving up onto a longer line keeps the caret on it.
+        app.move_cue_editor_cursor(0, -1);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!(editor.row).is_equal_to(0);
+        assert_that!(editor.column <= "First line".chars().count()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Closing the editor stages the edit rather than discarding it, and the page shows the
+    /// new words at once — the list, and the frame, which was drawn with the old ones
+    /// burned into it.
+    #[test]
+    fn closing_the_cue_editor_should_stage_the_edit_and_show_it_on_the_page() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+
+        // Act
+        app.close_cue_editor();
+
+        // Assert: staged against the track, and on the page.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the edit should be staged against the track");
+        let edit = change.cue_text.get(&0).expect("cue zero should be staged");
+        assert_that!(edit.original.as_str()).is_equal_to("First line");
+        assert_that!(edit.text.as_str()).is_equal_to("First line!");
+        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].text.as_str())
+            .is_equal_to("First line!");
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(
+            app.staged_cue_edits()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.has_track_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Editing a cue back to what it said is not an edit, and must leave nothing staged —
+    /// otherwise the file would be rewritten, and the page would ask about unsaved work,
+    /// over a change the reader undid. The *original* stays the file's text across a second
+    /// visit, so the writer still checks against what is on disk.
+    #[test]
+    fn editing_a_cue_back_to_its_own_text_should_stage_nothing() {
+        // Arrange: one edit staged.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act: open it again and take the character back off.
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.as_ref().unwrap().original.as_str()).is_equal_to("First line!");
+        app.cue_editor_backspace();
+        app.close_cue_editor();
+
+        // Assert: nothing staged at all, since the text is the file's again.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].text.as_str())
+            .is_equal_to("First line");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An ASS cue names a style and positions itself against the script rather than
+    /// carrying its own appearance, so editing the stripped text the list shows would throw
+    /// the styling away. The refusal says so instead.
+    #[test]
+    fn the_cue_editor_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_sync();
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "A sign".into(),
+                dialogue: vec!["Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,A sign".into()],
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        app.open_cue_editor();
+
+        // Assert
+        assert_that!(app.cue_editor.is_none()).is_true();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page is where cue edits end, so the question is asked because the answer
+    /// throws work away — and the answer that says "discard" has to actually discard, or the
+    /// reader carries invisible words to the next Ctrl+S.
+    #[test]
+    fn leaving_the_timing_page_should_ask_about_unsaved_cue_edits() {
+        // Arrange: an edit staged.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act
+        app.back();
+
+        // Assert: still on the page, with the question up and the safe answer under the
+        // cursor.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.leave_cues_choice).is_equal_to(LeaveCuesChoice::StayHere);
+
+        // Act / Assert: saying no puts the reader back on the page with their edits.
+        app.activate_leave_subtitle_sync();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: and discarding leaves with the words gone — nothing staged against
+        // the track, so the file is not carrying an edit nowhere shows.
+        app.back();
+        app.choose_leave_subtitle_sync(1);
+        app.activate_leave_subtitle_sync();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_track_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Discarding is about the words typed on this page, not about the track. A conversion
+    /// or a language tag staged from the track list was never visible here and has nothing
+    /// to do with the question being asked, so throwing it away with the cue text would
+    /// silently undo an edit the reader made somewhere else.
+    #[test]
+    fn discarding_cue_edits_should_leave_the_tracks_other_edits_alone() {
+        // Arrange: a language tag staged from the track list, and a cue edit staged here.
+        let (mut app, directory) = cue_editing_app();
+        let source = SubtitleSource::Embedded(2);
+        let mut staged = app.subtitle_change(&source, SubtitleFormat::SubRip);
+        staged.metadata = Some(SubtitleMetadata {
+            language: "fra".to_string(),
+            title: None,
+            forced: false,
+            cc: false,
+            hearing_impaired: false,
+            original: false,
+            commentary: false,
+        });
+        app.store_subtitle_change(source.clone(), staged);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act: leave, discarding.
+        app.back();
+        app.choose_leave_subtitle_sync(1);
+        app.activate_leave_subtitle_sync();
+
+        // Assert: the words are gone, the tag is not.
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the track should still be carrying its language tag");
+        assert_that!(change.cue_text.is_empty()).is_true();
+        assert_that!(change.metadata.as_ref().map(|data| data.language.as_str()))
+            .is_equal_to(Some("fra"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Nothing staged, nothing to ask about: the page closes on the first `Esc` the way it
+    /// did before it could be edited at all.
+    #[test]
+    fn leaving_the_timing_page_should_not_ask_when_nothing_was_edited() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.close_cue_editor();
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Writing a cue edit rewrites the file the timing page is reading, so the page is
+    /// closed and the file re-probed — but the reader asked to save a cue, not to leave.
+    /// The page comes back on the same track, and the cursor lands on the cue it was on.
+    #[test]
+    fn saving_from_the_timing_page_should_come_back_to_it() {
+        // Arrange: the page open on the second cue, then a save closing it the way the
+        // rescan of its own output does.
+        let (mut app, directory) = cue_editing_app();
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        let media = app.selected_file().unwrap().path.clone();
+        app.pending_sync_reopen = Some(SyncReopen {
+            media,
+            source: SubtitleSource::Embedded(2),
+            cue: 1,
+        });
+        app.close_subtitle_sync();
+        app.layer = Layer::Files;
+
+        // Act
+        app.reopen_subtitle_sync();
+
+        // Assert: the page is up again, on the track it was about.
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        let state = app.subtitle_sync.as_ref().expect("the page should be open");
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
+        assert_that!(app.pending_sync_reopen.clone()).is_none();
+
+        // And the cursor goes back where it was, once the rewritten file has been read.
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![
+                sync_cue_at(1, 2, "First line"),
+                sync_cue_at(3, 4, "Second line!"),
+            ],
+            CueStyle::SubRip,
+        );
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A save runs in the background, and the reader is free to walk away while it does.
+    /// Coming back to the page then means dragging them off whatever they moved to, so the
+    /// request is dropped rather than honoured.
+    #[test]
+    fn saving_should_not_drag_the_reader_back_from_another_file() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.close_subtitle_sync();
+        app.layer = Layer::Files;
+        app.pending_sync_reopen = Some(SyncReopen {
+            media: directory.join("something-else.mkv"),
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+
+        // Act
+        app.reopen_subtitle_sync();
+
+        // Assert
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(app.pending_sync_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A save that removes the very track the page was about has nothing to come back to,
+    /// and must not open the page on whatever track happens to sit at that row now.
+    #[test]
+    fn saving_should_not_reopen_the_page_on_a_track_that_is_gone() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        app.close_subtitle_sync();
+        app.layer = Layer::Files;
+        app.pending_sync_reopen = Some(SyncReopen {
+            media,
+            source: SubtitleSource::Embedded(7),
+            cue: 0,
+        });
+
+        // Act
+        app.reopen_subtitle_sync();
+
+        // Assert
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.pending_sync_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The request waits for the re-probe rather than being dropped by it: there is nothing
+    /// to open a page against until the rewritten file has been read, and a request dropped
+    /// there would leave the reader on the track list with no way to tell why.
+    #[test]
+    fn saving_should_wait_for_the_rewritten_file_to_be_read_before_coming_back() {
+        // Arrange: the file selected, its probe still out.
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        app.close_subtitle_sync();
+        app.layer = Layer::Files;
+        app.pending_sync_reopen = Some(SyncReopen {
+            media,
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+        let outcome = app.outcome.take();
+        app.loading = true;
+
+        // Act / Assert: nothing yet, and the request is still owed.
+        app.reopen_subtitle_sync();
+        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.pending_sync_reopen.is_some()).is_true();
+
+        // Act / Assert: and it is honoured the moment the answer lands.
+        app.loading = false;
+        app.outcome = outcome;
+        app.reopen_subtitle_sync();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // A page already open owes nothing, and holding the request would spring one open
+        // later on something else entirely.
+        app.pending_sync_reopen = Some(SyncReopen {
+            media: directory.join("movie.mkv"),
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+        app.reopen_subtitle_sync();
+        assert_that!(app.pending_sync_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The frames a track's page rendered are moved onto the rewritten file's key, and only
+    /// for the files an edit was recorded for.
+    #[test]
+    fn a_completed_edit_should_move_the_frames_it_left_behind() {
+        // Arrange: a file, and a directory of "frames" filed under the key it had before.
+        // The read guard keeps this out of the way of the tests that clear the whole cache
+        // directory; this one only ever touches keys of its own.
+        let _guard = crate::framecache::testing::one_key();
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        let pixels = (960, 540);
+        let before = framecache::media_key(FrameKeyParts {
+            media: &media,
+            media_length: 1,
+            media_modified: None,
+            pixels,
+        });
+        assert!(framecache::store(&before, "frame", &[5u8; 32]));
+        app.pending_frame_moves
+            .insert(media.clone(), (before.clone(), pixels));
+
+        // Act
+        app.move_frame_cache(&[(media.clone(), media.clone())]);
+
+        // Assert: under the file's *current* key, and gone from the old one.
+        let fingerprint = crate::files::FileFingerprint::for_path(&media).unwrap();
+        let after = framecache::media_key(FrameKeyParts {
+            media: &media,
+            media_length: fingerprint.length,
+            media_modified: fingerprint.modified,
+            pixels,
+        });
+        assert_that!(framecache::read(&after, "frame")).is_equal_to(Some(vec![5u8; 32]));
+        assert_that!(framecache::is_cached(&before, "frame")).is_false();
+        // Consumed, so a later edit of another file cannot move these again.
+        assert_that!(app.pending_frame_moves.is_empty()).is_true();
+
+        // And a file nothing was recorded for, or one that is no longer there, is left be.
+        app.pending_frame_moves
+            .insert(media.clone(), (after.clone(), pixels));
+        app.move_frame_cache(&[(media.clone(), directory.join("gone.mkv"))]);
+        assert_that!(framecache::read(&after, "frame")).is_equal_to(Some(vec![5u8; 32]));
+        app.move_frame_cache(&[(media, directory.join("gone.mkv"))]);
+        assert_that!(framecache::read(&after, "frame")).is_equal_to(Some(vec![5u8; 32]));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(framecache::directory().unwrap().join(after));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The frames a page rendered are worth carrying over a remux that copies the picture
+    /// through, and must never be carried over one that changes it.
+    #[test]
+    fn frames_should_survive_only_the_edits_that_leave_the_picture_alone() {
+        // Arrange: one video track, one audio, one subtitle.
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+        ]));
+        let settings = BTreeMap::new();
+
+        // Act / Assert: an ordinary remux keeps them, however the other tracks move.
+        assert_that!(frames_survive_edit(&info, &[0, 1, 2], &settings)).is_true();
+        assert_that!(frames_survive_edit(&info, &[0, 2, 1], &settings)).is_true();
+
+        // Re-encoding the video changes the pixels themselves.
+        let mut encoded = BTreeMap::new();
+        encoded.insert(0, VideoSettings::default());
+        assert_that!(frames_survive_edit(&info, &[0, 1, 2], &encoded)).is_false();
+
+        // Dropping the video leaves nothing the old frames describe.
+        assert_that!(frames_survive_edit(&info, &[1, 2], &settings)).is_false();
+
+        // And reordering two video tracks changes which one a grab reads.
+        let two = media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "video", "codec_name": "h264"},
+        ]));
+        assert_that!(frames_survive_edit(&two, &[0, 1], &settings)).is_true();
+        assert_that!(frames_survive_edit(&two, &[1, 0], &settings)).is_false();
     }
 
     /// The page draws a loader while its cues are being read, and `main` only repaints

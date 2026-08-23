@@ -84,6 +84,60 @@ impl InputState {
 
 pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> InputOutcome {
     match app.dialog {
+        // The one dialog in the application that is a text buffer rather than a set of
+        // choices, so it takes the keys first and hands almost nothing back: a cue's text
+        // can contain any character, `j` and `k` included.
+        Some(Dialog::EditCue) => {
+            input.reset_sequence();
+            match (key.code, key.modifiers) {
+                // Stage what is typed and start writing it, which is what Ctrl+S means
+                // everywhere else in the application.
+                (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                    app.close_cue_editor();
+                    app.request_process_all();
+                }
+                // Leaving keeps the typing, the way leaving vim's insert mode does.
+                (KeyCode::Esc, _) => app.close_cue_editor(),
+                (KeyCode::Enter, _) => app.cue_editor_newline(),
+                (KeyCode::Backspace, _) => app.cue_editor_backspace(),
+                (KeyCode::Delete, _) => app.cue_editor_delete(),
+                (KeyCode::Left, _) => app.move_cue_editor_cursor(-1, 0),
+                (KeyCode::Right, _) => app.move_cue_editor_cursor(1, 0),
+                (KeyCode::Up, _) => app.move_cue_editor_cursor(0, -1),
+                (KeyCode::Down, _) => app.move_cue_editor_cursor(0, 1),
+                (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                    app.move_cue_editor_home(false)
+                }
+                (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                    app.move_cue_editor_home(true)
+                }
+                (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    app.cue_editor_insert(character)
+                }
+                _ => {}
+            }
+        }
+        Some(Dialog::ConfirmLeaveCues) => match (key.code, key.modifiers) {
+            (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_leave_subtitle_sync(-1);
+            }
+            (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                input.reset_sequence();
+                app.choose_leave_subtitle_sync(1);
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.activate_leave_subtitle_sync();
+            }
+            // `Esc` out of the question is not an answer to it: it puts the reader back on
+            // the page with their edits, which is the safe half of the choice.
+            _ if is_back_key(key) => {
+                input.reset_sequence();
+                app.resolve_leave_subtitle_sync(false);
+            }
+            _ => {}
+        },
         Some(Dialog::ConfirmCancel) => match (key.code, key.modifiers) {
             (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
                 input.reset_sequence();
@@ -980,6 +1034,21 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char(':'), _) if app.layer == Layer::SubtitleSync => {
             input.reset_sequence();
             app.open_preview_settings();
+        }
+        // `i` for insert, which is what it is: the editor opens with the cue's own text in
+        // it and the caret in it. `c` would be the other vim answer and is taken — it is
+        // what opens this page from the track list, and reusing it one layer deeper reads
+        // worse than the key that already means "type here".
+        (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.open_cue_editor();
+        }
+        // The same key that processes staged files everywhere else, from the page where the
+        // cue edits were made: they are staged edits like any other, so the key that writes
+        // them is the key that writes those.
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.request_process_all();
         }
         // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
         // move between rows and these move between the cues sharing one. Ahead of the
@@ -3443,6 +3512,59 @@ mod tests {
         assert_that!(app.playback_active()).is_true();
         handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
         assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `i` opens the cue editor on the timing page, and everything typed after that has to
+    /// reach the buffer rather than the page underneath — `j`, `k` and `p` are ordinary
+    /// characters inside a subtitle.
+    #[test]
+    fn i_should_open_the_cue_editor_and_send_every_key_to_it() {
+        // Arrange: the timing page, with a cue on it.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: ["subtitles", "scale"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: std::time::Duration::from_secs(1),
+                end: std::time::Duration::from_secs(2),
+                text: "line".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            crate::preview::CueStyle::SubRip,
+        );
+
+        // Act / Assert: `i` raises the editor.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::EditCue));
+
+        // Act / Assert: the keys the page would otherwise use are typed instead.
+        for character in "jkp".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("linejkp\nx");
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.playback_active()).is_false();
+
+        // Act / Assert: `Esc` keeps the typing rather than throwing it away.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
 
         // Cleanup
         drop(app);

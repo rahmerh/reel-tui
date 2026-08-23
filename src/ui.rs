@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use isolang::Language;
 use ratatui::{
@@ -16,7 +20,7 @@ use crate::{
     app::{
         App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
         ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
-        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer,
+        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer, LeaveCuesChoice,
         PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState, StagedFileStatus,
         SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode, SubtitleSettingsPopup,
         TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
@@ -154,6 +158,10 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // while `subtitle_sync` is held mutably below.
     let badge = playback_settings_badge(app.preview_settings(), app.preview_defaults());
     let dialog_open = app.dialog.is_some();
+    // Which of this track's cues have been rewritten but not written out. Read here for the
+    // same reason the badge is, and shown on the cue panel: a staged edit is invisible once
+    // the editor closes, and invisible unsaved work is work a reader thinks is saved.
+    let edited = app.staged_cue_edits();
     let Some(state) = app.subtitle_sync.as_mut() else {
         return;
     };
@@ -220,7 +228,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
     render_sync_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
-    render_sync_cues(frame, state, columns[1]);
+    render_sync_cues(frame, state, columns[1], &edited);
     render_sync_timeline(frame, state, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
@@ -474,16 +482,34 @@ impl GroupTiming {
 /// rows and a group is six, so how many rows a screenful holds depends on which groups are
 /// in it and the arithmetic belongs where the group heights are (`SubtitleSyncState::
 /// sync_scroll`).
-fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
+fn render_sync_cues(
+    frame: &mut Frame,
+    state: &mut SubtitleSyncState,
+    area: Rect,
+    edited: &BTreeSet<usize>,
+) {
     let mut block = Block::bordered().title(" Cues ");
     // The background pass's count sits on this panel's border rather than on the status
     // row: it is a count of *these* rows' frames, and the status row carries one message at
     // a time — where "Preparing playback…" is the one worth reading while a span decodes.
+    //
+    // The count of *edited* cues takes the same corner when the pass is over, which is when
+    // editing happens: a staged edit is invisible the moment the editor closes, and
+    // invisible unsaved work is work the reader believes is saved. The pass wins the corner
+    // while it runs because it is finite and about to stop; the edits are still there after.
     if let WarmState::Working { done, total } = state.warm {
         block = block.title(
             Line::styled(
                 format!(" [{done}/{total}] "),
                 Style::default().fg(Color::Cyan),
+            )
+            .right_aligned(),
+        );
+    } else if !edited.is_empty() {
+        block = block.title(
+            Line::styled(
+                format!(" {} edited ", edited.len()),
+                Style::default().fg(Color::Yellow),
             )
             .right_aligned(),
         );
@@ -510,6 +536,7 @@ fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect
             state,
             group,
             timing,
+            edited,
             Rect {
                 x: inner.x,
                 y: top,
@@ -567,6 +594,7 @@ fn render_sync_group(
     state: &SubtitleSyncState,
     group: CueGroup,
     timing: GroupTiming,
+    edited: &BTreeSet<usize>,
     area: Rect,
 ) {
     // Fetched as one slice and matched on rather than indexed twice: `cues` is public and
@@ -583,6 +611,7 @@ fn render_sync_group(
             frame,
             cue,
             first == state.selected,
+            edited.contains(&first),
             &format!(
                 " {} → {} ",
                 format_timestamp(cue.start),
@@ -629,6 +658,7 @@ fn render_sync_group(
             frame,
             cue,
             position == state.selected,
+            edited.contains(&position),
             &timing.title(cue),
             Rect {
                 x: area.x + if offset == 0 { 0 } else { left_width },
@@ -737,7 +767,14 @@ fn render_sync_fork(
 /// how the row was built, so it is the one that gives way. At the sizes the panel is actually
 /// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
 /// fits, with the two titles' decorative spaces sharing the column where they meet.
-fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, timing: &str, area: Rect) {
+fn render_sync_cue(
+    frame: &mut Frame,
+    cue: &Cue,
+    selected: bool,
+    edited: bool,
+    timing: &str,
+    area: Rect,
+) {
     let folded = (cue.events > 1)
         .then(|| format!(" ×{} ", cue.events))
         // Measured on what the two titles *say*, plus one column between them, rather than on
@@ -783,6 +820,21 @@ fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, timing: &str, a
         &cue.text.replace('\n', " / "),
         usize::from(inner.width).saturating_sub(1).max(1),
     );
+    // A rewritten cue is said by its own words rather than by a marker beside them: the
+    // words *are* what changed, and the row is otherwise identical to one that was not
+    // touched. Yellow is the colour every other staged-but-unwritten thing in the
+    // application already wears, and the italic carries it into the selected row, where the
+    // cyan fill owns the colours and yellow on cyan would be unreadable.
+    let text_style = if edited {
+        let italic = text_style.add_modifier(Modifier::ITALIC);
+        if selected {
+            italic
+        } else {
+            italic.fg(Color::Yellow)
+        }
+    } else {
+        text_style
+    };
     frame.render_widget(
         Paragraph::new(Line::styled(format!(" {text}"), text_style)),
         inner,
@@ -2132,6 +2184,14 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_resolve_conflicts_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::EditCue {
+        render_cue_editor(frame, app);
+        return;
+    }
+    if dialog == Dialog::ConfirmLeaveCues {
+        render_confirm_leave_cues_dialog(frame, app);
+        return;
+    }
     // Matched exhaustively rather than falling through to the error popup: every dialog
     // above returns, so a new `Dialog` variant that forgets to must fail to compile here
     // instead of silently rendering itself as an editing error.
@@ -2146,7 +2206,9 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::ConfirmProcessAll
         | Dialog::BatchProcessing
         | Dialog::ConfirmReset
-        | Dialog::ResolveConflicts => unreachable!("handled and returned above"),
+        | Dialog::ResolveConflicts
+        | Dialog::EditCue
+        | Dialog::ConfirmLeaveCues => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -2409,6 +2471,110 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+/// The cue editor: one cue's text, in a box big enough to see the shape of it.
+///
+/// **Deliberately the largest popup in the application.** What is being judged is how the
+/// line will read on screen — where it breaks, how long each half is — so the box is sized
+/// from the terminal rather than from the text, and a cue that is two short lines is shown as
+/// two short lines rather than reflowed to fill a narrow field. `Wrap` is off for the same
+/// reason: a line long enough to wrap is a line the reader should see is too long.
+///
+/// The cue's timing goes in the title, because the editor covers the list it was opened from
+/// and "which cue is this" is the one thing the reader loses by opening it.
+fn render_cue_editor(frame: &mut Frame, app: &App) {
+    let Some(editor) = app.cue_editor.as_ref() else {
+        return;
+    };
+    let timing = app
+        .subtitle_sync
+        .as_ref()
+        .and_then(|state| state.cues.get(editor.cue))
+        .map(|cue| {
+            format!(
+                " Cue {} · {} → {} ",
+                editor.cue + 1,
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            )
+        })
+        .unwrap_or_else(|| " Cue ".to_string());
+
+    let area = centered_percent(
+        frame.area(),
+        CUE_EDITOR_WIDTH_PERCENT,
+        CUE_EDITOR_HEIGHT_PERCENT,
+    );
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::styled(timing, Style::default().fg(Color::Cyan)));
+    // Right-aligned opposite the timing, the way the cue panel carries its frame count: it
+    // is the answer to "will leaving keep this", which is worth having in view while typing.
+    let block = if editor.is_modified() {
+        block.title(Line::styled(" edited ", Style::default().fg(Color::Yellow)).right_aligned())
+    } else {
+        block
+    };
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line<'static>> = editor
+        .lines
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    // A real terminal caret rather than a styled cell: it blinks, it is where the terminal
+    // puts an IME's candidates, and it is the one cursor the reader already knows how to
+    // find. Clamped inside the pane so a line longer than the box cannot park it outside.
+    let column = inner.x + (editor.column as u16).min(inner.width.saturating_sub(1));
+    let row = inner.y + (editor.row as u16).min(inner.height.saturating_sub(1));
+    frame.set_cursor_position((column, row));
+}
+
+/// "Leaving discards them" — the question `Esc` asks on the way off the timing page.
+fn render_confirm_leave_cues_dialog(frame: &mut Frame, app: &App) {
+    let lines = vec![
+        Line::from("Cue edits are staged but not written yet.").centered(),
+        Line::from("Ctrl+S writes them; leaving discards them.").centered(),
+        Line::from(""),
+        Line::from(vec![
+            action_option(
+                " Stay here ",
+                choice_style(
+                    app.leave_cues_choice == LeaveCuesChoice::StayHere,
+                    false,
+                    true,
+                ),
+            ),
+            Span::raw("  "),
+            action_option(
+                " Discard edits ",
+                choice_style(
+                    app.leave_cues_choice == LeaveCuesChoice::DiscardEdits,
+                    false,
+                    true,
+                ),
+            ),
+        ])
+        .centered(),
+    ];
+    let area = centered_fixed(frame.area(), 64, 8);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(padded_popup_text(Text::from(lines)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Unsaved cue edits "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// One button in a row of them — a confirm dialog's Keep/Cancel pair, or a settings row's
 /// Yes/No.
 ///
@@ -2582,6 +2748,11 @@ fn keybindings_text() -> Text<'static> {
         &mut lines,
         "h / l",
         "Move between cues that share a moment, or choose Yes or No on a preview settings switch",
+    );
+    keybinding(
+        &mut lines,
+        "i",
+        "Edit the selected cue's text (SubRip tracks); Esc keeps the edit, Ctrl-s writes it",
     );
     keybinding(
         &mut lines,
@@ -5692,6 +5863,19 @@ fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
+/// Share of the terminal the cue editor takes, in each direction.
+///
+/// Sized from the terminal rather than from the cue, because what is being judged is how the
+/// line will read on screen — a box that shrank to fit two short lines would say nothing
+/// about how much room they have.
+const CUE_EDITOR_WIDTH_PERCENT: u16 = 70;
+const CUE_EDITOR_HEIGHT_PERCENT: u16 = 50;
+
+/// A centred box taking a share of the area in each direction.
+fn centered_percent(area: Rect, width: u16, height: u16) -> Rect {
+    centered_fixed(area, area.width * width / 100, area.height * height / 100)
+}
+
 /// Share of the terminal every `i` panel takes, whichever track it describes. One width
 /// for all of them: a panel that resized itself to its content made the container, video
 /// and subtitle panels three different shapes.
@@ -6553,6 +6737,17 @@ mod tests {
         app.layer = Layer::Streams;
         match dialog {
             Dialog::Keybindings => {}
+            Dialog::EditCue => {
+                app.cue_editor = Some(crate::app::CueEditor {
+                    source: SubtitleSource::Embedded(2),
+                    cue: 0,
+                    original: "Hello there".to_string(),
+                    lines: vec!["Hello there".to_string()],
+                    row: 0,
+                    column: 0,
+                });
+            }
+            Dialog::ConfirmLeaveCues => {}
             Dialog::PreviewSettings => {
                 app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup::default());
             }
@@ -6712,7 +6907,7 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 12] = [
+        const DIALOGS: [(Dialog, &str); 14] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::PreviewSettings, "Preview settings"),
@@ -6728,6 +6923,8 @@ mod tests {
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
             (Dialog::ResolveConflicts, "Changed:   video tracks"),
+            (Dialog::EditCue, "Hello there"),
+            (Dialog::ConfirmLeaveCues, "Cue edits are staged"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -8470,6 +8667,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -9600,6 +9798,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9651,6 +9850,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let imported = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -9669,6 +9869,7 @@ mod tests {
         )
         .unwrap();
         let exported = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9788,6 +9989,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9877,6 +10079,7 @@ mod tests {
 
             // Act: the embedded track, staying embedded.
             let change = SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -9901,6 +10104,7 @@ mod tests {
 
             // Act: the sidecar, being imported into the same container.
             let change = SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 import_into_media: true,
                 metadata: Some(metadata.clone()),
@@ -9958,6 +10162,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10891,6 +11096,7 @@ mod tests {
         app.subtitle_changes.insert(
             embedded_source.clone(),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: embedded_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -10922,6 +11128,7 @@ mod tests {
         app.subtitle_changes.insert(
             sidecar_source.clone(),
             SubtitleChange {
+                cue_text: Default::default(),
                 source: sidecar_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -11382,9 +11589,9 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", and the SRT
-        // timing preview, which matches on "tracks".
-        assert_eq!(count, 3);
+        // "Move track down / up", "Mark or unmark track for deletion", and the two that
+        // match on "tracks": the SRT timing preview and the cue editor.
+        assert_eq!(count, 4);
     }
 
     #[test]
@@ -14039,6 +14246,132 @@ mod tests {
         let screen = drawn(50, 13, |frame| render(frame, &mut app));
         assert_that!(screen.contains("network mounts")).is_true();
         assert_that!(screen.contains('▲')).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The editor covers the list it was opened from, so it has to carry the cue's own
+    /// timing — "which cue is this" is the one thing opening it costs the reader. The
+    /// buffer is drawn as it stands, line breaks and all, because where the line breaks is
+    /// part of what is being judged.
+    #[test]
+    fn the_cue_editor_should_draw_the_cue_it_is_editing() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-editor",
+            vec![
+                sync_cue(5000, 7000, "Hello there"),
+                sync_cue(9000, 11_000, "Later"),
+            ],
+        );
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.cue_editor_newline();
+        app.cue_editor_insert('a');
+
+        // Act
+        let screen = draw(&mut app, 100, 30).join("\n");
+
+        // Assert: the timing on the border, the buffer inside it, and the mark saying the
+        // typing will be kept.
+        assert_that!(screen.contains("Cue 1 · 00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(screen.contains("Hello there!")).is_true();
+        assert_that!(screen.contains("edited")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A staged cue edit is invisible the moment the editor closes, and invisible unsaved
+    /// work is work the reader believes is saved. The cue panel's border carries the count,
+    /// in the corner the background pass uses while it is running.
+    #[test]
+    fn the_cue_panel_should_count_the_edits_waiting_to_be_written() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-edited-count", vec![sync_cue(5000, 7000, "Hello")]);
+
+        // Act / Assert: nothing staged, nothing said.
+        assert_that!(draw(&mut app, 100, 30).join("\n").contains("edited")).is_false();
+
+        // Act / Assert: one edit staged, and the panel says so.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        assert_that!(draw(&mut app, 100, 30).join("\n").contains("1 edited")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A count on the panel's border says *how many* cues were rewritten but not *which*,
+    /// and on a track of a thousand cues that is no answer at all. The rewritten row says
+    /// so itself, in the words that changed — yellow and italic, the same pair every other
+    /// staged-but-unwritten thing in the application wears.
+    #[test]
+    fn a_rewritten_cue_should_say_so_in_its_own_words() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = sync_page_app(
+            "sync-edited-mark",
+            vec![
+                sync_cue(1000, 3000, "Untouched"),
+                sync_cue(5000, 7000, "Rewritten"),
+            ],
+        );
+
+        // The words of the row at `y`, with the style of its first character.
+        let row = |app: &mut App, y: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = line.find("Untouched").or_else(|| line.find("Rewritten"));
+            (line.clone(), text.map(|x| buffer[(x as u16, y)].clone()))
+        };
+
+        // The two cue rows, found by the words on them.
+        let mut rows = (0..30).filter(|y| {
+            let line = row(&mut app, *y).0;
+            line.contains("Untouched") || line.contains("Rewritten")
+        });
+        let untouched = rows.next().expect("the first cue should be drawn");
+        let rewritten = rows.next().expect("the second cue should be drawn");
+        drop(rows);
+
+        // Act: rewrite the second one.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Assert: the rewritten row's words are yellow and italic; the other row's are not.
+        let (_, edited_cell) = row(&mut app, rewritten);
+        let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
+        assert!(
+            edited_cell.modifier.contains(Modifier::ITALIC),
+            "a rewritten cue's words should be italic"
+        );
+        let (_, plain_cell) = row(&mut app, untouched);
+        let plain_cell = plain_cell.expect("the untouched cue should still be drawn");
+        assert_that!(plain_cell.fg).is_equal_to(Color::Gray);
+        assert!(
+            !plain_cell.modifier.contains(Modifier::ITALIC),
+            "an untouched cue's words should be left alone"
+        );
+
+        // And with the cursor off it, the colour carries the same thing the italic does.
+        app.subtitle_sync.as_mut().unwrap().select(-1);
+        let (_, edited_cell) = row(&mut app, rewritten);
+        let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
+        assert_that!(edited_cell.fg).is_equal_to(Color::Yellow);
+        assert!(edited_cell.modifier.contains(Modifier::ITALIC));
 
         // Cleanup
         drop(app);

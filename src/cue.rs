@@ -163,6 +163,33 @@ fn collapse(cues: Vec<Cue>) -> Vec<Cue> {
     collapsed
 }
 
+/// Renders a cue list back to SubRip.
+///
+/// The inverse of [`parse_srt`] for everything a SubRip file actually carries: counters
+/// numbered from one, `00:00:01,500 --> 00:00:03,000` timings, the text, a blank line
+/// between blocks. Written with `\n` and a trailing newline, which is what every player
+/// reads and what `parse_srt` is at home with; a file that arrived with CRLF comes back
+/// with LF, since keeping the returns would mean threading the file's line ending through a
+/// parse that deliberately ignores it.
+///
+/// **A folded cue is written once, not once per event it stands for.** `collapse` only folds
+/// entries that are identical in every way a reader can see — same timing, same text — so
+/// the duplicates it removes carry nothing a player would draw differently. Writing them
+/// back would preserve a defect rather than the file.
+pub fn write_srt(cues: &[Cue]) -> String {
+    let mut out = String::new();
+    for (position, cue) in cues.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            position + 1,
+            format_srt_timestamp(cue.start),
+            format_srt_timestamp(cue.end),
+            cue.text
+        ));
+    }
+    out
+}
+
 /// Parses SubRip text into cues, discarding anything it cannot make sense of.
 ///
 /// Returns a `Vec` rather than a `Result` on purpose. SubRip is a lenient, widely
@@ -1366,6 +1393,49 @@ mod tests {
         assert_that!(cues[0].start).is_equal_to(milliseconds(1000));
         assert_that!(cues[0].end).is_equal_to(milliseconds(2500));
         assert_that!(texts(&cues)).contains_exactly_in_given_order(["Hello", "World"]);
+    }
+
+    /// The file the cue editor writes has to be one the parser reads back unchanged, or a
+    /// second edit of the same track would be editing something else. Round-tripping is the
+    /// only way to assert that without pinning the exact bytes of a lenient format.
+    #[test]
+    fn write_srt_should_produce_a_file_that_parses_back_to_the_same_cues() {
+        // Arrange: two cues, one of them two lines and past the minute.
+        let source = "1\n00:00:01,000 --> 00:00:02,500\nHello\nthere\n\n\
+                      2\n00:01:03,250 --> 00:01:04,000\nWorld\n\n";
+        let cues = parse_srt(source);
+
+        // Act
+        let written = write_srt(&cues);
+
+        // Assert: the counters, the timings to the millisecond, and the line break inside
+        // the first cue all survive.
+        assert_that!(written.as_str()).contains("2\n00:01:03,250 --> 00:01:04,000\nWorld\n");
+        let round_tripped = parse_srt(&written);
+        assert_that!(round_tripped.len()).is_equal_to(2);
+        assert_that!(texts(&round_tripped))
+            .contains_exactly_in_given_order(["Hello\nthere", "World"]);
+        assert_that!(round_tripped[1].start).is_equal_to(milliseconds(63_250));
+        assert_that!(round_tripped[1].end).is_equal_to(milliseconds(64_000));
+    }
+
+    /// The counters a file arrives with are advisory and routinely wrong — restarted,
+    /// skipped, duplicated. What is written back is numbered from one by position, so a
+    /// rewritten file is a file with the defect gone rather than carried forward.
+    #[test]
+    fn write_srt_should_number_from_one_however_the_file_was_counted() {
+        // Arrange: counters that restart mid-file.
+        let cues = parse_srt(
+            "7\n00:00:01,000 --> 00:00:02,000\none\n\n\
+             1\n00:00:03,000 --> 00:00:04,000\ntwo\n\n",
+        );
+
+        // Act
+        let written = write_srt(&cues);
+
+        // Assert
+        assert_that!(written.starts_with("1\n00:00:01,000")).is_true();
+        assert_that!(written.contains("\n2\n00:00:03,000")).is_true();
     }
 
     #[test]

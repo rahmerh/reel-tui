@@ -19,7 +19,7 @@ use crate::{
     files::FileFingerprint,
     probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_any_file, probe_file},
     subtitle::{
-        SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
+        CueTextEdit, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
         SubtitleSource, canonical_language_code, language_choice, sidecar_filename, stream_cc,
         stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
         stream_original, stream_title,
@@ -802,6 +802,12 @@ pub enum EditPhase {
         language: String,
     },
     ValidateSubtitle(String),
+    /// Writing the timing page's rewritten cue text into a staged subtitle file. Its own
+    /// phase rather than folded into `UpdateSubtitle`, because it is the one step of a save
+    /// that can fail on something the reader did rather than on a tool: a cue edited here
+    /// and then changed on disk elsewhere stops the save, and the phase is what names the
+    /// step that stopped.
+    RewriteCues(String),
     ResolveNames,
     WriteMedia(String),
     ValidateOutput,
@@ -838,6 +844,7 @@ impl EditPhase {
                 compact_subject(subject)
             ),
             Self::ValidateSubtitle(subject) => format!("Checking {}", compact_subject(subject)),
+            Self::RewriteCues(subject) => format!("Rewriting cues in {}", compact_subject(subject)),
             Self::ResolveNames => "Choosing filenames".to_string(),
             Self::WriteMedia(operation) => operation.clone(),
             Self::ValidateOutput => "Checking output".to_string(),
@@ -2303,6 +2310,44 @@ fn prepare_subtitle_changes(
                     .expect("subtitle sources are validated before preparation");
                 let metadata = effective_subtitle_metadata(change, stream_metadata(stream));
                 let mut replacement_artifact = None;
+                // Cue edits reach an embedded track the only way anything does: the track
+                // comes out of the container, is rewritten, and goes back in as a
+                // replacement stream in the remux that was going to happen anyway. Copied
+                // out rather than transcoded (`-c:s copy`), so a track this page could open
+                // is a track this can rewrite.
+                if !change.cue_text.is_empty() {
+                    let subject = format!("subtitle #{index}");
+                    let extracted = workspace.join(format!("cues-{job}-in.srt"));
+                    extract_subtitle(
+                        ConversionInput::Embedded {
+                            media: media_path,
+                            index: *index,
+                        },
+                        &extracted,
+                        SubtitleFormat::SubRip,
+                        &subject,
+                        cancelled,
+                        report_progress,
+                    )?;
+                    let staged = workspace.join(format!("cues-{job}.srt"));
+                    rewrite_cue_file(
+                        &extracted,
+                        &change.cue_text,
+                        &staged,
+                        &subject,
+                        report_progress,
+                    )?;
+                    report_progress(EditProgress::new(EditPhase::ValidateSubtitle(
+                        subject.clone(),
+                    )));
+                    validate_subtitle_output(&staged, SubtitleFormat::SubRip)?;
+                    prepared.replacements.push(SubtitleReplacement {
+                        source_index: *index,
+                        target: SubtitleFormat::SubRip,
+                        path: staged.clone(),
+                    });
+                    replacement_artifact = Some((SubtitleFormat::SubRip, staged));
+                }
                 if let Some(target) = change
                     .embedded_target
                     .filter(|_| change.export_target.is_none())
@@ -2409,6 +2454,51 @@ fn prepare_subtitle_changes(
                         commentary: false,
                     },
                 );
+                // Cue edits are applied to the file *first*, and everything after this
+                // works from the rewritten copy: a track that is also being converted or
+                // imported must carry the new words into whatever it becomes, and the only
+                // way to guarantee that is for there to be one edited file that the rest of
+                // the branch cannot tell from the original.
+                let rewritten = if change.cue_text.is_empty() {
+                    None
+                } else {
+                    let staged = workspace.join(format!("cues-{job}.srt"));
+                    rewrite_cue_file(
+                        path,
+                        &change.cue_text,
+                        &staged,
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("sidecar"),
+                        report_progress,
+                    )?;
+                    Some(staged)
+                };
+                let path = rewritten.as_deref().unwrap_or(path.as_path());
+                // Cue edits alone leave the file where it is and under the name it has.
+                // The conversion path below derives a filename from the track's language
+                // and flags, which is right when the format or the metadata changed and
+                // wrong here — rewriting a line inside `clip.English.srt` must not also
+                // rename it to `clip.eng.srt`.
+                if rewritten.is_some()
+                    && !change.import_into_media
+                    && change.metadata.is_none()
+                    && change
+                        .embedded_target
+                        .is_none_or(|target| target == change.source_format)
+                {
+                    // The original is listed as removed even though the new file lands on
+                    // the same name: that is what makes this a *replacement* rather than
+                    // an export. The transaction backs a removed file up before anything
+                    // is published, so a failure half way puts the reader's sidecar back —
+                    // and `resolve_export_duplicates`, which renumbers exports that would
+                    // land on an existing name, leaves replacements alone.
+                    prepared.publications.push(Publication {
+                        staged: vec![(path.to_path_buf(), sidecar.path.clone())],
+                        remove: sidecar.source_paths().cloned().collect(),
+                    });
+                    continue;
+                }
                 if change.import_into_media {
                     let target = change.embedded_target.unwrap_or(change.source_format);
                     let filename = path
@@ -2449,7 +2539,7 @@ fn prepare_subtitle_changes(
                     )));
                     validate_subtitle_output(&input, target)?;
                     prepared.imports.push(SubtitleImport {
-                        source_path: path.clone(),
+                        source_path: sidecar.path.clone(),
                         target,
                         path: input,
                         metadata,
@@ -2656,6 +2746,7 @@ fn convert_subtitle(
             report_progress,
         )?;
         let text_change = SubtitleChange {
+            cue_text: Default::default(),
             source: change.source.clone(),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -2815,6 +2906,37 @@ fn extract_subtitle(
             }
         }
     }
+}
+
+/// Writes a SubRip file with the timing page's cue edits applied, into the workspace.
+///
+/// Staged rather than written over the original, because that is how every other artifact a
+/// save produces is handled: the publication step is what puts files in the user's directory,
+/// with the backup and rollback that go with it. A rewrite that patched the sidecar in place
+/// would be the one edit in the application that could not be rolled back.
+fn rewrite_cue_file(
+    source: &Path,
+    edits: &BTreeMap<usize, CueTextEdit>,
+    destination: &Path,
+    subject: &str,
+    report_progress: &mut ProgressReporter<'_>,
+) -> Result<(), EditError> {
+    report_progress(EditProgress::new(EditPhase::RewriteCues(
+        subject.to_string(),
+    )));
+    let text = std::fs::read_to_string(source).map_err(|error| {
+        EditError::Failed(format!(
+            "Could not read {} to rewrite its cues: {error}",
+            source.display()
+        ))
+    })?;
+    let rewritten = crate::subtitle::rewrite_srt_cues(&text, edits).map_err(EditError::Failed)?;
+    std::fs::write(destination, rewritten).map_err(|error| {
+        EditError::Failed(format!(
+            "Could not stage the rewritten cues: {}: {error}",
+            destination.display()
+        ))
+    })
 }
 
 fn copy_subtitle_artifact(
@@ -4953,6 +5075,7 @@ mod tests {
         ocr_language: Option<&str>,
     ) -> SubtitleChange {
         SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(PathBuf::from("movie.eng.sup")),
             source_format,
             embedded_target,
@@ -5444,6 +5567,7 @@ mod tests {
             },
         )]);
         let subtitle_changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -5477,6 +5601,7 @@ mod tests {
             {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
         ]));
         let subtitle_changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::VobSub),
@@ -5531,6 +5656,7 @@ mod tests {
             companion_fingerprint: None,
         }];
         let mut changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(path),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -6550,6 +6676,7 @@ mod tests {
 
     fn embedded_change(index: u64, source_format: SubtitleFormat) -> SubtitleChange {
         SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(index),
             source_format,
             embedded_target: None,
@@ -6615,6 +6742,7 @@ mod tests {
         let mut sidecar = sidecar_entry(&path, None, SubtitleFormat::SubRip);
         sidecar.fingerprint = FileFingerprint::for_path(&path).unwrap();
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -6711,6 +6839,7 @@ mod tests {
         let mut sidecar = sidecar_entry(&path, None, SubtitleFormat::SubRip);
         sidecar.language = "und".to_string();
         let mut retagged = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(path),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -7548,6 +7677,7 @@ mod tests {
             },
         )]);
         let exported = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8092,6 +8222,7 @@ mod tests {
         retagged.language = "dan".to_string();
         retagged.title = Some("Dansk".to_string());
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8937,6 +9068,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -9001,6 +9133,7 @@ mod tests {
                 audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[SubtitleChange {
+                    cue_text: Default::default(),
                     source: SubtitleSource::Embedded(1),
                     source_format: SubtitleFormat::MovText,
                     embedded_target: Some(SubtitleFormat::SubRip),
@@ -9265,6 +9398,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -9366,6 +9500,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::VobSub),
@@ -9585,6 +9720,7 @@ mod tests {
         assert_that!(original.streams[2]["codec_name"].as_str()).contains("dvd_subtitle");
 
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::VobSub,
             embedded_target: None,
@@ -9704,6 +9840,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9841,6 +9978,7 @@ mod tests {
         // real report's group structure (video, 2 audio, then subtitles) — "position
         // 3" in the output is the surviving subtitle.
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(5),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -9976,6 +10114,7 @@ mod tests {
 
         // Delete subtitle 3, keep 4 converted to MOV Text, and leave it non-default.
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(4),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -10119,6 +10258,7 @@ mod tests {
         let changes = sidecars
             .iter()
             .map(|sidecar| SubtitleChange {
+                cue_text: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -10237,6 +10377,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(sidecar_path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10360,6 +10501,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(sidecar_path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -10479,6 +10621,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(ass_path.clone()),
             source_format: SubtitleFormat::Ass,
             embedded_target: Some(SubtitleFormat::SubRip),
@@ -12129,6 +12272,7 @@ mod tests {
             },
         );
         request.subtitle_changes.push(SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(3),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -12191,6 +12335,7 @@ mod tests {
         // Left unset, so the "no container change" wording is exercised too.
         request.container = None;
         request.subtitle_changes.push(SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(PathBuf::from("/videos/movie.eng.srt")),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13014,6 +13159,275 @@ mod tests {
         assert_eq!(mov.title.as_deref(), Some("English"));
     }
 
+    /// A cue edited on the timing page is written back into the sidecar it came from, under
+    /// the name it already has. The conversion path below derives a filename from the
+    /// track's language and flags, which is right when the format or the metadata changed
+    /// and wrong here — rewriting a line must not also rename the file.
+    #[test]
+    fn a_cue_edit_should_rewrite_the_sidecar_in_place() {
+        // Arrange: a sidecar named nothing like what `sidecar_filename` would choose.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cue-edit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let media_path = directory.join("movie.mkv");
+        let source = directory.join("movie.English.srt");
+        fs::write(
+            &source,
+            b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nWorld\n\n",
+        )
+        .unwrap();
+        let sidecar = SidecarEntry {
+            path: source.clone(),
+            companion: None,
+            display_name: "movie.English.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&source).unwrap(),
+            companion_fingerprint: None,
+        };
+        let change = SubtitleChange {
+            cue_text: BTreeMap::from([(
+                1,
+                CueTextEdit {
+                    original: "World".to_string(),
+                    text: "World, rewritten".to_string(),
+                },
+            )]),
+            source: SubtitleSource::Sidecar(source.clone()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act
+        let prepared = prepare_subtitle_changes(
+            &media_path,
+            &media(serde_json::json!([{"index": 0, "codec_type": "video"}])),
+            &[change],
+            &[sidecar],
+            &BTreeSet::new(),
+            &workspace,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // Assert: published over the file it came from, with the edit applied and the
+        // untouched cue exactly as it was.
+        assert_that!(prepared.publications.len()).is_equal_to(1);
+        let (staged, destination) = prepared.publications[0].staged[0].clone();
+        assert_that!(destination).is_equal_to(source.clone());
+        assert_that!(prepared.publications[0].remove.clone()).contains(source.clone());
+        let written = fs::read_to_string(&staged).unwrap();
+        assert_that!(written.as_str()).contains("World, rewritten");
+        assert_that!(written.as_str()).contains("00:00:01,000 --> 00:00:02,000\nHello");
+        // Nothing to remux for a sidecar's own text.
+        assert_that!(prepared.replacements.is_empty()).is_true();
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An embedded track's cues are rewritten the only way anything in a container is: the
+    /// track comes out, is rewritten, and goes back in as a replacement stream in the remux
+    /// that the change already requires. Asserted end to end through `apply_edits`, because
+    /// the halves — extract, rewrite, map the replacement into the output — each look right
+    /// on their own while the file still holds the old words.
+    #[test]
+    fn a_cue_edit_should_rewrite_an_embedded_track_through_the_remux() {
+        require_tools(
+            "a_cue_edit_should_rewrite_an_embedded_track_through_the_remux",
+            &["ffmpeg", "ffprobe"],
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cue-edit-embedded-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let cues = directory.join("cues.srt");
+        fs::write(
+            &cues,
+            b"1\n00:00:00,000 --> 00:00:01,000\nHello\n\n2\n00:00:01,000 --> 00:00:02,000\nWorld\n\n",
+        )
+        .unwrap();
+        let source = directory.join("movie.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=2",
+                "-i",
+            ])
+            .arg(&cues)
+            .args([
+                "-c:v",
+                "ffv1",
+                "-c:s",
+                "srt",
+                "-metadata:s:s:0",
+                "language=eng",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+
+        // Act: rewrite the second cue and save.
+        let change = SubtitleChange {
+            cue_text: BTreeMap::from([(
+                1,
+                CueTextEdit {
+                    original: "World".to_string(),
+                    text: "World, rewritten".to_string(),
+                },
+            )]),
+            source: SubtitleSource::Embedded(1),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        };
+        let mut phases = Vec::new();
+        apply_edits(
+            EditTarget {
+                source: &source,
+                destination: SaveDestination::ReplaceOriginal,
+                container: None,
+                container_metadata: None,
+            },
+            TrackEdits {
+                stream_order: &[0, 1],
+                deleted_streams: &BTreeSet::new(),
+                default_streams: &BTreeSet::new(),
+                default_sidecars: &BTreeSet::new(),
+                audio_settings: &BTreeMap::new(),
+                video_settings: &BTreeMap::new(),
+                subtitle_changes: &[change],
+                left_subtitle_order: &[],
+                sidecars: &[],
+            },
+            &AtomicBool::new(false),
+            |progress| phases.push(progress.phase.label()),
+        )
+        .expect("the save should succeed");
+
+        // Assert: the words in the container itself changed, and the cue left alone did not.
+        let extracted = directory.join("out.srt");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&source)
+            .args(["-map", "0:s:0", "-c:s", "copy"])
+            .arg(&extracted)
+            .status()
+            .unwrap();
+        assert_that!(status.success()).is_true();
+        let written = fs::read_to_string(&extracted).unwrap();
+        assert_that!(written.as_str()).contains("World, rewritten");
+        assert_that!(written.as_str()).contains("Hello");
+
+        // Assert: and the step announced itself, so a save that stalls there says where.
+        assert_that!(
+            phases
+                .iter()
+                .any(|phase| phase.starts_with("Rewriting cues"))
+        )
+        .is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same edit against a file that changed underneath it stops the save rather than
+    /// landing the text on whichever line moved into the slot.
+    #[test]
+    fn a_cue_edit_should_refuse_a_sidecar_that_changed_underneath_it() {
+        // Arrange: the file says something else at that position now.
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-cue-edit-stale-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = directory.join("movie.eng.srt");
+        fs::write(
+            &source,
+            b"1\n00:00:01,000 --> 00:00:02,000\nSomething else\n\n",
+        )
+        .unwrap();
+        let sidecar = SidecarEntry {
+            path: source.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: FileFingerprint::for_path(&source).unwrap(),
+            companion_fingerprint: None,
+        };
+        let change = SubtitleChange {
+            cue_text: BTreeMap::from([(
+                0,
+                CueTextEdit {
+                    original: "Hello".to_string(),
+                    text: "Hello, rewritten".to_string(),
+                },
+            )]),
+            source: SubtitleSource::Sidecar(source.clone()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act
+        let error = prepare_subtitle_changes(
+            &directory.join("movie.mkv"),
+            &media(serde_json::json!([{"index": 0, "codec_type": "video"}])),
+            &[change],
+            &[sidecar],
+            &BTreeSet::new(),
+            &workspace,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        // Assert: refused, saying why, and the file is untouched.
+        assert_that!(format!("{error:?}")).contains("changed elsewhere");
+        assert_that!(fs::read_to_string(&source).unwrap().as_str()).contains("Something else");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn metadata_only_sidecar_change_should_stage_a_collision_safe_filename_rename() {
         require_tools(
@@ -13046,6 +13460,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Sidecar(source.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13164,6 +13579,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         defaults.insert(subtitle_index);
         let change = SubtitleChange {
+            cue_text: Default::default(),
             source: SubtitleSource::Embedded(subtitle_index),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,

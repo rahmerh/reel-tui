@@ -463,6 +463,10 @@ pub struct SubtitleSyncState {
     /// Cleared with the cue list, since the keys are positions in a `groups` that a new
     /// track rebuilds from scratch.
     group_memory: HashMap<usize, (usize, usize)>,
+    /// Where the cursor should land once this page's cues arrive, when the page is being
+    /// opened again rather than for the first time — after a save, which rewrites the file
+    /// and so has to close and reload it. See [`Self::restore_selection`].
+    restore: Option<usize>,
     /// First group drawn, moved only to keep `selected` on screen.
     ///
     /// Counted in groups rather than cues, because a group is one row of the panel however
@@ -547,6 +551,7 @@ impl SubtitleSyncState {
             selected: 0,
             group_page: 0,
             group_memory: HashMap::new(),
+            restore: None,
             list_scroll: 0,
             list_rows: 0,
             preview_cells: Size::new(0, 0),
@@ -618,11 +623,32 @@ impl SubtitleSyncState {
             SyncStatus::Ready
         };
         self.cues = cues;
-        self.selected = 0;
-        self.group_page = 0;
+        // Clamped rather than trusted: the cue the page is being restored to came from the
+        // *previous* reading of a file that has since been rewritten, and a save can remove
+        // cues as easily as it can change their words.
+        self.selected = self
+            .restore
+            .take()
+            .unwrap_or(0)
+            .min(self.cues.len().saturating_sub(1));
+        self.group_page = self
+            .groups
+            .get(self.group_of(self.selected))
+            .map(|group| (self.selected - group.first) / GROUP_COLUMNS)
+            .unwrap_or(0);
         self.group_memory.clear();
         self.list_scroll = 0;
         self.select_cue();
+    }
+
+    /// Where the cursor should land when this page's cues arrive.
+    ///
+    /// For a page being opened again after a save rewrote the file under it: the reader was
+    /// on a cue, and the reload is the application's business rather than theirs. Recorded
+    /// rather than applied, because there is no cue list to select in until the worker has
+    /// read the rewritten file back.
+    pub fn restore_selection(&mut self, cue: usize) {
+        self.restore = Some(cue);
     }
 
     pub fn fail(&mut self, message: String) {
@@ -747,6 +773,28 @@ impl SubtitleSyncState {
     pub fn request_frame(&mut self) {
         self.prune_frames();
         self.frame_pending_since = Some(Instant::now());
+    }
+
+    /// Rewrites one cue's text and asks for its picture again.
+    ///
+    /// For the cue editor: the frame on hand was drawn with the old words burned into it, so
+    /// it is dropped rather than left to be redrawn whenever the cursor next moves — the
+    /// whole point of editing here is seeing the new line against the picture. The disk
+    /// cache needs no telling, since a frame is filed under the bytes handed to libass and
+    /// the edited cue simply misses (`framecache::cue_key`).
+    ///
+    /// The timings are untouched, so the groups, the lanes and the scroll all still describe
+    /// this list; only the words changed.
+    pub fn edit_cue_text(&mut self, cue: usize, text: String) {
+        let Some(target) = self.cues.get_mut(cue) else {
+            return;
+        };
+        target.text = text;
+        self.encoded.retain(|frame| frame.cue_index != cue);
+        if self.frame_error.as_ref().is_some_and(|(at, _)| *at == cue) {
+            self.frame_error = None;
+        }
+        self.request_frame();
     }
 
     /// Marks the frames stale *and* drops any playback, for the moves where the page is no
@@ -1379,6 +1427,68 @@ mod tests {
         assert_that!(state.is_busy()).is_true();
         assert_that!(state.cues.as_slice()).is_empty();
         assert_that!(state.selected_cue()).is_none();
+    }
+
+    /// A page opened again after a save put the cursor back where the reader left it — and
+    /// on a file that came back shorter, as far down as there is list to land on.
+    #[test]
+    fn a_restored_page_should_come_back_to_the_cue_it_was_left_on() {
+        // Arrange
+        let mut state = state();
+
+        // Act
+        state.restore_selection(2);
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "a"),
+                cue(2000, 3000, "b"),
+                cue(4000, 5000, "c"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Assert
+        assert_that!(state.selected).is_equal_to(2);
+
+        // And a cue that is no longer there lands on the last one that is.
+        state.restore_selection(9);
+        state.apply_prepared(
+            vec![cue(0, 1000, "a"), cue(2000, 3000, "b")],
+            CueStyle::SubRip,
+        );
+        assert_that!(state.selected).is_equal_to(1);
+
+        // With nothing to restore, the page opens on its first cue as it always has.
+        state.apply_prepared(
+            vec![cue(0, 1000, "a"), cue(2000, 3000, "b")],
+            CueStyle::SubRip,
+        );
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    /// Restoring into a group has to bring the drawn page with it, or the cursor lands on a
+    /// member the panel is not showing.
+    #[test]
+    fn a_restored_page_should_show_the_page_of_the_group_it_lands_in() {
+        // Arrange: one group of four cues, all sharing the screen.
+        let mut state = state();
+
+        // Act: back onto the third member, which is the second page of that group.
+        state.restore_selection(2);
+        state.apply_prepared(
+            vec![
+                cue(0, 9000, "a"),
+                cue(1000, 9000, "b"),
+                cue(2000, 9000, "c"),
+                cue(3000, 9000, "d"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Assert
+        assert_that!(state.selected).is_equal_to(2);
+        let group = state.groups[state.selected_group()];
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
     }
 
     #[test]

@@ -34,8 +34,8 @@ use harness::{
     Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
 };
 use reel_tui::app::{
-    AudioSettingsField, ContainerSettingsField, Layer, PreviewSettings, SubtitleSettingsField,
-    TrackRef, VideoSettingsField,
+    AudioSettingsField, ContainerSettingsField, Dialog, Layer, PreviewSettings,
+    SubtitleSettingsField, TrackRef, VideoSettingsField,
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
@@ -4184,6 +4184,249 @@ fn a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable() {
     assert!(
         track.contains("|<──") && !track.contains("||||"),
         "the cues in the window should be drawn as readable spans:\n{track}"
+    );
+}
+
+/// A cue is edited on the timing page, staged like any other edit, and written by Ctrl+S.
+///
+/// Asserted through the whole workflow rather than on the editor alone, because the feature
+/// is the workflow: the words have to reach the buffer, the buffer has to reach the staged
+/// edit, the staged edit has to survive leaving the page, and the save has to put the new
+/// line — and only that line — into the file on disk. Every one of those halves looks right
+/// on its own while the file still says what it always said.
+#[test]
+fn editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-edit");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // edited-count uses, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    // Act: edit the second cue — down a row, `i`, type, and leave the editor.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('i')));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::EditCue),
+        "i should open the cue editor"
+    );
+    for character in ", rewritten".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+
+    // Assert: staged, and the page shows the new words in the list.
+    assert_eq!(app.app.dialog, None, "Esc should close the editor");
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "leaving the editor should keep the typing"
+    );
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("Second line, rewritten") && screen.contains("1 edited"),
+        "the page should show the edit and say it is unwritten:\n{screen}"
+    );
+
+    // Act / Assert: `Esc` off the page asks before leaving the edits behind, and saying no
+    // keeps the reader where they are.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmLeaveCues));
+    app.press(key(KeyCode::Enter));
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "the safe answer should keep the page open"
+    );
+
+    // Act: write it.
+    app.process_all();
+
+    // Assert: the reader is still on the timing page, on the cue they edited. The save
+    // rewrites the file the page is reading, so the page is closed and the file re-read
+    // behind the scenes — but "save this cue" is not "take me somewhere else".
+    app.wait_until("the timing page to come back", |app| {
+        app.layer == Layer::SubtitleSync
+            && app
+                .subtitle_sync
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        1,
+        "the cursor should come back to the cue that was edited"
+    );
+
+    // Assert: the file on disk carries the new line, and the cue nobody touched is exactly
+    // as it was.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        written.contains("Second line, rewritten"),
+        "the save should write the edited cue:\n{written}"
+    );
+    assert!(
+        written.contains("First line"),
+        "the save should leave the other cue alone:\n{written}"
+    );
+    assert!(
+        written.contains("00:00:03,000 --> 00:00:04,000"),
+        "the save should leave the timings alone:\n{written}"
+    );
+
+    // Assert: and with the write done there is nothing left to warn about.
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written edit should stop being unsaved work"
+    );
+
+    // Act: type into another cue and this time answer the question with "discard".
+    app.press(key(KeyCode::Char('i')));
+    for character in " and again".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "the second edit should stage like the first"
+    );
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmLeaveCues));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Enter));
+
+    // Assert: the page is closed and the words are gone rather than travelling with the
+    // file to the next Ctrl+S, where they would be written from a page nobody is looking at.
+    assert_eq!(app.app.layer, Layer::Streams, "discarding should leave");
+    assert!(
+        !app.app.has_track_edits(),
+        "discarding should take the staged cue text with it"
+    );
+
+    // Assert: and coming back to the page shows the file's words, not the discarded ones.
+    open_sidecar_timing_page(&mut app);
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        !screen.contains("and again") && !screen.contains("edited"),
+        "the discarded edit should be gone from the page:\n{screen}"
+    );
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        !written.contains("and again"),
+        "a discarded edit should never reach the file:\n{written}"
+    );
+}
+
+/// Saving a cue edit on an embedded track keeps the frames the page already rendered.
+///
+/// Writing an embedded track means remuxing the file, which moves its length and mtime —
+/// and those are in the frame cache's media key, so every frame the page rendered is filed
+/// under a name that no longer describes anything. Left alone, saving one word costs a
+/// feature-length track its entire cache and the page spends the next several minutes
+/// rendering it again, every save. The frames move with the file instead, because the remux
+/// copies the video stream through untouched.
+///
+/// Asserted on the cached files rather than on a count of `ffmpeg` runs: the frame for the
+/// cue that was rewritten *should* be rendered again — its picture changed — and it is the
+/// cues nobody touched that must survive.
+#[test]
+fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-edit-cache");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"])
+            .subtitles(vec![SubtitleSpec::new("eng", "subrip").cues(CACHED_CUES)]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let subtitle_row = app.first_subtitle_row();
+    app.select_track_row(subtitle_row);
+    app.press(key(KeyCode::Char('c')));
+    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    app.wait_until("the embedded track's cues to be read", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+    wait_for_frames(&mut app);
+
+    // What the pass rendered, and where it put it.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 2, "the track holds two cues");
+    let old_track = track_dir(&state.frames.media_key());
+    let untouched = cached_frame(state, 0);
+    let untouched_bytes = fs::read(&untouched).expect("the first cue's frame should be cached");
+
+    // Act: rewrite the *second* cue and write it, which remuxes the file.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('i')));
+    for character in ", rewritten".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+    app.process_all();
+    app.wait_until("the timing page to come back", |app| {
+        app.layer == Layer::SubtitleSync
+            && app
+                .subtitle_sync
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: the file really was rewritten, so this is not passing on an unchanged key.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let new_track = track_dir(&state.frames.media_key());
+    assert_ne!(
+        new_track, old_track,
+        "remuxing the file should move its frame-cache key"
+    );
+    assert!(
+        !old_track.exists(),
+        "the frames should have moved rather than been copied: {}",
+        old_track.display()
+    );
+
+    // Assert: and the untouched cue's frame is there, under the new key, byte for byte —
+    // the same picture, not a re-render that happens to look the same.
+    let carried = cached_frame(state, 0);
+    assert_eq!(
+        carried.parent(),
+        Some(new_track.as_path()),
+        "the surviving frame should be filed under the rewritten file's key"
+    );
+    assert_eq!(
+        fs::read(&carried).ok(),
+        Some(untouched_bytes),
+        "the cue nobody edited should keep the frame that was already rendered for it"
     );
 }
 
