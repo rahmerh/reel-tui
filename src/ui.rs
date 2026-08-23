@@ -235,12 +235,15 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// What the page has to say about the background frame pass, if anything.
 ///
-/// Deliberately only two cases say anything at all. A pass that has finished, or one that
-/// was never going to run because the terminal draws no images, leaves the row absent —
+/// Deliberately almost nothing here says anything at all. A pass that has finished, or one
+/// that was never going to run because the terminal draws no images, leaves the row absent —
 /// there is nothing there for the user to act on, and a line that says "done" forever is
 /// just furniture. A network mount is the exception: the frames are missing for a reason
 /// the user did not choose, so the page says so rather than leaving them wondering why
-/// this directory feels slower than the last one.
+/// this directory feels slower than the last one. **A pass that is running says so on the
+/// cue panel's border** (`render_sync_cues`), not here: it is a count of that panel's rows,
+/// and it left this row occupied for the whole of a long pass, hiding the messages that are
+/// about what the reader is doing right now.
 ///
 /// This is a status line, not control help — the keybindings popup (`?`) remains the only
 /// place this application documents its keys.
@@ -266,10 +269,9 @@ fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
         return Some((" Preparing playback…".to_string(), Color::Cyan));
     }
     match state.warm {
-        WarmState::Working { done, total } => Some((
-            format!(" Generating preview frames [{done}/{total}]"),
-            Color::Cyan,
-        )),
+        // The running pass says its count on the cue panel's own border instead, where it
+        // sits next to the rows it is counting.
+        WarmState::Working { .. } => None,
         WarmState::OffForNetwork => Some((
             " Preview frames are not generated on network mounts.".to_string(),
             Color::DarkGray,
@@ -473,7 +475,19 @@ impl GroupTiming {
 /// in it and the arithmetic belongs where the group heights are (`SubtitleSyncState::
 /// sync_scroll`).
 fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
-    let block = Block::bordered().title(" Cues ");
+    let mut block = Block::bordered().title(" Cues ");
+    // The background pass's count sits on this panel's border rather than on the status
+    // row: it is a count of *these* rows' frames, and the status row carries one message at
+    // a time — where "Preparing playback…" is the one worth reading while a span decodes.
+    if let WarmState::Working { done, total } = state.warm {
+        block = block.title(
+            Line::styled(
+                format!(" [{done}/{total}] "),
+                Style::default().fg(Color::Cyan),
+            )
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -13943,7 +13957,9 @@ mod tests {
     }
 
     /// The count is the only sign the background pass is running, and it goes away when
-    /// there is nothing left to report — a line reading "done" forever is furniture.
+    /// there is nothing left to report — a border reading "done" forever is furniture. It
+    /// sits on the cue panel's border, next to the rows whose frames it is counting, rather
+    /// than occupying the one status row for the whole of a long pass.
     #[test]
     fn the_page_should_count_the_frames_being_generated_while_the_pass_runs() {
         // Arrange
@@ -13956,18 +13972,17 @@ mod tests {
         );
 
         // Act / Assert: nothing to say before the pass starts.
-        assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("Generating"))
-            .is_false();
+        assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("/2]")).is_false();
 
         // Act / Assert: counting while it runs...
         app.subtitle_sync.as_mut().unwrap().apply_warming(3, 42);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
-        assert_that!(screen.contains("Generating preview frames [3/42]")).is_true();
+        assert_that!(screen.contains("[3/42]")).is_true();
 
         // ...and silent again once it is over.
         app.subtitle_sync.as_mut().unwrap().apply_warming(42, 42);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
-        assert_that!(screen.contains("Generating")).is_false();
+        assert_that!(screen.contains("[42/42]")).is_false();
 
         // Cleanup
         drop(app);
@@ -14008,19 +14023,21 @@ mod tests {
                 sync_cue(3000, 9000, "d"),
             ],
         );
-        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+        // A message that stands for the whole status row: what is being tested is the row's
+        // cost, and the running pass's count is on the cue panel's border rather than here.
+        app.subtitle_sync.as_mut().unwrap().warm = WarmState::OffForNetwork;
 
         // Act / Assert: twelve rows fit the axis without the status line, and the status
         // line costs it — the cue block stays either way.
         let screen = drawn(50, 12, |frame| render(frame, &mut app));
-        assert_that!(screen.contains("Generating preview frames [1/4]")).is_true();
+        assert_that!(screen.contains("network mounts")).is_true();
         assert_that!(screen.contains('▲')).is_false();
         // Four overlapping cues are one group, so the block carries the compact timing.
         assert_that!(screen.contains("┌ 0:00.0 ")).is_true();
 
         // Act / Assert: one more row and both fit.
         let screen = drawn(50, 13, |frame| render(frame, &mut app));
-        assert_that!(screen.contains("Generating preview frames [1/4]")).is_true();
+        assert_that!(screen.contains("network mounts")).is_true();
         assert_that!(screen.contains('▲')).is_true();
 
         // Cleanup

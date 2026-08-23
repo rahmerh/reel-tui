@@ -6,6 +6,7 @@
 //! way of leaving it — Esc, selecting another file, quitting — releases the whole thing
 //! including its temp directory, without each exit path having to remember to.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -447,9 +448,21 @@ pub struct SubtitleSyncState {
     /// the right-hand block of a backed-up page turn the page instead of moving to the
     /// block beside it, which is the one thing paging exists to avoid.
     ///
-    /// Reset to zero wherever the cursor enters a group from outside it — every such move
-    /// lands on the group's first member, which is on page zero by construction.
+    /// Reset to zero wherever the cursor enters a group with no remembered position — a
+    /// group first arrived at is entered on its first member, which is on page zero by
+    /// construction.
     group_page: usize,
+    /// Where the cursor was left in each group: its cue and its page, keyed by the group's
+    /// position in `groups`.
+    ///
+    /// `j` out of a group and `k` back into it returns to the cue that was under the cursor
+    /// rather than to the group's first member. Without it, stepping down a row to look at
+    /// something and coming back cost the reader their place sideways — on a group of six
+    /// that is five presses of `l` to undo one press of `k`, every time.
+    ///
+    /// Cleared with the cue list, since the keys are positions in a `groups` that a new
+    /// track rebuilds from scratch.
+    group_memory: HashMap<usize, (usize, usize)>,
     /// First group drawn, moved only to keep `selected` on screen.
     ///
     /// Counted in groups rather than cues, because a group is one row of the panel however
@@ -533,6 +546,7 @@ impl SubtitleSyncState {
             groups: Vec::new(),
             selected: 0,
             group_page: 0,
+            group_memory: HashMap::new(),
             list_scroll: 0,
             list_rows: 0,
             preview_cells: Size::new(0, 0),
@@ -606,6 +620,7 @@ impl SubtitleSyncState {
         self.cues = cues;
         self.selected = 0;
         self.group_page = 0;
+        self.group_memory.clear();
         self.list_scroll = 0;
         self.select_cue();
     }
@@ -1021,14 +1036,22 @@ impl SubtitleSyncState {
     /// The last page backs up to keep two members drawn, since a page holding one would
     /// leave half the row empty next to the cue the cursor is on.
     ///
-    /// A group the cursor is not in shows its first members, since there is nothing there
-    /// to anchor the window on.
+    /// **A group the cursor has left keeps the page it was left on** ([`Self::group_memory`]),
+    /// rather than snapping back to its first members. The row the reader was just working
+    /// in redrawing itself the moment they step off it is the same lost place as re-entering
+    /// on the wrong cue — they can see it happen, one row up, as they press `j`. A group
+    /// never visited has nothing to anchor a window on and shows its first members.
     pub fn group_window(&self, group: CueGroup) -> (usize, usize) {
         let shown = group.len.min(GROUP_COLUMNS);
-        if !group.holds(self.selected) {
-            return (group.first, shown);
-        }
-        let start = (group.first + self.group_page * GROUP_COLUMNS)
+        let page = if group.holds(self.selected) {
+            self.group_page
+        } else {
+            self.group_memory
+                .get(&self.group_of(group.first))
+                .map(|(_, page)| *page)
+                .unwrap_or(0)
+        };
+        let start = (group.first + page * GROUP_COLUMNS)
             .min(group.end().saturating_sub(shown))
             .max(group.first);
         (start, shown)
@@ -1038,9 +1061,13 @@ impl SubtitleSyncState {
     ///
     /// A group is one stop: `j` from the cue above a pair lands on the pair's first member,
     /// and `j` again leaves for the cue below it rather than visiting the second member.
-    /// `k` re-enters on that same first member, so the two directions agree and there is no
-    /// "which one was I on" to remember. Moving *within* a group is `h`/`l`
-    /// ([`Self::select_within_group`]).
+    /// Moving *within* a group is `h`/`l` ([`Self::select_within_group`]).
+    ///
+    /// **A group is re-entered where it was left**, cue and page both
+    /// ([`Self::group_memory`]). Stepping down a row to look at something and coming back
+    /// otherwise cost the reader their place sideways, which on a long group is several
+    /// presses of `l` to undo one press of `k`. A group the cursor has never been in is
+    /// entered on its first member, so nothing has to be remembered before it exists.
     ///
     /// The return value is what stops a held-down `j` at the end of the list from
     /// re-requesting the same preview frame on every repeat — including the case that only
@@ -1061,10 +1088,33 @@ impl SubtitleSyncState {
         if next == current {
             return false;
         }
-        self.selected = self.groups[next].first;
-        self.group_page = 0;
+        self.remember_place();
+        self.enter_group(next);
         self.select_cue();
         true
+    }
+
+    /// Records where the cursor is being left, for the next `k` back into this group.
+    fn remember_place(&mut self) {
+        self.group_memory
+            .insert(self.selected_group(), (self.selected, self.group_page));
+    }
+
+    /// Puts the cursor into a group, at the place it was left if it has been visited.
+    ///
+    /// The remembered cue is checked against the group rather than trusted: `cues` and
+    /// `groups` are public, so a caller can leave a shorter list under a memory taken from
+    /// a longer one, and a selection outside its group is a cursor the panel cannot draw.
+    fn enter_group(&mut self, index: usize) {
+        let group = self.groups[index];
+        let (cue, page) = self
+            .group_memory
+            .get(&index)
+            .copied()
+            .filter(|(cue, _)| group.holds(*cue))
+            .unwrap_or((group.first, 0));
+        self.selected = cue;
+        self.group_page = page;
     }
 
     /// Moves the cursor between the cues of the group it is already in, for `h` and `l`.
@@ -1105,12 +1155,19 @@ impl SubtitleSyncState {
         true
     }
 
+    /// The top of the list, which is the first cue rather than wherever the first group was
+    /// last left: `gg` is an absolute move, and answering it with a remembered place would
+    /// make it land somewhere the reader did not ask for. The memory is overwritten rather
+    /// than left stale, so a later `k` back into the group agrees with where `gg` put the
+    /// cursor.
     pub fn select_first(&mut self) -> bool {
         if self.cues.is_empty() || self.selected == 0 {
             return false;
         }
+        self.remember_place();
         self.selected = 0;
         self.group_page = 0;
+        self.remember_place();
         self.select_cue();
         true
     }
@@ -1119,14 +1176,16 @@ impl SubtitleSyncState {
     /// last cue — the same place `j` would land on arriving there, so `G` and a held `j`
     /// agree about where the end is.
     pub fn select_last(&mut self) -> bool {
-        let Some(group) = self.groups.last() else {
+        let Some(group) = self.groups.last().copied() else {
             return false;
         };
         if self.selected == group.first {
             return false;
         }
+        self.remember_place();
         self.selected = group.first;
         self.group_page = 0;
+        self.remember_place();
         self.select_cue();
         true
     }
@@ -1591,6 +1650,76 @@ mod tests {
         state.select_within_group(1);
         assert_that!(state.group_window(group)).is_equal_to((2, 2));
         assert_that!(state.selected).is_equal_to(3);
+    }
+
+    /// Stepping down a row to look at something and coming back should not cost the reader
+    /// their place sideways. The cue *and* the page are both remembered, or a `k` back into
+    /// a long group would land on the right cue with the wrong pair drawn around it.
+    #[test]
+    fn a_group_should_be_re_entered_where_it_was_left() {
+        // Arrange: into the group, then across it.
+        let mut state = grouped();
+        let group = state.groups[1];
+        state.select(1);
+        state.select_within_group(2);
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act: down out of the group and back up into it.
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(4);
+        assert_that!(state.select(-1)).is_true();
+
+        // Assert: the cue the cursor was on, with the pair it was drawn in.
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+    }
+
+    /// The row the reader was working in must not redraw itself the moment they step off
+    /// it: a group the cursor has left keeps the page it was left on, which is visible one
+    /// row up as `j` is pressed.
+    #[test]
+    fn a_group_the_cursor_has_left_should_keep_the_page_it_was_left_on() {
+        // Arrange: across the group, then out of it.
+        let mut state = grouped();
+        let group = state.groups[1];
+        state.select(1);
+        state.select_within_group(2);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act
+        state.select(1);
+
+        // Assert: still the pair it was left showing, though the cursor is elsewhere.
+        assert_that!(state.selected_group()).is_equal_to(2);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+    }
+
+    /// A group the cursor has never been in has nothing to remember, so it is entered on
+    /// its first member — and `gg`/`G` are absolute moves that say where they land rather
+    /// than deferring to a remembered place.
+    #[test]
+    fn an_unvisited_group_and_the_absolute_moves_should_enter_on_the_first_member() {
+        // Arrange
+        let mut state = grouped();
+
+        // Act / Assert: never visited, so the group's first member.
+        state.select(1);
+        assert_that!(state.selected).is_equal_to(1);
+
+        // Act / Assert: `G` lands on the last group's first member, and leaves the memory
+        // agreeing with that rather than stale.
+        state.select_within_group(2);
+        state.select_last();
+        let last = state.groups.last().unwrap().first;
+        assert_that!(state.selected).is_equal_to(last);
+        state.select(-1);
+        state.select(1);
+        assert_that!(state.selected).is_equal_to(last);
+
+        // Act / Assert: and `gg` the same way at the top.
+        state.select_first();
+        assert_that!(state.selected).is_equal_to(0);
     }
 
     /// A group of three ends on a page that backed up to keep two blocks drawn, so its
