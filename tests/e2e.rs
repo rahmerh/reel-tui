@@ -2966,7 +2966,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     open_sidecar_timing_page(&mut app);
 
     // The background pass: every cue rendered without the cursor going near it, counting
-    // up on the status row while it works.
+    // up on the cue panel's border while it works.
     let counted = wait_for_frames(&mut app);
     assert!(
         counted,
@@ -2989,7 +2989,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     // And the count goes away once there is nothing left to report.
     let screen = app.screen();
     assert!(
-        !screen.contains("Generating preview frames"),
+        !warm_count_pattern(&screen),
         "a finished pass should stop reporting:\n{screen}"
     );
 
@@ -4051,6 +4051,30 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
         "a group is a closed unit sideways"
     );
 
+    // Act / Assert: `j` out of the group and `k` back into it returns to the member the
+    // cursor was left on, with the same pair drawn around it — leaving a row to look at the
+    // one below must not cost the reader their place sideways.
+    app.press(key(KeyCode::Char('j')));
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 4);
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("and a third") && !screen.contains("the spoken line"),
+        "the group left behind should keep the page it was left on:\n{screen}"
+    );
+    app.press(key(KeyCode::Char('k')));
+    app.pump();
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        3,
+        "a group should be re-entered where it was left"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("and a third") && !screen.contains("the spoken line"),
+        "the pair drawn around it should be the one it was left in:\n{screen}"
+    );
+
     // Assert: the rest of the page followed the cursor into the group. The timeline names
     // the member under it, and the preview holds that member's own frame rather than the
     // one the group was entered on.
@@ -4217,6 +4241,25 @@ fn open_sidecar_timing_page(app: &mut Harness) {
 
 /// Pumps until the background pass is done, answering whether its count was ever drawn.
 ///
+/// Whether the cue panel's border is carrying the background pass's `[done/total]` count.
+///
+/// Read off the border rather than off a phrase, because that is where the count lives: the
+/// status row is left for the messages about what the reader is doing right now.
+fn warm_count_pattern(screen: &str) -> bool {
+    screen.lines().any(|line| {
+        line.split_once(" Cues ").is_some_and(|(_, title)| {
+            title
+                .split_once('[')
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .is_some_and(|(count, _)| count.contains('/'))
+        })
+    })
+}
+
+fn warm_count_drawn(app: &Harness) -> bool {
+    warm_count_pattern(&app.screen())
+}
+
 /// Its own loop rather than `wait_until`, because what is being watched is the screen the
 /// pass paints on the way past, not only the state it ends in.
 fn wait_for_frames(app: &mut Harness) -> bool {
@@ -4224,7 +4267,7 @@ fn wait_for_frames(app: &mut Harness) -> bool {
     let mut counted = false;
     loop {
         app.pump();
-        counted |= app.screen().contains("Generating preview frames [");
+        counted |= warm_count_drawn(app);
         if app
             .app
             .subtitle_sync
