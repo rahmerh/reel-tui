@@ -2849,6 +2849,15 @@ impl App {
         }
     }
 
+    /// Moves the cue cursor sideways, between the cues that share a moment with the one it
+    /// is on. Does nothing on a cue that overlaps nothing, which has nowhere sideways to go.
+    pub fn move_sync_cue_within_group(&mut self, delta: isize) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_sync.as_mut() {
+            state.select_within_group(delta);
+        }
+    }
+
     /// Starts or stops the scrub playback of the selected cue.
     ///
     /// A span is `PLAYBACK_PAD` either side of the cue, played as a slideshow of frames the

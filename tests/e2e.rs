@@ -1017,13 +1017,20 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         "the two overlapping cues need a lane each"
     );
     let screen = app.screen();
+    // The first two cues are on screen together, so they are one row of the list and carry
+    // the compact timing that fits half a panel; the third stands alone and keeps the full
+    // one. See **Cues That Share The Screen Are One Row** in AGENTS.md.
     assert!(
-        screen.contains("Overlapping opener") && screen.contains("00:00:00.5 → 00:00:02.0"),
+        screen.contains("Overlapping opener") && screen.contains("0:00.5→0:02.0"),
         "the cue list should show cue text and timing:\n{screen}"
+    );
+    assert!(
+        screen.contains("00:00:04.0 → 00:00:05.0"),
+        "a cue that overlaps nothing should keep the full timing:\n{screen}"
     );
     let selected = app.filled_selection();
     assert!(
-        selected.contains("00:00:00.5 → 00:00:02.0") && selected.contains("Overlapping opener"),
+        selected.contains("0:00.5→0:02.0") && selected.contains("Overlapping opener"),
         "the first cue's block should start out filled: {selected:?}\n{screen}"
     );
     assert!(
@@ -1064,15 +1071,17 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     );
 
     // Navigating the list moves the selection, and only the selection — and the frame
-    // follows it, rather than the previous cue's picture staying under the new cue.
-    app.press(key(KeyCode::Char('j')));
+    // follows it, rather than the previous cue's picture staying under the new cue. `l`
+    // rather than `j` for the second cue: it shares the screen with the first, so the two
+    // are one row and `j` would step over both of them.
+    app.press(key(KeyCode::Char('l')));
     app.pump();
     assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
     let screen = app.screen();
     let selected = app.filled_selection();
     assert!(
-        selected.contains("00:00:01.5 → 00:00:03.0") && selected.contains("Overlapping answer"),
-        "j should move the fill onto the second cue: {selected:?}\n{screen}"
+        selected.contains("0:01.5→0:03.0") && selected.contains("Overlapping answer"),
+        "l should move the fill onto the second cue: {selected:?}\n{screen}"
     );
     assert!(
         screen.contains("Timeline (00:00:01.5 → 00:00:03.0)"),
@@ -3902,6 +3911,163 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
         !app.preview_shades().is_empty(),
         "the playback should be drawn:\n{}",
         app.screen()
+    );
+}
+
+/// A track whose middle three cues are on screen together, over a lone cue either side.
+const GROUPED_CUES: &str = "1\n\
+     00:00:00,500 --> 00:00:01,500\n\
+     alone at the start\n\
+     \n\
+     2\n\
+     00:00:02,000 --> 00:00:04,000\n\
+     the spoken line\n\
+     \n\
+     3\n\
+     00:00:02,500 --> 00:00:04,500\n\
+     a sign over it\n\
+     \n\
+     4\n\
+     00:00:03,000 --> 00:00:05,000\n\
+     and a third\n\
+     \n\
+     5\n\
+     00:00:05,500 --> 00:00:06,000\n\
+     alone at the end\n";
+
+/// Cues that share the screen are one row of the list, and the row says so.
+///
+/// The complaint this answers: the cue panel drew two cues that are on screen *together*
+/// exactly as it drew two that merely follow one another — a block, an arrow, a block. On the
+/// page whose whole job is judging a subtitle against the picture it is burned into, the one
+/// relationship worth seeing was the one the list could not express.
+///
+/// Asserted through the whole page rather than on the panel alone, because the grouping
+/// reaches the movement keys as well as the drawing: `j` has to step *over* a group where it
+/// used to step through it, `h`/`l` have to move inside one, and the frame and timeline have
+/// to follow whichever member the cursor lands on.
+#[test]
+fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "cues_that_share_the_screen_should_be_one_row_of_the_list";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-overlap");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"]),
+    );
+    fs::write(scratch.join("clip.eng.srt"), GROUPED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    wait_for_frames(&mut app);
+
+    // Assert: five cues, but three rows — the middle three are one group.
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 5, "every cue should still be read");
+    let groups: Vec<(usize, usize)> = state
+        .groups
+        .iter()
+        .map(|group| (group.first, group.len))
+        .collect();
+    assert_eq!(
+        groups,
+        vec![(0, 1), (1, 3), (4, 1)],
+        "the three overlapping cues should be one group"
+    );
+
+    // Assert: the panel draws the group as a fork into two blocks side by side. The lone
+    // cues keep the full timing; the pair takes the compact one, because half a panel cannot
+    // hold twenty-three characters.
+    let screen = app.screen();
+    assert!(
+        screen.contains("00:00:00.5 → 00:00:01.5"),
+        "a lone cue should keep its full timing:\n{screen}"
+    );
+    assert!(
+        screen.contains("0:02.0→0:04.0") && screen.contains("0:02.5→0:04.5"),
+        "the group's first two members should be drawn side by side:\n{screen}"
+    );
+    assert!(
+        screen.contains('┬'),
+        "the group reaches past what is drawn, so its bar should run off that side:\n{screen}"
+    );
+    assert!(
+        !screen.contains("and a third"),
+        "only two members fit, so the third should be off the row:\n{screen}"
+    );
+
+    // Act / Assert: `j` steps over the whole group rather than through it, and `k` comes
+    // back to the member it entered on.
+    app.press(key(KeyCode::Char('j')));
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+    app.press(key(KeyCode::Char('j')));
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        4,
+        "j should leave the group rather than visit its second member"
+    );
+    app.press(key(KeyCode::Char('k')));
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+
+    // Act / Assert: the first `l` crosses the page without moving the pair, and the second
+    // turns it — the drawn pair follows, and the bar now runs off the other side.
+    app.press(key(KeyCode::Char('l')));
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 2);
+    // `press` pumps before the key rather than after it, so the panel is a press behind
+    // until the loop runs again.
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        !screen.contains("and a third"),
+        "crossing the page should leave the pair on screen where it is:\n{screen}"
+    );
+    app.press(key(KeyCode::Char('l')));
+    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 3);
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("and a third"),
+        "the third member should be drawn once the page turns:\n{screen}"
+    );
+    assert!(
+        !screen.contains("the spoken line"),
+        "the pair should have slid past the group's first member:\n{screen}"
+    );
+
+    // Act / Assert: `l` at the group's far end is held rather than spilling into the next
+    // row — `j` is the only way out.
+    app.press(key(KeyCode::Char('l')));
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        3,
+        "a group is a closed unit sideways"
+    );
+
+    // Assert: the rest of the page followed the cursor into the group. The timeline names
+    // the member under it, and the preview holds that member's own frame rather than the
+    // one the group was entered on.
+    app.wait_until("the third member's frame", |app| {
+        app.subtitle_sync
+            .as_ref()
+            .is_some_and(|state| state.selected == 3 && state.frame().is_some())
+    });
+    let screen = app.screen();
+    assert!(
+        screen.contains("00:00:03.0 → 00:00:05.0"),
+        "the timeline should name the cue the cursor is on:\n{screen}"
+    );
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert!(
+        cached_frame(state, 1) != cached_frame(state, 3),
+        "each member of a group should have its own frame"
     );
 }
 

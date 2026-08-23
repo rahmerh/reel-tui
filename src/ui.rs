@@ -22,7 +22,9 @@ use crate::{
         TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
         VideoSettingsMode, describe_track_groups,
     },
-    cue::{Cue, LaneLayout, TimelineWindow, format_clock, format_timestamp},
+    cue::{
+        Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_timestamp,
+    },
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
     staging::BatchItemStatus,
@@ -31,7 +33,10 @@ use crate::{
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
-    sync::{SubtitleSyncState, SyncStatus, WarmState},
+    sync::{
+        GROUP_COLUMNS, SYNC_CONNECTOR_ROWS, SYNC_FORK_ROWS, SubtitleSyncState, SyncStatus,
+        WarmState,
+    },
 };
 
 const SUBTITLE_COLUMN_GUTTER: u16 = 2;
@@ -115,10 +120,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// the space below and above it once they exist.
 /// Rows one cue's block occupies: two borders with a line of text between them. The
 /// timing rides on the top border, which is what keeps a cue down to three rows.
-const SYNC_CUE_BLOCK_ROWS: u16 = 3;
-
-/// Rows one cue costs the panel: its block, plus the arrow leading to the next one.
-const SYNC_CUE_ROWS: u16 = SYNC_CUE_BLOCK_ROWS + 1;
+const SYNC_CUE_BLOCK_ROWS: u16 = crate::sync::SYNC_BLOCK_ROWS as u16;
 
 /// Columns the cue panel needs to show " 00:00:05.0 → 00:00:07.0 " on a block's top
 /// border, plus that block's corners and the panel's own borders. Its content is
@@ -394,65 +396,302 @@ fn render_sync_preview(
     }
 }
 
+/// Which of the two timings a grouped block can afford, decided once for the whole track.
+///
+/// See [`group_timing`] for why it is a decision rather than a per-cue formatting call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupTiming {
+    /// `0:05.0→0:07.0`, or `1:05:05.0→1:05:07.0` on media past the hour.
+    Span { with_hours: bool },
+    /// `0:05.0` alone, when even the compact span will not fit half a panel.
+    StartOnly { with_hours: bool },
+}
+
+/// What a grouped block's top border can say, given how wide half the panel is.
+///
+/// A grouped block is half a panel wide — fourteen to twenty-three columns — and
+/// `00:00:05.0 → 00:00:07.0` is twenty-three characters on its own, so the full timing that
+/// an ungrouped block carries cannot be drawn on one at any terminal size. The compact form
+/// (`cue::format_compact`) is what replaces it, and where even that will not fit, the start
+/// alone: eleven columns at its widest, which fits the panel's own thirty-column floor.
+///
+/// **Decided once for the track rather than per cue**, and measured against the widest
+/// reading the track can produce — which is the last cue's end, since the list is start
+/// ordered. The reasoning is `cue::format_clock`'s: a column of timings that changed width
+/// or shape halfway down the list would make the reader work out which format they were
+/// looking at before they could read the number, on the page whose whole purpose is reading
+/// those numbers. It is recomputed each draw because it depends on the panel's width, but
+/// never varies within one.
+fn group_timing(cues: &[Cue], block_width: u16) -> GroupTiming {
+    let furthest = cues.last().map(|cue| cue.end).unwrap_or_default();
+    let with_hours = furthest >= Duration::from_secs(3600);
+    let widest = format_compact(furthest, with_hours).chars().count();
+    // The block's two borders, the title's own leading and trailing space, and the arrow
+    // between the two readings.
+    let span_width = widest * 2 + 5;
+    if span_width <= usize::from(block_width) {
+        GroupTiming::Span { with_hours }
+    } else {
+        GroupTiming::StartOnly { with_hours }
+    }
+}
+
+impl GroupTiming {
+    /// The title one grouped block's top border carries.
+    fn title(self, cue: &Cue) -> String {
+        match self {
+            Self::Span { with_hours } => format!(
+                " {}→{} ",
+                format_compact(cue.start, with_hours),
+                format_compact(cue.end, with_hours)
+            ),
+            Self::StartOnly { with_hours } => {
+                format!(" {} ", format_compact(cue.start, with_hours))
+            }
+        }
+    }
+}
+
+/// The cue list, drawn one *group* to a row rather than one cue.
+///
+/// A group is a run of cues that are on screen together (`cue::group_overlaps`). The
+/// ordinary cue overlaps nothing and is a group of one, drawn exactly as it always was: a
+/// full-width block with the full `00:00:05.0 → 00:00:07.0` timing, and a `↓` to the next
+/// row. A group of several is drawn as a fork into two blocks side by side — see
+/// [`render_sync_group`], which owns everything that is new here.
+///
+/// Rows are asked for by height rather than counted out by the caller: a lone cue is three
+/// rows and a group is six, so how many rows a screenful holds depends on which groups are
+/// in it and the arithmetic belongs where the group heights are (`SubtitleSyncState::
+/// sync_scroll`).
 fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect) {
     let block = Block::bordered().title(" Cues ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // `height + 1` because the last block on screen needs no arrow under it, so a panel
-    // seven rows tall holds two blocks rather than one. At least one either way, so the
-    // shortest panel the layout can produce still shows the cue under the cursor rather
-    // than nothing at all — a block that does not fit whole is clipped from the bottom,
-    // which costs its lower border and leaves its timing and text in place.
-    state.sync_scroll(usize::from(((inner.height + 1) / SYNC_CUE_ROWS).max(1)));
+    state.sync_scroll(usize::from(inner.height));
 
-    let last = state.cues.len().saturating_sub(1);
-    for (offset, (position, cue)) in state
-        .cues
+    let last = state.groups.len().saturating_sub(1);
+    let timing = group_timing(&state.cues, inner.width / GROUP_COLUMNS as u16);
+    let mut top = inner.y;
+
+    for (index, group) in state
+        .groups
         .iter()
+        .copied()
         .enumerate()
         .skip(state.list_scroll)
         .take(state.list_rows)
-        .enumerate()
     {
-        let top = inner.y + offset as u16 * SYNC_CUE_ROWS;
-        // Saturating rather than guarded: `sync_scroll` above already limits the loop to
-        // the blocks that start inside the panel, so a height of zero here is unreachable
-        // — and a zero-height block draws nothing, where the subtraction underflowing
-        // would panic. There is no branch to leave untested either way.
-        // Keyed on the row's position, not on `Cue::index`. The index is assigned by
-        // whoever produced the cues and nothing downstream re-derives it, so trusting it
-        // here would put the cursor on the wrong block for any list that did not number
-        // itself the way the parser happens to.
-        render_sync_cue(
+        render_sync_group(
             frame,
-            cue,
-            position == state.selected,
+            state,
+            group,
+            timing,
             Rect {
                 x: inner.x,
                 y: top,
                 width: inner.width,
-                height: SYNC_CUE_BLOCK_ROWS.min(inner.bottom().saturating_sub(top)),
+                // Saturating rather than guarded: `sync_scroll` above already limits the
+                // loop to the groups that start inside the panel, so a height of zero here
+                // is unreachable — and a zero-height group draws nothing, where the
+                // subtraction underflowing would panic.
+                height: (state.group_height(index) as u16).min(inner.bottom().saturating_sub(top)),
             },
         );
+        top += state.group_height(index) as u16;
 
-        // Between the blocks rather than after each one: the arrow says "and then this",
-        // so the last cue has nothing to point at.
-        let arrow = top + SYNC_CUE_BLOCK_ROWS;
-        if arrow < inner.bottom() && position < last {
+        // Between the rows rather than after each one: the arrow says "and then this", so
+        // the last group has nothing to point at.
+        if top < inner.bottom() && index < last {
             frame.render_widget(
                 Paragraph::new("↓")
                     .centered()
                     .style(Style::default().fg(Color::DarkGray)),
                 Rect {
                     x: inner.x,
-                    y: arrow,
+                    y: top,
                     width: inner.width,
                     height: 1,
                 },
             );
         }
+        top += SYNC_CONNECTOR_ROWS as u16;
     }
+}
+
+/// One row of the cue list: a lone cue's block, or a fork into the cues sharing its moment.
+///
+/// A group of one is the ordinary case and is drawn as it always was, full width and with
+/// the full timing. Everything below is about the rest.
+///
+/// **Two members side by side, and the later-starting one a row lower.** The step is not
+/// proportional to the overlap and is not meant to be — it says which of the two comes in
+/// first, and nothing more. Because cues arrive start-ordered, the step is always downward
+/// to the right, which means the case actually carrying information is the one where the
+/// step is *not* taken: two members with identical starts are drawn level, and that is the
+/// panel saying "these two appear together" rather than "this one comes in after". The
+/// group is charged the fourth row either way, so `h` and `l` move the cursor through it
+/// without the list reflowing underneath.
+///
+/// **Exactly two, however many the group holds**, because half a panel is the narrowest a
+/// block with a timing on it can be (`sync::GROUP_COLUMNS`). The fork's crossbar runs off
+/// the panel's edge on whichever side the group reaches past what is drawn, and `h`/`l` page
+/// through it. That lives on the crossbar because the fork is part of the group rather than
+/// the connector into it, so it is drawn at every scroll position — a line that vanished
+/// when the list happened to scroll would be worse than none at all.
+fn render_sync_group(
+    frame: &mut Frame,
+    state: &SubtitleSyncState,
+    group: CueGroup,
+    timing: GroupTiming,
+    area: Rect,
+) {
+    // Fetched as one slice and matched on rather than indexed twice: `cues` is public and
+    // can be emptied under a `groups` that still describes the old list, so the "there is
+    // nothing there" case has to be answered somewhere — and answering it once, for both
+    // members at a time, leaves no second guard that only the first one's absence protects.
+    let (first, shown) = state.group_window(group);
+    let members = state.cues.get(first..first + shown).unwrap_or_default();
+    let [cue, rest @ ..] = members else {
+        return;
+    };
+    let [second] = rest else {
+        render_sync_cue(
+            frame,
+            cue,
+            first == state.selected,
+            &format!(
+                " {} → {} ",
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            ),
+            area,
+        );
+        return;
+    };
+
+    // The left block keeps the odd column, so the two together span the panel exactly and
+    // no gap opens between them.
+    let right_width = area.width / GROUP_COLUMNS as u16;
+    let left_width = area.width - right_width;
+    // The blocks are what must survive a panel too short to hold the whole group: at the
+    // smallest size `render` allows, the cue list gets two rows, and a fork drawn into them
+    // would leave the cue under the cursor off screen entirely. The fork is decoration about
+    // an arrangement the side-by-side blocks already show.
+    let fork_rows = if area.height > SYNC_FORK_ROWS as u16 + 1 {
+        SYNC_FORK_ROWS as u16
+    } else {
+        0
+    };
+    if fork_rows > 0 {
+        render_sync_fork(
+            frame,
+            Rect {
+                height: fork_rows,
+                ..area
+            },
+            left_width,
+            group.first < first,
+            group.end() > first + shown,
+        );
+    }
+
+    let blocks = area.y + fork_rows;
+    // Level when the two start together, which is the one arrangement here that says
+    // something the left-to-right order does not.
+    let step = u16::from(second.start > cue.start);
+    for (offset, (position, cue)) in [(first, cue), (first + 1, second)].into_iter().enumerate() {
+        let y = blocks + step * offset as u16;
+        render_sync_cue(
+            frame,
+            cue,
+            position == state.selected,
+            &timing.title(cue),
+            Rect {
+                x: area.x + if offset == 0 { 0 } else { left_width },
+                y,
+                width: if offset == 0 { left_width } else { right_width },
+                height: SYNC_CUE_BLOCK_ROWS.min(area.bottom().saturating_sub(y)),
+            },
+        );
+    }
+}
+
+/// The two rows above a group: a crossbar splitting into an arrow over each of its blocks.
+///
+/// Drawn as characters into a `Paragraph` rather than as a `Block`'s border, because what is
+/// wanted is a stem branching rather than anything enclosing.
+///
+/// **A group reaching past the pair on screen is said by the crossbar running off the panel
+/// rather than by a marker on its end.** The bar carries on to the panel's edge and the
+/// corner over the outer block becomes a `┬`, so the eye reads a line continuing past the
+/// wall — the same thing a cut-off diagram says. A `‹`/`›` had to be noticed and then
+/// decoded; the line needs neither, and it costs no row of its own either way.
+fn render_sync_fork(
+    frame: &mut Frame,
+    area: Rect,
+    left_width: u16,
+    more_before: bool,
+    more_after: bool,
+) {
+    // Centred over each block, which is where each block's own arrow has to land. Built by
+    // mapping the row rather than by writing into it, so there is no index to guard and no
+    // width this can be handed that it has to refuse.
+    let width = usize::from(area.width);
+    let left = usize::from(left_width / 2);
+    let right = usize::from(left_width + (area.width - left_width) / 2);
+    let stem = width / 2;
+
+    let bar: String = (0..width)
+        .map(|column| match column {
+            _ if column == left => {
+                if more_before {
+                    '┬'
+                } else {
+                    '┌'
+                }
+            }
+            _ if column == right => {
+                if more_after {
+                    '┬'
+                } else {
+                    '┐'
+                }
+            }
+            _ if column < left => {
+                if more_before {
+                    '─'
+                } else {
+                    ' '
+                }
+            }
+            _ if column > right => {
+                if more_after {
+                    '─'
+                } else {
+                    ' '
+                }
+            }
+            _ if column == stem => '┴',
+            _ => '─',
+        })
+        .collect();
+    let arrows: String = (0..width)
+        .map(|column| {
+            if column == left || column == right {
+                '↓'
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(bar), Line::from(arrows)])
+            .style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
 }
 
 /// One cue as a block: its timing on the top border, its text inside, and how many of the
@@ -476,12 +715,7 @@ fn render_sync_cues(frame: &mut Frame, state: &mut SubtitleSyncState, area: Rect
 /// how the row was built, so it is the one that gives way. At the sizes the panel is actually
 /// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
 /// fits, with the two titles' decorative spaces sharing the column where they meet.
-fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, area: Rect) {
-    let timing = format!(
-        " {} → {} ",
-        format_timestamp(cue.start),
-        format_timestamp(cue.end)
-    );
+fn render_sync_cue(frame: &mut Frame, cue: &Cue, selected: bool, timing: &str, area: Rect) {
     let folded = (cue.events > 1)
         .then(|| format!(" ×{} ", cue.events))
         // Measured on what the two titles *say*, plus one column between them, rather than on
@@ -2298,7 +2532,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "h / l",
-        "Choose Yes or No on a switch, in the preview settings dialog",
+        "Move between cues that share a moment, or choose Yes or No on a preview settings switch",
     );
     keybinding(
         &mut lines,
@@ -12405,6 +12639,209 @@ mod tests {
         (app, directory)
     }
 
+    /// Just the cue panel, which is the rightmost `cue_width` columns of the page. Sliced
+    /// by characters rather than bytes: the panel is drawn almost entirely in box-drawing
+    /// glyphs, none of which is one byte wide.
+    fn cue_panel(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let panel = usize::from((width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48));
+        draw(app, width, height)
+            .iter()
+            .map(|line| {
+                let columns: Vec<char> = line.chars().collect();
+                columns[columns.len() - panel..].iter().collect()
+            })
+            .collect()
+    }
+
+    /// The crossbar of the first group's fork, with the cue panel's own border trimmed off
+    /// either end — so the first and last characters here are the edges the bar either runs
+    /// off or stops short of.
+    fn fork_bar(app: &mut App) -> Vec<char> {
+        let row: Vec<char> = cue_panel(app, 120, 30)[1].chars().collect();
+        row[1..row.len() - 1].to_vec()
+    }
+
+    /// The panel used to draw two cues that share the screen exactly as it drew two that
+    /// follow one another, so it said nothing at all about the one relationship a subtitle
+    /// timing page exists to show. A fork into two blocks side by side is the answer, and
+    /// the block that starts later sits a row lower.
+    #[test]
+    fn overlapping_cues_should_be_drawn_as_a_fork_into_two_blocks_side_by_side() {
+        // Arrange: a lone cue, then two that overlap, then a lone cue.
+        let (mut app, directory) = sync_page_app(
+            "sync-fork",
+            vec![
+                sync_cue(1000, 3000, "Before this"),
+                sync_cue(5000, 7000, "Hello there"),
+                sync_cue(6000, 8000, "[sign: BAKERY]"),
+                sync_cue(12000, 14000, "After that"),
+            ],
+        );
+
+        // Act
+        let panel = cue_panel(&mut app, 120, 30);
+
+        // Assert: the lone cues keep the full timing and the plain `↓`; the pair gets the
+        // fork, the compact timing, and the second block one row down and one block over.
+        assert_that!(panel[1].as_str()).contains("┌ 00:00:01.0 → 00:00:03.0");
+        assert_that!(panel[4].as_str()).contains("↓");
+        assert_that!(panel[5].as_str()).contains("┴");
+        assert_that!(panel[6].matches('↓').count()).is_equal_to(2);
+        assert_that!(panel[7].as_str()).contains("┌ 0:05.0→0:07.0");
+        assert_that!(panel[8].as_str()).contains("│ Hello there");
+        // The later cue's block starts on the row below, and to the right of the first.
+        assert_that!(panel[8].as_str()).contains("┌ 0:06.0→0:08.0");
+        assert_that!(panel[9].as_str()).contains("│ [sign: BAKERY]");
+        assert_that!(panel[7].find("0:05.0").unwrap() < panel[8].find("0:06.0").unwrap()).is_true();
+        assert_that!(panel[12].as_str()).contains("┌ 00:00:12.0 → 00:00:14.0");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The step down is always to the right, because cues arrive start-ordered — so the
+    /// arrangement actually carrying information is the one where the step is *not* taken.
+    /// Two cues that begin at the same instant are drawn level, and that is the panel
+    /// saying "these appear together" rather than "this one comes in after".
+    #[test]
+    fn cues_that_begin_together_should_be_drawn_level_rather_than_stepped() {
+        // Arrange
+        let (mut app, directory) = sync_page_app(
+            "sync-level",
+            vec![
+                sync_cue(5000, 7000, "Hello there"),
+                sync_cue(5000, 8000, "[sign: BAKERY]"),
+            ],
+        );
+
+        // Act
+        let panel = cue_panel(&mut app, 120, 30);
+
+        // Assert: both top borders on one row, and both texts on the next.
+        assert_that!(panel[3].as_str()).contains("┌ 0:05.0→0:07.0");
+        assert_that!(panel[3].as_str()).contains("┌ 0:05.0→0:08.0");
+        assert_that!(panel[4].as_str()).contains("│ Hello there");
+        assert_that!(panel[4].as_str()).contains("│ [sign: BAKERY]");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Only two members fit side by side, so a group of more has to say that it reaches
+    /// past what is drawn — otherwise the third cue is simply missing from the list with
+    /// nothing on screen to explain it, which is the defect the `×N` fold count exists to
+    /// prevent one level down. It says it by the crossbar running off the panel on that
+    /// side, which reads as a line continuing rather than as a marker to be decoded.
+    #[test]
+    fn a_group_reaching_past_its_two_visible_cues_should_run_its_bar_off_that_side() {
+        // Arrange: three cues sharing a moment.
+        let (mut app, directory) = sync_page_app(
+            "sync-more",
+            vec![
+                sync_cue(5000, 9000, "first"),
+                sync_cue(6000, 9000, "second"),
+                sync_cue(7000, 9000, "third"),
+            ],
+        );
+
+        // Act: the crossbar of the group's fork, inside the panel's own border.
+        let bar = fork_bar(&mut app);
+
+        // Assert: at the group's head, the bar runs off the way `l` would go and stops
+        // short on the other side.
+        assert_that!(bar.first().copied()).is_equal_to(Some(' '));
+        assert_that!(bar.last().copied()).is_equal_to(Some('─'));
+        assert_that!(bar.contains(&'┬')).is_true();
+        assert_that!(draw(&mut app, 120, 30).join("\n").contains("│ third")).is_false();
+
+        // Act / Assert: two presses turn the page, and the bar turns round with it.
+        app.move_sync_cue_within_group(1);
+        app.move_sync_cue_within_group(1);
+        let bar = fork_bar(&mut app);
+        assert_that!(bar.first().copied()).is_equal_to(Some('─'));
+        assert_that!(bar.last().copied()).is_equal_to(Some(' '));
+        let screen = draw(&mut app, 120, 30).join("\n");
+        assert_that!(screen.contains("│ third")).is_true();
+        assert_that!(screen.contains("│ first")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A group of four is two pages of two: `l` from a page's left member moves the
+    /// highlight across the page it is on, and only the press after that turns to the next
+    /// pair. A window that slid one cue per press moved both blocks every time, so no two
+    /// cues ever stayed still long enough to be compared — which is what the side-by-side
+    /// row is for.
+    #[test]
+    fn moving_sideways_should_cross_the_page_before_turning_it() {
+        // Arrange: four cues sharing a moment.
+        let (mut app, directory) = sync_page_app(
+            "sync-pages",
+            vec![
+                sync_cue(5000, 9000, "first"),
+                sync_cue(6000, 9000, "second"),
+                sync_cue(7000, 9000, "third"),
+                sync_cue(8000, 9000, "fourth"),
+            ],
+        );
+        let group = app.subtitle_sync.as_ref().unwrap().groups[0];
+
+        // Act / Assert: the first press stays on the page it is on.
+        app.move_sync_cue_within_group(1);
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.group_window(group)).is_equal_to((0, 2));
+
+        // Act / Assert: the second turns the page, landing on its left member.
+        app.move_sync_cue_within_group(1);
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act / Assert: and back the same way.
+        app.move_sync_cue_within_group(-1);
+        let state = app.subtitle_sync.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.group_window(group)).is_equal_to((0, 2));
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `00:00:05.0 → 00:00:07.0` is twenty-three characters and half a cue panel is at most
+    /// twenty-three columns, so a grouped block can never carry the full timing. The
+    /// compact span replaces it, and where even that will not fit — a narrow panel, or
+    /// media past the hour — the start alone does. Decided once for the track, so the
+    /// column never changes shape halfway down.
+    #[test]
+    fn a_grouped_block_should_fall_back_to_the_start_alone_when_a_span_will_not_fit() {
+        // Arrange: two overlapping cues an hour into the media, so the compact span needs
+        // its hours field and becomes too wide for half a panel.
+        let (mut app, directory) = sync_page_app(
+            "sync-hours",
+            vec![
+                sync_cue(3_605_000, 3_607_000, "Hello there"),
+                sync_cue(3_606_000, 3_608_000, "[sign: BAKERY]"),
+            ],
+        );
+
+        // Act / Assert: measured on the panel alone, since the timeline's title carries a
+        // span arrow of its own.
+        let panel = cue_panel(&mut app, 120, 30).join("\n");
+        assert_that!(panel.contains("┌ 1:00:05.0 ")).is_true();
+        assert_that!(panel.contains("┌ 1:00:06.0 ")).is_true();
+        assert_that!(panel.contains('→')).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The track's height is the one part of the layout that is data-driven, so an
     /// overlapping region has to cost the preview pane exactly the rows it gains.
     #[test]
@@ -12849,10 +13286,14 @@ mod tests {
         assert_that!(screen.contains("Preview")).is_true();
         assert_that!(screen.contains("Cues")).is_true();
         assert_that!(screen.contains("Timeline")).is_true();
+        // The four cues are one overlap group, so the panel draws the first two side by
+        // side — and at half a thirty-column panel even the compact span will not fit, so
+        // this is also where `group_timing`'s start-only fallback is exercised for real.
         // The cue block's own border, rather than the title's copy of the same span.
-        assert_that!(screen.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
+        assert_that!(screen.contains("┌ 0:00.0 ")).is_true();
+        assert_that!(screen.contains("┌ 0:00.1 ")).is_true();
         // With room to spare after it, so the panel's floor width is doing its job.
-        assert_that!(screen.contains("→ 00:00:09.0 ")).is_true();
+        assert_that!(screen.contains("0:00.0 ─")).is_true();
         let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
         assert_that!(cells.width > 0 && cells.height > 0).is_true();
 
@@ -12867,7 +13308,7 @@ mod tests {
         // ...and twelve fit both.
         let taller = drawn(50, 12, |frame| render(frame, &mut app));
         assert_that!(taller.contains('▲')).is_true();
-        assert_that!(taller.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
+        assert_that!(taller.contains("┌ 0:00.0 ")).is_true();
 
         // Cleanup
         drop(app);
@@ -13508,7 +13949,8 @@ mod tests {
         let screen = drawn(50, 12, |frame| render(frame, &mut app));
         assert_that!(screen.contains("Generating preview frames [1/4]")).is_true();
         assert_that!(screen.contains('▲')).is_false();
-        assert_that!(screen.contains("┌ 00:00:00.0 → 00:00:09.0")).is_true();
+        // Four overlapping cues are one group, so the block carries the compact timing.
+        assert_that!(screen.contains("┌ 0:00.0 ")).is_true();
 
         // Act / Assert: one more row and both fit.
         let screen = drawn(50, 13, |frame| render(frame, &mut app));
