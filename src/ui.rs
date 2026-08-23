@@ -131,10 +131,18 @@ const SYNC_CUE_PANEL_WIDTH: u16 = 30;
 /// the time axis beneath the lanes.
 const SYNC_TRACK_CHROME: u16 = 3;
 
-/// Seconds between the axis's ticks. Ten reads as a round number at a glance, and across
-/// the sixty-second window the track shows it lands six of them — enough to judge a cue's
-/// width against, few enough not to become a texture.
-const TICK: u64 = 10;
+/// Seconds between the axis's ticks, longest first.
+///
+/// Ten across a minute-wide window lands six readings — enough to judge a cue's width
+/// against, few enough not to become a texture. **The interval has to follow the window**,
+/// which is no longer always a minute: on a dense track shortened to eight seconds a
+/// ten-second tick can land a single reading, or none at all once the selected cue's marks
+/// take precedence over the one it lands on, leaving an axis with no numbers on it. Every
+/// value here reads as a round number, so no window makes the reader do arithmetic.
+const TICKS: [u64; 6] = [30, 15, 10, 5, 2, 1];
+
+/// Readings the axis aims for. Six is what a sixty-second window has always shown.
+const TICK_TARGET: u64 = 6;
 
 /// Draws the subtitle timing page over the entire frame.
 ///
@@ -790,7 +798,13 @@ fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let window = TimelineWindow::centered(cue, state.duration, inner.width);
+    let window = TimelineWindow::fitted(
+        cue,
+        &state.cues,
+        state.duration,
+        inner.width,
+        state.layout.lane_count,
+    );
     let mut lines = timeline_lines(
         &state.cues,
         &state.layout,
@@ -811,6 +825,20 @@ fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect
 /// `selected` is the cue's column span, taken from `TimelineWindow::span` rather than
 /// re-derived here, so the marks land exactly under the bracket ends drawn above them even
 /// where the window has clamped a cue that runs past its edge.
+/// Seconds between the axis's readings for a window of this length.
+///
+/// The longest interval that still lands [`TICK_TARGET`] readings, so the axis keeps the
+/// roundest numbers it can afford at whatever length the window has shortened to. A window
+/// shorter than six seconds takes the last interval and gets fewer readings rather than
+/// sub-second ones, which would be a different kind of unreadable.
+fn axis_tick(span: Duration) -> u64 {
+    let seconds = span.as_secs();
+    TICKS
+        .into_iter()
+        .find(|tick| seconds / tick >= TICK_TARGET)
+        .unwrap_or(TICKS[TICKS.len() - 1])
+}
+
 fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line<'static> {
     // No width guard: `TimelineWindow::column` and `span` both answer `None` for a window
     // with no columns, so a track drawn no cells wide places no readings and no marks and
@@ -827,11 +855,12 @@ fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line
         .flat_map(|(first, last)| [first, last])
         .collect();
 
-    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(TICK) * TICK);
+    let tick = axis_tick(window.end.saturating_sub(window.start));
+    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(tick) * tick);
     let mut written_to = None;
     while at <= window.end {
         let moment = at;
-        at += Duration::from_secs(TICK);
+        at += Duration::from_secs(tick);
         let Some(column) = window.column(moment) else {
             continue;
         };
@@ -862,6 +891,12 @@ fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line
 ///
 /// A pure function over the cue list rather than something that draws as it goes, so the
 /// column arithmetic that decides whether a cue is visible at all can be asserted directly.
+///
+/// **Every cue is drawn the same way, whatever the track's density.** A dense typeset track
+/// is made readable by shortening the window it is drawn in (`TimelineWindow::fitted`), never
+/// by demoting the cues the cursor is not on to something plainer: a timeline where only the
+/// selection's neighbours are drawn in full loses where every other line begins and ends,
+/// which is most of what the pane is worth reading for.
 fn timeline_lines(
     cues: &[Cue],
     layout: &LaneLayout,
@@ -13704,6 +13739,37 @@ mod tests {
     /// A track with no columns to draw on is a layout the renderer never asks for, but the
     /// arithmetic below divides by the window's span and indexes by column, so it answers
     /// with an empty line rather than panicking.
+    /// The window shortens on a dense track, and a ten-second interval in an eight-second
+    /// window lands one reading — or none, once the selected cue's marks take the column it
+    /// would have gone in. An axis with no numbers on it is not an axis, so the interval
+    /// follows the window down.
+    #[test]
+    fn the_axis_interval_should_follow_the_window_down() {
+        // Act / Assert: the longest round interval that still lands six readings.
+        assert_that!(axis_tick(Duration::from_secs(60))).is_equal_to(10);
+        assert_that!(axis_tick(Duration::from_secs(30))).is_equal_to(5);
+        assert_that!(axis_tick(Duration::from_secs(15))).is_equal_to(2);
+        assert_that!(axis_tick(Duration::from_secs(8))).is_equal_to(1);
+        // Nothing sub-second, however short the window gets.
+        assert_that!(axis_tick(Duration::from_secs(2))).is_equal_to(1);
+        assert_that!(axis_tick(Duration::ZERO)).is_equal_to(1);
+    }
+
+    /// A window with readings a second apart still has to place them, which is the case the
+    /// crowding rule was written against a ten-second interval for.
+    #[test]
+    fn a_short_window_should_still_carry_readings() {
+        // Arrange: eight seconds across a full-width track.
+        let window = window_over(20, 28, 150);
+
+        // Act
+        let text = ruler_text(&window, &sync_cue(24_000, 24_500, "x"));
+
+        // Assert
+        assert_that!(text.contains("0:21")).is_true();
+        assert_that!(text.contains("0:27")).is_true();
+    }
+
     #[test]
     fn an_axis_with_no_width_should_draw_nothing() {
         // Arrange
