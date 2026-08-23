@@ -747,9 +747,31 @@ pub fn group_overlaps(cues: &[Cue]) -> Vec<CueGroup> {
 /// typical track width this is roughly half a second per column.
 pub const WINDOW: Duration = Duration::from_secs(60);
 
+/// The window lengths the timeline will pick between, longest first.
+///
+/// A minute is right for the ordinary dialogue track, where it holds a dozen cues and each
+/// one is wide enough to read. It is hopeless for a typeset ASS track, where a minute holds
+/// several hundred events: every lane fills end to end with brackets and the track becomes a
+/// texture rather than a timing. The window therefore shortens until what is in it can
+/// actually be drawn — the reader loses context they could not read anyway, and gets back
+/// the one thing this pane is for, which is where the selected cue sits against its
+/// neighbours.
+pub const WINDOW_STEPS: [Duration; 4] = [
+    WINDOW,
+    Duration::from_secs(30),
+    Duration::from_secs(15),
+    Duration::from_secs(8),
+];
+
+/// Columns a cue needs before it reads as a span rather than as a mark.
+///
+/// `|<─>|` is five, and one column of gap keeps two neighbours from running together into a
+/// single unreadable rule.
+const READABLE_CUE_COLUMNS: u16 = 6;
+
 /// The slice of time the timeline track is currently showing, and how wide it is drawn.
 ///
-/// [`TimelineWindow::centered`] is the only constructor the application uses, and it
+/// [`TimelineWindow::fitted`] is the only constructor the application uses, and it
 /// always yields `end > start` — so `column` divides by a non-zero span without needing
 /// to guard for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -765,25 +787,67 @@ impl TimelineWindow {
     /// Clamping at both ends matters: a cue two seconds in must not produce a window
     /// starting at minus twenty-eight seconds, which would waste half the track on time
     /// that does not exist.
-    pub fn centered(on: &Cue, duration: Duration, width: u16) -> Self {
+    /// The window for a selected cue on *this* track, shortened until its cues are drawable.
+    ///
+    /// The choice is made against how many cues the candidate window holds rather than
+    /// against the format or the cue count of the file: a sparse ASS track keeps the full
+    /// minute and a dialogue track that happens to be dense loses it, which is the right way
+    /// round. Capacity is every lane's columns divided by what one readable cue costs, since
+    /// the cues in view are spread across the lanes rather than queued in one.
+    ///
+    /// **Never shorter than the selected cue plus half again.** A twelve-second sign in an
+    /// eight-second window would be clamped at both edges and drawn as a bar with no ends,
+    /// which loses the only timing the reader came for. A track dense enough to want a
+    /// shorter window than that keeps the longer one and stays crowded — legibility of the
+    /// selection outranks legibility of its company.
+    pub fn fitted(on: &Cue, cues: &[Cue], duration: Duration, width: u16, lanes: usize) -> Self {
+        let capacity = usize::from(width / READABLE_CUE_COLUMNS) * lanes.max(1);
+        let floor = on.end.saturating_sub(on.start) * 3 / 2;
+        let mut window = Self::spanning(on, duration, width, WINDOW_STEPS[0]);
+        for step in WINDOW_STEPS {
+            if step < floor {
+                break;
+            }
+            window = Self::spanning(on, duration, width, step);
+            if window.count(cues) <= capacity {
+                break;
+            }
+        }
+        window
+    }
+
+    /// How many of the track's cues fall inside the window.
+    ///
+    /// Counted by intersection rather than by start, so a sign that opened before the window
+    /// and is still on screen is charged for — it is drawn across the whole track and is
+    /// exactly the kind of cue that crowds one.
+    fn count(&self, cues: &[Cue]) -> usize {
+        cues.iter()
+            .filter(|cue| cue.end >= self.start && cue.start <= self.end)
+            .count()
+    }
+
+    /// The window of a given length, clamped to the media's bounds.
+    ///
+    /// Clamping at both ends matters: a cue two seconds in must not produce a window
+    /// starting at minus twenty-eight seconds, which would waste half the track on time
+    /// that does not exist.
+    fn spanning(on: &Cue, duration: Duration, width: u16, span: Duration) -> Self {
         // A track can outlast its video — subtitles running past the last frame are
         // common — and the probed duration can be missing entirely. Either way the
         // window still has to contain the cue it was built for.
         let duration = duration.max(on.end).max(Duration::from_millis(1));
-        if duration <= WINDOW {
+        if duration <= span {
             return Self {
                 start: Duration::ZERO,
                 end: duration,
                 width,
             };
         }
-        let start = on
-            .midpoint()
-            .saturating_sub(WINDOW / 2)
-            .min(duration - WINDOW);
+        let start = on.midpoint().saturating_sub(span / 2).min(duration - span);
         Self {
             start,
-            end: start + WINDOW,
+            end: start + span,
             width,
         }
     }
@@ -1889,20 +1953,75 @@ mod tests {
     }
 
     #[test]
-    fn centered_should_show_the_whole_media_when_it_is_shorter_than_the_window() {
+    fn the_window_should_show_the_whole_media_when_it_is_shorter_than_the_window() {
         // Act
-        let window = TimelineWindow::centered(&cue(1000, 2000), Duration::from_secs(30), 100);
+        let window = TimelineWindow::fitted(
+            &cue(1000, 2000),
+            &[cue(1000, 2000)],
+            Duration::from_secs(30),
+            100,
+            1,
+        );
 
         // Assert
         assert_that!(window.start).is_equal_to(Duration::ZERO);
         assert_that!(window.end).is_equal_to(Duration::from_secs(30));
     }
 
+    /// A minute of a typeset track holds several hundred events, which no width can draw as
+    /// spans — every lane fills end to end and the pane becomes a texture. The window
+    /// shortens until what is in it can be drawn, and a sparse track is left alone, so the
+    /// choice follows the track's actual density rather than its format.
     #[test]
-    fn centered_should_place_the_selected_cue_in_the_middle() {
+    fn the_window_should_shorten_for_a_track_too_dense_to_draw() {
+        // Arrange: a cue every half second for ten minutes, and the same span with four
+        // cues in it.
+        let dense: Vec<Cue> = (0..1200)
+            .map(|n| cue(n * 500, n * 500 + 400))
+            .collect::<Vec<_>>();
+        let sparse: Vec<Cue> = (0..4).map(|n| cue(n * 20_000, n * 20_000 + 2000)).collect();
+        let media = Duration::from_secs(600);
+
+        // Act: lanes taken from the packing rather than assumed, since the capacity a
+        // window is measured against is every lane's columns.
+        let lanes = |cues: &[Cue]| pack_lanes(cues, MAX_LANES).lane_count;
+        let crowded = TimelineWindow::fitted(&dense[600], &dense, media, 120, lanes(&dense));
+        let roomy = TimelineWindow::fitted(&sparse[2], &sparse, media, 120, lanes(&sparse));
+
+        // Assert
+        assert_that!(crowded.end - crowded.start).is_equal_to(WINDOW_STEPS[3]);
+        assert_that!(roomy.end - roomy.start).is_equal_to(WINDOW);
+    }
+
+    /// Shortening past the selected cue would clamp it at both edges and draw it as a bar
+    /// with no ends, losing the one timing the reader came for. A sign covering a scene on
+    /// a dense track therefore keeps a long window and stays crowded.
+    #[test]
+    fn the_window_should_never_shorten_past_the_selected_cue() {
+        // Arrange: a dense track, with a twenty-second sign over it.
+        let mut cues: Vec<Cue> = (0..1200).map(|n| cue(n * 500, n * 500 + 400)).collect();
+        cues.push(cue(295_000, 315_000));
+        let sign = cues.last().unwrap().clone();
+
         // Act
-        let window =
-            TimelineWindow::centered(&cue(600_000, 602_000), Duration::from_secs(1200), 100);
+        let lanes = pack_lanes(&cues, MAX_LANES).lane_count;
+        let window = TimelineWindow::fitted(&sign, &cues, Duration::from_secs(600), 120, lanes);
+
+        // Assert: the shortest step that still holds the sign and half again.
+        assert_that!(window.end - window.start).is_equal_to(WINDOW_STEPS[1]);
+        assert_that!(window.span(&sign)).is_some();
+    }
+
+    #[test]
+    fn the_window_should_place_the_selected_cue_in_the_middle() {
+        // Act
+        let window = TimelineWindow::fitted(
+            &cue(600_000, 602_000),
+            &[cue(600_000, 602_000)],
+            Duration::from_secs(1200),
+            100,
+            1,
+        );
 
         // Assert
         assert_that!(window.start).is_equal_to(Duration::from_secs(571));
@@ -1912,9 +2031,15 @@ mod tests {
     /// Without clamping, an early cue produces a window starting before zero, wasting
     /// half the track on time that does not exist.
     #[test]
-    fn centered_should_clamp_to_the_start_of_the_media() {
+    fn the_window_should_clamp_to_the_start_of_the_media() {
         // Act
-        let window = TimelineWindow::centered(&cue(2000, 3000), Duration::from_secs(1200), 100);
+        let window = TimelineWindow::fitted(
+            &cue(2000, 3000),
+            &[cue(2000, 3000)],
+            Duration::from_secs(1200),
+            100,
+            1,
+        );
 
         // Assert
         assert_that!(window.start).is_equal_to(Duration::ZERO);
@@ -1922,10 +2047,15 @@ mod tests {
     }
 
     #[test]
-    fn centered_should_clamp_to_the_end_of_the_media() {
+    fn the_window_should_clamp_to_the_end_of_the_media() {
         // Act
-        let window =
-            TimelineWindow::centered(&cue(1_199_000, 1_200_000), Duration::from_secs(1200), 100);
+        let window = TimelineWindow::fitted(
+            &cue(1_199_000, 1_200_000),
+            &[cue(1_199_000, 1_200_000)],
+            Duration::from_secs(1200),
+            100,
+            1,
+        );
 
         // Assert
         assert_that!(window.start).is_equal_to(Duration::from_secs(1140));
@@ -1935,9 +2065,15 @@ mod tests {
     /// Subtitles running past the last video frame are common, and a probed duration can
     /// be missing entirely. The window still has to contain the cue it was built for.
     #[test]
-    fn centered_should_still_contain_a_cue_that_outlasts_the_media() {
+    fn the_window_should_still_contain_a_cue_that_outlasts_the_media() {
         // Act
-        let window = TimelineWindow::centered(&cue(9000, 10_000), Duration::ZERO, 100);
+        let window = TimelineWindow::fitted(
+            &cue(9000, 10_000),
+            &[cue(9000, 10_000)],
+            Duration::ZERO,
+            100,
+            1,
+        );
 
         // Assert
         assert_that!(window.end >= milliseconds(10_000)).is_true();

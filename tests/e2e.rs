@@ -4071,6 +4071,98 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     );
 }
 
+/// A typeset track's timeline should be readable rather than a texture.
+///
+/// The complaint this answers: on an ASS track carrying signs and karaoke, the timeline drew
+/// every one of the hundreds of events in its minute-wide window as a bracketed span, four
+/// lanes deep. Every lane filled end to end and the pane said nothing at all — least of all
+/// the one thing it exists for, which is where the selected cue sits against its neighbours.
+///
+/// The answer is scale rather than selection: the window shortens until the cues in it can
+/// be drawn as spans. Every cue is still drawn in full, because which lines begin and end
+/// where is most of what the pane is worth reading for.
+#[test]
+fn a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-dense");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(45.0)
+            .audio(&["eng"]),
+    );
+    // A hundred and fifty overlapping cues packed into twenty seconds, which is what a
+    // typeset scene looks like: far more events than a minute-wide window can draw as spans.
+    let dense: String = (0..150)
+        .map(|n| {
+            let start = 20_000 + n * 130;
+            format!(
+                "{}\n00:00:{:02},{:03} --> 00:00:{:02},{:03}\nevent {n}\n\n",
+                n + 1,
+                start / 1000,
+                start % 1000,
+                (start + 600) / 1000,
+                (start + 600) % 1000,
+            )
+        })
+        .collect();
+    fs::write(scratch.join("clip.eng.srt"), dense).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // Act: to the end of the track, which is the densest part of it.
+    app.press(key(KeyCode::Char('G')));
+    app.pump();
+
+    // Assert: the axis no longer reaches back to the start of the media, because the window
+    // shortened around the selection rather than keeping the full minute.
+    let screen = app.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains("Timeline ("))
+        .expect("the timeline pane should be on screen");
+    let bottom = top
+        + 1
+        + lines[top + 1..]
+            .iter()
+            .position(|line| line.contains('┘'))
+            .expect("the timeline pane should be closed");
+    let ruler = lines[bottom - 1];
+    let readings: Vec<u64> = ruler
+        .split_whitespace()
+        .filter_map(|token| token.split_once(':'))
+        .filter_map(|(minutes, seconds)| {
+            Some(minutes.parse::<u64>().ok()? * 60 + seconds.parse::<u64>().ok()?)
+        })
+        .collect();
+    let selected_at = 20;
+    assert!(
+        readings.len() >= 2
+            && readings
+                .iter()
+                .all(|reading| reading.abs_diff(selected_at) <= 10),
+        "the axis should have closed in around the selection at {selected_at}s:\n{ruler}"
+    );
+
+    // Assert: and the cues in it are wide enough to read as spans rather than as marks.
+    // Every cue is still drawn in full — the shorter window is what buys the room, and
+    // nothing is demoted to make space.
+    let track = lines[top + 1..bottom - 1].join("\n");
+    assert!(
+        track.contains("|<──") && !track.contains("||||"),
+        "the cues in the window should be drawn as readable spans:\n{track}"
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
