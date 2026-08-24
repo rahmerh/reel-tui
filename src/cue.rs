@@ -119,7 +119,7 @@ pub fn on_screen_between(cues: &[Cue], at: usize, start: Duration, end: Duration
 /// though it were would make most of an ordinary dialogue track one continuous overlap.
 ///
 /// Its own function because two callers need the rule for spans that are *not* a cue's:
-/// [`on_screen_between`] asks it of a playback's stretch, and the timing page asks it of a
+/// [`on_screen_between`] asks it of a playback's stretch, and the subtitle edit page asks it of a
 /// cue's span before and after a nudge, to find whose pictures the move invalidated.
 pub fn shares_screen(cue: &Cue, start: Duration, end: Duration) -> bool {
     cue.start < end && cue.end > start
@@ -148,7 +148,7 @@ fn ordered(mut cues: Vec<Cue>) -> Vec<Cue> {
 ///
 /// **One visible line is often many events.** A typeset or karaoke line is routinely a dozen
 /// `Dialogue:` events sharing a timing and a set of words, each carrying a different
-/// override tag so that together they animate; the reader sees one line, and the timing page
+/// override tag so that together they animate; the reader sees one line, and the subtitle edit page
 /// showed a dozen identical rows, each previewing a fraction of the picture. Folding them
 /// makes the row match what is on the screen: one entry, one frame, one span to play.
 ///
@@ -279,7 +279,7 @@ pub fn read_srt(path: &Path) -> std::io::Result<Vec<Cue>> {
     Ok(parse_srt(&String::from_utf8_lossy(&bytes)))
 }
 
-/// An ASS script split into the parts the timing page needs.
+/// An ASS script split into the parts the subtitle edit page needs.
 ///
 /// The cues alone are not enough to draw one. An ASS cue names a *style* rather than
 /// carrying one, and positions itself against the script's declared `PlayResX`/`PlayResY`

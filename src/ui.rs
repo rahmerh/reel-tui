@@ -37,9 +37,8 @@ use crate::{
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
-    sync::{
-        GROUP_COLUMNS, SYNC_CONNECTOR_ROWS, SYNC_FORK_ROWS, SubtitleSyncState, SyncStatus,
-        WarmState,
+    subtitle_edit::{
+        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, GROUP_COLUMNS, LoadStatus, SubtitleEditState, WarmState,
     },
 };
 
@@ -87,8 +86,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // The one view that replaces the whole frame rather than drawing over the file list.
-    if app.layer == Layer::SubtitleSync {
-        render_subtitle_sync(frame, app, area);
+    if app.layer == Layer::SubtitleEdit {
+        render_subtitle_edit(frame, app, area);
         if let Some(dialog) = app.dialog {
             dim_backdrop(frame);
             render_dialog(frame, app, dialog);
@@ -118,22 +117,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Draws the subtitle timing page over the entire frame.
+/// Draws the subtitle edit page over the entire frame.
 ///
 /// Only the cue list is built out so far; the timeline track and the video preview take
 /// the space below and above it once they exist.
 /// Rows one cue's block occupies: two borders with a line of text between them. The
 /// timing rides on the top border, which is what keeps a cue down to three rows.
-const SYNC_CUE_BLOCK_ROWS: u16 = crate::sync::SYNC_BLOCK_ROWS as u16;
+const CUE_BLOCK_ROWS: u16 = crate::subtitle_edit::CUE_BLOCK_ROWS as u16;
 
 /// Columns the cue panel needs to show " 00:00:05.0 → 00:00:07.0 " on a block's top
 /// border, plus that block's corners and the panel's own borders. Its content is
 /// fixed-format, so it gets a floor rather than a share of the width.
-const SYNC_CUE_PANEL_WIDTH: u16 = 30;
+const CUE_PANEL_WIDTH: u16 = 30;
 
 /// Rows the timeline track spends on everything that is not a lane: its two borders and
 /// the time axis beneath the lanes.
-const SYNC_TRACK_CHROME: u16 = 3;
+const TIMELINE_CHROME: u16 = 3;
 
 /// Seconds between the axis's ticks, longest first.
 ///
@@ -148,14 +147,14 @@ const TICKS: [u64; 6] = [30, 15, 10, 5, 2, 1];
 /// Readings the axis aims for. Six is what a sixty-second window has always shown.
 const TICK_TARGET: u64 = 6;
 
-/// Draws the subtitle timing page over the entire frame.
+/// Draws the subtitle edit page over the entire frame.
 ///
 /// Three panes: the frame at the selected cue on the left, the cue list on the right, and
 /// the timeline track across the bottom. The track's height follows the lane count, so a
 /// track whose cues never overlap spends one row on it and gives the rest to the preview.
-fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // Read before the page is borrowed, because `App`'s accessors take the whole of it
-    // while `subtitle_sync` is held mutably below.
+    // while `subtitle_edit` is held mutably below.
     let badge = playback_settings_badge(app.preview_settings(), app.preview_defaults());
     let dialog_open = app.dialog.is_some();
     // Which of this track's cues have been rewritten but not written out. Read here for the
@@ -165,21 +164,21 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // How far the selected cue has been moved, for the timeline's title. Read here for the
     // same reason `edited` is: it comes from the staged edits rather than from the page.
     let shift = app.selected_cue_shift().map(format_shift);
-    let Some(state) = app.subtitle_sync.as_mut() else {
+    let Some(state) = app.subtitle_edit.as_mut() else {
         return;
     };
 
     let message = match &state.status {
-        SyncStatus::Preparing => Some(("Reading cues…".to_string(), Color::Gray)),
-        SyncStatus::Empty => Some((
+        LoadStatus::Preparing => Some(("Reading cues…".to_string(), Color::Gray)),
+        LoadStatus::Empty => Some((
             "This subtitle track has no cues.".to_string(),
             Color::Yellow,
         )),
-        SyncStatus::Failed(message) => Some((message.clone(), Color::Red)),
-        SyncStatus::Ready => None,
+        LoadStatus::Failed(message) => Some((message.clone(), Color::Red)),
+        LoadStatus::Ready => None,
     };
     if let Some((message, color)) = message {
-        let block = Block::bordered().title(" Subtitle timing ");
+        let block = Block::bordered().title(" Subtitle edit ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
@@ -207,20 +206,20 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // The status row is charged to the same budget: it appears only while the background
     // frame pass has something to say, so on the sizes where it and the axis cannot both
     // fit, the axis gives way for as long as the pass runs and comes back when it ends.
-    let status = sync_status_line(state);
+    let status = edit_status_line(state);
     let status_height = u16::from(status.is_some());
     let lanes = state.layout.lane_count as u16;
-    let cue_panel_floor = SYNC_CUE_BLOCK_ROWS + 2;
+    let cue_panel_floor = CUE_BLOCK_ROWS + 2;
     let track_height = if area
         .height
-        .saturating_sub(lanes + SYNC_TRACK_CHROME + status_height)
+        .saturating_sub(lanes + TIMELINE_CHROME + status_height)
         >= cue_panel_floor
     {
-        lanes + SYNC_TRACK_CHROME
+        lanes + TIMELINE_CHROME
     } else {
-        lanes + SYNC_TRACK_CHROME - 1
+        lanes + TIMELINE_CHROME - 1
     };
-    let cue_width = (area.width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48);
+    let cue_width = (area.width * 35 / 100).clamp(CUE_PANEL_WIDTH, 48);
     let rows = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(track_height),
@@ -230,9 +229,9 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
-    render_sync_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
-    render_sync_cues(frame, state, columns[1], &edited);
-    render_sync_timeline(frame, state, shift, rows[1]);
+    render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
+    render_edit_cues(frame, state, columns[1], &edited);
+    render_edit_timeline(frame, state, shift, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -252,13 +251,13 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
 /// just furniture. A network mount is the exception: the frames are missing for a reason
 /// the user did not choose, so the page says so rather than leaving them wondering why
 /// this directory feels slower than the last one. **A pass that is running says so on the
-/// cue panel's border** (`render_sync_cues`), not here: it is a count of that panel's rows,
+/// cue panel's border** (`render_edit_cues`), not here: it is a count of that panel's rows,
 /// and it left this row occupied for the whole of a long pass, hiding the messages that are
 /// about what the reader is doing right now.
 ///
 /// This is a status line, not control help — the keybindings popup (`?`) remains the only
 /// place this application documents its keys.
-fn sync_status_line(state: &SubtitleSyncState) -> Option<(String, Color)> {
+fn edit_status_line(state: &SubtitleEditState) -> Option<(String, Color)> {
     // A cue that could not be drawn comes first. It is the only line here that explains
     // something the user is looking *at* — an empty pane under the cursor — where the
     // others describe work going on elsewhere, and it clears itself as soon as the cursor
@@ -339,7 +338,7 @@ fn playback_settings_badge(
 /// to fill that gap, and it read as a flicker rather than as a fallback: the picture is
 /// what the pane is for, so every cursor move flashed the line as plain text for a moment
 /// before the real frame replaced it. With the cues either side of the selection kept
-/// encoded and ready (`SubtitleSyncState::nearby_frame_targets`) there is usually no gap
+/// encoded and ready (`SubtitleEditState::nearby_frame_targets`) there is usually no gap
 /// left to fill, and the cue's text is on screen in the list beside this anyway.
 ///
 /// The one thing that *is* written here is a reason no frame will ever arrive — no libass,
@@ -347,9 +346,9 @@ fn playback_settings_badge(
 /// rather than as a flicker, and without it the pane is an unexplained empty box for a
 /// user whose build simply cannot do this. A failure on one *cue* is a different thing and
 /// goes to the status row, because it changes as the cursor moves.
-fn render_sync_preview(
+fn render_edit_preview(
     frame: &mut Frame,
-    state: &mut SubtitleSyncState,
+    state: &mut SubtitleEditState,
     area: Rect,
     badge: Option<&str>,
     dialog_open: bool,
@@ -479,15 +478,15 @@ impl GroupTiming {
 /// ordinary cue overlaps nothing and is a group of one, drawn exactly as it always was: a
 /// full-width block with the full `00:00:05.0 → 00:00:07.0` timing, and a `↓` to the next
 /// row. A group of several is drawn as a fork into two blocks side by side — see
-/// [`render_sync_group`], which owns everything that is new here.
+/// [`render_edit_group`], which owns everything that is new here.
 ///
 /// Rows are asked for by height rather than counted out by the caller: a lone cue is three
 /// rows and a group is six, so how many rows a screenful holds depends on which groups are
-/// in it and the arithmetic belongs where the group heights are (`SubtitleSyncState::
-/// sync_scroll`).
-fn render_sync_cues(
+/// in it and the arithmetic belongs where the group heights are (`SubtitleEditState::
+/// cue_scroll`).
+fn render_edit_cues(
     frame: &mut Frame,
-    state: &mut SubtitleSyncState,
+    state: &mut SubtitleEditState,
     area: Rect,
     edited: &BTreeSet<usize>,
 ) {
@@ -520,7 +519,7 @@ fn render_sync_cues(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    state.sync_scroll(usize::from(inner.height));
+    state.cue_scroll(usize::from(inner.height));
 
     let last = state.groups.len().saturating_sub(1);
     let timing = group_timing(&state.cues, inner.width / GROUP_COLUMNS as u16);
@@ -534,7 +533,7 @@ fn render_sync_cues(
         .skip(state.list_scroll)
         .take(state.list_rows)
     {
-        render_sync_group(
+        render_edit_group(
             frame,
             state,
             group,
@@ -544,7 +543,7 @@ fn render_sync_cues(
                 x: inner.x,
                 y: top,
                 width: inner.width,
-                // Saturating rather than guarded: `sync_scroll` above already limits the
+                // Saturating rather than guarded: `cue_scroll` above already limits the
                 // loop to the groups that start inside the panel, so a height of zero here
                 // is unreachable — and a zero-height group draws nothing, where the
                 // subtraction underflowing would panic.
@@ -568,7 +567,7 @@ fn render_sync_cues(
                 },
             );
         }
-        top += SYNC_CONNECTOR_ROWS as u16;
+        top += CUE_CONNECTOR_ROWS as u16;
     }
 }
 
@@ -587,14 +586,14 @@ fn render_sync_cues(
 /// without the list reflowing underneath.
 ///
 /// **Exactly two, however many the group holds**, because half a panel is the narrowest a
-/// block with a timing on it can be (`sync::GROUP_COLUMNS`). The fork's crossbar runs off
+/// block with a timing on it can be (`subtitle_edit::GROUP_COLUMNS`). The fork's crossbar runs off
 /// the panel's edge on whichever side the group reaches past what is drawn, and `h`/`l` page
 /// through it. That lives on the crossbar because the fork is part of the group rather than
 /// the connector into it, so it is drawn at every scroll position — a line that vanished
 /// when the list happened to scroll would be worse than none at all.
-fn render_sync_group(
+fn render_edit_group(
     frame: &mut Frame,
-    state: &SubtitleSyncState,
+    state: &SubtitleEditState,
     group: CueGroup,
     timing: GroupTiming,
     edited: &BTreeSet<usize>,
@@ -610,7 +609,7 @@ fn render_sync_group(
         return;
     };
     let [second] = rest else {
-        render_sync_cue(
+        render_edit_cue(
             frame,
             cue,
             first == state.selected,
@@ -633,13 +632,13 @@ fn render_sync_group(
     // smallest size `render` allows, the cue list gets two rows, and a fork drawn into them
     // would leave the cue under the cursor off screen entirely. The fork is decoration about
     // an arrangement the side-by-side blocks already show.
-    let fork_rows = if area.height > SYNC_FORK_ROWS as u16 + 1 {
-        SYNC_FORK_ROWS as u16
+    let fork_rows = if area.height > CUE_FORK_ROWS as u16 + 1 {
+        CUE_FORK_ROWS as u16
     } else {
         0
     };
     if fork_rows > 0 {
-        render_sync_fork(
+        render_edit_fork(
             frame,
             Rect {
                 height: fork_rows,
@@ -657,7 +656,7 @@ fn render_sync_group(
     let step = u16::from(second.start > cue.start);
     for (offset, (position, cue)) in [(first, cue), (first + 1, second)].into_iter().enumerate() {
         let y = blocks + step * offset as u16;
-        render_sync_cue(
+        render_edit_cue(
             frame,
             cue,
             position == state.selected,
@@ -667,7 +666,7 @@ fn render_sync_group(
                 x: area.x + if offset == 0 { 0 } else { left_width },
                 y,
                 width: if offset == 0 { left_width } else { right_width },
-                height: SYNC_CUE_BLOCK_ROWS.min(area.bottom().saturating_sub(y)),
+                height: CUE_BLOCK_ROWS.min(area.bottom().saturating_sub(y)),
             },
         );
     }
@@ -683,7 +682,7 @@ fn render_sync_group(
 /// corner over the outer block becomes a `┬`, so the eye reads a line continuing past the
 /// wall — the same thing a cut-off diagram says. A `‹`/`›` had to be noticed and then
 /// decoded; the line needs neither, and it costs no row of its own either way.
-fn render_sync_fork(
+fn render_edit_fork(
     frame: &mut Frame,
     area: Rect,
     left_width: u16,
@@ -770,7 +769,7 @@ fn render_sync_fork(
 /// how the row was built, so it is the one that gives way. At the sizes the panel is actually
 /// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
 /// fits, with the two titles' decorative spaces sharing the column where they meet.
-fn render_sync_cue(
+fn render_edit_cue(
     frame: &mut Frame,
     cue: &Cue,
     selected: bool,
@@ -844,9 +843,9 @@ fn render_sync_cue(
     );
 }
 
-fn render_sync_timeline(
+fn render_edit_timeline(
     frame: &mut Frame,
-    state: &SubtitleSyncState,
+    state: &SubtitleEditState,
     shift: Option<String>,
     area: Rect,
 ) {
@@ -864,7 +863,7 @@ fn render_sync_timeline(
     //
     // Parenthetical rather than separated by " · ": that separator is the house style for
     // inline control hints, which this page is forbidden from carrying, and
-    // `the_sync_page_should_not_carry_inline_control_hints` watches for it by name.
+    // `the_edit_page_should_not_carry_inline_control_hints` watches for it by name.
     //
     // The shift is appended only once the cue has actually moved, and it is what makes this
     // a readout rather than a label: after three presses the times alone cannot say whether
@@ -1367,7 +1366,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn details_selected_stream(app: &App) -> Option<usize> {
-    // Named layers rather than "anything but Files": the subtitle timing page replaces
+    // Named layers rather than "anything but Files": the subtitle edit page replaces
     // this pane entirely, so it has no track cursor to show here.
     (matches!(app.layer, Layer::Streams | Layer::StreamDetails) && app.dialog.is_none())
         .then_some(app.selected_stream)
@@ -2558,7 +2557,7 @@ fn render_cue_editor(frame: &mut Frame, app: &App) {
         return;
     };
     let timing = app
-        .subtitle_sync
+        .subtitle_edit
         .as_ref()
         .and_then(|state| state.cues.get(editor.cue))
         .map(|cue| {
@@ -2605,7 +2604,7 @@ fn render_cue_editor(frame: &mut Frame, app: &App) {
     frame.set_cursor_position((column, row));
 }
 
-/// "Leaving discards them" — the question `Esc` asks on the way off the timing page.
+/// "Leaving discards them" — the question `Esc` asks on the way off the subtitle edit page.
 fn render_confirm_leave_cues_dialog(frame: &mut Frame, app: &App) {
     let lines = vec![
         Line::from("Cue edits are staged but not written yet.").centered(),
@@ -2799,13 +2798,17 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
-    keybinding(&mut lines, "c", "Preview subtitle timing (SRT tracks)");
+    keybinding(
+        &mut lines,
+        "c",
+        "Edit a subtitle track: its text, its timing, and the frames they land on",
+    );
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
 
     // The page's navigation is the general `j/k`, `gg/G` and `Esc` above; this is the one
     // key it adds. It lives here because this popup is the only place the application
     // documents a key — see the no-inline-control-help rule in `AGENTS.md`.
-    keybindings_section(&mut lines, "Subtitle timing");
+    keybindings_section(&mut lines, "Subtitle editing");
     keybinding(
         &mut lines,
         "p",
@@ -4882,7 +4885,7 @@ fn setting_line(
     ])
 }
 
-/// How the timing page's scrub playback is done, for this session.
+/// How the subtitle edit page's scrub playback is done, for this session.
 ///
 /// Five stepped values and nothing else — no dropdowns, no text entry, no help panel — so
 /// this is the plainest use of the shared [`SettingsDialog`] in the application. A value
@@ -12754,15 +12757,15 @@ mod tests {
             .join("\n");
 
         // Assert
-        assert_that!(rendered.contains("Preview subtitle timing")).is_true();
+        assert_that!(rendered.contains("Edit a subtitle track")).is_true();
     }
 
-    /// The timing page is the only view that owns the whole frame. If it merely drew on
+    /// The subtitle edit page is the only view that owns the whole frame. If it merely drew on
     /// top, the file list and details pane would still be underneath it.
     #[test]
-    fn render_should_replace_the_whole_frame_with_the_subtitle_sync_page() {
+    fn render_should_replace_the_whole_frame_with_the_subtitle_edit_page() {
         // Arrange
-        let (mut app, directory) = test_app("sync-page", &["movie.mkv"]);
+        let (mut app, directory) = test_app("edit-page", &["movie.mkv"]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "format": {"format_name": "matroska,webm"},
@@ -12781,7 +12784,7 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
-        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
         // the page opens knowing it can never draw a frame and fills its pane with the
         // reason, which is a different view from the one these tests are about.
         app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
@@ -12792,8 +12795,8 @@ mod tests {
             ..crate::subtitle::ToolCapabilities::default()
         };
         app.set_preview_handles(Some(crate::preview::test_handles().handles));
-        app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
                 start: std::time::Duration::from_millis(62_300),
@@ -12823,9 +12826,9 @@ mod tests {
     }
 
     #[test]
-    fn the_sync_page_should_report_progress_and_emptiness_without_pretending_to_have_cues() {
+    fn the_edit_page_should_report_progress_and_emptiness_without_pretending_to_have_cues() {
         // Arrange
-        let (mut app, directory) = test_app("sync-states", &["movie.mkv"]);
+        let (mut app, directory) = test_app("edit-states", &["movie.mkv"]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "format": {"format_name": "matroska,webm"},
@@ -12844,7 +12847,7 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
-        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
         // the page opens knowing it can never draw a frame and fills its pane with the
         // reason, which is a different view from the one these tests are about.
         app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
@@ -12855,14 +12858,14 @@ mod tests {
             ..crate::subtitle::ToolCapabilities::default()
         };
         app.set_preview_handles(Some(crate::preview::test_handles().handles));
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Act / Assert: still reading.
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
         assert_that!(screen.contains("Reading cues")).is_true();
 
         // Act / Assert: read, but the track holds nothing.
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_prepared(Vec::new(), crate::preview::CueStyle::SubRip);
@@ -12870,7 +12873,7 @@ mod tests {
         assert_that!(screen.contains("no cues")).is_true();
 
         // Act / Assert: it went wrong, and says so.
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .fail("ffprobe said no".to_string());
@@ -12891,10 +12894,10 @@ mod tests {
     #[test]
     fn a_row_standing_for_several_entries_should_say_how_many() {
         // Arrange: one ordinary cue and one folded from four events.
-        let mut folded = sync_cue(2000, 3000, "wo");
+        let mut folded = edit_cue(2000, 3000, "wo");
         folded.events = 4;
         let (mut app, directory) =
-            sync_page_app("sync-count", vec![sync_cue(0, 1000, "fu"), folded]);
+            edit_page_app("edit-count", vec![edit_cue(0, 1000, "fu"), folded]);
 
         // Act
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
@@ -12905,7 +12908,7 @@ mod tests {
 
         // Act / Assert: and it survives the row being selected, which repaints the whole
         // block in the fill's own colours.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         let selected = drawn(80, 20, |frame| render(frame, &mut app));
         assert_that!(selected.contains("×4")).is_true();
 
@@ -12918,7 +12921,7 @@ mod tests {
         // Act / Assert: and a count too wide to sit beside the timing gives way rather than
         // painting over the end time. Ratatui does not arbitrate between overlapping titles,
         // so without this the row would read a plausible, wrong timestamp.
-        app.subtitle_sync.as_mut().unwrap().cues[1].events = 100_000;
+        app.subtitle_edit.as_mut().unwrap().cues[1].events = 100_000;
         let crowded = drawn(50, 20, |frame| render(frame, &mut app));
         assert_that!(crowded.contains("00:00:02.0 → 00:00:03.0")).is_true();
         assert_that!(crowded.contains("×100000")).is_false();
@@ -12932,7 +12935,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    fn sync_cue(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+    fn edit_cue(start: u64, end: u64, text: &str) -> crate::cue::Cue {
         crate::cue::Cue {
             index: 0,
             start: std::time::Duration::from_millis(start),
@@ -12943,8 +12946,8 @@ mod tests {
         }
     }
 
-    /// An app sitting on the timing page with `cues` loaded, ready to render.
-    fn sync_page_app(tag: &str, cues: Vec<crate::cue::Cue>) -> (App, std::path::PathBuf) {
+    /// An app sitting on the subtitle edit page with `cues` loaded, ready to render.
+    fn edit_page_app(tag: &str, cues: Vec<crate::cue::Cue>) -> (App, std::path::PathBuf) {
         let (mut app, directory) = test_app(tag, &["movie.mkv"]);
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
@@ -12964,7 +12967,7 @@ mod tests {
             .iter()
             .position(|row| matches!(row, TrackRef::Embedded(1)))
             .unwrap();
-        // Both gates `open_subtitle_sync` reads to decide `PreviewSupport`. Without them
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
         // the page opens knowing it can never draw a frame and fills its pane with the
         // reason, which is a different view from the one these tests are about.
         app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
@@ -12975,8 +12978,8 @@ mod tests {
             ..crate::subtitle::ToolCapabilities::default()
         };
         app.set_preview_handles(Some(crate::preview::test_handles().handles));
-        app.open_subtitle_sync();
-        app.subtitle_sync
+        app.open_subtitle_edit();
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_prepared(cues, crate::preview::CueStyle::SubRip);
@@ -12987,7 +12990,7 @@ mod tests {
     /// by characters rather than bytes: the panel is drawn almost entirely in box-drawing
     /// glyphs, none of which is one byte wide.
     fn cue_panel(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        let panel = usize::from((width * 35 / 100).clamp(SYNC_CUE_PANEL_WIDTH, 48));
+        let panel = usize::from((width * 35 / 100).clamp(CUE_PANEL_WIDTH, 48));
         draw(app, width, height)
             .iter()
             .map(|line| {
@@ -13007,18 +13010,18 @@ mod tests {
 
     /// The panel used to draw two cues that share the screen exactly as it drew two that
     /// follow one another, so it said nothing at all about the one relationship a subtitle
-    /// timing page exists to show. A fork into two blocks side by side is the answer, and
+    /// subtitle edit page exists to show. A fork into two blocks side by side is the answer, and
     /// the block that starts later sits a row lower.
     #[test]
     fn overlapping_cues_should_be_drawn_as_a_fork_into_two_blocks_side_by_side() {
         // Arrange: a lone cue, then two that overlap, then a lone cue.
-        let (mut app, directory) = sync_page_app(
-            "sync-fork",
+        let (mut app, directory) = edit_page_app(
+            "edit-fork",
             vec![
-                sync_cue(1000, 3000, "Before this"),
-                sync_cue(5000, 7000, "Hello there"),
-                sync_cue(6000, 8000, "[sign: BAKERY]"),
-                sync_cue(12000, 14000, "After that"),
+                edit_cue(1000, 3000, "Before this"),
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(6000, 8000, "[sign: BAKERY]"),
+                edit_cue(12000, 14000, "After that"),
             ],
         );
 
@@ -13051,11 +13054,11 @@ mod tests {
     #[test]
     fn cues_that_begin_together_should_be_drawn_level_rather_than_stepped() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-level",
+        let (mut app, directory) = edit_page_app(
+            "edit-level",
             vec![
-                sync_cue(5000, 7000, "Hello there"),
-                sync_cue(5000, 8000, "[sign: BAKERY]"),
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(5000, 8000, "[sign: BAKERY]"),
             ],
         );
 
@@ -13081,12 +13084,12 @@ mod tests {
     #[test]
     fn a_group_reaching_past_its_two_visible_cues_should_run_its_bar_off_that_side() {
         // Arrange: three cues sharing a moment.
-        let (mut app, directory) = sync_page_app(
-            "sync-more",
+        let (mut app, directory) = edit_page_app(
+            "edit-more",
             vec![
-                sync_cue(5000, 9000, "first"),
-                sync_cue(6000, 9000, "second"),
-                sync_cue(7000, 9000, "third"),
+                edit_cue(5000, 9000, "first"),
+                edit_cue(6000, 9000, "second"),
+                edit_cue(7000, 9000, "third"),
             ],
         );
 
@@ -13101,8 +13104,8 @@ mod tests {
         assert_that!(draw(&mut app, 120, 30).join("\n").contains("│ third")).is_false();
 
         // Act / Assert: two presses turn the page, and the bar turns round with it.
-        app.move_sync_cue_within_group(1);
-        app.move_sync_cue_within_group(1);
+        app.move_cue_within_group(1);
+        app.move_cue_within_group(1);
         let bar = fork_bar(&mut app);
         assert_that!(bar.first().copied()).is_equal_to(Some('─'));
         assert_that!(bar.last().copied()).is_equal_to(Some(' '));
@@ -13123,32 +13126,32 @@ mod tests {
     #[test]
     fn moving_sideways_should_cross_the_page_before_turning_it() {
         // Arrange: four cues sharing a moment.
-        let (mut app, directory) = sync_page_app(
-            "sync-pages",
+        let (mut app, directory) = edit_page_app(
+            "edit-pages",
             vec![
-                sync_cue(5000, 9000, "first"),
-                sync_cue(6000, 9000, "second"),
-                sync_cue(7000, 9000, "third"),
-                sync_cue(8000, 9000, "fourth"),
+                edit_cue(5000, 9000, "first"),
+                edit_cue(6000, 9000, "second"),
+                edit_cue(7000, 9000, "third"),
+                edit_cue(8000, 9000, "fourth"),
             ],
         );
-        let group = app.subtitle_sync.as_ref().unwrap().groups[0];
+        let group = app.subtitle_edit.as_ref().unwrap().groups[0];
 
         // Act / Assert: the first press stays on the page it is on.
-        app.move_sync_cue_within_group(1);
-        let state = app.subtitle_sync.as_ref().unwrap();
+        app.move_cue_within_group(1);
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(state.selected).is_equal_to(1);
         assert_that!(state.group_window(group)).is_equal_to((0, 2));
 
         // Act / Assert: the second turns the page, landing on its left member.
-        app.move_sync_cue_within_group(1);
-        let state = app.subtitle_sync.as_ref().unwrap();
+        app.move_cue_within_group(1);
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(state.selected).is_equal_to(2);
         assert_that!(state.group_window(group)).is_equal_to((2, 2));
 
         // Act / Assert: and back the same way.
-        app.move_sync_cue_within_group(-1);
-        let state = app.subtitle_sync.as_ref().unwrap();
+        app.move_cue_within_group(-1);
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(state.selected).is_equal_to(1);
         assert_that!(state.group_window(group)).is_equal_to((0, 2));
 
@@ -13166,11 +13169,11 @@ mod tests {
     fn a_grouped_block_should_fall_back_to_the_start_alone_when_a_span_will_not_fit() {
         // Arrange: two overlapping cues an hour into the media, so the compact span needs
         // its hours field and becomes too wide for half a panel.
-        let (mut app, directory) = sync_page_app(
-            "sync-hours",
+        let (mut app, directory) = edit_page_app(
+            "edit-hours",
             vec![
-                sync_cue(3_605_000, 3_607_000, "Hello there"),
-                sync_cue(3_606_000, 3_608_000, "[sign: BAKERY]"),
+                edit_cue(3_605_000, 3_607_000, "Hello there"),
+                edit_cue(3_606_000, 3_608_000, "[sign: BAKERY]"),
             ],
         );
 
@@ -13191,16 +13194,16 @@ mod tests {
     #[test]
     fn the_timeline_should_grow_a_row_per_lane_and_take_them_from_the_preview() {
         // Arrange: one track whose cues never overlap, one where three do.
-        let (mut flat, flat_dir) = sync_page_app(
-            "sync-lanes-flat",
-            vec![sync_cue(0, 1000, "a"), sync_cue(2000, 3000, "b")],
+        let (mut flat, flat_dir) = edit_page_app(
+            "edit-lanes-flat",
+            vec![edit_cue(0, 1000, "a"), edit_cue(2000, 3000, "b")],
         );
-        let (mut stacked, stacked_dir) = sync_page_app(
-            "sync-lanes-stacked",
+        let (mut stacked, stacked_dir) = edit_page_app(
+            "edit-lanes-stacked",
             vec![
-                sync_cue(0, 5000, "a"),
-                sync_cue(1000, 6000, "b"),
-                sync_cue(2000, 7000, "c"),
+                edit_cue(0, 5000, "a"),
+                edit_cue(1000, 6000, "b"),
+                edit_cue(2000, 7000, "c"),
             ],
         );
 
@@ -13209,10 +13212,10 @@ mod tests {
         let stacked_screen = drawn(80, 24, |frame| render(frame, &mut stacked));
 
         // Assert: one lane against three, so the preview pane loses two rows.
-        assert_that!(flat.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(1);
-        assert_that!(stacked.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(3);
-        let flat_preview = flat.subtitle_sync.as_ref().unwrap().preview_cells.height;
-        let stacked_preview = stacked.subtitle_sync.as_ref().unwrap().preview_cells.height;
+        assert_that!(flat.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(1);
+        assert_that!(stacked.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(3);
+        let flat_preview = flat.subtitle_edit.as_ref().unwrap().preview_cells.height;
+        let stacked_preview = stacked.subtitle_edit.as_ref().unwrap().preview_cells.height;
         assert_that!(flat_preview - stacked_preview).is_equal_to(2);
         assert_that!(flat_screen.contains("Timeline")).is_true();
         assert_that!(stacked_screen.contains("Timeline")).is_true();
@@ -13307,10 +13310,10 @@ mod tests {
     #[test]
     fn the_preview_pane_should_draw_the_frame_the_worker_rendered() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-frame", vec![sync_cue(0, 1000, "spoken")]);
+        let (mut app, directory) = edit_page_app("edit-frame", vec![edit_cue(0, 1000, "spoken")]);
         drawn(80, 24, |frame| render(frame, &mut app));
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        app.subtitle_sync
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_frame(0, striped_protocol(cells.width, cells.height));
@@ -13347,10 +13350,10 @@ mod tests {
     fn a_dialog_over_the_preview_should_take_the_picture_down_rather_than_sit_on_it() {
         // Arrange: a page with a frame on screen.
         let (mut app, directory) =
-            sync_page_app("sync-frame-dialog", vec![sync_cue(0, 1000, "spoken")]);
+            edit_page_app("edit-frame-dialog", vec![edit_cue(0, 1000, "spoken")]);
         drawn(80, 24, |frame| render(frame, &mut app));
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        app.subtitle_sync
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_frame(0, striped_protocol(cells.width, cells.height));
@@ -13394,10 +13397,10 @@ mod tests {
     fn a_frame_too_big_for_the_pane_should_be_left_out_rather_than_drawn() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-frame-big", vec![sync_cue(0, 1000, "spoken")]);
+            edit_page_app("edit-frame-big", vec![edit_cue(0, 1000, "spoken")]);
         drawn(80, 24, |frame| render(frame, &mut app));
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        app.subtitle_sync
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_frame(0, striped_protocol(cells.width + 10, cells.height + 10));
@@ -13425,8 +13428,9 @@ mod tests {
     fn a_build_that_cannot_draw_frames_should_say_so_in_the_pane() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-unsupported", vec![sync_cue(0, 1000, "spoken")]);
-        app.subtitle_sync.as_mut().unwrap().support = crate::sync::PreviewSupport::NoSubtitleBurn;
+            edit_page_app("edit-unsupported", vec![edit_cue(0, 1000, "spoken")]);
+        app.subtitle_edit.as_mut().unwrap().support =
+            crate::subtitle_edit::PreviewSupport::NoSubtitleBurn;
 
         // Act
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
@@ -13449,8 +13453,9 @@ mod tests {
     #[test]
     fn a_terminal_that_cannot_show_images_should_say_that_instead() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-no-protocol", vec![sync_cue(0, 1000, "a")]);
-        app.subtitle_sync.as_mut().unwrap().support = crate::sync::PreviewSupport::NoImageProtocol;
+        let (mut app, directory) = edit_page_app("edit-no-protocol", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().support =
+            crate::subtitle_edit::PreviewSupport::NoImageProtocol;
 
         // Act
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
@@ -13471,11 +13476,11 @@ mod tests {
     #[test]
     fn a_cue_that_could_not_be_drawn_should_report_on_the_status_row() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-cue-failure",
-            vec![sync_cue(0, 1000, "first"), sync_cue(2000, 3000, "second")],
+        let (mut app, directory) = edit_page_app(
+            "edit-cue-failure",
+            vec![edit_cue(0, 1000, "first"), edit_cue(2000, 3000, "second")],
         );
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .fail_frame(0, "Could not draw this frame: no such file".to_string());
@@ -13490,7 +13495,7 @@ mod tests {
         assert_that!(image_shades(&painted).is_empty()).is_true();
 
         // Act / Assert: moving to a cue the failure says nothing about drops it.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         let moved = drawn(80, 24, |frame| render(frame, &mut app));
         assert_that!(&moved).does_not_contain("Could not draw this frame");
 
@@ -13507,7 +13512,7 @@ mod tests {
     fn a_pane_with_no_frame_should_stay_empty_rather_than_flash_the_cue_text() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-frame-gap", vec![sync_cue(0, 1000, "spoken")]);
+            edit_page_app("edit-frame-gap", vec![edit_cue(0, 1000, "spoken")]);
 
         // Act: drawn before any frame has been rendered, which is the gap in question.
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
@@ -13526,8 +13531,8 @@ mod tests {
     #[test]
     fn rendering_should_report_the_measured_preview_size_back_to_the_page() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-measure", vec![sync_cue(0, 1000, "a")]);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().preview_cells)
+        let (mut app, directory) = edit_page_app("edit-measure", vec![edit_cue(0, 1000, "a")]);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preview_cells)
             .is_equal_to(ratatui::layout::Size::new(0, 0));
 
         // Act
@@ -13536,7 +13541,7 @@ mod tests {
         // Assert: 80 columns less the cue panel's floor width, less the pane's own
         // borders, and the rows left after the track takes its lane, its two borders and
         // its time axis.
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
         assert_that!(cells.width).is_equal_to(48);
         assert_that!(cells.height).is_equal_to(18);
 
@@ -13550,14 +13555,14 @@ mod tests {
     #[test]
     fn the_selected_cue_should_be_marked_in_the_list_and_highlighted_in_the_track() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-selection",
+        let (mut app, directory) = edit_page_app(
+            "edit-selection",
             vec![
-                sync_cue(1000, 3000, "first"),
-                sync_cue(5000, 7000, "second"),
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
             ],
         );
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
 
         // Act
         let mut terminal =
@@ -13611,13 +13616,13 @@ mod tests {
     #[test]
     fn the_page_should_stay_usable_at_the_smallest_size_render_allows() {
         // Arrange: four mutually overlapping cues, so the track claims six rows.
-        let (mut app, directory) = sync_page_app(
-            "sync-cramped",
+        let (mut app, directory) = edit_page_app(
+            "edit-cramped",
             vec![
-                sync_cue(0, 9000, "a"),
-                sync_cue(100, 9000, "bcdef"),
-                sync_cue(200, 9000, "c"),
-                sync_cue(300, 9000, "d"),
+                edit_cue(0, 9000, "a"),
+                edit_cue(100, 9000, "bcdef"),
+                edit_cue(200, 9000, "c"),
+                edit_cue(300, 9000, "d"),
             ],
         );
 
@@ -13626,7 +13631,7 @@ mod tests {
 
         // Assert: every pane is still drawn, and the cue panel is wide enough that a
         // timestamp survives whole rather than being truncated away.
-        assert_that!(app.subtitle_sync.as_ref().unwrap().layout.lane_count).is_equal_to(4);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(4);
         assert_that!(screen.contains("Preview")).is_true();
         assert_that!(screen.contains("Cues")).is_true();
         assert_that!(screen.contains("Timeline")).is_true();
@@ -13638,7 +13643,7 @@ mod tests {
         assert_that!(screen.contains("┌ 0:00.1 ")).is_true();
         // With room to spare after it, so the panel's floor width is doing its job.
         assert_that!(screen.contains("0:00.0 ─")).is_true();
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
         assert_that!(cells.width > 0 && cells.height > 0).is_true();
 
         // Act / Assert: four lanes plus an axis do not fit alongside a whole cue block, so
@@ -13667,7 +13672,7 @@ mod tests {
     fn the_axis_should_still_mark_a_cue_that_outruns_the_window() {
         // Arrange: two minutes of dialogue in a window that shows one.
         let (mut app, directory) =
-            sync_page_app("sync-long-cue", vec![sync_cue(0, 120_000, "a long one")]);
+            edit_page_app("edit-long-cue", vec![edit_cue(0, 120_000, "a long one")]);
 
         // Act
         let painted = drawn_cells(100, 24, |frame| render(frame, &mut app));
@@ -13690,15 +13695,15 @@ mod tests {
     #[test]
     fn each_cue_should_be_a_block_the_selection_fills() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-blocks",
+        let (mut app, directory) = edit_page_app(
+            "edit-blocks",
             vec![
-                sync_cue(1000, 3000, "first"),
-                sync_cue(5000, 7000, "second"),
-                sync_cue(9000, 11_000, "third"),
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+                edit_cue(9000, 11_000, "third"),
             ],
         );
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
 
         // Act
         let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
@@ -13746,12 +13751,12 @@ mod tests {
     #[test]
     fn an_arrow_should_lead_from_each_cue_to_the_next_but_not_past_the_last() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-arrows",
+        let (mut app, directory) = edit_page_app(
+            "edit-arrows",
             vec![
-                sync_cue(1000, 3000, "first"),
-                sync_cue(5000, 7000, "second"),
-                sync_cue(9000, 11_000, "third"),
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+                edit_cue(9000, 11_000, "third"),
             ],
         );
 
@@ -13763,7 +13768,7 @@ mod tests {
 
         // Act / Assert: and a single cue has none at all.
         let (mut lone, lone_directory) =
-            sync_page_app("sync-one-arrow", vec![sync_cue(1000, 3000, "only")]);
+            edit_page_app("edit-one-arrow", vec![edit_cue(1000, 3000, "only")]);
         let screen = drawn(80, 24, |frame| render(frame, &mut lone));
         assert_that!(screen.contains('↓')).is_false();
 
@@ -13780,15 +13785,15 @@ mod tests {
     fn the_panel_should_fit_a_block_in_the_rows_the_last_arrow_does_not_need() {
         // Arrange: cues enough to overflow any panel this test renders.
         let cues = (0..8)
-            .map(|index| sync_cue(index * 2000, index * 2000 + 1000, "x"))
+            .map(|index| edit_cue(index * 2000, index * 2000 + 1000, "x"))
             .collect();
-        let (mut app, directory) = sync_page_app("sync-fit", cues);
+        let (mut app, directory) = edit_page_app("edit-fit", cues);
 
         // Act / Assert: the panel's inner height is the page height less the track and the
         // panel's own borders, so these two sizes bracket the arrow-free last block.
         for (height, blocks) in [(20, 3), (21, 4)] {
             drawn(80, height, |frame| render(frame, &mut app));
-            assert_that!(app.subtitle_sync.as_ref().unwrap().list_rows).is_equal_to(blocks);
+            assert_that!(app.subtitle_edit.as_ref().unwrap().list_rows).is_equal_to(blocks);
         }
 
         // Cleanup
@@ -13802,11 +13807,11 @@ mod tests {
     #[test]
     fn the_timeline_title_should_carry_the_selected_cues_exact_span_and_follow_it() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-title",
+        let (mut app, directory) = edit_page_app(
+            "edit-title",
             vec![
-                sync_cue(1500, 3200, "first"),
-                sync_cue(9000, 11_500, "second"),
+                edit_cue(1500, 3200, "first"),
+                edit_cue(9000, 11_500, "second"),
             ],
         );
 
@@ -13835,9 +13840,9 @@ mod tests {
     /// AGENTS.md forbids per-view keybinding hints; the global `?` popup is the only
     /// place controls are documented. This keeps that from being undone by accident.
     #[test]
-    fn the_sync_page_should_not_carry_inline_control_hints() {
+    fn the_edit_page_should_not_carry_inline_control_hints() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-no-hints", vec![sync_cue(0, 1000, "a")]);
+        let (mut app, directory) = edit_page_app("edit-no-hints", vec![edit_cue(0, 1000, "a")]);
 
         // Act
         let screen = drawn(100, 24, |frame| render(frame, &mut app));
@@ -13899,7 +13904,7 @@ mod tests {
     fn the_axis_should_read_out_absolute_time_every_ten_seconds() {
         // Arrange: a minute of a ten-minute file, starting somewhere untidy.
         let window = window_over(52, 112, 76);
-        let cue = sync_cue(80_000, 84_000, "x");
+        let cue = edit_cue(80_000, 84_000, "x");
 
         // Act
         let text = ruler_text(&window, &cue);
@@ -13936,7 +13941,7 @@ mod tests {
     fn an_axis_reaching_past_an_hour_should_carry_hours_on_every_reading() {
         // Arrange: a window straddling the hour mark.
         let window = window_over(3570, 3630, 90);
-        let cue = sync_cue(3_600_000, 3_602_000, "x");
+        let cue = edit_cue(3_600_000, 3_602_000, "x");
 
         // Act
         let text = ruler_text(&window, &cue);
@@ -13954,7 +13959,7 @@ mod tests {
     fn a_reading_that_cannot_be_drawn_clear_should_not_be_drawn_at_all() {
         // Arrange: the cue's ends fall right where 1:20's reading would go.
         let window = window_over(60, 120, 76);
-        let cue = sync_cue(80_000, 84_000, "x");
+        let cue = edit_cue(80_000, 84_000, "x");
 
         // Act
         let text = ruler_text(&window, &cue);
@@ -13990,7 +13995,7 @@ mod tests {
     fn readings_too_close_to_stand_apart_should_thin_out() {
         // Arrange: the smallest track `render` allows, on a film past the hour mark.
         let window = window_over(3600, 3660, 48);
-        let cue = sync_cue(3_610_000, 3_612_000, "x");
+        let cue = edit_cue(3_610_000, 3_612_000, "x");
 
         // Act
         let text = ruler_text(&window, &cue);
@@ -14020,7 +14025,7 @@ mod tests {
     fn the_axis_should_mark_the_selected_cue_under_its_bracket_ends() {
         // Arrange
         let window = window_over(60, 120, 76);
-        let cue = sync_cue(80_000, 84_000, "x");
+        let cue = edit_cue(80_000, 84_000, "x");
         let (first, last) = window.span(&cue).expect("the cue is inside the window");
 
         // Act
@@ -14034,7 +14039,7 @@ mod tests {
 
         // Arrange / Act: a cue longer than the window it is centred in, so both of its
         // ends fall outside and the bracket above is drawn clamped to the track edges.
-        let overflowing = sync_cue(30_000, 150_000, "x");
+        let overflowing = edit_cue(30_000, 150_000, "x");
         let text = ruler_text(&window, &overflowing);
 
         // Assert: the marks are clamped the same way, rather than disappearing with the
@@ -14072,7 +14077,7 @@ mod tests {
         let window = window_over(20, 28, 150);
 
         // Act
-        let text = ruler_text(&window, &sync_cue(24_000, 24_500, "x"));
+        let text = ruler_text(&window, &edit_cue(24_000, 24_500, "x"));
 
         // Assert
         assert_that!(text.contains("0:21")).is_true();
@@ -14083,7 +14088,7 @@ mod tests {
     fn an_axis_with_no_width_should_draw_nothing() {
         // Arrange
         let window = window_over(0, 60, 0);
-        let cue = sync_cue(0, 1000, "x");
+        let cue = edit_cue(0, 1000, "x");
 
         // Act
         let text = ruler_text(&window, &cue);
@@ -14095,7 +14100,7 @@ mod tests {
     #[test]
     fn timeline_lines_should_put_overlapping_cues_on_their_own_rows() {
         // Arrange
-        let cues = vec![sync_cue(0, 10_000, "a"), sync_cue(5000, 15_000, "b")];
+        let cues = vec![edit_cue(0, 10_000, "a"), edit_cue(5000, 15_000, "b")];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
             start: std::time::Duration::ZERO,
@@ -14121,7 +14126,7 @@ mod tests {
     #[test]
     fn timeline_lines_should_keep_a_cue_shorter_than_one_column() {
         // Arrange
-        let cues = vec![sync_cue(30_000, 30_100, "blink")];
+        let cues = vec![edit_cue(30_000, 30_100, "blink")];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
             start: std::time::Duration::ZERO,
@@ -14141,8 +14146,8 @@ mod tests {
     fn timeline_lines_should_skip_cues_outside_the_visible_window() {
         // Arrange: the second cue sits an hour later, far outside a 60 s window.
         let cues = vec![
-            sync_cue(1000, 3000, "here"),
-            sync_cue(3_600_000, 3_602_000, "later"),
+            edit_cue(1000, 3000, "here"),
+            edit_cue(3_600_000, 3_602_000, "later"),
         ];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
@@ -14170,7 +14175,7 @@ mod tests {
     #[test]
     fn the_timing_mode_should_swap_the_selected_cues_colour_with_the_playheads() {
         // Arrange: one cue with the playhead inside it, so both colours are on one lane.
-        let cues = vec![sync_cue(10_000, 20_000, "line")];
+        let cues = vec![edit_cue(10_000, 20_000, "line")];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
             start: std::time::Duration::ZERO,
@@ -14220,7 +14225,7 @@ mod tests {
     fn the_axis_marks_should_follow_the_selected_cue_into_the_timing_mode() {
         // Arrange
         let window = window_over(0, 60, 61);
-        let cue = sync_cue(10_000, 20_000, "line");
+        let cue = edit_cue(10_000, 20_000, "line");
         let colour_of_marks = |retiming: bool| {
             timeline_ruler(&window, window.span(&cue), retiming)
                 .spans
@@ -14250,7 +14255,7 @@ mod tests {
     fn timeline_lines_should_mark_a_crowded_cue_distinctly() {
         // Arrange: five mutually overlapping cues against a cap of four.
         let cues: Vec<_> = (0..5)
-            .map(|index| sync_cue(index * 100, 9000, "x"))
+            .map(|index| edit_cue(index * 100, 9000, "x"))
             .collect();
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
@@ -14274,15 +14279,15 @@ mod tests {
         // Cleanup: none.
     }
 
-    /// `Layer::SubtitleSync` and `subtitle_sync: Some(..)` are two pieces of state that
+    /// `Layer::SubtitleEdit` and `subtitle_edit: Some(..)` are two pieces of state that
     /// have to agree and nothing in the type system makes them. If they ever drift the
     /// page must draw nothing rather than panic mid-frame.
     #[test]
     fn the_page_should_draw_nothing_when_the_layer_outlives_its_state() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-orphan", vec![sync_cue(0, 1000, "a")]);
-        app.subtitle_sync = None;
-        app.layer = Layer::SubtitleSync;
+        let (mut app, directory) = edit_page_app("edit-orphan", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit = None;
+        app.layer = Layer::SubtitleEdit;
 
         // Act
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
@@ -14300,8 +14305,8 @@ mod tests {
     #[test]
     fn the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_underneath_it() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-emptied", vec![sync_cue(0, 1000, "a")]);
-        app.subtitle_sync.as_mut().unwrap().cues.clear();
+        let (mut app, directory) = edit_page_app("edit-emptied", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().cues.clear();
 
         // Act
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
@@ -14345,11 +14350,11 @@ mod tests {
     #[test]
     fn the_page_should_count_the_frames_being_generated_while_the_pass_runs() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-warming",
+        let (mut app, directory) = edit_page_app(
+            "edit-warming",
             vec![
-                sync_cue(1000, 3000, "first"),
-                sync_cue(5000, 7000, "second"),
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
             ],
         );
 
@@ -14357,12 +14362,12 @@ mod tests {
         assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("/2]")).is_false();
 
         // Act / Assert: counting while it runs...
-        app.subtitle_sync.as_mut().unwrap().apply_warming(3, 42);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(3, 42);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
         assert_that!(screen.contains("[3/42]")).is_true();
 
         // ...and silent again once it is over.
-        app.subtitle_sync.as_mut().unwrap().apply_warming(42, 42);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(42, 42);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
         assert_that!(screen.contains("[42/42]")).is_false();
 
@@ -14376,10 +14381,10 @@ mod tests {
     #[test]
     fn the_page_should_say_when_a_network_mount_is_why_there_are_no_frames() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-network", vec![sync_cue(1000, 3000, "one")]);
+        let (mut app, directory) = edit_page_app("edit-network", vec![edit_cue(1000, 3000, "one")]);
 
         // Act
-        app.subtitle_sync.as_mut().unwrap().warm = WarmState::OffForNetwork;
+        app.subtitle_edit.as_mut().unwrap().warm = WarmState::OffForNetwork;
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
         // Assert
@@ -14396,18 +14401,18 @@ mod tests {
     #[test]
     fn the_status_row_should_take_its_row_from_the_axis_rather_than_from_the_cue_list() {
         // Arrange: four lanes, which is the deepest track the timeline draws.
-        let (mut app, directory) = sync_page_app(
-            "sync-status-room",
+        let (mut app, directory) = edit_page_app(
+            "edit-status-room",
             vec![
-                sync_cue(0, 9000, "a"),
-                sync_cue(1000, 9000, "b"),
-                sync_cue(2000, 9000, "c"),
-                sync_cue(3000, 9000, "d"),
+                edit_cue(0, 9000, "a"),
+                edit_cue(1000, 9000, "b"),
+                edit_cue(2000, 9000, "c"),
+                edit_cue(3000, 9000, "d"),
             ],
         );
         // A message that stands for the whole status row: what is being tested is the row's
         // cost, and the running pass's count is on the cue panel's border rather than here.
-        app.subtitle_sync.as_mut().unwrap().warm = WarmState::OffForNetwork;
+        app.subtitle_edit.as_mut().unwrap().warm = WarmState::OffForNetwork;
 
         // Act / Assert: twelve rows fit the axis without the status line, and the status
         // line costs it — the cue block stays either way.
@@ -14434,11 +14439,11 @@ mod tests {
     #[test]
     fn the_cue_editor_should_draw_the_cue_it_is_editing() {
         // Arrange
-        let (mut app, directory) = sync_page_app(
-            "sync-editor",
+        let (mut app, directory) = edit_page_app(
+            "edit-editor",
             vec![
-                sync_cue(5000, 7000, "Hello there"),
-                sync_cue(9000, 11_000, "Later"),
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(9000, 11_000, "Later"),
             ],
         );
         app.open_cue_editor();
@@ -14467,7 +14472,7 @@ mod tests {
     fn the_cue_panel_should_count_the_edits_waiting_to_be_written() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-edited-count", vec![sync_cue(5000, 7000, "Hello")]);
+            edit_page_app("edit-edited-count", vec![edit_cue(5000, 7000, "Hello")]);
 
         // Act / Assert: nothing staged, nothing said.
         assert_that!(draw(&mut app, 100, 30).join("\n").contains("edited")).is_false();
@@ -14493,7 +14498,7 @@ mod tests {
     fn the_timeline_title_should_read_out_the_shift_while_a_cue_is_being_retimed() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-timing-title", vec![sync_cue(5000, 7000, "Hello")]);
+            edit_page_app("edit-timing-title", vec![edit_cue(5000, 7000, "Hello")]);
 
         // Act / Assert: unmoved, the title names the cue's times and no shift — "+0.00s" on
         // every cue the reader walks past would be a number that never changes.
@@ -14529,20 +14534,20 @@ mod tests {
     #[test]
     fn a_retimed_cue_should_be_counted_and_marked_like_a_rewritten_one() {
         // Arrange: two cues, so an untouched row is there to compare against.
-        let (mut app, directory) = sync_page_app(
-            "sync-retimed-mark",
+        let (mut app, directory) = edit_page_app(
+            "edit-retimed-mark",
             vec![
-                sync_cue(1000, 3000, "Untouched"),
-                sync_cue(5000, 7000, "Retimed"),
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Retimed"),
             ],
         );
 
         // Act: move the second cue, and put the cursor back on the first so the retimed row
         // is drawn unselected — where the cyan fill does not own its colours.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.toggle_cue_timing_mode();
         app.nudge_selected_cue(2);
-        app.subtitle_sync.as_mut().unwrap().select(-1);
+        app.subtitle_edit.as_mut().unwrap().select(-1);
 
         // Assert: counted on the border.
         let mut terminal =
@@ -14588,11 +14593,11 @@ mod tests {
     #[test]
     fn a_rewritten_cue_should_say_so_in_its_own_words() {
         // Arrange: two cues, so an untouched row is there to compare against.
-        let (mut app, directory) = sync_page_app(
-            "sync-edited-mark",
+        let (mut app, directory) = edit_page_app(
+            "edit-edited-mark",
             vec![
-                sync_cue(1000, 3000, "Untouched"),
-                sync_cue(5000, 7000, "Rewritten"),
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Rewritten"),
             ],
         );
 
@@ -14619,7 +14624,7 @@ mod tests {
         drop(rows);
 
         // Act: rewrite the second one.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.open_cue_editor();
         app.cue_editor_insert('!');
         app.close_cue_editor();
@@ -14640,7 +14645,7 @@ mod tests {
         );
 
         // And with the cursor off it, the colour carries the same thing the italic does.
-        app.subtitle_sync.as_mut().unwrap().select(-1);
+        app.subtitle_edit.as_mut().unwrap().select(-1);
         let (_, edited_cell) = row(&mut app, rewritten);
         let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
         assert_that!(edited_cell.fg).is_equal_to(Color::Yellow);
@@ -14658,11 +14663,11 @@ mod tests {
     #[test]
     fn the_page_should_say_that_a_playback_is_being_prepared() {
         // Arrange
-        let (mut app, directory) = sync_page_app("sync-preparing", vec![sync_cue(1000, 3000, "a")]);
-        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+        let (mut app, directory) = edit_page_app("edit-preparing", vec![edit_cue(1000, 3000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
 
         // Act
-        app.subtitle_sync.as_mut().unwrap().prepare_playback(0);
+        app.subtitle_edit.as_mut().unwrap().prepare_playback(0);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
         // Assert
@@ -14681,11 +14686,11 @@ mod tests {
     fn the_page_should_explain_a_playback_it_could_not_start() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-playback-failed", vec![sync_cue(1000, 3000, "a")]);
-        app.subtitle_sync.as_mut().unwrap().apply_warming(1, 4);
+            edit_page_app("edit-playback-failed", vec![edit_cue(1000, 3000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
 
         // Act
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .fail_playback(0, "Could not play this cue: no video".to_string());
@@ -14706,7 +14711,7 @@ mod tests {
     fn the_preview_settings_dialog_should_show_every_value_and_mark_the_changed_ones() {
         // Arrange: a config that asked for a lower rate than the built-in default, so the
         // *file's* answer is what an unchanged row has to show.
-        let (mut app, directory) = sync_page_app("preview-settings", vec![sync_cue(0, 2000, "a")]);
+        let (mut app, directory) = edit_page_app("preview-settings", vec![edit_cue(0, 2000, "a")]);
         app.set_preview_settings(crate::app::PreviewSettings {
             playback_fps: 24,
             ..crate::app::PreviewSettings::default()
@@ -14773,7 +14778,7 @@ mod tests {
     #[test]
     fn the_preview_help_panel_should_explain_whichever_row_the_cursor_is_on() {
         // Arrange
-        let (mut app, directory) = sync_page_app("preview-help", vec![sync_cue(0, 2000, "a")]);
+        let (mut app, directory) = edit_page_app("preview-help", vec![edit_cue(0, 2000, "a")]);
         app.open_preview_settings();
 
         // Act / Assert: nothing until asked for.
@@ -14866,7 +14871,7 @@ mod tests {
     #[test]
     fn the_preview_pane_should_name_only_the_settings_that_differ_from_the_config_file() {
         // Arrange
-        let (mut app, directory) = sync_page_app("preview-badge", vec![sync_cue(0, 2000, "a")]);
+        let (mut app, directory) = edit_page_app("preview-badge", vec![edit_cue(0, 2000, "a")]);
 
         // Act / Assert: nothing added to an untouched page.
         let plain = draw(&mut app, 140, 40).join(" ");
@@ -14937,10 +14942,10 @@ mod tests {
     fn the_preview_pane_should_show_the_playback_while_one_is_running() {
         // Arrange: a still frame on screen, painted a colour nothing else here draws.
         let (mut app, directory) =
-            sync_page_app("sync-playback-pane", vec![sync_cue(1000, 3000, "a")]);
+            edit_page_app("edit-playback-pane", vec![edit_cue(1000, 3000, "a")]);
         drawn(80, 24, |frame| render(frame, &mut app));
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
-        app.subtitle_sync
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_frame(0, still_frame(cells, [255, 0, 0]));
@@ -14960,7 +14965,7 @@ mod tests {
                 std::iter::repeat_n(shade, pixels.0 as usize * 3)
             })
             .collect();
-        app.subtitle_sync.as_mut().unwrap().begin_playback(
+        app.subtitle_edit.as_mut().unwrap().begin_playback(
             0,
             crate::preview::PlaybackFrames::new(
                 striped,
@@ -14988,7 +14993,7 @@ mod tests {
         assert_that!(playing == still).is_false();
 
         // Act / Assert: and when the playback ends, the still frame is back.
-        app.subtitle_sync.as_mut().unwrap().stop_playback();
+        app.subtitle_edit.as_mut().unwrap().stop_playback();
         assert_that!(drawn(80, 24, |frame| render(frame, &mut app))).is_equal_to(still);
 
         // Cleanup
@@ -15003,7 +15008,7 @@ mod tests {
     #[test]
     fn the_playhead_should_mark_where_the_sound_is_across_every_lane() {
         // Arrange: two overlapping cues, so the track has two lanes to cross.
-        let cues = [sync_cue(10_000, 20_000, "a"), sync_cue(15_000, 25_000, "b")];
+        let cues = [edit_cue(10_000, 20_000, "a"), edit_cue(15_000, 25_000, "b")];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
             start: std::time::Duration::ZERO,
@@ -15042,7 +15047,7 @@ mod tests {
     #[test]
     fn a_playhead_outside_the_visible_window_should_not_be_drawn() {
         // Arrange
-        let cues = [sync_cue(10_000, 20_000, "a")];
+        let cues = [edit_cue(10_000, 20_000, "a")];
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = crate::cue::TimelineWindow {
             start: std::time::Duration::from_secs(10),
@@ -15068,7 +15073,7 @@ mod tests {
     fn the_page_should_draw_a_playhead_while_a_span_is_playing() {
         // Arrange
         let (mut app, directory) =
-            sync_page_app("sync-playhead", vec![sync_cue(10_000, 20_000, "a")]);
+            edit_page_app("edit-playhead", vec![edit_cue(10_000, 20_000, "a")]);
         // Counted rather than searched for: `│` is also ratatui's vertical border glyph, so
         // the page is full of them before anything plays. The layout does not change here —
         // a playing page shows no status row, the same as an idle one — so any increase is
@@ -15078,13 +15083,13 @@ mod tests {
             .count();
 
         // Act: a span starting where the cue does, stepped onto its first frame.
-        let cells = app.subtitle_sync.as_ref().unwrap().preview_cells;
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
         let picker = ratatui_image::picker::Picker::halfblocks();
         let playback_cells =
             crate::preview::playback_cells(cells, (1920, 1080), picker.font_size());
         let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
         let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
-        app.subtitle_sync.as_mut().unwrap().begin_playback(
+        app.subtitle_edit.as_mut().unwrap().begin_playback(
             0,
             crate::preview::PlaybackFrames::new(
                 vec![40; stride * 20],
@@ -15114,7 +15119,7 @@ mod tests {
         assert_that!(playing).is_equal_to(before + 1);
 
         // Act / Assert: and it goes when the playback does.
-        app.subtitle_sync.as_mut().unwrap().stop_playback();
+        app.subtitle_edit.as_mut().unwrap().stop_playback();
         let stopped = drawn(80, 24, |frame| render(frame, &mut app))
             .matches('│')
             .count();

@@ -17,16 +17,16 @@ pub struct Config {
     pub remux_workers: usize,
     pub network_transcode_workers: usize,
     pub network_remux_workers: usize,
-    /// How many media files' preview frames the timing page's cache may hold before the
+    /// How many media files' preview frames the subtitle edit page's cache may hold before the
     /// least recently used one is dropped.
     pub preview_cache_tracks: usize,
-    /// Whether opening the timing page renders every cue's frame in the background.
+    /// Whether opening the subtitle edit page renders every cue's frame in the background.
     pub preview_prefetch: bool,
     /// The same, for media on a network mount. Off by default: a feature-length track is
     /// a thousand-odd accurate seeks, and doing that across NFS or SMB unasked is not a
     /// trade the user made.
     pub network_preview_prefetch: bool,
-    /// How many frames a second the timing page's scrub playback aims for.
+    /// How many frames a second the subtitle edit page's scrub playback aims for.
     ///
     /// The escape hatch for a terminal that cannot keep up with the picture: over ssh, or
     /// inside tmux, the bytes for a halfblocks frame have further to travel than they do
@@ -67,7 +67,7 @@ const DEFAULT_PLAYBACK_FPS: u32 = 30;
 /// stop reading as motion at all; sixty is past what any terminal keeps up with, and
 /// nothing above it would be drawn anyway.
 ///
-/// Public because the timing page's preview-settings popup adjusts the same value for the
+/// Public because the subtitle edit page's preview-settings popup adjusts the same value for the
 /// session, and it must stop at exactly the limits a config file is held to rather than at
 /// a second copy of them that can drift.
 pub const MIN_PLAYBACK_FPS: u32 = 5;
@@ -101,7 +101,7 @@ const MAX_WORKERS: usize = 16;
 /// track is nearly worthless — see `framecache`'s module docs for why the unit of eviction
 /// has to be the unit of use.
 ///
-/// Ten is the last ten films you opened the timing page on. Disk follows from the content
+/// Ten is the last ten films you opened the subtitle edit page on. Disk follows from the content
 /// rather than from a number: a feature-length track is a thousand or two cues at under a
 /// hundred kilobytes a frame, so ten of them is on the order of a gigabyte, and a set of
 /// unusually long and densely subtitled ones perhaps three.

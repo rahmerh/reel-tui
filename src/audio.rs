@@ -1,4 +1,4 @@
-//! Sound for the timing page's scrub playback, and the clock the picture is driven from.
+//! Sound for the subtitle edit page's scrub playback, and the clock the picture is driven from.
 //!
 //! The page's whole purpose is judging whether a subtitle lands when the speech does, so a
 //! playback whose picture and sound disagree by a few tens of milliseconds does not merely
@@ -162,7 +162,7 @@ pub fn frame_index_at(position: Duration, fps: u32) -> usize {
 /// Somewhere the span's sound is going, and the clock that says where it has got to.
 ///
 /// The trait is the seam that keeps every other module free of the audio library: `ui.rs`,
-/// `sync.rs` and `app.rs` ask this where the sound is and never learn what is producing it.
+/// `subtitle_edit.rs` and `app.rs` ask this where the sound is and never learn what is producing it.
 /// Dropping it stops playback — the single stop path, so that every way of leaving the page
 /// releases the device without each one having to remember to.
 pub trait AudioOutput: Send + std::fmt::Debug {
@@ -173,7 +173,7 @@ pub trait AudioOutput: Send + std::fmt::Debug {
 /// Somewhere a span's sound can be sent, as many times as it is asked for.
 ///
 /// A `cpal` stream plays its buffer once and is then finished, so a looping playback needs a
-/// *new* output each time round. `sync::Playback` therefore holds one of these rather than
+/// *new* output each time round. `subtitle_edit::Playback` therefore holds one of these rather than
 /// one already-open [`AudioOutput`], and a repeat costs a device open rather than another
 /// `ffmpeg` run — the frames and the samples are already in memory.
 ///
@@ -247,7 +247,7 @@ impl AudioOutput for SilentOutput {
 /// A real audio device, playing one span's samples once.
 ///
 /// **The stream lives on its own thread and never leaves it.** `cpal::Stream` is not
-/// guaranteed to be `Send` on every host, and this has to be owned by `SubtitleSyncState`,
+/// guaranteed to be `Send` on every host, and this has to be owned by `SubtitleEditState`,
 /// which lives on `App` — so instead of moving the stream anywhere, a short-lived thread
 /// builds it, starts it, and parks. Dropping this closes the channel it is parked on, the
 /// thread wakes, and the stream is dropped there. That is the single stop path, which is
@@ -786,7 +786,7 @@ mod tests {
         assert_that!(advanced <= waited.mul_f64(1.5)).is_true();
 
         // Assert: whichever it is, it describes itself — a `Box<dyn AudioOutput>` is printed
-        // whole in `SubtitleSyncState`'s `Debug`, which every test failure message carries.
+        // whole in `SubtitleEditState`'s `Debug`, which every test failure message carries.
         let described = format!("{output:?}");
         assert_that!(described.contains("CpalOutput") || described.contains("SilentOutput"))
             .is_true();

@@ -47,7 +47,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
     // hangs or corrupts the first frame. A terminal that answers nothing falls back to
     // halfblocks, which every terminal can draw.
     // `drawing_picker` then discards a halfblocks answer: two coloured half-cells cannot
-    // show a subtitle burned into a frame, and the timing page says so once rather than
+    // show a subtitle burned into a frame, and the subtitle edit page says so once rather than
     // rendering and caching a picture nobody could read.
     let picker = Picker::from_query_stdio()
         .ok()
@@ -71,7 +71,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
         playback_fps: app_config.playback_fps,
         playback_pad: app_config.playback_pad,
         // Session-only, and so not in the config file: these start where a fresh run starts
-        // and are changed from the timing page's preview-settings popup (`:`).
+        // and are changed from the subtitle edit page's preview-settings popup (`:`).
         ..PreviewSettings::default()
     });
     let mut input = InputState::default();

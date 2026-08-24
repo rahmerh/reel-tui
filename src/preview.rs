@@ -1,4 +1,4 @@
-//! Background preparation of one subtitle track for the timing page.
+//! Background preparation of one subtitle track for the subtitle edit page.
 //!
 //! The page opens immediately and shows a loader; this is what fills it in. Two source
 //! shapes exist and only two: a `.srt` sidecar, which is read straight off disk, and an
@@ -25,7 +25,7 @@
 //!
 //! The neighbours are why walking the cue list draws a picture per keypress rather than
 //! per round trip: by the time the cursor reaches a cue, the page is already holding it
-//! encoded (see `SubtitleSyncState::nearby_frame_targets`).
+//! encoded (see `SubtitleEditState::nearby_frame_targets`).
 
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -184,7 +184,7 @@ pub struct PrepareRequest {
     /// convention — never the `0:s:N` per-type form. `None` means `input` is a sidecar.
     pub stream_index: Option<u64>,
     /// What `input` holds, which decides how it is turned into cues. Settled by
-    /// `App::open_subtitle_sync`, which has already refused the formats with no road here
+    /// `App::open_subtitle_edit`, which has already refused the formats with no road here
     /// at all — see [`ToolCapabilities::preview_blocked`].
     ///
     /// [`ToolCapabilities::preview_blocked`]: crate::subtitle::ToolCapabilities::preview_blocked
@@ -546,7 +546,7 @@ pub struct PlaybackFrames {
     pub picker: Picker,
     /// How fast the span was decoded to play. Frames are `1 / fps` apart in *output* time,
     /// so this is the factor that turns a playhead into a position in the media — see
-    /// `sync::Playback::position`.
+    /// `subtitle_edit::Playback::position`.
     pub speed: PlaybackSpeed,
     /// Where in the media frame zero sits, for the playhead the timeline draws.
     pub span_start: Duration,
@@ -994,7 +994,7 @@ fn newest<T>(request: T, receiver: &Receiver<T>) -> T {
 /// ever reached when the newest carries none, which is precisely the case where the page
 /// believes the grab it made earlier is still on its way — so the cue adopted is the one
 /// under the cursor, not a stale one. A move to another cue always produces a `wanted` of
-/// its own ([`crate::sync::SubtitleSyncState::request_frame`]), which wins here.
+/// its own ([`crate::subtitle_edit::SubtitleEditState::request_frame`]), which wins here.
 ///
 /// Generations must match, or a request for a page the user has left could resurrect a grab
 /// the page it belongs to would only discard.
@@ -1183,7 +1183,7 @@ pub fn source_frame_ceiling(source: Option<f64>, speed: PlaybackSpeed) -> Option
 
 /// The frame rate this span can afford at this size, never above `fps`.
 ///
-/// The same shape as `SubtitleSyncState::window_radius`: a ceiling the user asked for,
+/// The same shape as `SubtitleEditState::window_radius`: a ceiling the user asked for,
 /// lowered to fit a budget, floored at the point where lowering it further defeats the
 /// feature.
 ///
@@ -1288,7 +1288,7 @@ pub fn playback_pixels(cells: Size, font: FontSize) -> (u32, u32) {
 /// needs the picture to be legible. `Picker::from_query_stdio` reports halfblocks for every
 /// terminal that answered nothing, so without this the page would open, render, cache and
 /// play for terminals that can only ever show a coloured smear. Refusing here means the
-/// page says [`crate::sync::PreviewSupport::NoImageProtocol`] once and stays quiet, which
+/// page says [`crate::subtitle_edit::PreviewSupport::NoImageProtocol`] once and stays quiet, which
 /// is the honest answer.
 ///
 /// Taken at startup rather than checked per frame: the protocol cannot change under a
@@ -2255,7 +2255,7 @@ impl WarmProgress {
 /// arrive here starting at zero and running far past the single frame that emerges: left at
 /// their original times they would be burned in or not depending on the frame rounding and
 /// the container's `start_time`, making the grab a coin toss on exactly the boundary frames
-/// a timing page exists to inspect.
+/// a subtitle edit page exists to inspect.
 ///
 /// Numbered from one in the order handed in. SubRip's counter is advisory — `parse_srt`
 /// ignores it for that reason — but a file whose blocks all claim to be block 1 is the kind
