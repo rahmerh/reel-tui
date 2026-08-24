@@ -61,7 +61,11 @@ pub const FRAME_EXTENSION: &str = "jpg";
 /// units. Without it a change of format or encoder leaves files whose names still collide
 /// with live keys — the PNG-to-JPEG switch did exactly that, because a key does not encode
 /// the format, and the leftovers had to be swept by hand. Bump this instead.
-const CACHE_FORMAT_VERSION: u32 = 3;
+///
+/// Version 4 is [`crate::preview::seek_for`] moving from the cue's midpoint to its start:
+/// the key covers the cue's timing, which did not change, so every frame already on disk
+/// would keep being served for a moment the page no longer grabs.
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Records when a media directory was last *used*, by its own mtime.
 ///

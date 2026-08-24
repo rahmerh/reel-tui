@@ -955,7 +955,7 @@ impl SubtitleSyncState {
     /// What the frame worker needs in order to draw the cue at `cue_index`.
     pub fn frame_target(&self, cue_index: usize) -> Option<FrameTarget> {
         let cue = self.cues.get(cue_index)?;
-        // `seek_for` rather than the midpoint outright: a cue running to the end of the
+        // `seek_for` rather than the cue's start outright: a cue running to the end of the
         // media has to be held back from the very last instant, and the background pass has
         // to make exactly the same decision — a disagreement would have the two writing
         // different pictures under one cache key.
@@ -2312,8 +2312,8 @@ mod tests {
         )
         .is_equal_to(vec![3, 5, 2, 6]);
         assert_that!(targets[0].cue.text.as_str()).is_equal_to("line 3");
-        // The seek is the cue's midpoint, the same one the background pass renders under,
-        // or the two would write different pictures for one cache key.
+        // The seek is the moment the cue comes in, the same one the background pass renders
+        // under, or the two would write different pictures for one cache key.
         assert_that!(targets[0].seek).is_equal_to(seek_for(&state.cues[3], state.duration));
 
         // Act / Assert: the ones already encoded drop out.
@@ -2372,13 +2372,15 @@ mod tests {
     /// fraction of a picture the viewer never sees.
     #[test]
     fn a_frame_target_should_carry_every_cue_on_screen_with_the_one_it_is_for() {
-        // Arrange: a line with two effect cues over its middle, and an unrelated cue after.
+        // Arrange: a line with two effect cues coming in with it, one arriving later in its
+        // span, and an unrelated cue after.
         let mut state = state();
         state.apply_prepared(
             vec![
                 cue(2000, 3000, "under"),
-                cue(2400, 2600, "effect one"),
-                cue(2400, 2600, "effect two"),
+                cue(2000, 2600, "effect one"),
+                cue(2000, 2600, "effect two"),
+                cue(2400, 3000, "later"),
                 cue(8000, 9000, "elsewhere"),
             ],
             CueStyle::SubRip,
@@ -2387,8 +2389,9 @@ mod tests {
         // Act
         let target = state.frame_target(0).expect("the first cue has a target");
 
-        // Assert: the grab lands in the middle of the first cue, where all three are up.
-        assert_that!(target.seek).is_equal_to(Duration::from_millis(2500));
+        // Assert: the grab lands where the line comes in, so the picture holds what is up
+        // at that instant — and not the cue that only joins it later in the span.
+        assert_that!(target.seek).is_equal_to(Duration::from_millis(2000));
         assert_that!(
             target
                 .on_screen
@@ -2405,8 +2408,26 @@ mod tests {
         assert_that!(target.cue_index).is_equal_to(0);
         assert_that!(target.cue.text.as_str()).is_equal_to("under");
 
+        // Act / Assert: and the later cue's own frame, grabbed where *it* comes in, holds
+        // the line it arrives over.
+        let later = state.frame_target(3).expect("the fourth cue has a target");
+        assert_that!(later.seek).is_equal_to(Duration::from_millis(2400));
+        assert_that!(
+            later
+                .on_screen
+                .iter()
+                .map(|cue| cue.text.clone())
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![
+            "under".to_string(),
+            "effect one".to_string(),
+            "effect two".to_string(),
+            "later".to_string(),
+        ]);
+
         // Act / Assert: the unrelated cue's own frame carries only itself.
-        let apart = state.frame_target(3).expect("the last cue has a target");
+        let apart = state.frame_target(4).expect("the last cue has a target");
         assert_that!(apart.on_screen.len()).is_equal_to(1);
 
         // Cleanup

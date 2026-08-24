@@ -22266,11 +22266,11 @@ mod tests {
             .expect("the selected cue should be asked for");
         assert_that!(wanted.cue_index).is_equal_to(0);
         assert_that!(wanted.cue.text.as_str()).is_equal_to("one");
-        // The midpoint of the cue, not its start: a cue's first frame is often the last
-        // frame of the previous shot. This file's duration would not parse, so there is
-        // nothing to hold the seek back from — clamping against the resulting zero would
-        // preview the first frame of the media for every cue in the track.
-        assert_that!(wanted.seek).is_equal_to(Duration::from_secs(2));
+        // The moment the cue comes in, which is what the reader is judging. This file's
+        // duration would not parse, so there is nothing to hold the seek back from —
+        // clamping against the resulting zero would preview the first frame of the media
+        // for every cue in the track.
+        assert_that!(wanted.seek).is_equal_to(Duration::from_secs(1));
         assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 20));
 
         // Act / Assert: and one settled selection asks exactly once.
@@ -22299,7 +22299,7 @@ mod tests {
         state.apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
-                start: Duration::from_secs(8),
+                start: Duration::from_secs(11),
                 end: Duration::from_secs(12),
                 text: "past the end".into(),
                 dialogue: Vec::new(),
@@ -22313,7 +22313,7 @@ mod tests {
         // Act
         app.start_pending_preview();
 
-        // Assert: the midpoint would be 10s, which is the whole duration.
+        // Assert: the cue comes in at 11s, past the end of a 10s file.
         let request = frames.try_recv().expect("a frame should be asked for");
         let wanted = request
             .wanted
