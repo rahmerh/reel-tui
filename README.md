@@ -51,12 +51,15 @@ reel /path/to/media
 - **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and modify stream metadata without re-encoding.
 - **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting; edit language, title, default, commentary, and rotation metadata on individual video tracks without re-encoding, so a sideways clip is corrected in seconds.
 - **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata.
-- **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
+- **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars, and rewrite the text of individual SubRip cues on the timing page, staged like any other edit and written on `Ctrl+S`.
+- **Subtitle Timing & Preview**: Open a text subtitle track on a timing page that lists its cues against a timeline and shows the video frame each one lands on, with the subtitle burned in as a viewer will see it — ASS styling, positioning and all. Play a cue's span with its audio to check the timing by ear, at adjustable speed. Frames render in the background and are cached on disk, so returning to a track costs a read rather than a seek. Needs a terminal with kitty, iTerm2, or sixel graphics.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
 - **Desktop Notifications**: Get notified when a file finishes processing, sent only while `reel` isn't the focused window.
 
 ## Future planned
 
-- **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
+- **Advanced subtitle editing**: More in depth editing of subtitles — timing, text, style and hopefully more.
+  - **Waveform visualizer**: An audio waveform on the timing page, so a cue's timing can be judged against the speech it belongs to rather than against the picture alone.
+  - **ASS/SSA cue editing**: Cue text editing currently covers SubRip only. An ASS cue carries its styling, positioning and animation in the line itself, so editing one means working on the markup rather than the stripped words the list shows.
 - **Track importing and exporting**: Importing and exporting of any track, using a file picker.
 - **Automatic subtitle syncing**: Automatic syncing of subtitles to an audio track, maybe using AI?
