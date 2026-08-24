@@ -19,7 +19,8 @@ use ratatui_image::{FilterType, Resize};
 use crate::audio::{AudioOutput, AudioSource, frame_index_at};
 use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes, shares_screen};
 use crate::preview::{
-    CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, seek_for,
+    CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, ScrubTarget,
+    seek_ceiling, seek_for,
 };
 use crate::subtitle::SubtitleSource;
 
@@ -54,6 +55,34 @@ pub const TIMING_STEP: Duration = Duration::from_millis(50);
 
 /// How many steps `H`/`L` move in one press.
 pub const TIMING_LEAP: i64 = 10;
+
+/// How far one press of `h`/`l` moves the timeline cursor.
+///
+/// **Ten times [`TIMING_STEP`], and deliberately not the same figure.** Nudging a cue is
+/// aimed at a mouth movement, where fifty milliseconds is about as fine as the eye can
+/// judge; the timeline cursor is aimed at a *shot*, and is there to reach parts of the file
+/// the cue list does not point at. At fifty milliseconds a minute of film is twelve hundred
+/// presses, which is not roaming, it is grinding.
+pub const TIMELINE_STEP: Duration = Duration::from_millis(500);
+
+/// How many steps `H`/`L` move the timeline cursor in one press.
+///
+/// Five seconds a press, which crosses a scene rather than a line.
+pub const TIMELINE_LEAP: i64 = 10;
+
+/// Which pane of the subtitle edit page holds the cursor.
+///
+/// The cue panel by default, which is every movement the page had before: `Ctrl+J` hands the
+/// cursor to the timeline and `Ctrl+K` takes it back. A pane holding the cursor **owns the
+/// keys that mean movement in it**, which is why `h`/`l` mean something different in each and
+/// why the timeline answers nothing at all to `j`/`k` — it has no vertical axis for them to
+/// move along.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EditFocus {
+    #[default]
+    Cues,
+    Timeline,
+}
 
 /// How many cues of one overlap group the panel draws side by side.
 ///
@@ -214,6 +243,26 @@ impl std::fmt::Debug for Frame {
         formatter
             .debug_struct("Frame")
             .field("cue_index", &self.cue_index)
+            .field("size", &self.protocol.size())
+            .finish()
+    }
+}
+
+/// A drawn frame and the moment of the media it is of.
+///
+/// [`Frame`]'s sibling for the timeline cursor, which names a moment rather than a cue. Its
+/// own `Debug` for the same reason: `Protocol` has none, and without this the page state
+/// would lose the derived one that every test failure message prints.
+struct ScrubFrame {
+    at: Duration,
+    protocol: Box<Protocol>,
+}
+
+impl std::fmt::Debug for ScrubFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrubFrame")
+            .field("at", &self.at)
             .field("size", &self.protocol.size())
             .finish()
     }
@@ -537,6 +586,40 @@ pub struct SubtitleEditState {
     frame_cost: u64,
     /// The scrub playback, if one is running or being decoded.
     playback: PlaybackState,
+    /// Which pane holds the cursor. See [`EditFocus`].
+    pub focus: EditFocus,
+    /// Where the timeline cursor stands, in media time.
+    ///
+    /// **Re-seeded from the selected cue every time the cursor enters the timeline**
+    /// ([`Self::focus_timeline`]) rather than remembered across visits. Entering the pane
+    /// then changes nothing on screen — the moment it lands on is the one the still already
+    /// shows — where a remembered position would come back pointing at wherever the reader
+    /// happened to leave it, which after a few `j`s is nowhere near what they are looking at.
+    cursor: Duration,
+    /// The frame at [`Self::cursor`], encoded and ready to draw.
+    ///
+    /// Exactly one, and **kept until a newer one replaces it**. Nothing caches these (see
+    /// [`crate::preview::ScrubTarget`]), so every settled position costs an `ffmpeg` seek;
+    /// blanking the pane in between would be a flicker on every press of a held key, where
+    /// the debounce already collapses a hold into one grab. The timeline's title states the
+    /// moment the cursor is really on throughout, so the pane is never the only thing
+    /// speaking.
+    scrub: Option<ScrubFrame>,
+    /// Set when the cursor has moved since the last grab was dispatched, and cleared when the
+    /// next one is sent.
+    ///
+    /// Its own clock rather than a share of [`Self::frame_pending_since`], which carries the
+    /// selected cue's request and the debounce arithmetic
+    /// ([`crate::app::App::start_pending_preview`]) built around a frame that may already be
+    /// cached. Nothing the cursor asks for is ever cached, so this one is simply always
+    /// debounced.
+    scrub_pending_since: Option<Instant>,
+    /// Why the frame at this moment could not be drawn.
+    ///
+    /// Keyed on the moment for the same reason [`Self::frame_error`] is keyed on the cue: the
+    /// reason a moment the reader has left could not be drawn says nothing about the one they
+    /// are on now.
+    scrub_error: Option<(Duration, String)>,
     /// Why the last playback of the cue at this index could not run.
     ///
     /// Keyed on the cue for the same reason `frame_error` is, and on the status row for the
@@ -580,6 +663,11 @@ impl SubtitleEditState {
             frame_error: None,
             frame_pending_since: None,
             refill_nearby: false,
+            focus: EditFocus::Cues,
+            cursor: Duration::ZERO,
+            scrub: None,
+            scrub_pending_since: None,
+            scrub_error: None,
             playback: PlaybackState::Idle,
             playback_error: None,
             workspace,
@@ -659,6 +747,10 @@ impl SubtitleEditState {
             .unwrap_or(0);
         self.group_memory.clear();
         self.list_scroll = 0;
+        // A new cue list is a new track under the cursor, so the timeline cursor has nothing
+        // left to be standing on: it is seeded from a cue, and every cue it was measured
+        // against has just been replaced.
+        self.leave_timeline();
         self.select_cue();
     }
 
@@ -683,6 +775,7 @@ impl SubtitleEditState {
         self.encoded.clear();
         self.frame_pending_since = None;
         self.refill_nearby = false;
+        self.leave_timeline();
         // Nothing left to play against, and the device is let go of with it.
         self.stop_playback();
     }
@@ -914,6 +1007,185 @@ impl SubtitleEditState {
         self.request_frame();
     }
 
+    /// Hands the cursor to the timeline, seeding it on the moment the still already shows.
+    ///
+    /// [`crate::preview::seek_for`] rather than the cue's start, so the seed is the exact
+    /// instant the preview pane is displaying: entering the pane is then a change of what the
+    /// keys mean and nothing else, with no picture moving under the reader as they arrive.
+    ///
+    /// Refused while the page is still reading its cues, has none, or failed — there is no
+    /// timeline drawn on any of those, so a cursor in it would be one the reader cannot see.
+    ///
+    /// Reports whether the cursor actually moved pane, so the caller can leave a notice alone
+    /// when nothing happened.
+    pub fn focus_timeline(&mut self) -> bool {
+        if self.focus == EditFocus::Timeline || self.status != LoadStatus::Ready {
+            return false;
+        }
+        let Some(seed) = self.selected_cue().map(|cue| seek_for(cue, self.duration)) else {
+            return false;
+        };
+        self.focus = EditFocus::Timeline;
+        self.cursor = seed.min(self.cursor_ceiling());
+        // Nothing is asked for here on purpose: the cursor is standing on the selected cue's
+        // own moment, and `scrub_frame` falls through to that cue's frame until the reader
+        // moves off it. Grabbing a second copy of a picture already on screen would spend an
+        // `ffmpeg` seek to change nothing.
+        self.scrub = None;
+        self.scrub_pending_since = None;
+        self.scrub_error = None;
+        true
+    }
+
+    /// Takes the cursor back to the cue panel.
+    pub fn focus_cues(&mut self) -> bool {
+        if self.focus == EditFocus::Cues {
+            return false;
+        }
+        self.leave_timeline();
+        true
+    }
+
+    /// Puts the page back in its default state, cursor in the cue panel and nothing scrubbed.
+    ///
+    /// Also what a new cue list and a failure do, since both leave the cursor standing on a
+    /// moment measured against cues that no longer exist.
+    fn leave_timeline(&mut self) {
+        self.focus = EditFocus::Cues;
+        self.cursor = Duration::ZERO;
+        self.scrub = None;
+        self.scrub_pending_since = None;
+        self.scrub_error = None;
+    }
+
+    /// Where the timeline cursor stands, or `None` when the cue panel holds the cursor.
+    ///
+    /// One question rather than two, so no caller can draw a cursor for a pane that does not
+    /// have one.
+    pub fn cursor(&self) -> Option<Duration> {
+        (self.focus == EditFocus::Timeline).then_some(self.cursor)
+    }
+
+    /// Moves the timeline cursor by `steps` of [`TIMELINE_STEP`], reporting whether it moved.
+    ///
+    /// **A move stops a playback**, for the reason retiming a cue does
+    /// ([`Self::set_cue_timing`]): a span decoded around one cue, still playing while the
+    /// reader looks at a different moment, is a picture in the pane that is not about what
+    /// the cursor points at — which on this page reads as the timing being wrong.
+    ///
+    /// A press against either end reports `false` and asks for nothing, so a held `h` at 0:00
+    /// does not re-grab the same frame per repeat.
+    pub fn move_cursor(&mut self, steps: i64) -> bool {
+        if self.focus != EditFocus::Timeline {
+            return false;
+        }
+        let Ok(steps_abs) = u32::try_from(steps.unsigned_abs()) else {
+            return false;
+        };
+        let shift = TIMELINE_STEP.saturating_mul(steps_abs);
+        let moved = if steps.is_negative() {
+            self.cursor.saturating_sub(shift)
+        } else {
+            self.cursor.saturating_add(shift).min(self.cursor_ceiling())
+        };
+        if moved == self.cursor {
+            return false;
+        }
+        self.cursor = moved;
+        self.scrub_pending_since = Some(Instant::now());
+        self.stop_playback();
+        true
+    }
+
+    /// The latest moment the cursor may stand on.
+    ///
+    /// [`crate::preview::seek_ceiling`] where the media's length is known, so the cursor and
+    /// the still grab agree about where the end of the file is. Where it is not — a container
+    /// whose duration would not parse — the last cue's end is the furthest point the page has
+    /// any evidence for, and letting the cursor run past that would be inventing media.
+    fn cursor_ceiling(&self) -> Duration {
+        seek_ceiling(self.duration).unwrap_or_else(|| {
+            self.cues
+                .last()
+                .map(|cue| cue.end)
+                .unwrap_or(Duration::ZERO)
+        })
+    }
+
+    /// What the frame worker needs in order to draw the moment the cursor stands on.
+    pub fn scrub_target(&self) -> Option<ScrubTarget> {
+        (self.focus == EditFocus::Timeline).then(|| ScrubTarget {
+            at: self.cursor,
+            // Unanchored, unlike a cue's: the reader pointed at this instant, so what belongs
+            // on it is exactly what a viewer would see there — which is often nothing.
+            on_screen: crate::cue::on_screen_now(&self.cues, self.cursor),
+        })
+    }
+
+    /// Whether the cursor has moved since the last grab was sent.
+    ///
+    /// False whenever the cue panel holds the cursor, whatever the clock says, so a request
+    /// left over from a pane the reader has left cannot keep the dispatch awake.
+    pub fn scrub_requested(&self) -> bool {
+        self.focus == EditFocus::Timeline && self.scrub_pending_since.is_some()
+    }
+
+    /// Whether that request has waited out [`FRAME_DEBOUNCE`].
+    ///
+    /// Always consulted, unlike a cue's: nothing the cursor asks for is ever in the frame
+    /// cache, so there is no cheap case for the debounce to be skipped for.
+    pub fn scrub_request_due(&self) -> bool {
+        self.scrub_requested()
+            && self
+                .scrub_pending_since
+                .is_some_and(|since| since.elapsed() >= FRAME_DEBOUNCE)
+    }
+
+    pub fn clear_scrub_request(&mut self) {
+        self.scrub_pending_since = None;
+    }
+
+    /// Takes the frame drawn for one moment, ignoring one the cursor has already left.
+    pub fn apply_scrub_frame(&mut self, at: Duration, protocol: Box<Protocol>) {
+        if at != self.cursor {
+            return;
+        }
+        self.scrub_error = None;
+        self.scrub = Some(ScrubFrame { at, protocol });
+    }
+
+    /// Records why one moment could not be drawn.
+    ///
+    /// The previous moment's picture goes with it. Keeping it would leave the pane showing one
+    /// moment while the status row explains why a different one is missing, which is a page
+    /// contradicting itself — where holding a picture *while the next one renders* is only a
+    /// page being a little behind.
+    pub fn fail_scrub_frame(&mut self, at: Duration, message: String) {
+        if at != self.cursor {
+            return;
+        }
+        self.scrub = None;
+        self.scrub_error = Some((at, message));
+    }
+
+    /// The picture for the moment the cursor is on, if the timeline holds the cursor and one
+    /// has been drawn.
+    pub fn scrub_frame(&self) -> Option<&Protocol> {
+        (self.focus == EditFocus::Timeline)
+            .then_some(self.scrub.as_ref())
+            .flatten()
+            .map(|frame| frame.protocol.as_ref())
+    }
+
+    /// Why the moment the cursor is on has no picture, if that is why it has none.
+    pub fn scrub_error(&self) -> Option<&str> {
+        (self.focus == EditFocus::Timeline)
+            .then_some(self.scrub_error.as_ref())
+            .flatten()
+            .filter(|(at, _)| *at == self.cursor)
+            .map(|(_, message)| message.as_str())
+    }
+
     /// Whether the selected cue's own frame has been asked for since the last request was
     /// sent — as opposed to only the neighbours around it.
     pub fn frame_requested(&self) -> bool {
@@ -922,7 +1194,7 @@ impl SubtitleEditState {
 
     /// Whether anything at all has been asked for, of either kind.
     pub fn any_frame_requested(&self) -> bool {
-        self.frame_pending_since.is_some() || self.refill_nearby
+        self.frame_pending_since.is_some() || self.refill_nearby || self.scrub_requested()
     }
 
     /// Whether the outstanding request has waited out [`FRAME_DEBOUNCE`].
@@ -1141,6 +1413,13 @@ impl SubtitleEditState {
         if self.preview_cells != cells {
             self.preview_cells = cells;
             self.encoded.clear();
+            // The cursor's frame is encoded for the pane too, so a resize makes it as stale
+            // as the rest — `Image` draws nothing at all for a protocol wider than the area
+            // it is given, so leaving it would blank the pane rather than shrink the picture.
+            self.scrub = None;
+            if self.focus == EditFocus::Timeline {
+                self.scrub_pending_since = Some(Instant::now());
+            }
             self.request_frame();
         }
     }
@@ -3588,5 +3867,369 @@ mod tests {
         // Assert
         let protocol = state.playback_frame().expect("a frame should be drawn");
         assert_that!(protocol.size()).is_equal_to(cells);
+    }
+
+    /// Entering the timeline must change what the keys mean and nothing else. The cursor
+    /// therefore lands on the exact instant the preview pane is already displaying — the
+    /// selected cue's seek moment — so no picture moves under the reader as they arrive.
+    #[test]
+    fn the_cursor_should_enter_the_timeline_on_the_moment_the_preview_already_shows() {
+        // Arrange
+        let mut state = ready(3);
+        state.select(1);
+        let seek = seek_for(state.selected_cue().unwrap(), state.duration);
+
+        // Act
+        let entered = state.focus_timeline();
+
+        // Assert
+        assert_that!(entered).is_true();
+        assert_that!(state.cursor()).is_equal_to(Some(seek));
+        assert_that!(state.focus).is_equal_to(EditFocus::Timeline);
+        // Nothing asked for: the frame on screen is already this moment's.
+        assert_that!(state.scrub_requested()).is_false();
+        assert_that!(state.scrub_target().map(|target| target.at)).is_equal_to(Some(seek));
+    }
+
+    /// A second `Ctrl+J` is not a fresh entry, and re-seeding on it would throw away
+    /// wherever the reader had scrubbed to.
+    #[test]
+    fn entering_the_timeline_twice_should_leave_the_cursor_where_it_was() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.move_cursor(4);
+        let at = state.cursor();
+
+        // Act
+        let entered = state.focus_timeline();
+
+        // Assert
+        assert_that!(entered).is_false();
+        assert_that!(state.cursor()).is_equal_to(at);
+    }
+
+    /// There is no timeline drawn while the page is reading, empty or failed, so a cursor in
+    /// it would be one the reader cannot see and cannot get back out of by looking.
+    #[test]
+    fn the_cursor_should_be_refused_on_a_page_with_no_timeline_to_stand_in() {
+        // Arrange / Act / Assert: still reading.
+        let mut preparing = state();
+        assert_that!(preparing.focus_timeline()).is_false();
+
+        // Arrange / Act / Assert: parsed, but holding nothing.
+        let mut empty = state();
+        empty.apply_prepared(Vec::new(), CueStyle::SubRip);
+        assert_that!(empty.focus_timeline()).is_false();
+
+        // Arrange / Act / Assert: failed outright.
+        let mut failed = ready(3);
+        failed.fail("ffmpeg said no".to_string());
+        assert_that!(failed.focus_timeline()).is_false();
+        assert_that!(failed.cursor()).is_none();
+    }
+
+    /// `Ctrl+K` reports whether it did anything, so `Esc` can peel the cursor off the
+    /// timeline without also swallowing the press that was meant to leave the page.
+    #[test]
+    fn taking_the_cursor_back_should_report_whether_it_moved() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act / Assert: nothing to take back.
+        assert_that!(state.focus_cues()).is_false();
+
+        // Act / Assert: and something to take back.
+        state.focus_timeline();
+        state.move_cursor(2);
+        assert_that!(state.focus_cues()).is_true();
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.scrub_requested()).is_false();
+        assert_that!(state.scrub_target()).is_none();
+    }
+
+    /// One press is [`TIMELINE_STEP`] and `H`/`L` are ten of them, which is what makes the
+    /// pair a fine control and a coarse one rather than two speeds of the same thing.
+    #[test]
+    fn a_leap_should_move_ten_steps_of_the_cursor() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+
+        // Act
+        state.move_cursor(1);
+        let one = state.cursor().unwrap();
+        state.move_cursor(TIMELINE_LEAP);
+
+        // Assert
+        assert_that!(one).is_equal_to(TIMELINE_STEP);
+        assert_that!(state.cursor())
+            .is_equal_to(Some(TIMELINE_STEP + TIMELINE_STEP * TIMELINE_LEAP as u32));
+    }
+
+    /// A press that would move nothing has to report so, or a held `h` at 0:00 spends an
+    /// `ffmpeg` seek per key repeat re-drawing the frame already on screen.
+    #[test]
+    fn the_cursor_should_stop_at_both_ends_of_the_media() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+
+        // Act / Assert: the floor.
+        assert_that!(state.move_cursor(-1)).is_false();
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
+        state.clear_scrub_request();
+
+        // Act / Assert: and the ceiling, which is held back from the very last instant so
+        // the grab lands on a frame that exists.
+        let ceiling = seek_ceiling(state.duration).unwrap();
+        assert_that!(state.move_cursor(i64::from(u16::MAX))).is_true();
+        assert_that!(state.cursor()).is_equal_to(Some(ceiling));
+        state.clear_scrub_request();
+        assert_that!(state.move_cursor(1)).is_false();
+    }
+
+    /// A container whose duration would not parse arrives here as zero. Clamping against
+    /// that would pin the cursor to 0:00; the last cue's end is the furthest point the page
+    /// has any evidence of media at.
+    #[test]
+    fn a_media_of_unknown_length_should_stop_the_cursor_at_the_last_cue() {
+        // Arrange
+        let mut state = costed_state(CHEAP_BYTES_PER_CELL);
+        state.duration = Duration::ZERO;
+        state.apply_prepared(
+            vec![cue(0, 1000, "one"), cue(2000, 3000, "two")],
+            CueStyle::SubRip,
+        );
+        state.focus_timeline();
+
+        // Act
+        state.move_cursor(i64::from(u16::MAX));
+
+        // Assert
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::from_millis(3000)));
+    }
+
+    /// The keys belong to the pane holding the cursor, so a move asked for while the cue
+    /// panel has it must do nothing at all rather than move an invisible cursor.
+    #[test]
+    fn the_cursor_should_not_move_while_the_cue_panel_holds_it() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act / Assert
+        assert_that!(state.move_cursor(1)).is_false();
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.scrub_requested()).is_false();
+        assert_that!(state.scrub_target()).is_none();
+    }
+
+    /// Moving the cursor is looking somewhere else, and a span decoded around one cue that
+    /// keeps playing under it is a picture in the pane that is not about what the cursor
+    /// points at. Arriving in the pane changes nothing on screen, so it must not stop one.
+    #[test]
+    fn moving_the_cursor_should_stop_a_playback_where_entering_the_pane_should_not() {
+        // Arrange
+        let mut state = ready(3);
+        let cells = Size::new(4, 2);
+        play(&mut state, 0, span(4, cells, 10));
+
+        // Act / Assert: arriving leaves it running.
+        state.focus_timeline();
+        assert_that!(state.playback_active()).is_true();
+
+        // Act / Assert: and the first press stops it.
+        state.move_cursor(1);
+        assert_that!(state.playback_active()).is_false();
+    }
+
+    /// Nothing caches these frames, so every settled position is an `ffmpeg` seek. Blanking
+    /// the pane between them would flicker on every press of a held key, and the timeline's
+    /// title says the true moment throughout.
+    #[test]
+    fn the_cursors_frame_should_stay_up_until_a_newer_one_replaces_it() {
+        // Arrange
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        state.focus_timeline();
+        state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
+
+        // Act: the cursor moves on, and the next frame has not arrived.
+        state.move_cursor(2);
+
+        // Assert
+        assert_that!(state.scrub_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
+
+        // Act: the new one lands.
+        state.apply_scrub_frame(state.cursor().unwrap(), protocol(6, 3));
+
+        // Assert
+        assert_that!(state.scrub_frame().map(Protocol::size)).is_equal_to(Some(Size::new(6, 3)));
+    }
+
+    /// A frame for a moment the cursor has already left is dropped rather than drawn: the
+    /// pane would otherwise show one moment while the title named another.
+    #[test]
+    fn a_frame_for_a_moment_the_cursor_has_left_should_be_dropped() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.move_cursor(2);
+
+        // Act
+        state.apply_scrub_frame(Duration::from_secs(30), protocol(8, 4));
+
+        // Assert
+        assert_that!(state.scrub_frame().is_none()).is_true();
+    }
+
+    /// The picture goes with the failure. Keeping the previous moment on screen while the
+    /// status row explains why a different one is missing is the page contradicting itself.
+    #[test]
+    fn a_moment_that_could_not_be_drawn_should_clear_the_picture_and_say_why() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
+        state.move_cursor(1);
+        let at = state.cursor().unwrap();
+
+        // Act
+        state.fail_scrub_frame(at, "Could not draw this frame".to_string());
+
+        // Assert
+        assert_that!(state.scrub_frame().is_none()).is_true();
+        assert_that!(state.scrub_error()).is_equal_to(Some("Could not draw this frame"));
+
+        // Act / Assert: a failure reported against a moment already left says nothing.
+        state.move_cursor(1);
+        assert_that!(state.scrub_error()).is_none();
+        state.fail_scrub_frame(Duration::from_secs(45), "stale".to_string());
+        assert_that!(state.scrub_error()).is_none();
+
+        // Act / Assert: and a frame that does arrive clears the reason with it.
+        state.fail_scrub_frame(state.cursor().unwrap(), "fresh".to_string());
+        assert_that!(state.scrub_error()).is_equal_to(Some("fresh"));
+        state.apply_scrub_frame(state.cursor().unwrap(), protocol(8, 4));
+        assert_that!(state.scrub_error()).is_none();
+    }
+
+    /// The reason and the picture both belong to the timeline pane, so taking the cursor
+    /// back to the cues must take them off the page rather than leave them explaining an
+    /// absence nobody is looking at.
+    #[test]
+    fn taking_the_cursor_back_should_take_its_picture_and_its_reason_with_it() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
+
+        // Act
+        state.focus_cues();
+
+        // Assert
+        assert_that!(state.scrub_frame().is_none()).is_true();
+        assert_that!(state.scrub_error()).is_none();
+    }
+
+    /// The cursor's frame is encoded for the pane, so a resize makes it as stale as every
+    /// other frame on hand — and `Image` draws nothing at all for a protocol wider than the
+    /// area it is given, so keeping it would blank the pane rather than shrink the picture.
+    #[test]
+    fn resizing_the_pane_should_drop_the_cursors_frame_and_ask_for_another() {
+        // Arrange
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        state.focus_timeline();
+        state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
+        state.clear_scrub_request();
+
+        // Act
+        state.set_preview_cells(Size::new(30, 15));
+
+        // Assert
+        assert_that!(state.scrub_frame().is_none()).is_true();
+        assert_that!(state.scrub_requested()).is_true();
+    }
+
+    /// A resize while the cue panel holds the cursor must not leave a request outstanding
+    /// that nothing will ever answer: `scrub_target` says nothing while the cursor is up
+    /// there, so the dispatch would examine an empty request on every loop iteration.
+    #[test]
+    fn resizing_with_the_cursor_in_the_cue_panel_should_ask_for_no_moment() {
+        // Arrange
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+
+        // Act
+        state.set_preview_cells(Size::new(30, 15));
+
+        // Assert
+        assert_that!(state.scrub_requested()).is_false();
+    }
+
+    /// A new cue list is a new track, and the cursor's moment was measured against cues that
+    /// have just been replaced.
+    #[test]
+    fn a_new_cue_list_should_take_the_cursor_home() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.move_cursor(3);
+        state.apply_scrub_frame(state.cursor().unwrap(), protocol(8, 4));
+
+        // Act
+        state.apply_prepared(vec![cue(0, 1000, "fresh")], CueStyle::SubRip);
+
+        // Assert
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.focus).is_equal_to(EditFocus::Cues);
+        assert_that!(state.scrub_frame().is_none()).is_true();
+    }
+
+    /// What gets burned into the cursor's frame is what a viewer would see at that instant —
+    /// which is often nothing at all, and never a cue forced in the way a cue's own grab
+    /// forces its anchor.
+    #[test]
+    fn the_cursors_target_should_carry_only_what_is_on_screen_at_that_moment() {
+        // Arrange: cues at 0-1s, 2-3s and 4-5s.
+        let mut state = ready(3);
+        state.focus_timeline();
+
+        // Act / Assert: a moment inside the second cue carries it and nothing else.
+        state.move_cursor(5);
+        let target = state.scrub_target().expect("the timeline holds the cursor");
+        assert_that!(target.at).is_equal_to(Duration::from_millis(2500));
+        assert_that!(target.on_screen.len()).is_equal_to(1);
+        assert_that!(target.on_screen[0].text.as_str()).is_equal_to("line 1");
+
+        // Act / Assert: and a moment in the gap between two carries none.
+        state.move_cursor(1);
+        let target = state.scrub_target().expect("the timeline holds the cursor");
+        assert_that!(target.at).is_equal_to(Duration::from_millis(3000));
+        assert_that!(target.on_screen.as_slice()).is_empty();
+    }
+
+    /// Every one of these costs an accurate seek, so a held key has to collapse to one grab
+    /// — and the request has to survive being examined before the debounce expires, or the
+    /// frame the reader settled on is never asked for at all.
+    #[test]
+    fn the_cursors_grab_should_wait_out_the_debounce_and_still_go_out() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+
+        // Act / Assert: asked for, but not yet due.
+        state.move_cursor(1);
+        assert_that!(state.scrub_requested()).is_true();
+        assert_that!(state.scrub_request_due()).is_false();
+        assert_that!(state.any_frame_requested()).is_true();
+
+        // Act / Assert: and due once the cursor has settled.
+        std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
+        assert_that!(state.scrub_request_due()).is_true();
+        state.clear_scrub_request();
+        assert_that!(state.scrub_requested()).is_false();
+        assert_that!(state.scrub_request_due()).is_false();
     }
 }

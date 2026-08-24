@@ -229,9 +229,13 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
 
+    // Read once and handed to all three panes, so no two of them can disagree about which
+    // one holds the cursor — the timeline draws it, the cue panel gives its border up, and
+    // the preview shows that moment instead of the selected cue's.
+    let cursor = state.cursor();
     render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
-    render_edit_cues(frame, state, columns[1], &edited);
-    render_edit_timeline(frame, state, shift, rows[1]);
+    render_edit_cues(frame, state, columns[1], &edited, cursor.is_none());
+    render_edit_timeline(frame, state, shift, cursor, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -270,6 +274,12 @@ fn edit_status_line(state: &SubtitleEditState) -> Option<(String, Color)> {
         return Some((format!(" {reason}"), Color::Red));
     }
     if let Some(reason) = state.frame_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
+    // Beside the cue's for the same reason: the reader is looking at an empty pane and this
+    // is what explains it. Below it because the two never coexist — the cursor's frame only
+    // takes the pane while the timeline holds the cursor, and only then can it fail.
+    if let Some(reason) = state.scrub_error() {
         return Some((format!(" {reason}"), Color::Red));
     }
     // Ahead of the background pass's count, because this one the user is waiting on: a
@@ -406,8 +416,14 @@ fn render_edit_preview(
     // is left when it stops. Before the first frame of a span is drawn — while it decodes,
     // and for the moment between the sound starting and the device's first callback — the
     // playback has no frame and the still one stays, so `p` never blanks the pane.
+    //
+    // The timeline cursor's frame sits between the two: a playback is the most recent thing
+    // the reader asked for and wins outright, and the selected cue's frame is the fallback
+    // that keeps `Ctrl+J` from blanking the pane — the cursor lands on that cue's own moment,
+    // so until it moves, the cue's frame *is* the right picture for it.
     if let Some(protocol) = state
         .playback_frame()
+        .or_else(|| state.scrub_frame())
         .or_else(|| state.frame())
         .filter(|protocol| protocol.size().width <= inner.width)
         .filter(|protocol| protocol.size().height <= inner.height)
@@ -489,8 +505,14 @@ fn render_edit_cues(
     state: &mut SubtitleEditState,
     area: Rect,
     edited: &BTreeSet<usize>,
+    focused: bool,
 ) {
-    let mut block = Block::bordered().title(" Cues ");
+    // The same border the file list and the track list wear when they hold the cursor. Two
+    // panes on this page now take keys, and without this there is nothing on screen saying
+    // which of them `h` is about to talk to.
+    let mut block = Block::bordered()
+        .border_style(focus_border(focused))
+        .title(" Cues ");
     // The background pass's count sits on this panel's border rather than on the status
     // row: it is a count of *these* rows' frames, and the status row carries one message at
     // a time — where "Preparing playback…" is the one worth reading while a span decodes.
@@ -847,6 +869,7 @@ fn render_edit_timeline(
     frame: &mut Frame,
     state: &SubtitleEditState,
     shift: Option<String>,
+    cursor: Option<Duration>,
     area: Rect,
 ) {
     let Some(cue) = state.selected_cue() else {
@@ -870,24 +893,35 @@ fn render_edit_timeline(
     // the reader is a tenth of a second in or a whole one, which is the only question they
     // are asking. Yellow in the timing mode, matching the cue the keys are pointing at.
     let retiming = state.timing_mode;
-    let title = match shift {
-        Some(shift) => format!(
-            " Timeline ({} → {} · {}) ",
-            format_timestamp(cue.start),
-            format_timestamp(cue.end),
-            shift
-        ),
-        None => format!(
-            " Timeline ({} → {}) ",
+    // The cursor's own moment is appended rather than replacing anything: the cue's times say
+    // what is being judged and the cursor's moment says where the picture in the pane comes
+    // from, and with the cursor free to walk out of the cue's neighbourhood the two answers
+    // can be far apart. The `▼` is the same glyph the ruler marks the column with, so the two
+    // read as one thing seen twice rather than as two separate readouts.
+    let readings = [
+        Some(format!(
+            "{} → {}",
             format_timestamp(cue.start),
             format_timestamp(cue.end)
-        ),
-    };
-    let block = Block::bordered().title(if retiming {
-        Line::styled(title, Style::default().fg(Color::Yellow))
-    } else {
-        Line::raw(title)
-    });
+        )),
+        shift,
+        cursor.map(|at| format!("▼ {}", format_timestamp(at))),
+    ];
+    let title = format!(
+        " Timeline ({}) ",
+        readings
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
+    let block = Block::bordered()
+        .border_style(focus_border(cursor.is_some()))
+        .title(if retiming {
+            Line::styled(title, Style::default().fg(Color::Yellow))
+        } else {
+            Line::raw(title)
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let window = TimelineWindow::fitted(
@@ -897,17 +931,33 @@ fn render_edit_timeline(
         inner.width,
         state.layout.lane_count,
     );
+    // The cursor is free to walk out of the window the selected cue chose, and a cursor drawn
+    // nowhere is a cursor the reader cannot follow. Slid rather than re-centred — see
+    // `TimelineWindow::containing`.
+    let window = match cursor {
+        Some(at) => window.containing(at, state.duration),
+        None => window,
+    };
     let mut lines = timeline_lines(
         &state.cues,
         &state.layout,
         &window,
         state.selected,
         state.playback_position(),
+        cursor,
         retiming,
     );
-    lines.push(timeline_ruler(&window, window.span(cue), retiming));
+    lines.push(timeline_ruler(&window, window.span(cue), cursor, retiming));
     frame.render_widget(Paragraph::new(lines), inner);
 }
+
+/// What the timeline cursor is drawn in.
+///
+/// Green, which nothing else on this page uses. Cyan and yellow are already spoken for by the
+/// selected cue and the playhead — and they *swap* between those two in the timing mode, so
+/// there is no spare shade of either to lend a third meaning. A reader nudging a cue with a
+/// span playing and the cursor parked somewhere else has all three on screen at once.
+const CURSOR_COLOUR: Color = Color::Green;
 
 /// The time axis drawn beneath the lanes: a reading every ten seconds, and the selected
 /// cue's two ends.
@@ -935,6 +985,7 @@ fn axis_tick(span: Duration) -> u64 {
 fn timeline_ruler(
     window: &TimelineWindow,
     selected: Option<(u16, u16)>,
+    cursor: Option<Duration>,
     retiming: bool,
 ) -> Line<'static> {
     // No width guard: `TimelineWindow::column` and `span` both answer `None` for a window
@@ -947,9 +998,14 @@ fn timeline_ruler(
     let with_hours = window.end.as_secs() >= 3600;
     // Reserved before anything is written. A reading with a mark painted through it leaves
     // a plausible but wrong time on the axis, which is worse than no reading at all.
+    // The cursor's column is reserved alongside the selection's two ends, and for the same
+    // reason: a reading with a mark painted through it leaves a plausible but wrong time on
+    // the axis, which is worse than no reading at all.
+    let cursor_column = cursor.and_then(|at| window.column(at));
     let marks: Vec<u16> = selected
         .into_iter()
         .flat_map(|(first, last)| [first, last])
+        .chain(cursor_column)
         .collect();
 
     let tick = axis_tick(window.end.saturating_sub(window.start));
@@ -980,6 +1036,15 @@ fn timeline_ruler(
     // `▀`, so this is known to render, and it cannot be read as part of a reading.
     for mark in marks {
         cells[usize::from(mark)] = ('▲', Style::default().fg(selection_colour(retiming)).bold());
+    }
+
+    // Last of all, so it wins the column outright where it lands on one of the selection's
+    // ends — the reader moved the cursor there and is looking for it, where the selection's
+    // ends are also stated by the bracket drawn directly above them. `▼` mirrors the `▲`
+    // beside it, which is what makes it read as a mark on the same axis rather than as a
+    // second kind of thing.
+    if let Some(column) = cursor_column {
+        cells[usize::from(column)] = ('▼', Style::default().fg(CURSOR_COLOUR).bold());
     }
     Line::from(runs(cells))
 }
@@ -1037,6 +1102,7 @@ fn timeline_lines(
     window: &TimelineWindow,
     selected: usize,
     playhead: Option<Duration>,
+    cursor: Option<Duration>,
     retiming: bool,
 ) -> Vec<Line<'static>> {
     let width = window.width as usize;
@@ -1095,6 +1161,19 @@ fn timeline_lines(
             // audio device rather than from the cue list this grid was sized against.
             if let Some(cell) = lane.get_mut(usize::from(column)) {
                 *cell = ('│', Style::default().fg(playhead_colour(retiming)).bold());
+            }
+        }
+    }
+
+    // The timeline cursor goes on top of everything, including the playhead: it is the one
+    // mark on this pane the reader is actively moving, so losing it behind something else
+    // would leave them pressing a key with nothing on screen answering. Green, because both
+    // the other colours here already mean something and swap between meanings — see
+    // `CURSOR_COLOUR`.
+    if let Some(column) = cursor.and_then(|at| window.column(at)) {
+        for lane in &mut grid {
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('│', Style::default().fg(CURSOR_COLOUR).bold());
             }
         }
     }
@@ -2826,14 +2905,21 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
+        "Ctrl-j / Ctrl-k",
+        "Put the cursor in the timeline / back in the cue list",
+    );
+    keybinding(
+        &mut lines,
         "h / l",
-        "Move the cue 0.05s earlier or later while timing, otherwise move between cues that \
-         share a moment or choose Yes or No on a preview settings switch",
+        "Move the timeline cursor 0.5s back or on while it holds the cursor, otherwise move \
+         the cue 0.05s earlier or later while timing, otherwise move between cues that share \
+         a moment or choose Yes or No on a preview settings switch",
     );
     keybinding(
         &mut lines,
         "H / L",
-        "Move the cue half a second earlier or later while timing",
+        "Move the timeline cursor five seconds back or on, or the cue half a second earlier \
+         or later while timing",
     );
     keybinding(
         &mut lines,
@@ -13883,7 +13969,7 @@ mod tests {
 
     /// The text of a ruler drawn for `window`, marked for `cue`.
     fn ruler_text(window: &TimelineWindow, cue: &crate::cue::Cue) -> String {
-        timeline_ruler(window, window.span(cue), false)
+        timeline_ruler(window, window.span(cue), None, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -14109,7 +14195,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None, false);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None, None, false);
         let text = timeline_text(&lines);
 
         // Assert
@@ -14135,7 +14221,9 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
+        let text = timeline_text(&timeline_lines(
+            &cues, &layout, &window, 0, None, None, false,
+        ));
 
         // Assert
         assert_that!(text[0].contains('|')).is_true();
@@ -14157,7 +14245,9 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
+        let text = timeline_text(&timeline_lines(
+            &cues, &layout, &window, 0, None, None, false,
+        ));
 
         // Assert: one cue drawn, and nothing wrapped around from the other.
         assert_that!(text.len()).is_equal_to(1);
@@ -14184,7 +14274,7 @@ mod tests {
         };
         let at = Some(std::time::Duration::from_secs(15));
         let colours = |retiming: bool| {
-            let lines = timeline_lines(&cues, &layout, &window, 0, at, retiming);
+            let lines = timeline_lines(&cues, &layout, &window, 0, at, None, retiming);
             let cells: Vec<(char, Option<Color>)> = lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
@@ -14227,7 +14317,7 @@ mod tests {
         let window = window_over(0, 60, 61);
         let cue = edit_cue(10_000, 20_000, "line");
         let colour_of_marks = |retiming: bool| {
-            timeline_ruler(&window, window.span(&cue), retiming)
+            timeline_ruler(&window, window.span(&cue), None, retiming)
                 .spans
                 .iter()
                 .find(|span| span.content.contains('▲'))
@@ -14265,7 +14355,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None, false);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None, None, false);
 
         // Assert: the overflowed cue is the only one painted magenta.
         let magenta = lines
@@ -14336,7 +14426,7 @@ mod tests {
         };
 
         // Act: an empty track, with the cursor still sitting on cue zero.
-        let lines = timeline_lines(&[], &layout, &window, 0, None, false);
+        let lines = timeline_lines(&[], &layout, &window, 0, None, None, false);
 
         // Assert: one blank lane rather than an index panic.
         assert_that!(lines.len()).is_equal_to(1);
@@ -15023,6 +15113,7 @@ mod tests {
             &window,
             0,
             Some(std::time::Duration::from_secs(18)),
+            None,
             false,
         );
 
@@ -15035,7 +15126,9 @@ mod tests {
         }
 
         // Act / Assert: and no playback means no mark, rather than one parked at zero.
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
+        let text = timeline_text(&timeline_lines(
+            &cues, &layout, &window, 0, None, None, false,
+        ));
         for lane in &text {
             assert_that!(lane.contains('│')).is_false();
         }
@@ -15060,7 +15153,15 @@ mod tests {
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(90),
         ] {
-            let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, Some(at), false));
+            let text = timeline_text(&timeline_lines(
+                &cues,
+                &layout,
+                &window,
+                0,
+                Some(at),
+                None,
+                false,
+            ));
             for lane in &text {
                 assert_that!(lane.contains('│')).is_false();
             }
@@ -15154,5 +15255,151 @@ mod tests {
                 )
                 .expect("halfblocks should encode any image"),
         )
+    }
+
+    /// The one mark on this pane the reader is actively moving, so it goes on top of
+    /// everything — including the playhead, which is the other `│` that can share a column
+    /// with it. Green, because both the other colours here already mean something and swap
+    /// meanings between them in the timing mode.
+    #[test]
+    fn the_timeline_cursor_should_be_drawn_through_every_lane_over_the_playhead() {
+        // Arrange: one cue, a window a minute wide over sixty-one columns, so a column is a
+        // second and the arithmetic is readable.
+        let cues = vec![edit_cue(0, 60_000, "sign")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = window_over(0, 60, 61);
+        let at = Duration::from_secs(20);
+
+        // Act: the playhead and the cursor on the same column.
+        let lines = timeline_lines(&cues, &layout, &window, 0, Some(at), Some(at), false);
+
+        // Assert: the cursor wins the column, and it is green.
+        let text = timeline_text(&lines);
+        assert_that!(text[0].chars().nth(20)).is_equal_to(Some('│'));
+        let painted = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('│'))
+            .expect("the cursor should be drawn");
+        assert_that!(painted.style.fg).is_equal_to(Some(CURSOR_COLOUR));
+
+        // Act / Assert: and with the cue panel holding the cursor there is no mark at all.
+        let text = timeline_text(&timeline_lines(
+            &cues, &layout, &window, 0, None, None, false,
+        ));
+        assert_that!(text[0].contains('│')).is_false();
+    }
+
+    /// The ruler marks the column too, with the `▼` that mirrors the selection's `▲`. Its
+    /// column is reserved before any reading is placed, for the reason the selection's ends
+    /// are: a reading with a mark painted through it is a plausible but wrong time.
+    #[test]
+    fn the_ruler_should_mark_the_cursors_column_without_defacing_a_reading() {
+        // Arrange: a minute over sixty-one columns puts 00:00:20 at column twenty.
+        let cue = edit_cue(0, 2_000, "line");
+        let window = window_over(0, 60, 61);
+
+        // Act
+        let marked: String = timeline_ruler(
+            &window,
+            window.span(&cue),
+            Some(Duration::from_secs(20)),
+            false,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+
+        // Assert: the mark is there, the reading that would have started in that column is
+        // gone whole rather than defaced, and the readings either side survive.
+        assert_that!(marked.chars().nth(20)).is_equal_to(Some('▼'));
+        assert_that!(marked.as_str()).does_not_contain("0:20");
+        assert_that!(marked.as_str()).contains("0:10");
+        assert_that!(marked.as_str()).contains("0:30");
+
+        // Act / Assert: and no cursor means no `▼`.
+        assert_that!(ruler_text(&window, &cue)).does_not_contain("▼");
+    }
+
+    /// Two panes take keys now, so the border has to say which of them `h` is about to talk
+    /// to — the same answer the file list and the track list already give.
+    #[test]
+    fn the_focused_border_should_move_between_the_cue_panel_and_the_timeline() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-focus",
+            vec![edit_cue(0, 2_000, "one"), edit_cue(4_000, 6_000, "two")],
+        );
+
+        // Act: drawn with the cue panel holding the cursor.
+        let cues_focused = draw(&mut app, 90, 24);
+
+        // Act: and again with the timeline holding it.
+        app.focus_timeline();
+        let timeline_focused = draw(&mut app, 90, 24);
+
+        // Assert: the title says where the cursor is, and the two draws differ.
+        assert_that!(cues_focused.join("\n").as_str()).does_not_contain("▼");
+        assert_that!(timeline_focused.join("\n").as_str()).contains("▼ 00:00:00.0");
+        assert_that!(cues_focused != timeline_focused).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor's moment is appended to the timeline's title rather than replacing the
+    /// cue's times: with the cursor free to walk out of the cue's neighbourhood, what is
+    /// being judged and where the picture came from are two different answers.
+    #[test]
+    fn the_timelines_title_should_carry_the_cue_the_shift_and_the_cursor_together() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-title",
+            vec![
+                edit_cue(5_000, 7_000, "one"),
+                edit_cue(20_000, 22_000, "two"),
+            ],
+        );
+
+        // Act: nudge the cue, then take the cursor into the timeline and move it.
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(3);
+        app.focus_timeline();
+        app.move_timeline_cursor(4);
+        let screen = draw(&mut app, 100, 24).join("\n");
+
+        // Assert: all three readings, in one title.
+        assert_that!(screen.as_str()).contains("00:00:05.1 → 00:00:07.1");
+        assert_that!(screen.as_str()).contains("+0.15s");
+        assert_that!(screen.as_str()).contains("▼ 00:00:07.1");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor is free to walk out of the window the selected cue chose, and a cursor
+    /// drawn nowhere is one the reader cannot follow — so the window slides to hold it.
+    #[test]
+    fn the_timeline_should_follow_a_cursor_that_walks_out_of_its_window() {
+        // Arrange: a cue at the very start of a two-minute file, so the window opens on it.
+        let (mut app, directory) = edit_page_app("edit-follow", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+
+        // Act: ninety seconds on, which is well past a sixty-second window opened at zero.
+        for _ in 0..18 {
+            app.move_timeline_cursor(crate::subtitle_edit::TIMELINE_LEAP);
+        }
+        let screen = draw(&mut app, 100, 24).join("\n");
+
+        // Assert: the cursor is on screen, and the axis has moved with it.
+        assert_that!(screen.as_str()).contains("▼ 00:01:30.0");
+        assert_that!(screen.matches('▼').count() >= 2).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

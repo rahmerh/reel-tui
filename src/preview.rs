@@ -67,6 +67,11 @@ pub enum CueSlot {
     /// stages is a *differently timed* copy of the same cue, so sharing a name with the
     /// interactive grab would have each drawing the other's timing.
     Playback,
+    /// The timeline cursor's grab. It travels in the same request as the interactive one and
+    /// is served by the same single worker, so the two never actually run at once — but it
+    /// stages a *different set of cues* for a different moment, and a name of its own is what
+    /// keeps that fact from depending on the worker staying single-threaded.
+    Scrub,
 }
 
 impl CueSlot {
@@ -83,6 +88,7 @@ impl CueSlot {
             Self::Interactive => format!("cue.{extension}"),
             Self::Warm(worker) => format!("warm-{worker}.{extension}"),
             Self::Playback => format!("playback.{extension}"),
+            Self::Scrub => format!("scrub.{extension}"),
         }
     }
 }
@@ -420,6 +426,23 @@ pub struct FrameTarget {
     pub seek: Duration,
 }
 
+/// One moment of the media to draw, named by the timeline cursor rather than by a cue.
+///
+/// The rest of this module files a picture under the cue it belongs to; this one belongs to
+/// no cue, which is the whole reason the timeline cursor exists. So it travels as its own
+/// field of [`FrameRequest`] and comes back as its own event, rather than borrowing a cue
+/// index that would collide with a real one in the page's frame window and in the cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrubTarget {
+    /// Where in the media to grab, already clamped inside it by the caller.
+    pub at: Duration,
+    /// Every cue on screen at that instant, in file order, and **empty is ordinary** — most
+    /// of a film has no subtitle on it. Nothing is forced into this list the way
+    /// [`FrameTarget::on_screen`] forces its anchor: a moment the reader pointed at is where
+    /// they want to look, so what gets burned in is what a viewer would actually see there.
+    pub on_screen: Vec<Cue>,
+}
+
 /// What to have ready to draw: the cue under the cursor, and the ones around it.
 ///
 /// Two lists rather than one because they are allowed to cost different amounts. The
@@ -436,6 +459,9 @@ pub struct FrameRequest {
     pub wanted: Option<FrameTarget>,
     /// Cues either side of the cursor, encoded only from the cache.
     pub nearby: Vec<FrameTarget>,
+    /// The moment the timeline cursor stands on, when the reader has moved it since the last
+    /// grab. Rendered like `wanted` and never cached — see [`ScrubTarget`].
+    pub scrub: Option<ScrubTarget>,
     /// The preview pane, in terminal cells, as the renderer measured it. Only the encode
     /// to a terminal protocol uses this — the picture itself is rendered at
     /// `source.pixels` so that one cached frame serves every pane size.
@@ -693,6 +719,15 @@ pub enum PreviewEvent {
     Frame {
         generation: u64,
         cue_index: usize,
+        outcome: FrameOutcome,
+    },
+    /// The frame at the moment the timeline cursor stood on, or why there is none.
+    ///
+    /// Carries the moment rather than a cue index, so a frame that arrives after the cursor
+    /// has moved on can be dropped rather than drawn under a moment it is not of.
+    ScrubFrame {
+        generation: u64,
+        at: Duration,
         outcome: FrameOutcome,
     },
     /// How far the background pass has got.
@@ -996,13 +1031,22 @@ fn newest<T>(request: T, receiver: &Receiver<T>) -> T {
 /// under the cursor, not a stale one. A move to another cue always produces a `wanted` of
 /// its own ([`crate::subtitle_edit::SubtitleEditState::request_frame`]), which wins here.
 ///
+/// The timeline cursor's grab is carried forward the same way and for the same reason: it is
+/// dispatched once and forgotten, so one coalesced away is a preview pane that never catches
+/// up with the cursor.
+///
 /// Generations must match, or a request for a page the user has left could resurrect a grab
 /// the page it belongs to would only discard.
 fn newest_frame(request: FrameRequest, receiver: &Receiver<FrameRequest>) -> FrameRequest {
     let mut request = request;
     while let Ok(mut newer) = receiver.try_recv() {
-        if newer.wanted.is_none() && newer.generation == request.generation {
-            newer.wanted = request.wanted.take();
+        if newer.generation == request.generation {
+            if newer.wanted.is_none() {
+                newer.wanted = request.wanted.take();
+            }
+            if newer.scrub.is_none() {
+                newer.scrub = request.scrub.take();
+            }
         }
         request = newer;
     }
@@ -1316,12 +1360,27 @@ pub fn drawing_picker(picker: Picker) -> Option<Picker> {
 /// rounding error before its first frame would draw nothing at all — precisely the frame
 /// this is aiming at.
 pub fn seek_for(cue: &Cue, duration: Duration) -> Duration {
-    if duration.is_zero() {
-        cue.start
-    } else {
-        cue.start
-            .min(duration.saturating_sub(Duration::from_millis(200)))
+    match seek_ceiling(duration) {
+        Some(ceiling) => cue.start.min(ceiling),
+        None => cue.start,
     }
+}
+
+/// How far from the end of the media a grab is held back.
+///
+/// Seeking to the last instant of a file lands past the final frame, and `-frames:v 1` then
+/// writes nothing at all.
+pub const SEEK_BACKOFF: Duration = Duration::from_millis(200);
+
+/// The latest moment worth grabbing, or `None` when the media's length is not known.
+///
+/// Shared by [`seek_for`] and the timeline cursor so the two cannot disagree about where the
+/// end of the file is — a cursor allowed past this would sit on a moment that renders nothing,
+/// with no way for the reader to tell that from a slow grab. `None` rather than a fallback,
+/// because a duration that would not parse arrives here as zero and clamping against that
+/// would pin every grab to the first frame of the media.
+pub fn seek_ceiling(duration: Duration) -> Option<Duration> {
+    (!duration.is_zero()).then(|| duration.saturating_sub(SEEK_BACKOFF))
 }
 
 /// Handles with no worker thread behind them, so `App`'s dispatch can be asserted from
@@ -1533,7 +1592,68 @@ fn frame_window(
             return false;
         }
     }
+    // Between the two, because it is ordered by who is waiting: `wanted` is the cue the
+    // cursor sits on, this is the moment the cursor sits on — one of the two is always
+    // absent in practice — and `nearby` is cache-only work nobody is watching.
+    if let Some(target) = request.scrub.as_ref() {
+        let Some(outcome) = drawn(
+            scrub(&request.source, target, abandoned),
+            picker,
+            request.cells,
+        ) else {
+            return true;
+        };
+        let sent = events
+            .send(PreviewEvent::ScrubFrame {
+                generation: request.generation,
+                at: target.at,
+                outcome,
+            })
+            .is_ok();
+        if !sent {
+            return false;
+        }
+    }
     nearby(request, picker, abandoned, events)
+}
+
+/// Grabs the frame at one moment of the media, with whatever is on screen there burned in.
+///
+/// **Never cached, and that is the point of it being separate from [`png`].**
+/// [`crate::framecache`] keys on a cue and evicts whole media directories, so a run of
+/// frames keyed on time would compete with the track's real frames for the unit of eviction
+/// — the same reason the scrub playback's frames never go in either. A moment revisited is
+/// re-rendered, which the request debounce already makes rare.
+///
+/// **A moment with no cue on it is grabbed with no filter at all.** Staging an empty SubRip
+/// file instead would hand libass a file its demuxer rejects, failing a grab that has nothing
+/// to burn in the first place.
+fn scrub(source: &FrameSource, target: &ScrubTarget, abandoned: Abandoned<'_>) -> PngOutcome {
+    let staged = if target.on_screen.is_empty() {
+        None
+    } else {
+        let staged = source.staged_name(CueSlot::Scrub);
+        let path = source.workspace.join(&staged);
+        if let Err(error) = std::fs::write(&path, source.stage(&target.on_screen)) {
+            return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
+        }
+        Some(staged)
+    };
+    let mut command = frame_command(
+        &source.media,
+        target.at,
+        source.pixels,
+        &source.workspace,
+        staged.as_deref(),
+    );
+    match run_cancellable(&mut command, abandoned) {
+        RunOutcome::Abandoned => PngOutcome::Abandoned,
+        RunOutcome::Failed(message) => PngOutcome::Failed(message),
+        RunOutcome::Finished(output) if !output.status.success() => {
+            PngOutcome::Failed(command_failure("Could not draw this frame", &output.stderr))
+        }
+        RunOutcome::Finished(output) => PngOutcome::Ready(output.stdout),
+    }
 }
 
 /// Encodes the cues around the cursor, from the frame cache only.
@@ -1695,7 +1815,7 @@ fn render(
         target.seek,
         source.pixels,
         &source.workspace,
-        &staged,
+        Some(staged.as_str()),
     );
     grabbed(run_cancellable(&mut command, abandoned), media_key, cue_key)
 }
@@ -2286,9 +2406,18 @@ fn frame_command(
     seek: Duration,
     pixels: (u32, u32),
     workspace: &Path,
-    staged: &str,
+    staged: Option<&str>,
 ) -> Command {
     let (width, height) = pixels;
+    let scale = format!("scale={width}:{height}:force_original_aspect_ratio=decrease");
+    // `None` is a moment with nothing on screen, which the timeline cursor reaches routinely.
+    // The filter is dropped rather than pointed at an empty file: an empty SubRip file is not
+    // a subtitle file libass will read, so staging one would fail a grab that simply has
+    // nothing to burn.
+    let filters = match staged {
+        Some(staged) => format!("subtitles={staged},{scale}"),
+        None => scale,
+    };
     let mut command = Command::new("ffmpeg");
     command
         .current_dir(workspace)
@@ -2297,9 +2426,7 @@ fn frame_command(
         .arg("-i")
         .arg(media)
         .args(["-map", "0:v:0", "-frames:v", "1", "-vf"])
-        .arg(format!(
-            "subtitles={staged},scale={width}:{height}:force_original_aspect_ratio=decrease"
-        ))
+        .arg(filters)
         // `-q:v 2` is mjpeg's near-lossless end. The frame is judged by eye against a
         // burned-in subtitle, so visible compression artefacts would be read as the
         // rendering being wrong; anything looser is not worth the kilobytes it saves.
@@ -2802,6 +2929,7 @@ mod tests {
             generation: 1,
             source: source(media, workspace),
             wanted: Some(alone(0, cue(0, 1000, "BURNED IN"), seek)),
+            scrub: None,
             nearby: Vec::new(),
             cells: Size::new(20, 10),
         }
@@ -3582,7 +3710,7 @@ mod tests {
             Duration::from_millis(2500),
             (640, 480),
             Path::new("/tmp/reel-tui-preview/7-1"),
-            &cue_file(),
+            Some(cue_file().as_str()),
         );
 
         // Assert
@@ -3930,6 +4058,7 @@ mod tests {
                     Duration::from_millis(index as u64 * 1000),
                 )
             }),
+            scrub: None,
             nearby: Vec::new(),
             cells: Size::new(40, 20),
         };
@@ -3958,6 +4087,7 @@ mod tests {
                     Duration::from_millis(index as u64 * 1000),
                 )
             }),
+            scrub: None,
             nearby: Vec::new(),
             cells: Size::new(40, 20),
         };
@@ -4083,6 +4213,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: Some(alone(7, cues[0].clone(), Duration::ZERO)),
+            scrub: None,
             nearby: vec![alone(8, cues[1].clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
@@ -4126,6 +4257,7 @@ mod tests {
         let media = video(&directory);
         let uncached = cue(4000, 5000, "not rendered yet");
         let request = FrameRequest {
+            scrub: None,
             nearby: vec![alone(1, uncached.clone(), Duration::from_millis(4500))],
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         };
@@ -4168,6 +4300,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: Some(alone(0, selected.clone(), Duration::ZERO)),
+            scrub: None,
             nearby: vec![alone(1, corrupt.clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
@@ -4206,6 +4339,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
+            scrub: None,
             nearby: cues
                 .iter()
                 .enumerate()
@@ -4253,6 +4387,7 @@ mod tests {
         let ahead = cue(4000, 5000, "the cue behind it");
         seed(&source(&media, &directory), &ahead, &frame_bytes(64, 48));
         let request = FrameRequest {
+            scrub: None,
             nearby: vec![alone(1, ahead.clone(), Duration::from_millis(4500))],
             ..frame_request(&media, &directory, Duration::from_millis(2500))
         };
@@ -4300,6 +4435,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
+            scrub: None,
             nearby: cues
                 .iter()
                 .enumerate()
@@ -4347,6 +4483,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
+            scrub: None,
             nearby: vec![alone(1, ahead.clone(), Duration::ZERO)],
             cells: Size::new(20, 10),
         };
@@ -4379,6 +4516,7 @@ mod tests {
             generation: 1,
             source: source.clone(),
             wanted: None,
+            scrub: None,
             nearby: vec![alone(4, ahead.clone(), Duration::from_millis(2500))],
             cells: Size::new(20, 10),
         };
@@ -6661,5 +6799,237 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timeline cursor's grab is dispatched once and forgotten, exactly as the selected
+    /// cue's is, so one coalesced away is a preview pane that never catches up with the
+    /// cursor. Both halves of the carry-forward are asserted here because they are one rule.
+    #[test]
+    fn coalescing_frame_requests_should_carry_a_discarded_cursor_grab_forward() {
+        // Arrange
+        let (sender, receiver) = mpsc::channel();
+        let request = |generation: u64, at: Option<u64>| FrameRequest {
+            generation,
+            source: source(Path::new("/media.mkv"), Path::new("/workspace")),
+            wanted: None,
+            scrub: at.map(|millis| ScrubTarget {
+                at: Duration::from_millis(millis),
+                on_screen: Vec::new(),
+            }),
+            nearby: Vec::new(),
+            cells: Size::new(40, 20),
+        };
+
+        // Act / Assert: a later request carrying no moment adopts the one still owed.
+        sender.send(request(7, None)).unwrap();
+        let coalesced = newest_frame(request(7, Some(4500)), &receiver);
+        assert_that!(coalesced.scrub.map(|target| target.at))
+            .is_equal_to(Some(Duration::from_millis(4500)));
+
+        // Act / Assert: a newer moment is the cursor having moved, and wins outright.
+        sender.send(request(7, Some(9000))).unwrap();
+        let coalesced = newest_frame(request(7, Some(4500)), &receiver);
+        assert_that!(coalesced.scrub.map(|target| target.at))
+            .is_equal_to(Some(Duration::from_millis(9000)));
+
+        // Act / Assert: and nothing is carried across generations, which would resurrect a
+        // grab for a page the user has already left.
+        sender.send(request(8, None)).unwrap();
+        let coalesced = newest_frame(request(7, Some(4500)), &receiver);
+        assert_that!(coalesced.scrub.is_none()).is_true();
+    }
+
+    /// A grab is held back from the very last instant of the media, because seeking there
+    /// lands past the final frame and `-frames:v 1` then writes nothing. A length that would
+    /// not parse arrives as zero, and clamping against that would pin every grab to 0:00.
+    #[test]
+    fn the_seek_ceiling_should_hold_back_from_the_end_and_answer_nothing_for_an_unknown_length() {
+        // Act / Assert
+        assert_that!(seek_ceiling(Duration::from_secs(10)))
+            .is_equal_to(Some(Duration::from_secs(10) - SEEK_BACKOFF));
+        assert_that!(seek_ceiling(Duration::ZERO).is_none()).is_true();
+
+        // Act / Assert: and `seek_for` is the same decision, so a cue past the ceiling is
+        // pulled back to it and one before it is left alone.
+        let late = cue(9_900, 10_000, "last line");
+        assert_that!(seek_for(&late, Duration::from_secs(10)))
+            .is_equal_to(Duration::from_secs(10) - SEEK_BACKOFF);
+        assert_that!(seek_for(&late, Duration::ZERO)).is_equal_to(Duration::from_millis(9_900));
+    }
+
+    /// Most of a film has no subtitle on it, and the timeline cursor reaches those moments
+    /// routinely. An empty SubRip file is not something libass will read, so staging one
+    /// would fail a grab that simply has nothing to burn — the filter is dropped instead.
+    #[test]
+    fn a_moment_with_nothing_on_screen_should_be_grabbed_with_no_subtitles_filter() {
+        // Arrange
+        let workspace = Path::new("/tmp/reel-tui-preview/7-1");
+
+        // Act
+        let burned = frame_command(
+            Path::new("/media/clip.mkv"),
+            Duration::from_millis(2500),
+            (640, 480),
+            workspace,
+            Some("scrub.srt"),
+        );
+        let bare = frame_command(
+            Path::new("/media/clip.mkv"),
+            Duration::from_millis(2500),
+            (640, 480),
+            workspace,
+            None,
+        );
+
+        // Assert
+        let filters = |command: &Command| {
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .find(|argument| argument.contains("scale="))
+                .expect("every grab scales its frame")
+        };
+        assert_that!(filters(&burned).as_str())
+            .is_equal_to("subtitles=scrub.srt,scale=640:480:force_original_aspect_ratio=decrease");
+        assert_that!(filters(&bare).as_str())
+            .is_equal_to("scale=640:480:force_original_aspect_ratio=decrease");
+    }
+
+    /// Every renderer that can run at once needs a staging name of its own. The cursor's is
+    /// distinct from the interactive grab's because what it stages is a different set of cues
+    /// for a different moment, and from the pass's because it runs while the pass is walking.
+    #[test]
+    fn the_cursors_staging_should_have_a_name_of_its_own_per_format() {
+        // Arrange
+        let ass = CueStyle::Ass {
+            header: String::new(),
+            events_format: String::new(),
+        };
+
+        // Act / Assert
+        assert_that!(CueSlot::Scrub.file(&CueStyle::SubRip).as_str()).is_equal_to("scrub.srt");
+        assert_that!(CueSlot::Scrub.file(&ass).as_str()).is_equal_to("scrub.ass");
+        for other in [CueSlot::Interactive, CueSlot::Warm(0), CueSlot::Playback] {
+            assert_that!(other.file(&CueStyle::SubRip) != CueSlot::Scrub.file(&CueStyle::SubRip))
+                .is_true();
+        }
+    }
+
+    /// The cursor's frames are never written to the frame cache: it keys on a cue and evicts
+    /// whole media directories, so a run of pictures keyed on time would compete with the
+    /// track's real frames for the unit of eviction. Asserted against a real grab, because
+    /// the only way to be sure nothing was stored is to render one and look.
+    #[test]
+    fn a_moment_the_cursor_reached_should_be_drawn_and_never_cached() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_moment_the_cursor_reached_should_be_drawn_and_never_cached");
+        let directory = scratch("scrub-grab");
+        let media = video(&directory);
+        let source = source(&media, &directory);
+        let before = framecache::path(&source.media_key(), "any")
+            .and_then(|path| path.parent().map(std::fs::read_dir))
+            .and_then(Result::ok)
+            .map(Iterator::count)
+            .unwrap_or(0);
+        let live = AtomicU64::new(1);
+        let target = ScrubTarget {
+            at: Duration::from_millis(2500),
+            on_screen: vec![cue(2000, 3000, "ON THE SCREEN")],
+        };
+
+        // Act
+        let drawn = scrub(&source, &target, &|| live.load(Ordering::Relaxed) != 1);
+
+        // Assert: a real picture came back...
+        let PngOutcome::Ready(bytes) = drawn else {
+            panic!("the grab should have produced a frame");
+        };
+        assert_that!(bytes.is_empty()).is_false();
+        // ...the cue was staged under the cursor's own name...
+        assert_that!(directory.join("scrub.srt").exists()).is_true();
+        // ...and the cache gained nothing at all.
+        let after = framecache::path(&source.media_key(), "any")
+            .and_then(|path| path.parent().map(std::fs::read_dir))
+            .and_then(Result::ok)
+            .map(Iterator::count)
+            .unwrap_or(0);
+        assert_that!(after).is_equal_to(before);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A moment with nothing on it still draws a picture — the frame itself — rather than
+    /// failing on a subtitle file that was never written.
+    #[test]
+    fn a_moment_with_no_cue_on_it_should_still_draw_its_frame() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_moment_with_no_cue_on_it_should_still_draw_its_frame");
+        let directory = scratch("scrub-bare");
+        let media = video(&directory);
+        let source = source(&media, &directory);
+        let live = AtomicU64::new(1);
+        let target = ScrubTarget {
+            at: Duration::from_millis(1500),
+            on_screen: Vec::new(),
+        };
+
+        // Act
+        let drawn = scrub(&source, &target, &|| live.load(Ordering::Relaxed) != 1);
+
+        // Assert
+        let PngOutcome::Ready(bytes) = drawn else {
+            panic!("the grab should have produced a frame");
+        };
+        assert_that!(bytes.is_empty()).is_false();
+        assert_that!(directory.join("scrub.srt").exists()).is_false();
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The worker answers a cue and a moment in the same pass, and reports them through
+    /// different events — a moment has no cue index to be filed under, and borrowing one
+    /// would collide with a real cue in the page's frame window.
+    #[test]
+    fn the_worker_should_answer_a_cue_and_a_moment_in_one_request() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("the_worker_should_answer_a_cue_and_a_moment_in_one_request");
+        let directory = scratch("scrub-both");
+        let media = video(&directory);
+        let mut request = frame_request(&media, &directory, Duration::from_millis(500));
+        request.scrub = Some(ScrubTarget {
+            at: Duration::from_millis(3500),
+            on_screen: Vec::new(),
+        });
+        let picker = test_picker();
+        let live = AtomicU64::new(1);
+
+        // Act
+        let (events, published) = mpsc::channel();
+        assert_that!(frame(&request, &picker, &live, &events)).is_true();
+        drop(events);
+        let published: Vec<_> = published.into_iter().collect();
+
+        // Assert: one of each, and the moment is reported by its time.
+        assert_that!(published.len()).is_equal_to(2);
+        assert_that!(matches!(
+            published[0],
+            PreviewEvent::Frame { cue_index: 0, .. }
+        ))
+        .is_true();
+        assert_that!(matches!(
+            published[1],
+            PreviewEvent::ScrubFrame {
+                at,
+                outcome: FrameOutcome::Ready(_),
+                ..
+            } if at == Duration::from_millis(3500)
+        ))
+        .is_true();
+
+        forget(&source(&media, &directory), wanted(&request));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

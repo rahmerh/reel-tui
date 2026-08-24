@@ -31,7 +31,8 @@ use fixtures::{
     write_solid_frame, write_vobsub_media,
 };
 use harness::{
-    Harness, Scratch, codec_names, key, languages, probe, require_tools, stream_indices_of_type,
+    Harness, Scratch, codec_names, ctrl, key, languages, probe, require_tools,
+    stream_indices_of_type,
 };
 use reel_tui::app::{
     AudioSettingsField, ContainerSettingsField, Dialog, Layer, PreviewSettings,
@@ -967,11 +968,11 @@ const SIDECAR_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nSidecar first\n\n\
 /// navigated and left through genuine keypresses, and leaving it has to take its scratch
 /// directory with it.
 #[test]
-fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks() {
+fn the_subtitle_edit_page_should_load_cues_for_embedded_and_sidecar_srt_tracks() {
     // Serialised against the other frame-cache scenarios: they share one cache and
     // prune each other's tracks — see `harness::frame_cache_lock`.
     let _frame_cache = harness::frame_cache_lock();
-    let test = "the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks";
+    let test = "the_subtitle_edit_page_should_load_cues_for_embedded_and_sidecar_srt_tracks";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-edit");
@@ -1146,11 +1147,11 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
 /// sound card. The fixture's audio track is `anullsrc`, so a developer running this hears
 /// nothing either way.
 #[test]
-fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
+fn the_subtitle_edit_page_should_play_the_span_around_a_cue() {
     // Serialised against the other frame-cache scenarios: they share one cache and
     // prune each other's tracks — see `harness::frame_cache_lock`.
     let _frame_cache = harness::frame_cache_lock();
-    let test = "the_subtitle_timing_page_should_play_the_span_around_a_cue";
+    let test = "the_subtitle_edit_page_should_play_the_span_around_a_cue";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-playback");
@@ -1173,7 +1174,7 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     app.wait_until("a still frame for the cue", |app| {
         app.subtitle_edit
             .as_ref()
@@ -1382,7 +1383,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     app.wait_until("a still frame for the cue", |app| {
         app.subtitle_edit
             .as_ref()
@@ -1641,7 +1642,7 @@ fn a_terminal_with_no_image_protocol_should_say_so_rather_than_draw() {
     let before = cached_tracks();
     app.open("clip.mkv");
     // The page opens and reads the track — the cue list is the half that still works.
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Assert: and it says why there is no picture, rather than leaving the pane blank —
     // silence there is indistinguishable from a render that has not finished.
@@ -1705,8 +1706,8 @@ fn cached_tracks() -> BTreeSet<std::ffi::OsString> {
 /// the two selectable non-subtitle kinds and the container row, since each takes a
 /// different branch to its subject; runs no ffmpeg beyond building the fixture.
 #[test]
-fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
-    let test = "the_timing_page_should_name_the_track_kind_it_cannot_edit_yet";
+fn the_edit_page_should_name_the_track_kind_it_cannot_edit_yet() {
+    let test = "the_edit_page_should_name_the_track_kind_it_cannot_edit_yet";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-edit-unimplemented");
@@ -1787,8 +1788,8 @@ fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
 /// page now, with its own styles, which
 /// `an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults` covers.
 #[test]
-fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
-    let test = "the_subtitle_timing_page_should_refuse_a_format_it_cannot_read";
+fn the_subtitle_edit_page_should_refuse_a_format_it_cannot_read() {
+    let test = "the_subtitle_edit_page_should_refuse_a_format_it_cannot_read";
     require_tools(
         test,
         &["ffmpeg:libx264", "ffmpeg:aac", "seconv", "tesseract"],
@@ -1864,11 +1865,11 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
 /// to `cues.vtt` instead, the WebVTT muxer refuses the SubRip the extraction hands it, and
 /// the page fails with a codec error nothing about WebVTT would suggest.
 #[test]
-fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
+fn the_subtitle_edit_page_should_read_a_webvtt_track_by_transcoding_it() {
     // Serialised against the other frame-cache scenarios: they share one cache and
     // prune each other's tracks — see `harness::frame_cache_lock`.
     let _frame_cache = harness::frame_cache_lock();
-    let test = "the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it";
+    let test = "the_subtitle_edit_page_should_read_a_webvtt_track_by_transcoding_it";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-edit-webvtt");
@@ -3024,11 +3025,11 @@ const RETYPED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
 /// page that read the cache. The same trick then shows that rewriting *that* cue's line
 /// stops it being drawn, while the cue left alone still is.
 #[test]
-fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
+fn the_subtitle_edit_page_should_cache_and_prefetch_preview_frames() {
     // Serialised against the other frame-cache scenarios: they share one cache and
     // prune each other's tracks — see `harness::frame_cache_lock`.
     let _frame_cache = harness::frame_cache_lock();
-    let test = "the_subtitle_timing_page_should_cache_and_prefetch_preview_frames";
+    let test = "the_subtitle_edit_page_should_cache_and_prefetch_preview_frames";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-frame-cache");
@@ -3044,7 +3045,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // The background pass: every cue rendered without the cursor going near it, counting
     // up on the cue panel's border while it works.
@@ -3078,7 +3079,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     app.press(key(KeyCode::Esc));
     app.pump();
     write_solid_frame(&keys[1], "magenta", 320, 240);
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     app.press(key(KeyCode::Char('j')));
     app.wait_until("the second cue's frame", |app| {
         app.subtitle_edit
@@ -3101,7 +3102,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     app.press(key(KeyCode::Esc));
     app.pump();
     fs::write(&sidecar, RETYPED_CUES).unwrap();
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     wait_for_frames(&mut app);
 
     let state = app.app.subtitle_edit.as_ref().unwrap();
@@ -3175,7 +3176,7 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     wait_for_frames(&mut app);
 
     let state = app.app.subtitle_edit.as_ref().unwrap();
@@ -3203,7 +3204,7 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
     app.press(key(KeyCode::Esc));
     app.pump();
     assert!(app.app.subtitle_edit.is_none(), "Esc should close the page");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     wait_for_frames(&mut app);
 
     // Every frame is the one already on disk, untouched.
@@ -3262,7 +3263,7 @@ fn a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane() {
         ..app.app.subtitle_capabilities.clone()
     };
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // The page is fully usable — cues, timeline, navigation — it simply cannot draw.
     let screen = app.screen();
@@ -3342,7 +3343,7 @@ fn the_background_pass_should_render_every_cue_with_its_own_line_burned_in() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     wait_for_frames(&mut app);
 
     // Every cue rendered, by whichever worker's slice it fell in.
@@ -3476,7 +3477,7 @@ fn render_sidecar_track(app: &mut Harness, file: &str) -> Vec<PathBuf> {
         app.press(key(KeyCode::Char('k')));
     }
     app.open(file);
-    open_sidecar_timing_page(app);
+    open_sidecar_edit_page(app);
     wait_for_frames(app);
     let state = app.app.subtitle_edit.as_ref().unwrap();
     let paths = (0..state.cues.len())
@@ -3518,12 +3519,11 @@ const WALKED_CUES: &str = "1\n00:00:00,500 --> 00:00:01,500\nWalkedone\n\n\
 /// The single `pump` after each keypress is the assertion: it is one turn of the event
 /// loop, so a frame that needed the worker to answer could not possibly be on screen yet.
 #[test]
-fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress() {
+fn walking_the_edit_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress() {
     // Serialised against the other frame-cache scenarios: they share one cache and
     // prune each other's tracks — see `harness::frame_cache_lock`.
     let _frame_cache = harness::frame_cache_lock();
-    let test =
-        "walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress";
+    let test = "walking_the_edit_page_should_draw_each_cues_frame_in_the_same_pass_as_the_keypress";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-frame-walk");
@@ -3538,7 +3538,7 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Before any frame has been drawn, which is the state the text fallback used to fill.
     let bare = app.screen();
@@ -3660,7 +3660,7 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // The cue list shows words, not markup: `{\pos(160,20)}` is how the cue draws, not
     // what it says, and a list full of override blocks is unreadable.
@@ -3785,7 +3785,7 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Arrange: find the three cues by what they say and when, rather than by position —
     // two of them start at the same instant and nothing here should depend on which of
@@ -3876,7 +3876,7 @@ fn a_cues_still_should_be_the_frame_it_comes_in_on() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Act: render the whole track.
     wait_for_frames(&mut app);
@@ -3978,7 +3978,7 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Assert: two rows for five events, and the folded one keeps the timing all four of its
     // events shared.
@@ -4128,7 +4128,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     wait_for_frames(&mut app);
 
     // Assert: five cues, but three rows — the middle three are one group.
@@ -4302,7 +4302,7 @@ fn a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
 
     // Act: to the end of the track, which is the densest part of it.
     app.press(key(KeyCode::Char('G')));
@@ -4377,7 +4377,7 @@ fn editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     // The background pass first: while it runs it owns the corner of the cue panel the
     // edited-count uses, so waiting it out is what makes the count assertable at all.
     wait_for_frames(&mut app);
@@ -4484,7 +4484,7 @@ fn editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
     );
 
     // Assert: and coming back to the page shows the file's words, not the discarded ones.
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     app.pump();
     let screen = app.screen();
     assert!(
@@ -4624,7 +4624,7 @@ fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
-    open_sidecar_timing_page(&mut app);
+    open_sidecar_edit_page(&mut app);
     // The background pass first: while it runs it owns the corner of the cue panel the
     // edited-count uses, so waiting it out is what makes the count assertable at all.
     wait_for_frames(&mut app);
@@ -4782,7 +4782,7 @@ fn frame_path(key: &(String, String)) -> PathBuf {
 }
 
 /// Opens the subtitle edit page on the sidecar track and waits for its cues.
-fn open_sidecar_timing_page(app: &mut Harness) {
+fn open_sidecar_edit_page(app: &mut Harness) {
     let row = app
         .app
         .track_rows()
@@ -4843,4 +4843,109 @@ fn wait_for_frames(app: &mut Harness) -> bool {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// One cue, sitting in the white stretch of a clip that turns from black to white two
+/// seconds in — so the cue's own still is a bright frame and the black stretch it says
+/// nothing about is only reachable with the timeline cursor.
+const LONE_LATE_CUE: &str = "1\n00:00:03,000 --> 00:00:04,000\nFIRST LINE\n\n";
+
+/// The timeline cursor shows a moment the cue list does not point at.
+///
+/// Everything else this page can draw is anchored to a cue: the still lands on the moment a
+/// cue comes in, and a playback covers a cue's span. The question "where does this line
+/// actually belong" is answered by a moment no cue names, so `Ctrl+J` hands the cursor to
+/// the timeline and `h`/`l` walk it through the media with the preview pane following.
+///
+/// Asserted on the picture rather than on the state, because every layer short of the pixels
+/// agrees whether or not the grab really moved: the cue list is untouched, the frame cache is
+/// untouched, and the request differs only in one `-ss`. The clip is black for its first two
+/// seconds and white after, and its one cue sits in the white stretch — so walking the cursor
+/// back to 0:00, a moment with no cue on it at all, must turn the pane black where the cue's
+/// own still is white.
+#[test]
+fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "the_timeline_cursor_should_preview_a_moment_no_cue_points_at";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("subtitle-edit-cursor");
+    write_shot_change_media(&scratch.join("clip.mkv"));
+    fs::write(scratch.join("clip.eng.srt"), LONE_LATE_CUE).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+
+    // Arrange: the cue's own still, which is three seconds in and so a white frame.
+    app.wait_until("the selected cue's frame", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    let cue_frame = brightest_preview_shade(&app);
+    assert!(
+        cue_frame > 192,
+        "the cue at 0:03 sits in the clip's white stretch, so its still should be bright, but \
+         the brightest shade drawn was {cue_frame}:\n{}",
+        app.screen()
+    );
+
+    // Act: the cursor into the timeline, then one leap back — five seconds from the cue's
+    // own moment, which the floor of the media clamps to 0:00.
+    app.press(ctrl('j'));
+    app.press(key(KeyCode::Char('H')));
+
+    // Assert: the page says where the cursor is, in the timeline's own title.
+    app.wait_until("the moment the cursor is on to be drawn", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.scrub_frame().is_some())
+    });
+    let screen = app.screen();
+    assert!(
+        screen.contains("▼ 00:00:00.0"),
+        "the timeline should say the moment its cursor stands on:\n{screen}"
+    );
+
+    // Assert: and the pane really is showing that moment rather than the cue's — no cue is
+    // on screen at 0:00, so this is the bare picture the clip opens on.
+    let scrubbed = brightest_preview_shade(&app);
+    assert!(
+        scrubbed < 64,
+        "the clip opens black and no cue is on screen there, so the cursor's frame should be \
+         dark, but the brightest shade drawn was {scrubbed} against the cue still's \
+         {cue_frame}:\n{screen}"
+    );
+
+    // Act: the cursor back to the cue list.
+    app.press(ctrl('k'));
+    app.pump();
+
+    // Assert: the cue's own still is back, and the timeline no longer carries a cursor.
+    let screen = app.screen();
+    assert!(
+        !screen.contains('▼'),
+        "the timeline should drop its cursor when the cue list takes it back:\n{screen}"
+    );
+    let returned = brightest_preview_shade(&app);
+    assert!(
+        returned > 192,
+        "the preview should be showing the selected cue's still again, but the brightest \
+         shade drawn was {returned}:\n{screen}"
+    );
+}
+
+/// The brightest channel of any colour the preview pane painted.
+///
+/// `preview_shades` is as much of a decoded picture as `TestBackend` can be asked about, and
+/// this clip is deliberately either black or white — so one number separates the two.
+fn brightest_preview_shade(app: &Harness) -> u8 {
+    app.preview_shades()
+        .into_iter()
+        .flat_map(|(red, green, blue)| [red, green, blue])
+        .max()
+        .unwrap_or(0)
 }
