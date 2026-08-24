@@ -17,7 +17,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
 use crate::audio::{AudioOutput, AudioSource, frame_index_at};
-use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes};
+use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes, shares_screen};
 use crate::preview::{
     CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, seek_for,
 };
@@ -43,6 +43,17 @@ pub const FRAME_DEBOUNCE: Duration = Duration::from_millis(120);
 /// `Protocol` holds the picture encoded for the pane, and a full-screen preview is several
 /// megabytes each.
 pub const NEARBY_FRAMES: usize = 2;
+
+/// How far one press of `h`/`l` moves a cue in timing mode.
+///
+/// Fifty milliseconds is a little over one frame of film and a little under two of PAL
+/// video, which is about as fine as a reader can judge a subtitle against a mouth movement.
+/// Coarser and a line can never be landed exactly; finer and a half-second correction —
+/// the common one — becomes twenty presses instead of ten.
+pub const TIMING_STEP: Duration = Duration::from_millis(50);
+
+/// How many steps `H`/`L` move in one press.
+pub const TIMING_LEAP: i64 = 10;
 
 /// How many cues of one overlap group the panel draws side by side.
 ///
@@ -430,6 +441,15 @@ pub struct SubtitleSyncState {
     /// How far the background frame pass has got, or why there is not one.
     pub warm: WarmState,
     pub cues: Vec<Cue>,
+    /// Whether `h`/`l` move the selected cue through time rather than through its group.
+    ///
+    /// A mode rather than a dialog because it has to coexist with a playback: no dialog may
+    /// be raised over one ([`crate::app::App::playback_in_progress`]), and the work this is
+    /// for is alternating a nudge with a `p` until the line lands.
+    ///
+    /// Sticky, and follows the cursor: `j`/`k` still walk the track, so a whole file can be
+    /// retimed without turning the mode on again at every cue.
+    pub timing_mode: bool,
     pub layout: LaneLayout,
     /// The cue list split into runs that share the screen, parallel to nothing — each cue
     /// is in exactly one group and the ordinary cue is a group of one.
@@ -546,6 +566,7 @@ impl SubtitleSyncState {
             support,
             warm: WarmState::Off,
             cues: Vec::new(),
+            timing_mode: false,
             layout: LaneLayout::default(),
             groups: Vec::new(),
             selected: 0,
@@ -784,7 +805,8 @@ impl SubtitleSyncState {
     /// the edited cue simply misses (`framecache::cue_key`).
     ///
     /// The timings are untouched, so the groups, the lanes and the scroll all still describe
-    /// this list; only the words changed.
+    /// this list; only the words changed. A nudge cannot say that — see
+    /// [`Self::set_cue_timing`].
     pub fn edit_cue_text(&mut self, cue: usize, text: String) {
         let Some(target) = self.cues.get_mut(cue) else {
             return;
@@ -794,6 +816,82 @@ impl SubtitleSyncState {
         if self.frame_error.as_ref().is_some_and(|(at, _)| *at == cue) {
             self.frame_error = None;
         }
+        self.request_frame();
+    }
+
+    /// Shifts the selected cue through time, keeping its duration, and reports the new
+    /// timing for staging.
+    ///
+    /// **Both ends move by the same amount even at the floor.** A cue near the start of the
+    /// media cannot go earlier than zero, and clamping only the start would shorten the cue
+    /// a little at a time — a nudge that quietly edits something the reader did not ask to
+    /// edit. The whole shift is shortened instead, so the cue stops moving with its duration
+    /// intact.
+    ///
+    /// `None` when there is no cue to move, or when the cue is already against the floor and
+    /// the press would do nothing: the caller stages nothing, and a held `h` at 0:00 does not
+    /// re-render a frame per repeat.
+    pub fn nudge_selected(&mut self, steps: i64) -> Option<(usize, Duration, Duration)> {
+        let cue = self.cues.get(self.selected)?;
+        let shift = TIMING_STEP.saturating_mul(steps.unsigned_abs().try_into().ok()?);
+        let (start, end) = if steps.is_negative() {
+            let shift = shift.min(cue.start);
+            (cue.start - shift, cue.end - shift)
+        } else {
+            (cue.start + shift, cue.end + shift)
+        };
+        if (start, end) == (cue.start, cue.end) {
+            return None;
+        }
+        let selected = self.selected;
+        self.set_cue_timing(selected, start, end);
+        Some((selected, start, end))
+    }
+
+    /// Retimes one cue and asks for its picture again.
+    ///
+    /// Three things follow from a timing change that do not follow from a text change, and
+    /// each is load-bearing:
+    ///
+    /// **A playback is stopped.** A span is decoded ahead of time with the cue already
+    /// burned into its frames, so one still playing is playing the timing the reader has
+    /// just moved away from — "a span playing under a line it is not about", which
+    /// [`Self::select_cue`] exists to prevent. Re-decoding instead would be an `ffmpeg` run
+    /// per keypress.
+    ///
+    /// **More frames than this cue's go stale.** A [`FrameTarget`] carries the cues sharing
+    /// its moment as well as the cue itself, so moving one line into or out of a
+    /// neighbour's moment changes what the neighbour's picture should show — and its cache
+    /// key with it. Every frame overlapping the cue's old *or* new span is dropped.
+    /// Clearing the whole window would also be correct and costs a decode per neighbour on
+    /// every press of a held key.
+    ///
+    /// **The lanes are repacked.** [`LaneLayout`] is computed once rather than per draw, so
+    /// a moved cue would otherwise keep being drawn in a lane that no longer describes it,
+    /// on top of whatever is really there. The overlap *groups* are deliberately left alone:
+    /// they are the unit the panel's cursor and scrolling are measured in, and recomputing
+    /// them under a held key would reflow the list around a keypress already resolved
+    /// against the old one — the same hazard [`Self::apply_prepared`] cites for not deriving
+    /// them per draw. A collision a nudge creates still shows, in the repacked lanes.
+    pub fn set_cue_timing(&mut self, cue: usize, start: Duration, end: Duration) {
+        let Some(target) = self.cues.get_mut(cue) else {
+            return;
+        };
+        let (was_start, was_end) = (target.start, target.end);
+        target.start = start;
+        target.end = end;
+        let cues = &self.cues;
+        self.encoded.retain(|frame| {
+            frame.cue_index != cue
+                && cues.get(frame.cue_index).is_some_and(|other| {
+                    !shares_screen(other, was_start, was_end) && !shares_screen(other, start, end)
+                })
+        });
+        if self.frame_error.as_ref().is_some_and(|(at, _)| *at == cue) {
+            self.frame_error = None;
+        }
+        self.layout = pack_lanes(&self.cues, MAX_LANES);
+        self.stop_playback();
         self.request_frame();
     }
 
@@ -2374,6 +2472,117 @@ mod tests {
         assert_that!(state.frame_error()).is_none();
     }
 
+    /// A nudge moves both of a cue's ends, so the cue arrives earlier or later without
+    /// getting longer or shorter.
+    #[test]
+    fn a_nudge_should_move_a_cue_through_time_without_changing_its_length() {
+        // Arrange: `ready` puts cue 1 at 2.0s → 3.0s.
+        let mut state = ready(3);
+        state.select(1);
+
+        // Act: two steps later, then one step back.
+        let moved = state.nudge_selected(2);
+        state.nudge_selected(-1);
+
+        // Assert: reported against the cue it moved, and landed one step on.
+        assert_that!(moved).is_equal_to(Some((
+            1,
+            Duration::from_millis(2100),
+            Duration::from_millis(3100),
+        )));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(2050));
+        assert_that!(state.cues[1].end).is_equal_to(Duration::from_millis(3050));
+
+        // Assert: and the cues either side of it are untouched.
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+        assert_that!(state.cues[2].start).is_equal_to(Duration::from_secs(4));
+    }
+
+    /// A cue against the start of the media stops moving with its duration intact.
+    ///
+    /// Clamping only the start would shave a little off the cue on every press — a nudge
+    /// silently editing something the reader did not ask it to.
+    #[test]
+    fn a_nudge_at_the_start_of_the_media_should_clamp_without_shortening_the_cue() {
+        // Arrange: cue 0 runs 0.0s → 1.0s, so it is already against the floor.
+        let mut state = ready(2);
+        state.cues[0].start = Duration::from_millis(30);
+        state.cues[0].end = Duration::from_millis(1030);
+
+        // Act: a step back, which is more than the cue has room for.
+        let clamped = state.nudge_selected(-1);
+
+        // Assert: it moved as far as it could and kept its full second.
+        assert_that!(clamped).is_equal_to(Some((0, Duration::ZERO, Duration::from_secs(1))));
+        assert_that!(state.cues[0].end - state.cues[0].start).is_equal_to(Duration::from_secs(1));
+
+        // Act / Assert: pressed again it reports nothing, so the caller stages nothing and
+        // a held key does not re-render a frame per repeat.
+        assert_that!(state.nudge_selected(-1)).is_none();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+    }
+
+    /// Nothing to move, nothing reported.
+    #[test]
+    fn a_nudge_on_a_track_with_no_cues_should_do_nothing() {
+        let mut state = state();
+        assert_that!(state.nudge_selected(1)).is_none();
+    }
+
+    /// Retiming a cue invalidates the pictures of the lines it *shares the screen with*, not
+    /// only its own.
+    ///
+    /// A frame is burned with every cue on screen at that moment, so moving one line into or
+    /// out of a neighbour's moment changes what the neighbour's picture should show. Keeping
+    /// a stale one would draw the old company under the new timing — which is exactly the
+    /// judgement this page exists to support, made against a lie.
+    #[test]
+    fn retiming_a_cue_should_drop_the_frames_of_everything_it_shared_the_screen_with() {
+        // Arrange: cue 1 overlaps cue 0 (which runs 0.0s → 1.0s) and nothing else; cues 2
+        // and 3 are at 4.0s and 6.0s, clear of it and of where it is about to go.
+        let mut state = ready(4);
+        state.cues[1].start = Duration::from_millis(500);
+        state.cues[1].end = Duration::from_millis(1500);
+        state.layout = pack_lanes(&state.cues, MAX_LANES);
+        state.selected = 1;
+        for index in 0..4 {
+            state.apply_frame(index, protocol(10, 5));
+        }
+        assert_that!((0..4).all(|index| state.has_frame(index))).is_true();
+
+        // Act: move cue 1 clear of cue 0, and clear of everything else.
+        state.set_cue_timing(1, Duration::from_secs(9), Duration::from_secs(10));
+
+        // Assert: the moved cue and the neighbour it left both lost their frames.
+        assert_that!(state.has_frame(1)).is_false();
+        assert_that!(state.has_frame(0)).is_false();
+
+        // Assert: and the cues it was never on screen with kept theirs.
+        assert_that!(state.has_frame(2)).is_true();
+        assert_that!(state.has_frame(3)).is_true();
+    }
+
+    /// The lanes are repacked so the timeline draws a moved cue where it now is, and the
+    /// overlap groups are deliberately not, so the panel does not reflow under a held key.
+    #[test]
+    fn retiming_a_cue_should_repack_the_lanes_but_leave_the_groups_alone() {
+        // Arrange: four cues that overlap nothing, so every one is its own group and lane.
+        let mut state = ready(4);
+        let groups_before = state.groups.clone();
+        assert_that!(state.layout.lane_count).is_equal_to(1);
+
+        // Act: drop cue 2 on top of cue 1, which needs a second lane to draw.
+        state.set_cue_timing(2, Duration::from_millis(2500), Duration::from_millis(3500));
+
+        // Assert: the timeline can draw the collision.
+        assert_that!(state.layout.lane_count).is_equal_to(2);
+
+        // Assert: but the panel's rows, its cursor and its scrolling still describe the
+        // list the last keypress was resolved against.
+        assert_that!(state.groups.len()).is_equal_to(groups_before.len());
+        assert_that!(state.groups).is_equal_to(groups_before);
+    }
+
     /// A frame that has to be rendered waits out the debounce, or a held-down `j` starts
     /// an ffmpeg per key repeat. (One already in the cache does not — that decision is
     /// `App::start_pending_preview`'s, and is asserted there.)
@@ -3045,6 +3254,14 @@ mod tests {
         assert_that!(state.playback_active()).is_false();
         started(&mut state);
         assert_that!(state.select_first()).is_true();
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: the cue itself being retimed under the span. A span is decoded ahead
+        // of time with the cue already burned into its frames, so one still playing after a
+        // nudge is playing the timing the reader has just moved away from — the same lie as
+        // playing it under a different line.
+        started(&mut state);
+        assert_that!(state.nudge_selected(1)).is_some();
         assert_that!(state.playback_active()).is_false();
 
         // Act / Assert: a new track arriving.

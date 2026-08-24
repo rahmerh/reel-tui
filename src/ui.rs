@@ -162,6 +162,9 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
     // same reason the badge is, and shown on the cue panel: a staged edit is invisible once
     // the editor closes, and invisible unsaved work is work a reader thinks is saved.
     let edited = app.staged_cue_edits();
+    // How far the selected cue has been moved, for the timeline's title. Read here for the
+    // same reason `edited` is: it comes from the staged edits rather than from the page.
+    let shift = app.selected_cue_shift().map(format_shift);
     let Some(state) = app.subtitle_sync.as_mut() else {
         return;
     };
@@ -229,7 +232,7 @@ fn render_subtitle_sync(frame: &mut Frame, app: &mut App, area: Rect) {
 
     render_sync_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
     render_sync_cues(frame, state, columns[1], &edited);
-    render_sync_timeline(frame, state, rows[1]);
+    render_sync_timeline(frame, state, shift, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -841,7 +844,12 @@ fn render_sync_cue(
     );
 }
 
-fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect) {
+fn render_sync_timeline(
+    frame: &mut Frame,
+    state: &SubtitleSyncState,
+    shift: Option<String>,
+    area: Rect,
+) {
     let Some(cue) = state.selected_cue() else {
         // "Ready but holding nothing" is reachable state, since `cues` and `selected` are
         // public — see `the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_\
@@ -857,11 +865,30 @@ fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect
     // Parenthetical rather than separated by " · ": that separator is the house style for
     // inline control hints, which this page is forbidden from carrying, and
     // `the_sync_page_should_not_carry_inline_control_hints` watches for it by name.
-    let block = Block::bordered().title(format!(
-        " Timeline ({} → {}) ",
-        format_timestamp(cue.start),
-        format_timestamp(cue.end)
-    ));
+    //
+    // The shift is appended only once the cue has actually moved, and it is what makes this
+    // a readout rather than a label: after three presses the times alone cannot say whether
+    // the reader is a tenth of a second in or a whole one, which is the only question they
+    // are asking. Yellow in the timing mode, matching the cue the keys are pointing at.
+    let retiming = state.timing_mode;
+    let title = match shift {
+        Some(shift) => format!(
+            " Timeline ({} → {} · {}) ",
+            format_timestamp(cue.start),
+            format_timestamp(cue.end),
+            shift
+        ),
+        None => format!(
+            " Timeline ({} → {}) ",
+            format_timestamp(cue.start),
+            format_timestamp(cue.end)
+        ),
+    };
+    let block = Block::bordered().title(if retiming {
+        Line::styled(title, Style::default().fg(Color::Yellow))
+    } else {
+        Line::raw(title)
+    });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let window = TimelineWindow::fitted(
@@ -877,8 +904,9 @@ fn render_sync_timeline(frame: &mut Frame, state: &SubtitleSyncState, area: Rect
         &window,
         state.selected,
         state.playback_position(),
+        retiming,
     );
-    lines.push(timeline_ruler(&window, window.span(cue)));
+    lines.push(timeline_ruler(&window, window.span(cue), retiming));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -905,7 +933,11 @@ fn axis_tick(span: Duration) -> u64 {
         .unwrap_or(TICKS[TICKS.len() - 1])
 }
 
-fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line<'static> {
+fn timeline_ruler(
+    window: &TimelineWindow,
+    selected: Option<(u16, u16)>,
+    retiming: bool,
+) -> Line<'static> {
     // No width guard: `TimelineWindow::column` and `span` both answer `None` for a window
     // with no columns, so a track drawn no cells wide places no readings and no marks and
     // falls out as an empty line — the same contract `timeline_lines` indexes under.
@@ -948,9 +980,39 @@ fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line
     // lane. A triangle rather than a box-drawing glyph: the repo already ships `▸` and
     // `▀`, so this is known to render, and it cannot be read as part of a reading.
     for mark in marks {
-        cells[usize::from(mark)] = ('▲', Style::default().fg(Color::Cyan).bold());
+        cells[usize::from(mark)] = ('▲', Style::default().fg(selection_colour(retiming)).bold());
     }
     Line::from(runs(cells))
+}
+
+/// How far a cue has been moved, as the timeline's title says it.
+///
+/// Always signed, including for a forward shift, because "0.40s" alone does not say which
+/// way — and which way is half of what the reader is checking. Hundredths rather than the
+/// tenths the timestamps beside it carry, since the step is fifty milliseconds and a
+/// tenth-second readout would sit still for every other press.
+fn format_shift(millis: i64) -> String {
+    let sign = if millis.is_negative() { '-' } else { '+' };
+    let millis = millis.unsigned_abs();
+    format!("{sign}{}.{:02}s", millis / 1000, (millis % 1000) / 10)
+}
+
+/// What the selected cue is drawn in on the timeline and its ruler.
+///
+/// Yellow while the cue is being retimed, which is the colour every staged-but-unwritten
+/// thing in the application wears and is what a nudged cue is about to become. Cyan
+/// otherwise, the selection colour everywhere else on the page.
+fn selection_colour(retiming: bool) -> Color {
+    if retiming { Color::Yellow } else { Color::Cyan }
+}
+
+/// What the playhead is drawn in — always the other one.
+///
+/// The two swap rather than the selection simply changing, because the pair has to stay
+/// distinguishable: a yellow playhead inside a yellow cue is invisible, and the reader
+/// nudging a cue against a playing span is looking at exactly that pair.
+fn playhead_colour(retiming: bool) -> Color {
+    if retiming { Color::Cyan } else { Color::Yellow }
 }
 
 /// Lays every cue out across the track, one line per lane.
@@ -963,12 +1025,20 @@ fn timeline_ruler(window: &TimelineWindow, selected: Option<(u16, u16)>) -> Line
 /// by demoting the cues the cursor is not on to something plainer: a timeline where only the
 /// selection's neighbours are drawn in full loses where every other line begins and ends,
 /// which is most of what the pane is worth reading for.
+///
+/// **`retiming` swaps two colours rather than adding a third.** The selected cue is normally
+/// cyan and the playhead yellow, chosen that way because they must not be the same; in the
+/// timing mode the selection takes yellow — the colour everything staged-but-unwritten wears
+/// — and hands cyan to the playhead. Painting the selection yellow without moving the
+/// playhead would hide a yellow `│` inside a yellow span, which is exactly the pair on
+/// screen when a reader nudges a cue with a span still playing.
 fn timeline_lines(
     cues: &[Cue],
     layout: &LaneLayout,
     window: &TimelineWindow,
     selected: usize,
     playhead: Option<Duration>,
+    retiming: bool,
 ) -> Vec<Line<'static>> {
     let width = window.width as usize;
     // `pack_lanes` already guarantees at least one lane, including for an empty track, so
@@ -995,7 +1065,7 @@ fn timeline_lines(
             .unwrap_or(0)
             .min(lanes.saturating_sub(1));
         let style = if index == selected {
-            Style::default().fg(Color::Cyan).bold()
+            Style::default().fg(selection_colour(retiming)).bold()
         } else if layout.overflowed.get(index).copied().unwrap_or(false) {
             Style::default().fg(Color::Magenta)
         } else {
@@ -1016,14 +1086,16 @@ fn timeline_lines(
     // cue it is being read against.
     //
     // Yellow because cyan is the selected cue's, and the whole judgement being made is
-    // where this sits relative to that — two things in one colour would be one thing.
+    // where this sits relative to that — two things in one colour would be one thing. In
+    // the timing mode the selection takes yellow and hands cyan back here, which keeps that
+    // rule rather than breaking it.
     if let Some(column) = playhead.and_then(|at| window.column(at)) {
         for lane in &mut grid {
             // Bounds-checked rather than indexed, unlike the cues above: `column` answers
             // for any moment inside the window, and the playhead's moment comes from the
             // audio device rather than from the cue list this grid was sized against.
             if let Some(cell) = lane.get_mut(usize::from(column)) {
-                *cell = ('│', Style::default().fg(Color::Yellow).bold());
+                *cell = ('│', Style::default().fg(playhead_colour(retiming)).bold());
             }
         }
     }
@@ -2746,8 +2818,24 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
+        "t",
+        "Move the selected cue's timing (SubRip tracks); Esc leaves, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
         "h / l",
-        "Move between cues that share a moment, or choose Yes or No on a preview settings switch",
+        "Move the cue 0.05s earlier or later while timing, otherwise move between cues that \
+         share a moment or choose Yes or No on a preview settings switch",
+    );
+    keybinding(
+        &mut lines,
+        "H / L",
+        "Move the cue half a second earlier or later while timing",
+    );
+    keybinding(
+        &mut lines,
+        "0",
+        "Put the cue back to the timing the file gives it, while timing",
     );
     keybinding(
         &mut lines,
@@ -8667,7 +8755,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
-                cue_text: Default::default(),
+                cue_edits: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -9798,7 +9886,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
-            cue_text: Default::default(),
+            cue_edits: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9850,7 +9938,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let imported = SubtitleChange {
-            cue_text: Default::default(),
+            cue_edits: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -9869,7 +9957,7 @@ mod tests {
         )
         .unwrap();
         let exported = SubtitleChange {
-            cue_text: Default::default(),
+            cue_edits: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9989,7 +10077,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
-            cue_text: Default::default(),
+            cue_edits: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10079,7 +10167,7 @@ mod tests {
 
             // Act: the embedded track, staying embedded.
             let change = SubtitleChange {
-                cue_text: Default::default(),
+                cue_edits: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -10104,7 +10192,7 @@ mod tests {
 
             // Act: the sidecar, being imported into the same container.
             let change = SubtitleChange {
-                cue_text: Default::default(),
+                cue_edits: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 import_into_media: true,
                 metadata: Some(metadata.clone()),
@@ -10162,7 +10250,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
-            cue_text: Default::default(),
+            cue_edits: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -11096,7 +11184,7 @@ mod tests {
         app.subtitle_changes.insert(
             embedded_source.clone(),
             SubtitleChange {
-                cue_text: Default::default(),
+                cue_edits: Default::default(),
                 source: embedded_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -11128,7 +11216,7 @@ mod tests {
         app.subtitle_changes.insert(
             sidecar_source.clone(),
             SubtitleChange {
-                cue_text: Default::default(),
+                cue_edits: Default::default(),
                 source: sidecar_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -11589,9 +11677,9 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", and the two that
-        // match on "tracks": the SRT timing preview and the cue editor.
-        assert_eq!(count, 4);
+        // "Move track down / up", "Mark or unmark track for deletion", and the three that
+        // match on "tracks": the SRT timing preview, the cue editor, and the timing mode.
+        assert_eq!(count, 5);
     }
 
     #[test]
@@ -13790,7 +13878,7 @@ mod tests {
 
     /// The text of a ruler drawn for `window`, marked for `cue`.
     fn ruler_text(window: &TimelineWindow, cue: &crate::cue::Cue) -> String {
-        timeline_ruler(window, window.span(cue))
+        timeline_ruler(window, window.span(cue), false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -14016,7 +14104,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None, false);
         let text = timeline_text(&lines);
 
         // Assert
@@ -14042,7 +14130,7 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
 
         // Assert
         assert_that!(text[0].contains('|')).is_true();
@@ -14064,11 +14152,98 @@ mod tests {
         };
 
         // Act
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
 
         // Assert: one cue drawn, and nothing wrapped around from the other.
         assert_that!(text.len()).is_equal_to(1);
         assert_that!(text[0].matches('|').count()).is_equal_to(2);
+    }
+
+    /// The timing mode swaps two colours rather than adding a third: the selected cue takes
+    /// yellow and hands cyan to the playhead.
+    ///
+    /// **Asserted as a swap rather than as "the cue is yellow"**, because that is the whole
+    /// requirement. Painting the selection yellow and leaving the playhead alone would put a
+    /// yellow `│` inside a yellow span, which draws as no playhead at all — and the two are
+    /// on screen together exactly when a reader nudges a cue with a span still playing,
+    /// which is what the mode is for.
+    #[test]
+    fn the_timing_mode_should_swap_the_selected_cues_colour_with_the_playheads() {
+        // Arrange: one cue with the playhead inside it, so both colours are on one lane.
+        let cues = vec![sync_cue(10_000, 20_000, "line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+        let at = Some(std::time::Duration::from_secs(15));
+        let colours = |retiming: bool| {
+            let lines = timeline_lines(&cues, &layout, &window, 0, at, retiming);
+            let cells: Vec<(char, Option<Color>)> = lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| {
+                    span.content
+                        .chars()
+                        .map(move |glyph| (glyph, span.style.fg))
+                })
+                .collect();
+            let of = |glyph: char| {
+                cells
+                    .iter()
+                    .find(|(candidate, _)| *candidate == glyph)
+                    .and_then(|(_, colour)| *colour)
+            };
+            (of('|'), of('│'))
+        };
+
+        // Act
+        let (cue_normally, playhead_normally) = colours(false);
+        let (cue_retiming, playhead_retiming) = colours(true);
+
+        // Assert: cyan cue, yellow playhead — and in the mode, the other way round.
+        assert_that!(cue_normally).is_equal_to(Some(Color::Cyan));
+        assert_that!(playhead_normally).is_equal_to(Some(Color::Yellow));
+        assert_that!(cue_retiming).is_equal_to(Some(Color::Yellow));
+        assert_that!(playhead_retiming).is_equal_to(Some(Color::Cyan));
+
+        // Assert: and whichever way round they are, they are never the same colour — which
+        // is the property the swap exists to keep.
+        assert_that!(cue_normally != playhead_normally).is_true();
+        assert_that!(cue_retiming != playhead_retiming).is_true();
+    }
+
+    /// The ruler's `▲` marks are the selected cue's two ends, so they follow it to yellow —
+    /// otherwise "which cue am I on" is answered in two colours at once.
+    #[test]
+    fn the_axis_marks_should_follow_the_selected_cue_into_the_timing_mode() {
+        // Arrange
+        let window = window_over(0, 60, 61);
+        let cue = sync_cue(10_000, 20_000, "line");
+        let colour_of_marks = |retiming: bool| {
+            timeline_ruler(&window, window.span(&cue), retiming)
+                .spans
+                .iter()
+                .find(|span| span.content.contains('▲'))
+                .and_then(|span| span.style.fg)
+        };
+
+        // Act / Assert
+        assert_that!(colour_of_marks(false)).is_equal_to(Some(Color::Cyan));
+        assert_that!(colour_of_marks(true)).is_equal_to(Some(Color::Yellow));
+    }
+
+    /// The shift is what the reader is actually reading after three presses: the two
+    /// timestamps alone cannot say whether they are a tenth of a second in or a whole one.
+    #[test]
+    fn format_shift_should_sign_and_round_a_nudge() {
+        assert_that!(format_shift(150).as_str()).is_equal_to("+0.15s");
+        assert_that!(format_shift(-50).as_str()).is_equal_to("-0.05s");
+        assert_that!(format_shift(2_500).as_str()).is_equal_to("+2.50s");
+        // Hundredths, so a fifty-millisecond step is visible on every press rather than on
+        // every other one.
+        assert_that!(format_shift(-1_005).as_str()).is_equal_to("-1.00s");
     }
 
     #[test]
@@ -14085,7 +14260,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None);
+        let lines = timeline_lines(&cues, &layout, &window, 0, None, false);
 
         // Assert: the overflowed cue is the only one painted magenta.
         let magenta = lines
@@ -14156,7 +14331,7 @@ mod tests {
         };
 
         // Act: an empty track, with the cursor still sitting on cue zero.
-        let lines = timeline_lines(&[], &layout, &window, 0, None);
+        let lines = timeline_lines(&[], &layout, &window, 0, None, false);
 
         // Assert: one blank lane rather than an index panic.
         assert_that!(lines.len()).is_equal_to(1);
@@ -14302,6 +14477,104 @@ mod tests {
         app.cue_editor_insert('!');
         app.close_cue_editor();
         assert_that!(draw(&mut app, 100, 30).join("\n").contains("1 edited")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timeline's title is the readout a reader nudges against: the cue's live times,
+    /// and how far it has been moved.
+    ///
+    /// Both halves matter and neither is enough alone. Without the times the reader cannot
+    /// see where the cue now is; without the shift they cannot tell three presses from six,
+    /// which is the question a burst of them is asking.
+    #[test]
+    fn the_timeline_title_should_read_out_the_shift_while_a_cue_is_being_retimed() {
+        // Arrange
+        let (mut app, directory) =
+            sync_page_app("sync-timing-title", vec![sync_cue(5000, 7000, "Hello")]);
+
+        // Act / Assert: unmoved, the title names the cue's times and no shift — "+0.00s" on
+        // every cue the reader walks past would be a number that never changes.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("0.00s")).is_false();
+
+        // Act: into the mode and three steps later.
+        app.toggle_cue_timing_mode();
+        for _ in 0..3 {
+            app.nudge_selected_cue(1);
+        }
+
+        // Assert: the times moved with the cue, and the shift says how far.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.1 → 00:00:07.1 · +0.15s)")).is_true();
+
+        // Act / Assert: and back at the file's timing the shift goes rather than reading
+        // zero, so the title is only ever carrying a number worth reading.
+        app.reset_selected_cue_timing();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("0.00s")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A retimed cue is a staged-but-unwritten edit like any other, so it counts on the
+    /// border and wears the mark on its row — the reader must not have to remember which
+    /// lines they moved.
+    #[test]
+    fn a_retimed_cue_should_be_counted_and_marked_like_a_rewritten_one() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = sync_page_app(
+            "sync-retimed-mark",
+            vec![
+                sync_cue(1000, 3000, "Untouched"),
+                sync_cue(5000, 7000, "Retimed"),
+            ],
+        );
+
+        // Act: move the second cue, and put the cursor back on the first so the retimed row
+        // is drawn unselected — where the cyan fill does not own its colours.
+        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+        app.subtitle_sync.as_mut().unwrap().select(-1);
+
+        // Assert: counted on the border.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited")).is_true();
+
+        // Assert: and said on the row itself, in the pair every staged edit wears.
+        // Matched over the row's *symbols* rather than over its bytes: the panel's borders
+        // are multi-byte box-drawing characters, so a byte offset from `str::find` is not
+        // the column the word starts in and would read the style of some other cell.
+        let cell_of = |word: &str| {
+            (0..buffer.area.height).find_map(|y| {
+                let symbols: Vec<&str> = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                (0..symbols.len())
+                    .find(|start| symbols[*start..].concat().starts_with(word))
+                    .map(|x| buffer[(x as u16, y)].clone())
+            })
+        };
+        let retimed = cell_of("Retimed").expect("the retimed row should be on screen");
+        let untouched = cell_of("Untouched").expect("the other row should be on screen");
+        assert_that!(retimed.fg).is_equal_to(Color::Yellow);
+        assert!(retimed.modifier.contains(Modifier::ITALIC));
+        // The untouched row is the one under the cursor, so it wears the selection's fill
+        // rather than the plain grey — and, not being edited, no italic.
+        assert_that!(untouched.fg).is_equal_to(Color::White);
+        assert_that!(untouched.bg).is_equal_to(Color::Cyan);
+        assert!(!untouched.modifier.contains(Modifier::ITALIC));
 
         // Cleanup
         drop(app);
@@ -14745,6 +15018,7 @@ mod tests {
             &window,
             0,
             Some(std::time::Duration::from_secs(18)),
+            false,
         );
 
         // Assert: on both lanes, at the column that moment maps to — over the cue rather
@@ -14756,7 +15030,7 @@ mod tests {
         }
 
         // Act / Assert: and no playback means no mark, rather than one parked at zero.
-        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None));
+        let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, None, false));
         for lane in &text {
             assert_that!(lane.contains('│')).is_false();
         }
@@ -14781,7 +15055,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(90),
         ] {
-            let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, Some(at)));
+            let text = timeline_text(&timeline_lines(&cues, &layout, &window, 0, Some(at), false));
             for lane in &text {
                 assert_that!(lane.contains('│')).is_false();
             }

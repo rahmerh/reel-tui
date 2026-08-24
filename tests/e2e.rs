@@ -4430,6 +4430,146 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
     );
 }
 
+/// A cue is retimed on the timing page with `t` and `h`/`l`, staged like any other edit, and
+/// written by Ctrl+S.
+///
+/// Asserted through the whole workflow rather than on the nudge alone, because the feature is
+/// the workflow: the keys have to reach the cue, the cue has to reach the staged edit, the
+/// staged edit has to survive leaving the page, and the save has to put the new `-->` line —
+/// and only that line — into the file on disk. Each half looks right on its own while the
+/// file still says exactly what it always said.
+///
+/// The mode is exercised as a mode, too: `h`/`l` have a second meaning only while it is on,
+/// and `Esc` has to give the first one back without also leaving the page.
+#[test]
+fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-retime");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // edited-count uses, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    // Act / Assert: with the mode off, `l` is the cue list's sideways move and moves no
+    // cue — so a stray press on a page nobody is retiming cannot edit the file.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('l')));
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "sideways movement should not be an edit"
+    );
+
+    // Act: into the mode, and four steps later — 0.20s.
+    app.press(key(KeyCode::Char('t')));
+    for _ in 0..4 {
+        app.press(key(KeyCode::Char('l')));
+    }
+
+    // Assert: staged, and the page says so — the shift on the timeline's title, the count
+    // on the cue panel's border.
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "a nudge should stage like any other edit"
+    );
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("+0.20s") && screen.contains("1 edited"),
+        "the page should show how far the cue moved and say it is unwritten:\n{screen}"
+    );
+
+    // Act / Assert: `Esc` gives `h`/`l` back without leaving the page or raising the
+    // question about the edits.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, None, "Esc should not ask anything yet");
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "Esc should take the mode rather than the page"
+    );
+
+    // Act: write it.
+    app.process_all();
+
+    // Assert: the reader is still on the timing page, on the cue they moved.
+    app.wait_until("the timing page to come back", |app| {
+        app.layer == Layer::SubtitleSync
+            && app
+                .subtitle_sync
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+    assert_eq!(
+        app.app.subtitle_sync.as_ref().unwrap().selected,
+        1,
+        "the cursor should come back to the cue that was retimed"
+    );
+
+    // Assert: the file carries the new timing, the cue's words are untouched, and the cue
+    // nobody moved is exactly as it was — including its timing, which a rewrite of the
+    // whole file has every opportunity to round.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        written.contains("00:00:03,200 --> 00:00:04,200"),
+        "the save should write the retimed cue:\n{written}"
+    );
+    assert!(
+        written.contains("Second line"),
+        "the save should leave the cue's words alone:\n{written}"
+    );
+    assert!(
+        written.contains("00:00:01,000 --> 00:00:02,000\nFirst line"),
+        "the save should leave the other cue alone:\n{written}"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written edit should stop being unsaved work"
+    );
+
+    // Act: move another cue and this time answer the leave question with "discard".
+    app.press(key(KeyCode::Char('t')));
+    app.press(key(KeyCode::Char('H')));
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "the second nudge should stage like the first"
+    );
+    app.press(key(KeyCode::Esc));
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmLeaveCues));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Enter));
+
+    // Assert: the page is closed and the shift is gone rather than travelling with the file
+    // to the next Ctrl+S, where it would be written from a page nobody is looking at.
+    assert_eq!(app.app.layer, Layer::Streams, "discarding should leave");
+    assert!(
+        !app.app.has_track_edits(),
+        "discarding should take the staged timing with it"
+    );
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        written.contains("00:00:03,200 --> 00:00:04,200"),
+        "a discarded nudge should never reach the file:\n{written}"
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
