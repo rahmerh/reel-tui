@@ -2724,7 +2724,7 @@ impl App {
             return;
         }
         let Some(source) = self.selected_subtitle_source() else {
-            self.notice = Some("Select a subtitle track to preview its timing.".to_string());
+            self.notice = Some(self.unimplemented_track_notice());
             return;
         };
         if let SubtitleSource::Embedded(index) = source
@@ -3074,6 +3074,27 @@ impl App {
     }
 
     /// The subtitle track under the cursor, if the cursor is on one at all.
+    /// What the timing page says on a row it has nothing to offer. It names the kind of
+    /// track the reader actually picked and states the absence of a feature, rather than
+    /// telling them to pick something else: `c` on a video track is a reasonable thing to
+    /// try, and "select a subtitle track" reads as a correction of the reader for a gap in
+    /// the program. Every refusal of this shape is worded the same way, so a reader who
+    /// meets one on one kind of track knows what they are being told on the next.
+    fn unimplemented_track_notice(&self) -> String {
+        // `track_rows` offers only the container, video, audio and subtitle rows, and a
+        // subtitle row never reaches here — so the kind is read off the stream rather than
+        // enumerated, and the fallback is for a selection that has gone stale rather than
+        // for a kind of track that has a row of its own.
+        let subject = match self.selected_track() {
+            Some(TrackRef::Container) => "the container".to_string(),
+            _ => self
+                .selected_stream_info()
+                .and_then(stream_kind)
+                .map_or_else(|| "this track".to_string(), |kind| format!("{kind} tracks")),
+        };
+        format!("Editing {subject} is not implemented yet.")
+    }
+
     fn selected_subtitle_source(&self) -> Option<SubtitleSource> {
         match self.selected_track()? {
             TrackRef::Embedded(index) => self
@@ -20994,26 +21015,47 @@ mod tests {
         }
     }
 
+    /// A track the page cannot open is turned away by naming its own kind, so the reader is
+    /// told which feature is missing rather than told to pick a different row.
     #[test]
     fn open_subtitle_sync_should_refuse_a_track_that_is_not_a_subtitle() {
+        for (index, expected) in [(0, "video tracks"), (1, "audio tracks")] {
+            // Arrange
+            let mut app = app_with_subtitle_codec("subrip");
+            let directory = app.directory.clone();
+            select_embedded_row(&mut app, index);
+
+            // Act
+            app.open_subtitle_sync();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_sync.is_none()).is_true();
+            assert_that!(app.notice.clone().unwrap().as_str())
+                .is_equal_to(format!("Editing {expected} is not implemented yet.").as_str());
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// A selection left pointing past the rows has no kind to name, so the refusal keeps
+    /// its shape and falls back to the row itself rather than to a message about
+    /// subtitles.
+    #[test]
+    fn open_subtitle_sync_should_refuse_a_selection_that_names_no_track() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        select_embedded_row(&mut app, 1);
+        app.selected_stream = app.track_rows().len();
 
         // Act
         app.open_subtitle_sync();
 
         // Assert
-        assert_that!(app.layer).is_equal_to(Layer::Streams);
         assert_that!(app.subtitle_sync.is_none()).is_true();
-        assert_that!(
-            app.notice
-                .clone()
-                .unwrap()
-                .contains("Select a subtitle track")
-        )
-        .is_true();
+        assert_that!(app.notice.clone().unwrap().as_str())
+            .is_equal_to("Editing this track is not implemented yet.");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -21035,13 +21077,8 @@ mod tests {
 
         // Assert
         assert_that!(app.subtitle_sync.is_none()).is_true();
-        assert_that!(
-            app.notice
-                .clone()
-                .unwrap()
-                .contains("Select a subtitle track")
-        )
-        .is_true();
+        assert_that!(app.notice.clone().unwrap().as_str())
+            .is_equal_to("Editing the container is not implemented yet.");
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
