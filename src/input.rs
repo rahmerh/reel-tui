@@ -1101,9 +1101,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.nudge_selected_cue(sync::TIMING_LEAP);
         }
-        // `0` for the timing this cue started at, the way `0` is the start of the line in
-        // vim. Inert outside the timing mode, where a bare digit means nothing on this page.
-        (KeyCode::Char('0'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+        // `r` for the timing this cue started at, which is what `r` already means one layer
+        // up: on the track list it puts the focused field back to what the file says. Inert
+        // outside the timing mode, where this page has nothing to reset.
+        (KeyCode::Char('r'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
             input.reset_sequence();
             app.reset_selected_cue_timing();
         }
@@ -3810,11 +3811,11 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// `0` undoes the whole burst rather than one press, because the file's timing is the
-    /// only one worth going back to — and it is inert outside the mode, where a bare digit
-    /// means nothing on this page.
+    /// `r` undoes the whole burst rather than one press, because the file's timing is the
+    /// only one worth going back to — and it is inert outside the mode, where this page has
+    /// nothing to reset.
     #[test]
-    fn zero_should_put_the_cue_back_to_the_timing_the_file_gives_it() {
+    fn r_should_put_the_cue_back_to_the_timing_the_file_gives_it() {
         // Arrange: the page, in the mode, three steps on.
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3827,7 +3828,7 @@ mod tests {
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1150));
 
         // Act
-        handle_key(&mut app, &mut input, key(KeyCode::Char('0')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
 
         // Assert: back where the file has it, and staged as nothing rather than as a
         // round trip — a cue returned to its own timing is not an edit.
@@ -3839,7 +3840,7 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(app.cue_timing_mode()).is_false();
-        handle_key(&mut app, &mut input, key(KeyCode::Char('0')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
 
         // Cleanup

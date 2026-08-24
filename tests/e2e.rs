@@ -4638,8 +4638,23 @@ fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
         "sideways movement should not be an edit"
     );
 
-    // Act: into the mode, and four steps later — 0.20s.
+    // Act / Assert: into the mode, and `r` undoes a burst of nudges in one press — a cue
+    // back at the timing the file gives it is staged as nothing at all.
     app.press(key(KeyCode::Char('t')));
+    for _ in 0..3 {
+        app.press(key(KeyCode::Char('h')));
+    }
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "a nudge should stage like any other edit"
+    );
+    app.press(key(KeyCode::Char('r')));
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "r should put the cue back to the file's timing, which is not an edit"
+    );
+
+    // Act: four steps later — 0.20s.
     for _ in 0..4 {
         app.press(key(KeyCode::Char('l')));
     }
