@@ -1696,6 +1696,87 @@ fn cached_tracks() -> BTreeSet<std::ffi::OsString> {
     .unwrap_or_default()
 }
 
+/// `c` on a row the timing page does not cover names that kind of track and says the
+/// feature is missing, rather than telling the reader to select something else.
+///
+/// Pressing it on a video or audio track is a reasonable thing to try — the page is about
+/// editing a track, and which tracks it can edit is not written on the row — so the answer
+/// has to be about the gap in the program rather than about the reader's choice. Covers
+/// the two selectable non-subtitle kinds and the container row, since each takes a
+/// different branch to its subject; runs no ffmpeg beyond building the fixture.
+#[test]
+fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
+    let test = "the_timing_page_should_name_the_track_kind_it_cannot_edit_yet";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-sync-unimplemented");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .audio(&["eng"])
+            .subtitles(vec![SubtitleSpec::new("eng", "subrip").cues(SIDECAR_CUES)]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    let rows = app.app.track_rows();
+    let video_row = rows
+        .iter()
+        .position(|track| matches!(track, TrackRef::Embedded(0)))
+        .expect("the fixture should have a video row");
+    let container_row = rows
+        .iter()
+        .position(|track| *track == TrackRef::Container)
+        .expect("the overview should have a container row");
+    let audio_row = video_row + 1;
+
+    for (row, expected) in [
+        (video_row, "Editing video tracks is not implemented yet."),
+        (audio_row, "Editing audio tracks is not implemented yet."),
+        (
+            container_row,
+            "Editing the container is not implemented yet.",
+        ),
+    ] {
+        app.select_track_row(row);
+        app.press(key(KeyCode::Char('c')));
+        app.pump();
+
+        assert_eq!(
+            app.app.layer,
+            Layer::Streams,
+            "row {row} should not have opened the timing page"
+        );
+        assert!(
+            app.app.subtitle_sync.is_none(),
+            "row {row} should not have left page state behind"
+        );
+        assert_eq!(
+            app.app.notice.as_deref(),
+            Some(expected),
+            "row {row} should say which kind of track is not editable yet"
+        );
+        assert!(
+            app.screen().contains(expected),
+            "the refusal should reach the screen:\n{}",
+            app.screen()
+        );
+    }
+
+    // And the subtitle track beside them still opens, so the refusal is about the kind of
+    // row rather than about the file.
+    let subtitle_row = app.first_subtitle_row();
+    app.select_track_row(subtitle_row);
+    app.press(key(KeyCode::Char('c')));
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleSync,
+        "the subtitle track should still open the page"
+    );
+    app.press(key(KeyCode::Esc));
+}
+
 /// A format the page has no road to a cue list through is turned away at the door rather
 /// than opening a page that can never fill in. Covers a text format and a bitmap one;
 /// runs no ffmpeg beyond building the fixtures.
