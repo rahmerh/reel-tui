@@ -982,6 +982,19 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.show_keybindings();
         }
+        // **The timeline pane has no vertical axis, so while it holds the cursor the keys
+        // that mean "move down a list" mean nothing at all.** Swallowed as two arms here
+        // rather than as a guard on each of the half-dozen movement arms below, so a key
+        // added to that set later cannot quietly start walking the cue list under a reader
+        // who is looking somewhere else entirely. The sequence is reset for the same reason
+        // every other arm resets it: a swallowed `g` must not leave half a `gg` pending.
+        (
+            KeyCode::Char('j' | 'k' | 'g' | 'G') | KeyCode::Down | KeyCode::Up,
+            KeyModifiers::NONE | KeyModifiers::SHIFT,
+        ) if app.timeline_focused() => input.reset_sequence(),
+        (KeyCode::Char('d' | 'u'), KeyModifiers::CONTROL) if app.timeline_focused() => {
+            input.reset_sequence();
+        }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             input.reset_sequence();
             app.scroll_down();
@@ -1057,20 +1070,35 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.toggle_cue_timing_mode();
         }
+        // `Ctrl+J` and `Ctrl+K` move the page's cursor down into the timeline and back up to
+        // the cues — the same vertical pair that moves a *track* up and down on the track
+        // list, applied to the two stacked panes here. Free on this layer, so nothing had to
+        // be given up for them.
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.focus_timeline();
+        }
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.focus_cues();
+        }
         // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
         // move between rows and these move between the cues sharing one. Ahead of the
         // generic `h`/`l` arms below, which are about horizontal choices on other layers.
         //
-        // **In timing mode they move the cue itself instead**, which is why the two
-        // meanings share one pair of keys rather than the second pair being bound
-        // elsewhere: left and right is what moving through time *is* on this page, and a
-        // reader in the mode is pointing at one cue rather than choosing between several.
-        // Sideways movement inside a group comes back with `Esc`.
+        // **Three meanings now share this pair, and the focus decides before the mode
+        // does.** With the cursor in the timeline they walk it through the media; that is
+        // what left and right mean in a pane whose only axis is time, and a pane holding the
+        // cursor owning its own movement keys is the whole point of the focus. Otherwise the
+        // timing mode moves the selected cue, and otherwise again the cursor steps between
+        // the cues sharing a moment. Each of the two inner meanings comes back with `Esc`.
         (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE)
             if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            if app.cue_timing_mode() {
+            if app.timeline_focused() {
+                app.move_timeline_cursor(-1);
+            } else if app.cue_timing_mode() {
                 app.nudge_selected_cue(-1);
             } else {
                 app.move_cue_within_group(-1);
@@ -1080,7 +1108,9 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            if app.cue_timing_mode() {
+            if app.timeline_focused() {
+                app.move_timeline_cursor(1);
+            } else if app.cue_timing_mode() {
                 app.nudge_selected_cue(1);
             } else {
                 app.move_cue_within_group(1);
@@ -1093,13 +1123,21 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP);
+            if app.timeline_focused() {
+                app.move_timeline_cursor(-subtitle_edit::TIMELINE_LEAP);
+            } else {
+                app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP);
+            }
         }
         (KeyCode::Char('L'), KeyModifiers::NONE | KeyModifiers::SHIFT)
             if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            app.nudge_selected_cue(subtitle_edit::TIMING_LEAP);
+            if app.timeline_focused() {
+                app.move_timeline_cursor(subtitle_edit::TIMELINE_LEAP);
+            } else {
+                app.nudge_selected_cue(subtitle_edit::TIMING_LEAP);
+            }
         }
         // `r` for the timing this cue started at, which is what `r` already means one layer
         // up: on the track list it puts the focused field back to what the file says. Inert
@@ -3882,7 +3920,7 @@ mod tests {
     /// `App::playback_in_progress`. Checked from the key rather than only from the method,
     /// since the binding is what a user actually presses.
     #[test]
-    fn a_playback_should_make_the_dialog_keys_inert_on_the_timing_page() {
+    fn a_playback_should_make_the_dialog_keys_inert_on_the_edit_page() {
         // Arrange: the page, with a span on the way.
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -4118,6 +4156,153 @@ mod tests {
         assert_that!(outcome).is_equal_to(InputOutcome::Continue);
         assert_that!(app.layer).is_equal_to(Layer::Streams);
         assert_that!(app.subtitle_edit.is_none()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A subtitle edit page holding three cues a second apart, for the timeline cursor.
+    fn timeline_app() -> (App, PathBuf, InputState) {
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            (0..3)
+                .map(|index| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(index as u64 * 4),
+                    end: std::time::Duration::from_secs(index as u64 * 4 + 2),
+                    text: "line".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+        (app, directory, input)
+    }
+
+    /// `Ctrl+J` and `Ctrl+K` move the page's cursor between its two stacked panes. The same
+    /// pair moves a track up and down on the track list, so they must stay apart by layer.
+    #[test]
+    fn ctrl_j_and_ctrl_k_should_move_the_cursor_between_the_panes_of_the_edit_page() {
+        // Arrange
+        let (mut app, directory, mut input) = timeline_app();
+
+        // Act / Assert: down into the timeline, and back up.
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert_that!(app.timeline_focused()).is_true();
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_that!(app.timeline_focused()).is_false();
+
+        // Act / Assert: and on the track list the same pair still moves a track, leaving the
+        // page's cursor alone.
+        app.layer = Layer::Streams;
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert_that!(app.timeline_focused()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Three meanings share `h`/`l` on this page and the focus settles it before the mode
+    /// does: a pane holding the cursor owns the keys that mean movement in it.
+    #[test]
+    fn h_and_l_should_move_the_timeline_cursor_before_they_move_a_cue() {
+        // Arrange: the timing mode on *and* the cursor in the timeline, which is the case
+        // the precedence exists for.
+        let (mut app, directory, mut input) = timeline_app();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        assert_that!(app.cue_timing_mode()).is_true();
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        let started = app.subtitle_edit.as_ref().unwrap().cursor().unwrap();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        );
+
+        // Assert: the cursor moved one step and one leap, and the cue did not move at all.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cursor()).is_equal_to(Some(
+            started
+                + crate::subtitle_edit::TIMELINE_STEP
+                + crate::subtitle_edit::TIMELINE_STEP * crate::subtitle_edit::TIMELINE_LEAP as u32,
+        ));
+        assert_that!(app.selected_cue_shift()).is_none();
+
+        // Act / Assert: back to the cues, and the same keys nudge the cue again.
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.selected_cue_shift()).is_equal_to(Some(50));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timeline has no vertical axis, so while it holds the cursor the keys that mean
+    /// "move down a list" must do nothing rather than walk the cue list out from under a
+    /// reader who is looking somewhere else.
+    #[test]
+    fn vertical_keys_should_be_inert_while_the_timeline_holds_the_cursor() {
+        // Arrange
+        let (mut app, directory, mut input) = timeline_app();
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+
+        // Act
+        for pressed in [
+            key(KeyCode::Char('j')),
+            key(KeyCode::Down),
+            key(KeyCode::Char('G')),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ] {
+            handle_key(&mut app, &mut input, pressed);
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.timeline_focused()).is_true();
+
+        // Act / Assert: and back in the cue panel they walk the list as they always did.
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
 
         // Cleanup
         drop(app);

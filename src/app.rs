@@ -2895,6 +2895,18 @@ impl App {
                     FrameOutcome::Ready(protocol) => state.apply_frame(cue_index, protocol),
                     FrameOutcome::Failed(message) => state.fail_frame(cue_index, message),
                 },
+                // The moment is the second gate here, the way the cue index is above: the
+                // cursor may have moved on while this was rendering, and the page drops what
+                // arrives for a moment it has left rather than drawing it under a different
+                // one. `SubtitleEditState` makes that check itself, since it owns the cursor.
+                PreviewEvent::ScrubFrame {
+                    generation,
+                    at,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    FrameOutcome::Ready(protocol) => state.apply_scrub_frame(at, protocol),
+                    FrameOutcome::Failed(message) => state.fail_scrub_frame(at, message),
+                },
                 // Two gates, not one. The generation says the span is for the playback that
                 // is still wanted; the cue index says the page has not moved to another
                 // line since — which it can have, because moving the cursor is one of the
@@ -3045,13 +3057,25 @@ impl App {
         });
         let wanted = if held_back { None } else { selected };
         let nearby = state.nearby_frame_targets();
+        // Always debounced, unlike the selected cue: nothing the timeline cursor asks for is
+        // ever in the frame cache, so there is no cheap case to let straight through. Held
+        // back rather than dropped for the same reason `wanted` is — the request stands until
+        // it is actually sent, so a settling cursor still gets its frame.
+        let scrub = state
+            .scrub_request_due()
+            .then(|| state.scrub_target())
+            .flatten();
+        let scrub_held_back = state.scrub_requested() && scrub.is_none();
         // Everything in the window is already encoded, which is the steady state while the
         // cursor sits still. Forgetting the request here is what stops the same window
         // being re-examined on every one of the twenty loop iterations a second — unless
         // the selected cue is being held back, which is a request still owed an answer.
-        if wanted.is_none() && nearby.is_empty() {
+        if wanted.is_none() && nearby.is_empty() && scrub.is_none() {
             if !held_back {
                 state.clear_frame_request();
+            }
+            if !scrub_held_back {
+                state.clear_scrub_request();
             }
             return;
         }
@@ -3064,11 +3088,15 @@ impl App {
         } else {
             state.clear_frame_request();
         }
+        if !scrub_held_back {
+            state.clear_scrub_request();
+        }
         preview.request_frame(FrameRequest {
             generation: state.generation,
             source: state.frames.clone(),
             wanted,
             nearby,
+            scrub,
             cells: state.preview_cells,
         });
     }
@@ -3113,6 +3141,44 @@ impl App {
         if let Some(state) = self.subtitle_edit.as_mut() {
             state.select(delta);
         }
+    }
+
+    /// Hands the page's cursor to the timeline pane, for `Ctrl+J`.
+    ///
+    /// The cursor lands on the moment the preview pane is already showing, so arriving
+    /// changes what the keys mean and nothing else. From there `h`/`l` walk it through the
+    /// media and the pane follows — which is the only way to look at a frame the cue list
+    /// does not point at.
+    pub fn focus_timeline(&mut self) {
+        if let Some(state) = self.subtitle_edit.as_mut()
+            && state.focus_timeline()
+        {
+            self.notice = None;
+        }
+    }
+
+    /// Takes the cursor back to the cue panel, for `Ctrl+K` and for `Esc`.
+    pub fn focus_cues(&mut self) -> bool {
+        self.subtitle_edit
+            .as_mut()
+            .is_some_and(SubtitleEditState::focus_cues)
+    }
+
+    /// Moves the timeline cursor by `steps` of `subtitle_edit::TIMELINE_STEP`, for `h`/`l`
+    /// and `H`/`L` while the timeline holds the cursor.
+    pub fn move_timeline_cursor(&mut self, steps: i64) {
+        if let Some(state) = self.subtitle_edit.as_mut()
+            && state.move_cursor(steps)
+        {
+            self.notice = None;
+        }
+    }
+
+    /// Whether the timeline pane holds the page's cursor, so the keys belong to it.
+    pub fn timeline_focused(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.cursor().is_some())
     }
 
     /// Moves the cue cursor sideways, between the cues that share a moment with the one it
@@ -4212,6 +4278,13 @@ impl App {
                 // before leaving the file list: a playback is something on screen the user
                 // may want gone without also losing the page they spent a second opening.
                 if self.stop_playback() {
+                    return true;
+                }
+                // The cursor comes home next. After the playback because the two are
+                // independent — a span may well be running while the reader scrubs — and
+                // before the timing mode because the cursor is the thing they moved most
+                // recently and so the thing `Esc` is most likely aimed at.
+                if self.focus_cues() {
                     return true;
                 }
                 // The timing mode is the next layer down, and it is peeled *after* the
@@ -21656,7 +21729,7 @@ mod tests {
     /// throws work away — and the answer that says "discard" has to actually discard, or the
     /// reader carries invisible words to the next Ctrl+S.
     #[test]
-    fn leaving_the_timing_page_should_ask_about_unsaved_cue_edits() {
+    fn leaving_the_edit_page_should_ask_about_unsaved_cue_edits() {
         // Arrange: an edit staged.
         let (mut app, directory) = cue_editing_app();
         app.open_cue_editor();
@@ -21741,7 +21814,7 @@ mod tests {
     /// Nothing staged, nothing to ask about: the page closes on the first `Esc` the way it
     /// did before it could be edited at all.
     #[test]
-    fn leaving_the_timing_page_should_not_ask_when_nothing_was_edited() {
+    fn leaving_the_edit_page_should_not_ask_when_nothing_was_edited() {
         // Arrange
         let (mut app, directory) = cue_editing_app();
         app.open_cue_editor();
@@ -21762,7 +21835,7 @@ mod tests {
     /// closed and the file re-probed — but the reader asked to save a cue, not to leave.
     /// The page comes back on the same track, and the cursor lands on the cue it was on.
     #[test]
-    fn saving_from_the_timing_page_should_come_back_to_it() {
+    fn saving_from_the_edit_page_should_come_back_to_it() {
         // Arrange: the page open on the second cue, then a save closing it the way the
         // rescan of its own output does.
         let (mut app, directory) = cue_editing_app();
@@ -23775,7 +23848,7 @@ mod tests {
     /// The popup belongs to the subtitle edit page, and every settings popup in the application
     /// refuses to open over another one.
     #[test]
-    fn the_preview_settings_popup_should_open_only_from_the_timing_page() {
+    fn the_preview_settings_popup_should_open_only_from_the_edit_page() {
         // Arrange
         let (mut app, settings_directory) = preview_settings_app();
 
@@ -24163,6 +24236,145 @@ mod tests {
         assert_that!(app.is_animating()).is_true();
         app.toggle_playback();
         assert_that!(app.poll_interval()).is_equal_to(IDLE_POLL_INTERVAL);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker cannot see the cursor any more than it can see the cue list, so the moment
+    /// and everything on screen at it have to travel in the request. It waits out the
+    /// debounce every time — nothing it asks for is ever in the frame cache, so there is no
+    /// cheap case to let straight through.
+    #[test]
+    fn start_pending_preview_should_ask_for_the_moment_the_cursor_stands_on() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        frames
+            .try_recv()
+            .expect("the selected cue is asked for first");
+
+        // Act: into the timeline, then two presses to 2:00 — inside the first cue, 1s to 3s.
+        app.focus_timeline();
+        app.move_timeline_cursor(2);
+
+        // Assert: the moment does not go out until the cursor has settled. A request may
+        // still leave carrying the neighbours, which are cache-only and cost nothing —
+        // holding those back behind the expensive grab is exactly what the window exists to
+        // avoid — but it must not carry the moment.
+        app.start_pending_preview();
+        while let Ok(early) = frames.try_recv() {
+            assert_that!(early.scrub.is_none()).is_true();
+        }
+
+        // Act
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+
+        // Assert
+        let request = frames.try_recv().expect("the moment should be asked for");
+        let scrub = request.scrub.expect("the request should name the moment");
+        assert_that!(scrub.at).is_equal_to(Duration::from_secs(2));
+        assert_that!(scrub.on_screen.len()).is_equal_to(1);
+        assert_that!(scrub.on_screen[0].text.as_str()).is_equal_to("one");
+
+        // Act / Assert: and a settled cursor asks exactly once.
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame for a moment the cursor has left is dropped rather than drawn under a moment
+    /// it is not of — and one for a page the reader has already closed is dropped too.
+    #[test]
+    fn receive_preview_events_should_take_a_frame_only_for_the_moment_the_cursor_is_on() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.focus_timeline();
+        app.move_timeline_cursor(2);
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (events, receiver) = std::sync::mpsc::channel();
+
+        // Act: a reason reported against a moment already left.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation,
+                at: Duration::from_secs(45),
+                outcome: FrameOutcome::Failed("stale".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().scrub_error()).is_none();
+
+        // Act: and one against the moment the cursor is actually on.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation,
+                at: Duration::from_secs(2),
+                outcome: FrameOutcome::Failed("Could not draw this frame".to_string()),
+            })
+            .unwrap();
+        // ...along with one for a page opening the reader has left, which says nothing.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation: generation.wrapping_add(1),
+                at: Duration::from_secs(2),
+                outcome: FrameOutcome::Failed("another page".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().scrub_error())
+            .is_equal_to(Some("Could not draw this frame"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` peels one layer at a time. The cursor comes home after a playback is stopped —
+    /// the two are independent and a span may well be running while the reader scrubs — and
+    /// before the timing mode, which is the older of the two states they are holding.
+    #[test]
+    fn back_should_bring_the_cursor_home_before_it_leaves_the_timing_mode() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_cue_timing_mode();
+        app.focus_timeline();
+
+        // Act / Assert: the first press takes the cursor back to the cues, leaving the mode.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.timeline_focused()).is_false();
+        assert_that!(app.cue_timing_mode()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: the second leaves the mode, still on the page.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: and the third leaves the page.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

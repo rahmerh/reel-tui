@@ -92,9 +92,35 @@ impl Cue {
 pub fn on_screen_at(cues: &[Cue], at: usize, instant: Duration) -> Vec<Cue> {
     cues.iter()
         .enumerate()
-        .filter(|(position, cue)| *position == at || (cue.start <= instant && instant < cue.end))
+        .filter(|(position, cue)| *position == at || on_screen(cue, instant))
         .map(|(_, cue)| cue.clone())
         .collect()
+}
+
+/// Every cue on the screen at `instant`, with no cue forced into the list.
+///
+/// [`on_screen_at`] without its anchor, for the timeline cursor: that cursor names a moment
+/// rather than a cue, so there is nothing to force. The anchor exists so a cue running to the
+/// last frame of the media still previews itself when the seek is held back outside it; a
+/// moment the reader pointed at is already exactly where they want to look, and forcing a cue
+/// onto it would draw a line the viewer would not see there.
+///
+/// Empty is an ordinary answer, not a failure: most of a film has no subtitle on it, and the
+/// grab that follows simply burns nothing in.
+pub fn on_screen_now(cues: &[Cue], instant: Duration) -> Vec<Cue> {
+    cues.iter()
+        .filter(|cue| on_screen(cue, instant))
+        .cloned()
+        .collect()
+}
+
+/// Whether `cue` is on the screen at `instant`.
+///
+/// Half-open (`start <= instant < end`), the boundary every other timing comparison on this
+/// page draws. Its own function so the anchored and unanchored forms above cannot come to
+/// disagree about the edge.
+fn on_screen(cue: &Cue, instant: Duration) -> bool {
+    cue.start <= instant && instant < cue.end
 }
 
 /// Every cue that is on the screen at some point during `start..end`, `cue` among them, in
@@ -890,6 +916,36 @@ impl TimelineWindow {
             start,
             end: start + span,
             width,
+        }
+    }
+
+    /// The same window slid the least it can to hold `at`, or unchanged if it already does.
+    ///
+    /// For the timeline cursor, which is free to walk out of the window the selected cue chose.
+    /// **Slid rather than re-centred**: re-centring would move the whole track under a cursor
+    /// that moved half a second, so nothing on the timeline would ever stay still long enough
+    /// to be read against anything. This holds the picture still until the cursor reaches an
+    /// edge and then scrolls with it, which is how every other viewport in the application
+    /// follows a cursor.
+    ///
+    /// The length is preserved exactly, including where the media is shorter than the window
+    /// and both ends are already pinned — there is nowhere to slide to and nothing to do.
+    pub fn containing(self, at: Duration, duration: Duration) -> Self {
+        let span = self.end.saturating_sub(self.start);
+        // A track can outlast its video and the probed duration can be missing, the same two
+        // cases `spanning` allows for; either way the cursor's own moment has to be reachable.
+        let duration = duration.max(self.end).max(at);
+        let start = if at < self.start {
+            at
+        } else if at > self.end {
+            (at.saturating_sub(span)).min(duration.saturating_sub(span))
+        } else {
+            return self;
+        };
+        Self {
+            start,
+            end: start + span,
+            width: self.width,
         }
     }
 
@@ -2259,5 +2315,102 @@ mod tests {
         assert_that!(window.span(&cue(0, 5000))).is_none();
         assert_that!(window.span(&cue(25_000, 30_000))).is_none();
         assert_that!(TimelineWindow { width: 0, ..window }.span(&cue(12_000, 15_000))).is_none();
+    }
+
+    /// The timeline cursor names a moment rather than a cue, so nothing is forced into what
+    /// gets burned onto its frame — what belongs there is exactly what a viewer would see.
+    #[test]
+    fn on_screen_now_should_return_only_the_cues_actually_on_screen() {
+        // Arrange: a sign across the whole stretch, a line under it, and one after both.
+        let cues = vec![cue(0, 6000), cue(1000, 2000), cue(4000, 5000)];
+
+        // Act / Assert: two on screen together.
+        let both = on_screen_now(&cues, milliseconds(1500));
+        assert_that!(both.len()).is_equal_to(2);
+        assert_that!(both[1].start).is_equal_to(milliseconds(1000));
+
+        // Act / Assert: half-open at both ends, the boundary every other comparison draws —
+        // a cue starts on its own start and is gone by its end.
+        assert_that!(on_screen_now(&cues, milliseconds(1000)).len()).is_equal_to(2);
+        assert_that!(on_screen_now(&cues, milliseconds(2000)).len()).is_equal_to(1);
+
+        // Act / Assert: and a moment past everything is an ordinary empty answer.
+        assert_that!(on_screen_now(&cues, milliseconds(9000)).as_slice()).is_empty();
+    }
+
+    /// The anchored form keeps its anchor: a cue running to the last frame of the media is
+    /// grabbed just outside itself, and dropping it there would preview every line but the
+    /// one being previewed.
+    #[test]
+    fn on_screen_at_should_still_force_its_anchor() {
+        // Arrange
+        let cues = vec![cue(0, 1000), cue(5000, 6000)];
+
+        // Act
+        let forced = on_screen_at(&cues, 1, milliseconds(500));
+
+        // Assert
+        assert_that!(forced.len()).is_equal_to(2);
+        assert_that!(forced[1].start).is_equal_to(milliseconds(5000));
+        assert_that!(on_screen_now(&cues, milliseconds(500)).len()).is_equal_to(1);
+    }
+
+    /// The timeline cursor walks out of the window the selected cue chose, and a cursor drawn
+    /// nowhere is one the reader cannot follow. The window slides the least it can rather than
+    /// re-centring, so the picture holds still until the cursor reaches an edge.
+    #[test]
+    fn containing_should_slide_the_window_the_least_it_can() {
+        // Arrange: thirty seconds of a five-minute file, starting a minute in.
+        let window = TimelineWindow {
+            start: Duration::from_secs(60),
+            end: Duration::from_secs(90),
+            width: 60,
+        };
+        let duration = Duration::from_secs(300);
+
+        // Act / Assert: a moment already inside changes nothing at all.
+        let held = window.containing(Duration::from_secs(75), duration);
+        assert_that!(held.start).is_equal_to(Duration::from_secs(60));
+        assert_that!(held.end).is_equal_to(Duration::from_secs(90));
+
+        // Act / Assert: and so does one on either edge.
+        assert_that!(window.containing(Duration::from_secs(60), duration).start)
+            .is_equal_to(Duration::from_secs(60));
+        assert_that!(window.containing(Duration::from_secs(90), duration).start)
+            .is_equal_to(Duration::from_secs(60));
+
+        // Act / Assert: past the right edge, the window's end follows the cursor and its
+        // length is unchanged.
+        let ahead = window.containing(Duration::from_secs(100), duration);
+        assert_that!(ahead.start).is_equal_to(Duration::from_secs(70));
+        assert_that!(ahead.end).is_equal_to(Duration::from_secs(100));
+
+        // Act / Assert: before the left edge, the window's start does.
+        let behind = window.containing(Duration::from_secs(40), duration);
+        assert_that!(behind.start).is_equal_to(Duration::from_secs(40));
+        assert_that!(behind.end).is_equal_to(Duration::from_secs(70));
+    }
+
+    /// A window slid to the very end must not run past the media, and one asked to reach a
+    /// moment the probed duration does not cover has to reach it anyway — a track can outlast
+    /// its video, and the duration can be missing altogether.
+    #[test]
+    fn containing_should_clamp_to_the_media_but_still_reach_the_cursor() {
+        // Arrange
+        let window = TimelineWindow {
+            start: Duration::ZERO,
+            end: Duration::from_secs(30),
+            width: 60,
+        };
+
+        // Act / Assert: the end of a known-length file pins the window there.
+        let pinned = window.containing(Duration::from_secs(100), Duration::from_secs(100));
+        assert_that!(pinned.start).is_equal_to(Duration::from_secs(70));
+        assert_that!(pinned.end).is_equal_to(Duration::from_secs(100));
+
+        // Act / Assert: a cursor past a duration that would not parse is still reached.
+        let beyond = window.containing(Duration::from_secs(100), Duration::ZERO);
+        assert_that!(beyond.start).is_equal_to(Duration::from_secs(70));
+        assert_that!(beyond.end).is_equal_to(Duration::from_secs(100));
     }
 }
