@@ -40,7 +40,7 @@ use reel_tui::app::{
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
 use reel_tui::subtitle::ToolCapabilities;
-use reel_tui::sync::WarmState;
+use reel_tui::subtitle_edit::WarmState;
 
 /// An FFmpeg older than the supported floor has to stop `reel` at the door.
 ///
@@ -950,7 +950,7 @@ fn exporting_vobsub_as_srt_should_run_real_ocr_and_publish_valid_text() {
     );
 }
 
-/// Three cues with a deliberate overlap between the first two, so the timing page has
+/// Three cues with a deliberate overlap between the first two, so the subtitle edit page has
 /// to pack two lanes rather than one.
 const OVERLAPPING_CUES: &str = "1\n00:00:00,500 --> 00:00:02,000\nOverlapping opener\n\n\
                                 2\n00:00:01,500 --> 00:00:03,000\nOverlapping answer\n\n\
@@ -959,7 +959,7 @@ const OVERLAPPING_CUES: &str = "1\n00:00:00,500 --> 00:00:02,000\nOverlapping op
 const SIDECAR_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nSidecar first\n\n\
                             2\n00:00:03,000 --> 00:00:04,000\nSidecar second\n\n";
 
-/// The subtitle timing page reads a track's cues in the background and draws them.
+/// The subtitle edit page reads a track's cues in the background and draws them.
 ///
 /// One fixture carries both source shapes — an embedded `subrip` stream, which the
 /// preview worker extracts with a real `ffmpeg`, and a `.srt` sidecar, which it reads
@@ -974,7 +974,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     let test = "the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync");
+    let scratch = Scratch::new("subtitle-edit");
     write_media(
         &scratch.join("clip.mkv"),
         // Big enough and long enough to grab a real frame at a cue: the cues run to five
@@ -996,21 +996,21 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     let subtitle_row = app.first_subtitle_row();
     app.select_track_row(subtitle_row);
     app.press(key(KeyCode::Char('c')));
-    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    assert_eq!(app.app.layer, Layer::SubtitleEdit, "c should open the page");
     let workspace = app
         .app
-        .subtitle_sync
+        .subtitle_edit
         .as_ref()
         .expect("the page should be open")
         .workspace()
         .to_path_buf();
     app.wait_until("the embedded track's cues to be read", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.cues.is_empty())
     });
 
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 3, "every cue in the track should be read");
     assert_eq!(
         state.layout.lane_count, 2,
@@ -1053,7 +1053,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     // The frame: a real `ffmpeg` seek with the cue burned in by libass, decoded and
     // encoded for the pane by the worker.
     app.wait_until("a frame for the first cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -1065,7 +1065,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         app.screen()
     );
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().frame_error(),
+        app.app.subtitle_edit.as_ref().unwrap().frame_error(),
         None,
         "a frame that drew should leave no failure behind"
     );
@@ -1076,7 +1076,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     // are one row and `j` would step over both of them.
     app.press(key(KeyCode::Char('l')));
     app.pump();
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 1);
     let screen = app.screen();
     let selected = app.filled_selection();
     assert!(
@@ -1088,7 +1088,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
         "the timeline's title should follow the selection:\n{screen}"
     );
     app.wait_until("a frame for the second cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -1097,7 +1097,7 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     app.press(key(KeyCode::Esc));
     app.pump();
     assert_eq!(app.app.layer, Layer::Streams);
-    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    assert!(app.app.subtitle_edit.is_none(), "Esc should close the page");
     assert!(
         !workspace.exists(),
         "closing the page should remove its workspace at {}",
@@ -1116,12 +1116,12 @@ fn the_subtitle_timing_page_should_load_cues_for_embedded_and_sidecar_srt_tracks
     );
     app.press(key(KeyCode::Char('c')));
     app.wait_until("the sidecar's cues to be read", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.cues.is_empty())
     });
 
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 2, "the sidecar holds two cues");
     assert_eq!(
         state.layout.lane_count, 1,
@@ -1175,7 +1175,7 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
     app.open("clip.mkv");
     open_sidecar_timing_page(&mut app);
     app.wait_until("a still frame for the cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -1195,11 +1195,11 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
 
     // Assert: the span arrives and starts drawing.
     app.wait_until("the span to start playing", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_frame().is_some())
     });
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let first = state
         .playback_position()
         .expect("a playing span knows where it is");
@@ -1241,7 +1241,7 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
     let mut ended = false;
     while started.elapsed() < harness::DEFAULT_TIMEOUT {
         app.pump();
-        let Some(state) = app.app.subtitle_sync.as_ref() else {
+        let Some(state) = app.app.subtitle_edit.as_ref() else {
             break;
         };
         if !state.playback_active() {
@@ -1286,7 +1286,7 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
         "a six-second span should not take thirty seconds to play: {:?}",
         started.elapsed()
     );
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert!(
         state.playback_frame().is_none(),
         "a finished playback should hand the pane back to the still frame"
@@ -1304,14 +1304,14 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
     app.pump();
     assert!(
         app.app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .is_some_and(|state| state.preparing_playback().is_some()),
         "p should start another span"
     );
     app.press(key(KeyCode::Char('p')));
     app.pump();
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert!(
         !state.playback_active(),
         "p again should stop a span that is still decoding"
@@ -1324,12 +1324,12 @@ fn the_subtitle_timing_page_should_play_the_span_around_a_cue() {
     app.pump();
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "Esc should stop the playback before leaving the page"
     );
     assert!(
         app.app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.playback_active()),
         "Esc should have stopped the playback"
@@ -1384,7 +1384,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     app.open("clip.mkv");
     open_sidecar_timing_page(&mut app);
     app.wait_until("a still frame for the cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -1397,7 +1397,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     // look at one, every playback holds none.
     app.press(key(KeyCode::Char('p')));
     app.wait_until("a first, unmuted span to play", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_frame().is_some())
     });
@@ -1469,7 +1469,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     // it will now do without the user having to open the popup again to find out.
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "Esc should close the popup, not the page"
     );
     let screen = app.screen();
@@ -1481,14 +1481,14 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     // Act
     app.press(key(KeyCode::Char('p')));
     app.wait_until("the span to start playing", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_frame().is_some())
     });
 
     // Assert: no padding means the span starts at the cue rather than a second before it,
     // which is the settings reaching the request.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let started_at = state
         .playback_position()
         .expect("a playing span knows where it is");
@@ -1507,7 +1507,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     let mut moved = Duration::ZERO;
     while sampling.elapsed() < Duration::from_millis(2_000) {
         app.pump();
-        let Some(state) = app.app.subtitle_sync.as_ref() else {
+        let Some(state) = app.app.subtitle_edit.as_ref() else {
             break;
         };
         if !state.playback_active() {
@@ -1565,7 +1565,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     app.press(key(KeyCode::Char('j')));
     app.press(key(KeyCode::Char('p')));
     app.wait_until("the short span to start playing", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_frame().is_some())
     });
@@ -1577,7 +1577,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
         app.pump();
         assert!(
             app.app
-                .subtitle_sync
+                .subtitle_edit
                 .as_ref()
                 .is_some_and(|state| state.playback_active()),
             "a looping playback should start again rather than end after {:?}",
@@ -1590,7 +1590,7 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
     app.pump();
     assert!(
         app.app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.playback_active()),
         "p should stop a looping playback"
@@ -1652,14 +1652,14 @@ fn a_terminal_with_no_image_protocol_should_say_so_rather_than_draw() {
     );
 
     // Assert: nothing was drawn and nothing is coming.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert!(
         state.frame().is_none(),
         "a page that cannot draw should hold no frame"
     );
     assert_eq!(
         state.support,
-        reel_tui::sync::PreviewSupport::NoImageProtocol,
+        reel_tui::subtitle_edit::PreviewSupport::NoImageProtocol,
         "the page should know why it is empty"
     );
 
@@ -1668,7 +1668,7 @@ fn a_terminal_with_no_image_protocol_should_say_so_rather_than_draw() {
     for _ in 0..10 {
         app.pump();
     }
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert!(
         state.preparing_playback().is_none() && state.playback_frame().is_none(),
         "a terminal that cannot draw a frame should not start a playback"
@@ -1696,7 +1696,7 @@ fn cached_tracks() -> BTreeSet<std::ffi::OsString> {
     .unwrap_or_default()
 }
 
-/// `c` on a row the timing page does not cover names that kind of track and says the
+/// `c` on a row the subtitle edit page does not cover names that kind of track and says the
 /// feature is missing, rather than telling the reader to select something else.
 ///
 /// Pressing it on a video or audio track is a reasonable thing to try — the page is about
@@ -1709,7 +1709,7 @@ fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
     let test = "the_timing_page_should_name_the_track_kind_it_cannot_edit_yet";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-unimplemented");
+    let scratch = Scratch::new("subtitle-edit-unimplemented");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -1746,10 +1746,10 @@ fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
         assert_eq!(
             app.app.layer,
             Layer::Streams,
-            "row {row} should not have opened the timing page"
+            "row {row} should not have opened the subtitle edit page"
         );
         assert!(
-            app.app.subtitle_sync.is_none(),
+            app.app.subtitle_edit.is_none(),
             "row {row} should not have left page state behind"
         );
         assert_eq!(
@@ -1771,7 +1771,7 @@ fn the_timing_page_should_name_the_track_kind_it_cannot_edit_yet() {
     app.press(key(KeyCode::Char('c')));
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "the subtitle track should still open the page"
     );
     app.press(key(KeyCode::Esc));
@@ -1794,7 +1794,7 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
         &["ffmpeg:libx264", "ffmpeg:aac", "seconv", "tesseract"],
     );
 
-    let scratch = Scratch::new("subtitle-sync-refusal");
+    let scratch = Scratch::new("subtitle-edit-refusal");
     write_vobsub_media(&scratch.join("bitmap.mkv"), "eng");
     write_media(
         &scratch.join("timed.mkv"),
@@ -1831,10 +1831,10 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
         assert_eq!(
             app.app.layer,
             Layer::Streams,
-            "{file} should not have opened the timing page"
+            "{file} should not have opened the subtitle edit page"
         );
         assert!(
-            app.app.subtitle_sync.is_none(),
+            app.app.subtitle_edit.is_none(),
             "{file} should not have left page state behind"
         );
         let notice = app
@@ -1855,7 +1855,7 @@ fn the_subtitle_timing_page_should_refuse_a_format_it_cannot_read() {
     }
 }
 
-/// A WebVTT track opens the timing page and draws frames, exactly as SubRip does.
+/// A WebVTT track opens the subtitle edit page and draws frames, exactly as SubRip does.
 ///
 /// The page's own parser reads SubRip and nothing else, so this track reaches the cue list
 /// only by being transcoded on the way out of the container — one `ffmpeg` rather than
@@ -1871,7 +1871,7 @@ fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
     let test = "the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-webvtt");
+    let scratch = Scratch::new("subtitle-edit-webvtt");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -1890,19 +1890,19 @@ fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
 
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "a WebVTT track should open the page; notice: {:?}",
         app.app.notice
     );
     app.wait_until("the transcoded track's cues to be read", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.cues.is_empty())
     });
 
     // The cues themselves, with their own timings — not a single cue spanning the clip,
     // which is what a transcode that dropped the timing would collapse to.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(
         state.cues.len(),
         4,
@@ -1925,7 +1925,7 @@ fn the_subtitle_timing_page_should_read_a_webvtt_track_by_transcoding_it() {
     // And a real frame gets burned and drawn, so the whole pipeline behind the transcode
     // works rather than only the parsing half.
     app.wait_until("a frame for the first cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -3015,7 +3015,7 @@ const CACHED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
 const RETYPED_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
                             2\n00:00:03,000 --> 00:00:04,000\nSecond line, rewritten\n\n";
 
-/// Opening the timing page renders every cue's frame in the background and keeps it on
+/// Opening the subtitle edit page renders every cue's frame in the background and keeps it on
 /// disk, so a second visit costs a decode rather than an `ffmpeg` seek — and a cue whose
 /// text changed is rendered again, because the cache is keyed on what the frame shows.
 ///
@@ -3053,7 +3053,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
         counted,
         "the page should count the frames it is generating while the pass runs"
     );
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let cues = state.cues.clone();
     assert_eq!(cues.len(), 2, "the sidecar holds two cues");
     let keys: Vec<PathBuf> = (0..cues.len())
@@ -3081,7 +3081,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     open_sidecar_timing_page(&mut app);
     app.press(key(KeyCode::Char('j')));
     app.wait_until("the second cue's frame", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.selected == 1 && state.frame().is_some())
     });
@@ -3104,7 +3104,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
     open_sidecar_timing_page(&mut app);
     wait_for_frames(&mut app);
 
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let retyped = state.cues.clone();
     assert_eq!(
         retyped[1].text, "Second line, rewritten",
@@ -3128,7 +3128,7 @@ fn the_subtitle_timing_page_should_cache_and_prefetch_preview_frames() {
 
     app.press(key(KeyCode::Char('j')));
     app.wait_until("the rewritten cue's frame", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.selected == 1 && state.frame().is_some())
     });
@@ -3178,7 +3178,7 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
     open_sidecar_timing_page(&mut app);
     wait_for_frames(&mut app);
 
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let paths: Vec<PathBuf> = (0..state.cues.len())
         .map(|index| cached_frame(state, index))
         .collect();
@@ -3202,7 +3202,7 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
     // Leave the page entirely and come back to the same track.
     app.press(key(KeyCode::Esc));
     app.pump();
-    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    assert!(app.app.subtitle_edit.is_none(), "Esc should close the page");
     open_sidecar_timing_page(&mut app);
     wait_for_frames(&mut app);
 
@@ -3223,7 +3223,7 @@ fn re_opening_a_rendered_track_should_not_render_any_of_it_again() {
     // And the second visit really did go through the cache rather than skipping the pass:
     // the page reports it finished, and the frames are still the ones it started with.
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().warm,
+        app.app.subtitle_edit.as_ref().unwrap().warm,
         WarmState::Done,
         "the pass should run and find everything already there"
     );
@@ -3294,7 +3294,7 @@ fn a_page_that_can_never_draw_a_frame_should_say_why_in_the_pane() {
     app.press(key(KeyCode::Char('j')));
     app.pump();
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         1,
         "the page should still navigate"
     );
@@ -3346,7 +3346,7 @@ fn the_background_pass_should_render_every_cue_with_its_own_line_burned_in() {
     wait_for_frames(&mut app);
 
     // Every cue rendered, by whichever worker's slice it fell in.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 9, "the sidecar holds nine cues");
     let frames: Vec<Vec<u8>> = state
         .cues
@@ -3464,7 +3464,7 @@ fn a_full_cache_should_evict_whole_tracks_and_never_the_open_one() {
     );
 }
 
-/// Opens a file's sidecar timing page, renders the whole track, and answers where each
+/// Opens a file's sidecar subtitle edit page, renders the whole track, and answers where each
 /// cue's frame landed. Leaves the page closed, ready for the next file.
 fn render_sidecar_track(app: &mut Harness, file: &str) -> Vec<PathBuf> {
     // `Harness::open` only ever walks downwards, so the cursor has to start above the file
@@ -3478,17 +3478,17 @@ fn render_sidecar_track(app: &mut Harness, file: &str) -> Vec<PathBuf> {
     app.open(file);
     open_sidecar_timing_page(app);
     wait_for_frames(app);
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let paths = (0..state.cues.len())
         .map(|index| cached_frame(state, index))
         .collect();
-    // Back out to the file panel: Esc leaves the timing page for the track list, and
+    // Back out to the file panel: Esc leaves the subtitle edit page for the track list, and
     // again for the files, which is where the next `open` starts from.
     while app.app.layer != Layer::Files {
         app.press(key(KeyCode::Esc));
         app.pump();
     }
-    assert!(app.app.subtitle_sync.is_none(), "Esc should close the page");
+    assert!(app.app.subtitle_edit.is_none(), "Esc should close the page");
     paths
 }
 
@@ -3555,7 +3555,7 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
     // The whole track rendered to disk, and the window around the cursor encoded.
     wait_for_frames(&mut app);
     app.wait_until("the first cue's frame and the one behind it", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some() && state.has_frame(1))
     });
@@ -3574,7 +3574,7 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
         app.wait_until(
             "the next cue to be encoded ahead of the cursor",
             move |app| {
-                app.subtitle_sync
+                app.subtitle_edit
                     .as_ref()
                     .is_some_and(|state| state.has_frame(selected))
             },
@@ -3584,7 +3584,7 @@ fn walking_the_timing_page_should_draw_each_cues_frame_in_the_same_pass_as_the_k
 
         let state = app
             .app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .expect("the page should still be open");
         assert_eq!(state.selected, selected, "j should move the cursor");
@@ -3648,7 +3648,7 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
     let test = "an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-ass");
+    let scratch = Scratch::new("subtitle-edit-ass");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -3664,7 +3664,7 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
 
     // The cue list shows words, not markup: `{\pos(160,20)}` is how the cue draws, not
     // what it says, and a list full of override blocks is unreadable.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(
         state.cues.len(),
         2,
@@ -3691,7 +3691,7 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
 
     // Render the whole track, then compare the two cues' frames.
     wait_for_frames(&mut app);
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let first = cached_frame(state, 0);
     let second = cached_frame(state, 1);
     assert_ne!(
@@ -3713,7 +3713,7 @@ fn an_ass_track_should_preview_with_its_own_styles_rather_than_libass_defaults()
 
     // And the page draws, so the styled path works end to end rather than only caching.
     app.wait_until("a frame for the selected cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -3773,7 +3773,7 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
     let test = "a_cues_frame_should_show_everything_on_screen_with_it";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-overlap");
+    let scratch = Scratch::new("subtitle-edit-overlap");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -3790,7 +3790,7 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
     // Arrange: find the three cues by what they say and when, rather than by position —
     // two of them start at the same instant and nothing here should depend on which of
     // those the parse's sort put first.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 3, "all three cues should parse");
     let index_of = |start_ms: u64, text: &str| {
         state
@@ -3805,7 +3805,7 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
 
     // Act: render the whole track.
     wait_for_frames(&mut app);
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let lone_frame = fs::read(cached_frame(state, lone))
         .unwrap_or_else(|error| panic!("the lone cue should have rendered: {error}"));
     let accompanied_frame = fs::read(cached_frame(state, accompanied))
@@ -3834,7 +3834,7 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
 
     // Assert: and the page really draws it, so this is the live path rather than the cache.
     app.wait_until("a frame for the selected cue", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.frame().is_some())
     });
@@ -3870,7 +3870,7 @@ fn a_cues_still_should_be_the_frame_it_comes_in_on() {
     let test = "a_cues_still_should_be_the_frame_it_comes_in_on";
     require_tools(test, &["ffmpeg:libx264"]);
 
-    let scratch = Scratch::new("subtitle-sync-shot-change");
+    let scratch = Scratch::new("subtitle-edit-shot-change");
     write_shot_change_media(&scratch.join("clip.mkv"));
     fs::write(scratch.join("clip.eng.srt"), SHOT_CHANGE_CUES).unwrap();
 
@@ -3880,7 +3880,7 @@ fn a_cues_still_should_be_the_frame_it_comes_in_on() {
 
     // Act: render the whole track.
     wait_for_frames(&mut app);
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 2, "both cues should parse");
     let before = mean_luminance(&cached_frame(state, 0));
     let after = mean_luminance(&cached_frame(state, 1));
@@ -3966,7 +3966,7 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
     let test = "events_that_draw_one_line_should_be_one_row_end_to_end";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-karaoke");
+    let scratch = Scratch::new("subtitle-edit-karaoke");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -3982,7 +3982,7 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
 
     // Assert: two rows for five events, and the folded one keeps the timing all four of its
     // events shared.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(
         state.cues.len(),
         2,
@@ -4026,11 +4026,11 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
     wait_for_frames(&mut app);
     app.press(key(KeyCode::Char('j')));
     app.wait_until("the folded row's frame", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.selected == 1 && state.frame().is_some())
     });
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let whole = fs::read(cached_frame(state, 1))
         .unwrap_or_else(|error| panic!("the folded row should have rendered: {error}"));
     let mut one_event = state.cues[1].clone();
@@ -4055,11 +4055,11 @@ fn events_that_draw_one_line_should_be_one_row_end_to_end() {
     // Act / Assert: and `p` plays that one span, burning all four events into it.
     app.press(key(KeyCode::Char('p')));
     app.wait_until("the span to start playing", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_frame().is_some())
     });
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let position = state
         .playback_position()
         .expect("a playing span knows where it is");
@@ -4116,7 +4116,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     let test = "cues_that_share_the_screen_should_be_one_row_of_the_list";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-overlap");
+    let scratch = Scratch::new("subtitle-edit-overlap");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -4132,7 +4132,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     wait_for_frames(&mut app);
 
     // Assert: five cues, but three rows — the middle three are one group.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 5, "every cue should still be read");
     let groups: Vec<(usize, usize)> = state
         .groups
@@ -4169,20 +4169,20 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     // Act / Assert: `j` steps over the whole group rather than through it, and `k` comes
     // back to the member it entered on.
     app.press(key(KeyCode::Char('j')));
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 1);
     app.press(key(KeyCode::Char('j')));
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         4,
         "j should leave the group rather than visit its second member"
     );
     app.press(key(KeyCode::Char('k')));
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 1);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 1);
 
     // Act / Assert: the first `l` crosses the page without moving the pair, and the second
     // turns it — the drawn pair follows, and the bar now runs off the other side.
     app.press(key(KeyCode::Char('l')));
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 2);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 2);
     // `press` pumps before the key rather than after it, so the panel is a press behind
     // until the loop runs again.
     app.pump();
@@ -4192,7 +4192,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
         "crossing the page should leave the pair on screen where it is:\n{screen}"
     );
     app.press(key(KeyCode::Char('l')));
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 3);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 3);
     app.pump();
     let screen = app.screen();
     assert!(
@@ -4208,7 +4208,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     // row — `j` is the only way out.
     app.press(key(KeyCode::Char('l')));
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         3,
         "a group is a closed unit sideways"
     );
@@ -4217,7 +4217,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     // cursor was left on, with the same pair drawn around it — leaving a row to look at the
     // one below must not cost the reader their place sideways.
     app.press(key(KeyCode::Char('j')));
-    assert_eq!(app.app.subtitle_sync.as_ref().unwrap().selected, 4);
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 4);
     app.pump();
     let screen = app.screen();
     assert!(
@@ -4227,7 +4227,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     app.press(key(KeyCode::Char('k')));
     app.pump();
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         3,
         "a group should be re-entered where it was left"
     );
@@ -4241,7 +4241,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
     // the member under it, and the preview holds that member's own frame rather than the
     // one the group was entered on.
     app.wait_until("the third member's frame", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.selected == 3 && state.frame().is_some())
     });
@@ -4250,7 +4250,7 @@ fn cues_that_share_the_screen_should_be_one_row_of_the_list() {
         screen.contains("00:00:03.0 → 00:00:05.0"),
         "the timeline should name the cue the cursor is on:\n{screen}"
     );
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert!(
         cached_frame(state, 1) != cached_frame(state, 3),
         "each member of a group should have its own frame"
@@ -4275,7 +4275,7 @@ fn a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable() {
     let test = "a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable";
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
-    let scratch = Scratch::new("subtitle-sync-dense");
+    let scratch = Scratch::new("subtitle-edit-dense");
     write_media(
         &scratch.join("clip.mkv"),
         &MediaSpec::mkv()
@@ -4349,7 +4349,7 @@ fn a_dense_track_should_shorten_the_timeline_until_its_cues_are_readable() {
     );
 }
 
-/// A cue is edited on the timing page, staged like any other edit, and written by Ctrl+S.
+/// A cue is edited on the subtitle edit page, staged like any other edit, and written by Ctrl+S.
 ///
 /// Asserted through the whole workflow rather than on the editor alone, because the feature
 /// is the workflow: the words have to reach the buffer, the buffer has to reach the staged
@@ -4415,25 +4415,25 @@ fn editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
     app.press(key(KeyCode::Enter));
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "the safe answer should keep the page open"
     );
 
     // Act: write it.
     app.process_all();
 
-    // Assert: the reader is still on the timing page, on the cue they edited. The save
+    // Assert: the reader is still on the subtitle edit page, on the cue they edited. The save
     // rewrites the file the page is reading, so the page is closed and the file re-read
     // behind the scenes — but "save this cue" is not "take me somewhere else".
-    app.wait_until("the timing page to come back", |app| {
-        app.layer == Layer::SubtitleSync
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
             && app
-                .subtitle_sync
+                .subtitle_edit
                 .as_ref()
                 .is_some_and(|state| !state.cues.is_empty())
     });
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         1,
         "the cursor should come back to the cue that was edited"
     );
@@ -4533,16 +4533,16 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
     let subtitle_row = app.first_subtitle_row();
     app.select_track_row(subtitle_row);
     app.press(key(KeyCode::Char('c')));
-    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    assert_eq!(app.app.layer, Layer::SubtitleEdit, "c should open the page");
     app.wait_until("the embedded track's cues to be read", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.cues.is_empty())
     });
     wait_for_frames(&mut app);
 
     // What the pass rendered, and where it put it.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     assert_eq!(state.cues.len(), 2, "the track holds two cues");
     let old_track = track_dir(&state.frames.media_key());
     let untouched = cached_frame(state, 0);
@@ -4556,16 +4556,16 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
     }
     app.press(key(KeyCode::Esc));
     app.process_all();
-    app.wait_until("the timing page to come back", |app| {
-        app.layer == Layer::SubtitleSync
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
             && app
-                .subtitle_sync
+                .subtitle_edit
                 .as_ref()
                 .is_some_and(|state| !state.cues.is_empty())
     });
 
     // Assert: the file really was rewritten, so this is not passing on an unchanged key.
-    let state = app.app.subtitle_sync.as_ref().unwrap();
+    let state = app.app.subtitle_edit.as_ref().unwrap();
     let new_track = track_dir(&state.frames.media_key());
     assert_ne!(
         new_track, old_track,
@@ -4592,7 +4592,7 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
     );
 }
 
-/// A cue is retimed on the timing page with `t` and `h`/`l`, staged like any other edit, and
+/// A cue is retimed on the subtitle edit page with `t` and `h`/`l`, staged like any other edit, and
 /// written by Ctrl+S.
 ///
 /// Asserted through the whole workflow rather than on the nudge alone, because the feature is
@@ -4678,23 +4678,23 @@ fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
     assert_eq!(app.app.dialog, None, "Esc should not ask anything yet");
     assert_eq!(
         app.app.layer,
-        Layer::SubtitleSync,
+        Layer::SubtitleEdit,
         "Esc should take the mode rather than the page"
     );
 
     // Act: write it.
     app.process_all();
 
-    // Assert: the reader is still on the timing page, on the cue they moved.
-    app.wait_until("the timing page to come back", |app| {
-        app.layer == Layer::SubtitleSync
+    // Assert: the reader is still on the subtitle edit page, on the cue they moved.
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
             && app
-                .subtitle_sync
+                .subtitle_edit
                 .as_ref()
                 .is_some_and(|state| !state.cues.is_empty())
     });
     assert_eq!(
-        app.app.subtitle_sync.as_ref().unwrap().selected,
+        app.app.subtitle_edit.as_ref().unwrap().selected,
         1,
         "the cursor should come back to the cue that was retimed"
     );
@@ -4765,7 +4765,7 @@ fn track_dir(media_key: &str) -> PathBuf {
 /// Through `frame_target` rather than by keying the cue directly, because a frame is a
 /// picture of the whole screen: the key covers every cue burned into it, and asking the page
 /// is the only way to get the same answer the worker did.
-fn cached_frame(state: &reel_tui::sync::SubtitleSyncState, cue_index: usize) -> PathBuf {
+fn cached_frame(state: &reel_tui::subtitle_edit::SubtitleEditState, cue_index: usize) -> PathBuf {
     let target = state
         .frame_target(cue_index)
         .unwrap_or_else(|| panic!("cue {cue_index} should have a target"));
@@ -4781,7 +4781,7 @@ fn frame_path(key: &(String, String)) -> PathBuf {
     ))
 }
 
-/// Opens the timing page on the sidecar track and waits for its cues.
+/// Opens the subtitle edit page on the sidecar track and waits for its cues.
 fn open_sidecar_timing_page(app: &mut Harness) {
     let row = app
         .app
@@ -4791,9 +4791,9 @@ fn open_sidecar_timing_page(app: &mut Harness) {
         .expect("the sidecar should have a track row");
     app.select_track_row(row);
     app.press(key(KeyCode::Char('c')));
-    assert_eq!(app.app.layer, Layer::SubtitleSync, "c should open the page");
+    assert_eq!(app.app.layer, Layer::SubtitleEdit, "c should open the page");
     app.wait_until("the sidecar's cues to be read", |app| {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .is_some_and(|state| !state.cues.is_empty())
     });
@@ -4830,7 +4830,7 @@ fn wait_for_frames(app: &mut Harness) -> bool {
         counted |= warm_count_drawn(app);
         if app
             .app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .is_some_and(|state| state.warm == WarmState::Done)
         {

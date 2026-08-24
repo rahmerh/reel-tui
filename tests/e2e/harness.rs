@@ -69,7 +69,7 @@ fn redirect_cache_dir() {
 /// Serialises the scenarios that share the preview frame cache.
 ///
 /// `XDG_CACHE_HOME` is process-global (see [`redirect_cache_dir`]), so every scenario in
-/// this binary renders into **one** frame cache — and the timing page prunes that cache to
+/// this binary renders into **one** frame cache — and the subtitle edit page prunes that cache to
 /// `cache_tracks` whole media directories at the start of every background pass. Run in
 /// parallel, the scenarios therefore evict each other's frames: one that walks a cue list
 /// expecting the cache to answer waits forever for frames another scenario has just
@@ -151,7 +151,7 @@ impl Harness {
         Self::start_with_picker(scratch, Some(Picker::halfblocks()))
     }
 
-    /// A terminal that offered no image protocol at all, so the timing page can never draw
+    /// A terminal that offered no image protocol at all, so the subtitle edit page can never draw
     /// a frame and says so instead of rendering one nobody could read.
     pub fn start_without_image_protocol(scratch: Scratch) -> Self {
         Self::start_with_picker(scratch, None)
@@ -1195,7 +1195,7 @@ impl Harness {
 
     /// Everything drawn on the selection's fill, as one string.
     ///
-    /// The timing page marks the selected cue by filling its block rather than by putting
+    /// The subtitle edit page marks the selected cue by filling its block rather than by putting
     /// a character beside it, so "which cue is selected" is a question about colour that
     /// only the buffer can answer.
     pub fn filled_selection(&self) -> String {

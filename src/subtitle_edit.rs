@@ -1,4 +1,4 @@
-//! State for the subtitle timing page: which cues a track holds, which one is selected,
+//! State for the subtitle edit page: which cues a track holds, which one is selected,
 //! and the scratch directory the preview worker stages files in.
 //!
 //! Kept out of `App` as one owned struct rather than a dozen loose fields, for the same
@@ -58,25 +58,25 @@ pub const TIMING_LEAP: i64 = 10;
 /// How many cues of one overlap group the panel draws side by side.
 ///
 /// **Two is forced by the width, not chosen.** The cue panel is thirty to forty-eight
-/// columns (`SYNC_CUE_PANEL_WIDTH`), so two blocks get fourteen to twenty-three each and a
+/// columns (`CUE_PANEL_WIDTH`), so two blocks get fourteen to twenty-three each and a
 /// third would leave ten to sixteen — which cannot hold a timing at all, and a block with no
 /// timing on this page is a block with nothing worth reading on it. Members past the two are
 /// reached with `h`/`l`, and the panel marks that they are there.
 pub const GROUP_COLUMNS: usize = 2;
 
 /// Rows one cue's block occupies: two borders with a line of text between them.
-pub const SYNC_BLOCK_ROWS: usize = 3;
+pub const CUE_BLOCK_ROWS: usize = 3;
 
 /// Rows a group of overlapping cues occupies: a block, plus the row the later-starting
 /// member is dropped by.
-pub const SYNC_GROUP_ROWS: usize = SYNC_BLOCK_ROWS + 1;
+pub const CUE_GROUP_ROWS: usize = CUE_BLOCK_ROWS + 1;
 
 /// Rows the fork at the head of a group costs: its crossbar, and the arrows down into each
 /// member.
-pub const SYNC_FORK_ROWS: usize = 2;
+pub const CUE_FORK_ROWS: usize = 2;
 
 /// Rows the `↓` between one row of the panel and the next costs.
-pub const SYNC_CONNECTOR_ROWS: usize = 1;
+pub const CUE_CONNECTOR_ROWS: usize = 1;
 
 /// How far the background pass has got in rendering the track's frames.
 ///
@@ -140,7 +140,7 @@ impl PreviewSupport {
 
 /// How far the page has got in loading a track's cues.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SyncStatus {
+pub enum LoadStatus {
     /// Cues are being extracted or read. The page is open and drawn during this.
     Preparing,
     Ready,
@@ -375,7 +375,7 @@ impl Playback {
     /// that absorbs it.
     ///
     /// There is no halfblocks case because there is no halfblocks *page*: `drawing_picker`
-    /// refuses that terminal at startup, and the timing page says why instead of rendering
+    /// refuses that terminal at startup, and the subtitle edit page says why instead of rendering
     /// something nobody could read.
     fn encode(&self, index: usize) -> Option<Box<Protocol>> {
         let (width, height) = self.frames.pixels;
@@ -423,9 +423,9 @@ pub enum PlaybackState {
     Playing(Playback),
 }
 
-/// Everything the subtitle timing page draws and navigates.
+/// Everything the subtitle edit page draws and navigates.
 #[derive(Debug)]
-pub struct SubtitleSyncState {
+pub struct SubtitleEditState {
     /// Which page opening this is. Echoed by every worker message so results belonging
     /// to a page the user has already left can be dropped rather than applied.
     pub generation: u64,
@@ -435,7 +435,7 @@ pub struct SubtitleSyncState {
     pub frames: FrameSource,
     pub source: SubtitleSource,
     pub duration: Duration,
-    pub status: SyncStatus,
+    pub status: LoadStatus,
     /// Whether frames can be drawn at all, and if not, why. Fixed for the page's life.
     pub support: PreviewSupport,
     /// How far the background frame pass has got, or why there is not one.
@@ -546,7 +546,7 @@ pub struct SubtitleSyncState {
     workspace: PreviewWorkspace,
 }
 
-impl SubtitleSyncState {
+impl SubtitleEditState {
     pub fn new(
         generation: u64,
         frames: FrameSource,
@@ -562,7 +562,7 @@ impl SubtitleSyncState {
             frames,
             source,
             duration,
-            status: SyncStatus::Preparing,
+            status: LoadStatus::Preparing,
             support,
             warm: WarmState::Off,
             cues: Vec::new(),
@@ -639,9 +639,9 @@ impl SubtitleSyncState {
         self.layout = pack_lanes(&cues, MAX_LANES);
         self.groups = group_overlaps(&cues);
         self.status = if cues.is_empty() {
-            SyncStatus::Empty
+            LoadStatus::Empty
         } else {
-            SyncStatus::Ready
+            LoadStatus::Ready
         };
         self.cues = cues;
         // Clamped rather than trusted: the cue the page is being restored to came from the
@@ -673,7 +673,7 @@ impl SubtitleSyncState {
     }
 
     pub fn fail(&mut self, message: String) {
-        self.status = SyncStatus::Failed(message);
+        self.status = LoadStatus::Failed(message);
         // Nothing to render frames for, so nothing to count. A pass already running for
         // this page is stopped by the generation bump that closing it performs.
         self.warm = WarmState::Off;
@@ -1151,7 +1151,7 @@ impl SubtitleSyncState {
 
     /// Whether the page is waiting on background work, so the loader keeps animating.
     pub fn is_busy(&self) -> bool {
-        self.status == SyncStatus::Preparing
+        self.status == LoadStatus::Preparing
     }
 
     /// Which group holds the cue at this position in the list.
@@ -1353,8 +1353,8 @@ impl SubtitleSyncState {
     /// row is to spend.
     pub fn group_height(&self, group: usize) -> usize {
         match self.groups.get(group) {
-            Some(group) if group.len > 1 => SYNC_FORK_ROWS + SYNC_GROUP_ROWS,
-            _ => SYNC_BLOCK_ROWS,
+            Some(group) if group.len > 1 => CUE_FORK_ROWS + CUE_GROUP_ROWS,
+            _ => CUE_BLOCK_ROWS,
         }
     }
 
@@ -1367,7 +1367,7 @@ impl SubtitleSyncState {
         let mut used = self.group_height(from);
         let mut count = 1;
         for group in from + 1..self.groups.len() {
-            let next = used + SYNC_CONNECTOR_ROWS + self.group_height(group);
+            let next = used + CUE_CONNECTOR_ROWS + self.group_height(group);
             if next > height {
                 break;
             }
@@ -1381,14 +1381,14 @@ impl SubtitleSyncState {
     /// group. Walked backwards from the end, because that is the direction the constraint
     /// comes from.
     fn max_scroll(&self, height: usize) -> usize {
-        // Saturating rather than guarded: an empty track never reaches here — `sync_scroll`
+        // Saturating rather than guarded: an empty track never reaches here — `cue_scroll`
         // has already returned — and if it did, the loop below is empty and the answer is
         // the zero it should be.
         let last = self.groups.len().saturating_sub(1);
         let mut used = self.group_height(last);
         let mut scroll = last;
         for group in (0..last).rev() {
-            let next = used + SYNC_CONNECTOR_ROWS + self.group_height(group);
+            let next = used + CUE_CONNECTOR_ROWS + self.group_height(group);
             if next > height {
                 break;
             }
@@ -1407,7 +1407,7 @@ impl SubtitleSyncState {
     /// count the renderer had divided out. It cannot be a division any more: a lone cue and
     /// a pair are different heights, so how many rows a screenful costs depends on which
     /// groups are in it.
-    pub fn sync_scroll(&mut self, height: usize) {
+    pub fn cue_scroll(&mut self, height: usize) {
         if height == 0 || self.groups.is_empty() {
             self.list_rows = 0;
             self.list_scroll = 0;
@@ -1446,7 +1446,7 @@ mod tests {
         }
     }
 
-    fn state() -> SubtitleSyncState {
+    fn state() -> SubtitleEditState {
         costed_state(CHEAP_BYTES_PER_CELL)
     }
 
@@ -1456,8 +1456,8 @@ mod tests {
     /// `a_costly_window_should_be_shortened_to_fit_the_budget` uses instead.
     const CHEAP_BYTES_PER_CELL: u64 = 12;
 
-    fn costed_state(frame_cost: u64) -> SubtitleSyncState {
-        SubtitleSyncState::new(
+    fn costed_state(frame_cost: u64) -> SubtitleEditState {
+        SubtitleEditState::new(
             1,
             FrameSource {
                 media: PathBuf::from("/media/show.mkv"),
@@ -1503,7 +1503,7 @@ mod tests {
         )
     }
 
-    fn ready(count: usize) -> SubtitleSyncState {
+    fn ready(count: usize) -> SubtitleEditState {
         let mut state = state();
         let cues = (0..count)
             .map(|index| {
@@ -1521,7 +1521,7 @@ mod tests {
         let state = state();
 
         // Assert
-        assert_that!(state.status.clone()).is_equal_to(SyncStatus::Preparing);
+        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Preparing);
         assert_that!(state.is_busy()).is_true();
         assert_that!(state.cues.as_slice()).is_empty();
         assert_that!(state.selected_cue()).is_none();
@@ -1606,7 +1606,7 @@ mod tests {
         );
 
         // Assert
-        assert_that!(state.status.clone()).is_equal_to(SyncStatus::Ready);
+        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Ready);
         assert_that!(state.layout.lane_count).is_equal_to(2);
         assert_that!(state.layout.lanes.as_slice()).contains_exactly_in_given_order([0, 1, 0]);
         assert_that!(state.selected).is_equal_to(0);
@@ -1625,7 +1625,7 @@ mod tests {
         state.apply_prepared(Vec::new(), CueStyle::SubRip);
 
         // Assert
-        assert_that!(state.status.clone()).is_equal_to(SyncStatus::Empty);
+        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Empty);
         assert_that!(state.is_busy()).is_false();
     }
 
@@ -1639,7 +1639,7 @@ mod tests {
 
         // Assert
         assert_that!(state.status.clone())
-            .is_equal_to(SyncStatus::Failed("ffmpeg exploded".to_string()));
+            .is_equal_to(LoadStatus::Failed("ffmpeg exploded".to_string()));
         assert_that!(state.cues.as_slice()).is_empty();
         assert_that!(state.layout.lane_count).is_equal_to(0);
         assert_that!(state.is_busy()).is_false();
@@ -1701,7 +1701,7 @@ mod tests {
     /// A track whose middle three cues share the screen: `a`, then the group `b`/`c`/`d`,
     /// then `e`. Cue positions and group indices deliberately differ, so a test that
     /// confused the two would fail rather than pass by coincidence.
-    fn grouped() -> SubtitleSyncState {
+    fn grouped() -> SubtitleEditState {
         let mut state = state();
         state.apply_prepared(
             vec![
@@ -1991,18 +1991,18 @@ mod tests {
     /// Rows a panel needs to show this many groups of a `ready` track, where every cue
     /// overlaps nothing and so is a lone block with a `↓` between one and the next.
     fn rows_for(groups: usize) -> usize {
-        SYNC_BLOCK_ROWS + groups.saturating_sub(1) * (SYNC_CONNECTOR_ROWS + SYNC_BLOCK_ROWS)
+        CUE_BLOCK_ROWS + groups.saturating_sub(1) * (CUE_CONNECTOR_ROWS + CUE_BLOCK_ROWS)
     }
 
     #[test]
-    fn sync_scroll_should_follow_the_selection_down_past_the_last_visible_row() {
+    fn cue_scroll_should_follow_the_selection_down_past_the_last_visible_row() {
         // Arrange
         let mut state = ready(10);
-        state.sync_scroll(rows_for(4));
+        state.cue_scroll(rows_for(4));
 
         // Act
         state.select(5);
-        state.sync_scroll(rows_for(4));
+        state.cue_scroll(rows_for(4));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(2);
@@ -2010,30 +2010,30 @@ mod tests {
     }
 
     #[test]
-    fn sync_scroll_should_follow_the_selection_back_up_above_the_first_visible_row() {
+    fn cue_scroll_should_follow_the_selection_back_up_above_the_first_visible_row() {
         // Arrange
         let mut state = ready(10);
         state.select(9);
-        state.sync_scroll(rows_for(4));
+        state.cue_scroll(rows_for(4));
 
         // Act
         state.select(-9);
-        state.sync_scroll(rows_for(4));
+        state.cue_scroll(rows_for(4));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(0);
     }
 
     #[test]
-    fn sync_scroll_should_not_leave_blank_rows_below_a_short_list() {
+    fn cue_scroll_should_not_leave_blank_rows_below_a_short_list() {
         // Arrange: scrolled to the bottom, then given a taller pane.
         let mut state = ready(6);
         state.select(5);
-        state.sync_scroll(rows_for(2));
+        state.cue_scroll(rows_for(2));
         assert_that!(state.list_scroll).is_equal_to(4);
 
         // Act
-        state.sync_scroll(rows_for(6));
+        state.cue_scroll(rows_for(6));
 
         // Assert
         assert_that!(state.list_scroll).is_equal_to(0);
@@ -2043,7 +2043,7 @@ mod tests {
     /// is dropped by — so a screenful is no longer a division. A panel holding three lone
     /// cues holds only two rows once the middle one is a group.
     #[test]
-    fn sync_scroll_should_charge_a_group_for_the_rows_it_actually_takes() {
+    fn cue_scroll_should_charge_a_group_for_the_rows_it_actually_takes() {
         // Arrange: cue 1 and cue 2 overlap, so the track is three groups, the middle of
         // them a pair.
         let mut state = state();
@@ -2059,28 +2059,26 @@ mod tests {
 
         // Act / Assert: a lone cue and the group is all that fits in the rows three lone
         // cues would have taken.
-        state.sync_scroll(rows_for(3));
+        state.cue_scroll(rows_for(3));
         assert_that!(state.list_rows).is_equal_to(2);
 
         // Act / Assert: one row short of the group is one row short of showing it.
-        state.sync_scroll(SYNC_BLOCK_ROWS + SYNC_CONNECTOR_ROWS + SYNC_FORK_ROWS + SYNC_GROUP_ROWS);
+        state.cue_scroll(CUE_BLOCK_ROWS + CUE_CONNECTOR_ROWS + CUE_FORK_ROWS + CUE_GROUP_ROWS);
         assert_that!(state.list_rows).is_equal_to(2);
-        state.sync_scroll(
-            SYNC_BLOCK_ROWS + SYNC_CONNECTOR_ROWS + SYNC_FORK_ROWS + SYNC_GROUP_ROWS - 1,
-        );
+        state.cue_scroll(CUE_BLOCK_ROWS + CUE_CONNECTOR_ROWS + CUE_FORK_ROWS + CUE_GROUP_ROWS - 1);
         assert_that!(state.list_rows).is_equal_to(1);
     }
 
     /// A panel too short for even one row still shows the group under the cursor rather
     /// than nothing at all — the renderer clips it from the bottom.
     #[test]
-    fn sync_scroll_should_always_keep_one_group_on_screen() {
+    fn cue_scroll_should_always_keep_one_group_on_screen() {
         // Arrange
         let mut state = ready(10);
         state.select(9);
 
         // Act
-        state.sync_scroll(1);
+        state.cue_scroll(1);
 
         // Assert
         assert_that!(state.list_rows).is_equal_to(1);
@@ -2088,13 +2086,13 @@ mod tests {
     }
 
     #[test]
-    fn sync_scroll_should_record_the_measured_row_count_and_tolerate_a_pane_with_none() {
+    fn cue_scroll_should_record_the_measured_row_count_and_tolerate_a_pane_with_none() {
         // Arrange
         let mut state = ready(10);
         state.select(9);
 
         // Act
-        state.sync_scroll(0);
+        state.cue_scroll(0);
 
         // Assert
         assert_that!(state.list_rows).is_equal_to(0);
@@ -2105,12 +2103,12 @@ mod tests {
     /// emptied under one — so a panel with rows to give and nothing to put in them has to
     /// answer rather than divide by an empty list.
     #[test]
-    fn sync_scroll_should_tolerate_a_track_with_no_cues_in_a_pane_with_rows() {
+    fn cue_scroll_should_tolerate_a_track_with_no_cues_in_a_pane_with_rows() {
         // Arrange
         let mut state = state();
 
         // Act
-        state.sync_scroll(20);
+        state.cue_scroll(20);
 
         // Assert
         assert_that!(state.list_rows).is_equal_to(0);
@@ -2119,7 +2117,7 @@ mod tests {
 
     /// The take-if-due the state used to expose, which `App::start_pending_preview` now
     /// spells out itself so that a frame already in the cache can skip the wait.
-    fn take_due(state: &mut SubtitleSyncState) -> bool {
+    fn take_due(state: &mut SubtitleEditState) -> bool {
         let due = state.frame_request_due();
         if due {
             state.clear_frame_request();
@@ -2628,7 +2626,7 @@ mod tests {
     fn every_way_the_frame_goes_stale_should_ask_for_a_new_one() {
         // Arrange
         let mut state = state();
-        let due = |state: &mut SubtitleSyncState| {
+        let due = |state: &mut SubtitleEditState| {
             std::thread::sleep(FRAME_DEBOUNCE + Duration::from_millis(20));
             take_due(state)
         };
@@ -2973,12 +2971,12 @@ mod tests {
     /// Starts a playback with the pane measured, which in the application the renderer does
     /// on the first draw. The height is generous so the fit is decided by the width, which
     /// makes the drawn cell area exactly the one the span was built with.
-    fn play(state: &mut SubtitleSyncState, cue_index: usize, frames: PlaybackFrames) {
+    fn play(state: &mut SubtitleEditState, cue_index: usize, frames: PlaybackFrames) {
         play_through(state, cue_index, frames, Box::new(SilentSource));
     }
 
     fn play_through(
-        state: &mut SubtitleSyncState,
+        state: &mut SubtitleEditState,
         cue_index: usize,
         frames: PlaybackFrames,
         source: Box<dyn AudioSource>,
@@ -2987,7 +2985,7 @@ mod tests {
     }
 
     fn play_looping(
-        state: &mut SubtitleSyncState,
+        state: &mut SubtitleEditState,
         cue_index: usize,
         frames: PlaybackFrames,
         source: Box<dyn AudioSource>,
@@ -3008,7 +3006,7 @@ mod tests {
         }
     }
 
-    fn playing(state: &mut SubtitleSyncState) -> &Playback {
+    fn playing(state: &mut SubtitleEditState) -> &Playback {
         match &state.playback {
             PlaybackState::Playing(playback) => playback,
             other => panic!("expected a playing page, got {other:?}"),
@@ -3261,7 +3259,7 @@ mod tests {
     /// timing being wrong on the one page built to judge exactly that.
     #[test]
     fn every_way_the_page_moves_under_a_playback_should_stop_it() {
-        let started = |state: &mut SubtitleSyncState| play(state, 0, span(30, Size::new(4, 2), 10));
+        let started = |state: &mut SubtitleEditState| play(state, 0, span(30, Size::new(4, 2), 10));
 
         // Act / Assert: the cursor moving.
         let mut state = ready(5);

@@ -802,7 +802,7 @@ pub enum EditPhase {
         language: String,
     },
     ValidateSubtitle(String),
-    /// Writing the timing page's rewritten cue text into a staged subtitle file. Its own
+    /// Writing the subtitle edit page's rewritten cue text into a staged subtitle file. Its own
     /// phase rather than folded into `UpdateSubtitle`, because it is the one step of a save
     /// that can fail on something the reader did rather than on a tool: a cue edited here
     /// and then changed on disk elsewhere stops the save, and the phase is what names the
@@ -2908,7 +2908,7 @@ fn extract_subtitle(
     }
 }
 
-/// Writes a SubRip file with the timing page's cue edits applied, into the workspace.
+/// Writes a SubRip file with the subtitle edit page's cue edits applied, into the workspace.
 ///
 /// Staged rather than written over the original, because that is how every other artifact a
 /// save produces is handled: the publication step is what puts files in the user's directory,
@@ -13178,7 +13178,7 @@ mod tests {
         assert_eq!(mov.title.as_deref(), Some("English"));
     }
 
-    /// A cue edited on the timing page is written back into the sidecar it came from, under
+    /// A cue edited on the subtitle edit page is written back into the sidecar it came from, under
     /// the name it already has. The conversion path below derives a filename from the
     /// track's language and flags, which is right when the format or the metadata changed
     /// and wrong here — rewriting a line must not also rename the file.

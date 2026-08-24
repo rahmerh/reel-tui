@@ -41,15 +41,15 @@ use crate::{
         path_extension, stream_cc, stream_commentary, stream_forced, stream_hearing_impaired,
         stream_language, stream_original, stream_title,
     },
-    sync::{PreviewSupport, PreviewWorkspace, SubtitleSyncState, WarmState},
+    subtitle_edit::{PreviewSupport, PreviewWorkspace, SubtitleEditState, WarmState},
 };
 
-/// What the subtitle timing page's frame cache and background pass are allowed to do.
+/// What the subtitle edit page's frame cache and background pass are allowed to do.
 ///
 /// Resolved by `main` from `config.toml` and from whether the directory sits on a network
 /// mount, so `App` holds one answer rather than re-deriving the policy at each decision.
 ///
-/// The playback half of it is also **adjustable for the session** from the timing page's
+/// The playback half of it is also **adjustable for the session** from the subtitle edit page's
 /// preview-settings popup (`:`), which mutates this in place and never writes to disk —
 /// `config.toml` stays the defaults, and `App::preview_defaults` keeps a copy of them so a
 /// field can be put back. The cache half is not adjustable: a background pass is already
@@ -100,7 +100,7 @@ impl Default for PreviewSettings {
     }
 }
 
-/// Why the timing page will not let a cue be changed on a track that is not SubRip.
+/// Why the subtitle edit page will not let a cue be changed on a track that is not SubRip.
 ///
 /// **The words and the timing are refused together and for one reason.** An ASS cue names a
 /// style and positions itself against the script rather than carrying its own appearance, so
@@ -110,7 +110,7 @@ impl Default for PreviewSettings {
 const CUE_EDITS_SUBRIP_ONLY: &str =
     "Only SubRip cues can be edited here; this track is another format.";
 
-/// The timing page's cue editor: one cue's text, being rewritten.
+/// The subtitle edit page's cue editor: one cue's text, being rewritten.
 ///
 /// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
 /// single line with a single cursor: a SubRip cue is routinely two lines, and how the text
@@ -308,10 +308,10 @@ pub enum Layer {
     Files,
     Streams,
     StreamDetails,
-    /// The subtitle timing page: a full-screen view of one track's cues, opened with
+    /// The subtitle edit page: a full-screen view of one track's cues, opened with
     /// `c` from [`Layer::Streams`]. Unlike the others this replaces the whole frame
     /// rather than drawing over the file list.
-    SubtitleSync,
+    SubtitleEdit,
 }
 
 /// Which characters a text field accepts. An enum rather than a `fn(char) -> bool`
@@ -704,14 +704,14 @@ pub enum Dialog {
     AudioSettings,
     VideoSettings,
     SubtitleSettings,
-    /// How the timing page's scrub playback is done, for this session only — speed, loop,
-    /// sound, padding and frame rate. Opened with `:` from the timing page; see
+    /// How the subtitle edit page's scrub playback is done, for this session only — speed, loop,
+    /// sound, padding and frame rate. Opened with `:` from the subtitle edit page; see
     /// `App::open_preview_settings`.
     PreviewSettings,
-    /// The timing page's cue editor, opened with `i` — see `App::open_cue_editor`.
+    /// The subtitle edit page's cue editor, opened with `i` — see `App::open_cue_editor`.
     EditCue,
-    /// "Leaving discards them" before walking off the timing page with staged cue text
-    /// that has not been written yet — see `App::request_leave_subtitle_sync`.
+    /// "Leaving discards them" before walking off the subtitle edit page with staged cue text
+    /// that has not been written yet — see `App::request_leave_subtitle_edit`.
     ConfirmLeaveCues,
     /// A confirm-cancel prompt over whichever processing view is showing
     /// (`Dialog::BatchProcessing`, one item or many) — see `App::request_cancel_edit`.
@@ -781,7 +781,7 @@ pub enum LeaveCuesChoice {
     DiscardEdits,
 }
 
-/// A timing page to open again on the far side of a save.
+/// A subtitle edit page to open again on the far side of a save.
 ///
 /// Writing a cue edit rewrites the file the page is about, which moves its fingerprint, so
 /// the page has to close and the file has to be re-probed before anything can be drawn from
@@ -794,7 +794,7 @@ pub enum LeaveCuesChoice {
 /// — and is checked before the page is opened again, so a reader who moved to another file
 /// while the save ran is not dragged back to this one.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SyncReopen {
+struct SubtitleEditReopen {
     media: PathBuf,
     source: SubtitleSource,
     cue: usize,
@@ -1363,21 +1363,21 @@ pub struct App {
     pub left_subtitle_order: Vec<TrackRef>,
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
-    /// The open subtitle timing page, if any. An `Option` rather than loose fields so
+    /// The open subtitle edit page, if any. An `Option` rather than loose fields so
     /// that dropping it — on `back`, on a file change, on quit — is what releases the
     /// page's scratch directory, instead of every exit path having to remember to.
-    pub subtitle_sync: Option<SubtitleSyncState>,
-    /// The timing page a save was started from, to be opened again once the file it
-    /// rewrote has been re-probed. See [`Self::reopen_subtitle_sync`].
-    pending_sync_reopen: Option<SyncReopen>,
+    pub subtitle_edit: Option<SubtitleEditState>,
+    /// The subtitle edit page a save was started from, to be opened again once the file it
+    /// rewrote has been re-probed. See [`Self::reopen_subtitle_edit`].
+    pending_reopen: Option<SubtitleEditReopen>,
     /// Where each in-flight edit's cached preview frames live now, for the files whose
     /// pictures the edit will not change. Consumed by `finish_batch_if_done`, which moves
     /// them onto the rewritten file's key. See [`Self::frames_survive_edit`].
     pending_frame_moves: HashMap<PathBuf, (String, (u32, u32))>,
     /// Bumped for each page opening, so a worker result that arrives after the user has
     /// moved on can be recognised as stale and dropped.
-    sync_generation: u64,
-    /// Bumped for each scrub playback, counted apart from `sync_generation`: stopping a
+    page_generation: u64,
+    /// Bumped for each scrub playback, counted apart from `page_generation`: stopping a
     /// playback must not abandon the background frame pass, which is a different piece of
     /// work for the same page.
     playback_generation: u64,
@@ -1395,11 +1395,11 @@ pub struct App {
     /// Tests and library consumers keep the fallback, which nothing plays anyway.
     audio_format: crate::audio::OutputFormat,
     /// The preview worker, when one is running. `None` in tests and for library
-    /// consumers that never open the timing page, exactly like
+    /// consumers that never open the subtitle edit page, exactly like
     /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
     /// sites construct, so new workers arrive through a setter rather than a parameter.
     preview: Option<PreviewHandles>,
-    /// What the timing page's background frame pass is allowed to do, from `config.toml`
+    /// What the subtitle edit page's background frame pass is allowed to do, from `config.toml`
     /// and from whether the directory is on a network mount. Set by `main` beside the
     /// worker handles; the default is what a test or a library consumer gets.
     preview_settings: PreviewSettings,
@@ -1408,7 +1408,7 @@ pub struct App {
     /// resetting agrees with what the user would get by restarting.
     preview_defaults: PreviewSettings,
     pub preview_settings_popup: Option<PreviewSettingsPopup>,
-    /// The timing page's open cue editor, if `i` has raised one.
+    /// The subtitle edit page's open cue editor, if `i` has raised one.
     pub cue_editor: Option<CueEditor>,
     /// Which answer the "discard the unwritten cue edits?" prompt is pointing at.
     pub leave_cues_choice: LeaveCuesChoice,
@@ -1549,10 +1549,10 @@ impl App {
             left_subtitle_order: Vec::new(),
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
-            subtitle_sync: None,
-            pending_sync_reopen: None,
+            subtitle_edit: None,
+            pending_reopen: None,
             pending_frame_moves: HashMap::new(),
-            sync_generation: 0,
+            page_generation: 0,
             playback_generation: 0,
             playback_live: false,
             audio_format: crate::audio::OutputFormat::FALLBACK,
@@ -1613,13 +1613,13 @@ impl App {
         self.completion_notification_tx = sender;
     }
 
-    /// Supplies the worker the subtitle timing page loads its cues through. Without it
+    /// Supplies the worker the subtitle edit page loads its cues through. Without it
     /// the page still opens and still closes cleanly, it just never leaves its loader.
     pub fn set_preview_handles(&mut self, handles: Option<PreviewHandles>) {
         self.preview = handles;
     }
 
-    /// Supplies the timing page's caching and prefetching policy, resolved by `main` from
+    /// Supplies the subtitle edit page's caching and prefetching policy, resolved by `main` from
     /// `config.toml` and the mount the directory is on.
     pub fn set_preview_settings(&mut self, settings: PreviewSettings) {
         self.preview_settings = settings;
@@ -2036,7 +2036,7 @@ impl App {
                 }
             }
             Layer::StreamDetails => self.scroll_details_down(1),
-            Layer::SubtitleSync => self.move_sync_cue(1),
+            Layer::SubtitleEdit => self.move_cue(1),
         }
     }
 
@@ -2058,7 +2058,7 @@ impl App {
                 self.selected_stream = self.selected_stream.saturating_sub(1);
             }
             Layer::StreamDetails => self.scroll_details_up(1),
-            Layer::SubtitleSync => self.move_sync_cue(-1),
+            Layer::SubtitleEdit => self.move_cue(-1),
         }
     }
 
@@ -2072,8 +2072,8 @@ impl App {
             }
             Layer::Streams => self.selected_stream = 0,
             Layer::StreamDetails => self.details_scroll = 0,
-            Layer::SubtitleSync => {
-                if let Some(state) = self.subtitle_sync.as_mut() {
+            Layer::SubtitleEdit => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
                     state.select_first();
                 }
             }
@@ -2112,8 +2112,8 @@ impl App {
                 self.selected_stream = self.stream_count().saturating_sub(1);
             }
             Layer::StreamDetails => self.details_scroll = self.details_max_scroll,
-            Layer::SubtitleSync => {
-                if let Some(state) = self.subtitle_sync.as_mut() {
+            Layer::SubtitleEdit => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
                     state.select_last();
                 }
             }
@@ -2148,10 +2148,10 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         self.details_scroll = 0;
         self.details_max_scroll = 0;
-        // The timing page belongs to one track of one file, so anything that changes
+        // The subtitle edit page belongs to one track of one file, so anything that changes
         // which file is open has to close it — otherwise it would keep showing cues for
         // a file the user has already navigated away from.
-        self.close_subtitle_sync();
+        self.close_subtitle_edit();
         self.layer = Layer::Files;
         self.selected_stream = 0;
         self.outcome = None;
@@ -2229,7 +2229,7 @@ impl App {
                 self.load_staged_or_reset();
                 // The answer a page owed after a save was waiting for. Nothing is owed in
                 // the ordinary case and this costs a `None` check.
-                self.reopen_subtitle_sync();
+                self.reopen_subtitle_edit();
             }
         }
         if disk_cache_dirty {
@@ -2585,19 +2585,19 @@ impl App {
         // re-probed — which for a cached outcome has already happened here, and otherwise
         // happens when `receive_probe_results` drains the answer. Pointed at whatever the
         // file became: a container conversion renames it, and the page has to follow.
-        if let Some(reopen) = self.pending_sync_reopen.as_mut() {
+        if let Some(reopen) = self.pending_reopen.as_mut() {
             match expected_selection {
                 Some(path) => reopen.media = path,
-                None => self.pending_sync_reopen = None,
+                None => self.pending_reopen = None,
             }
         }
-        self.reopen_subtitle_sync();
+        self.reopen_subtitle_edit();
     }
 
     /// Carries each rewritten file's cached preview frames over to the file it became.
     ///
     /// A save rewrites the container, which moves the file's length and mtime, which are in
-    /// the frame cache's media key — so without this every frame the timing page rendered is
+    /// the frame cache's media key — so without this every frame the subtitle edit page rendered is
     /// orphaned by the save that page's own edit started, and re-opening it re-renders the
     /// whole track. On a feature-length film that is minutes of `ffmpeg` seeks for a change
     /// that altered one line of text.
@@ -2626,21 +2626,21 @@ impl App {
         }
     }
 
-    /// Opens the timing page again after the save that closed it, if one is owed.
+    /// Opens the subtitle edit page again after the save that closed it, if one is owed.
     ///
     /// Owed and *possible* are different questions, and the second is asked here: the file
     /// has to be the one the page was about, its probe has to have landed, and the track has
     /// to still be there. Any of those failing drops the request rather than deferring it —
     /// a page owed forever would spring open on some unrelated file later on.
-    fn reopen_subtitle_sync(&mut self) {
-        let Some(reopen) = self.pending_sync_reopen.as_ref() else {
+    fn reopen_subtitle_edit(&mut self) {
+        let Some(reopen) = self.pending_reopen.as_ref() else {
             return;
         };
-        if self.subtitle_sync.is_some() {
+        if self.subtitle_edit.is_some() {
             // A page is already up — the save never closed this one, or the reader opened
             // another. Either way there is nothing owed, and holding the request would
             // spring a page open later on something unrelated.
-            self.pending_sync_reopen = None;
+            self.pending_reopen = None;
             return;
         }
         if self.dialog.is_some() {
@@ -2650,14 +2650,14 @@ impl App {
             .selected_file()
             .is_some_and(|file| file.path == reopen.media)
         {
-            self.pending_sync_reopen = None;
+            self.pending_reopen = None;
             return;
         }
         if self.loading || self.media_info().is_none() {
             // The probe for this file is still out; try again when its answer lands.
             return;
         }
-        let reopen = self.pending_sync_reopen.take().expect("checked above");
+        let reopen = self.pending_reopen.take().expect("checked above");
         let Some(row) = self.track_row_of(&reopen.source) else {
             return;
         };
@@ -2667,8 +2667,8 @@ impl App {
         // cursor already is.
         self.layer = Layer::Streams;
         self.selected_stream = row;
-        self.open_subtitle_sync();
-        if let Some(state) = self.subtitle_sync.as_mut() {
+        self.open_subtitle_edit();
+        if let Some(state) = self.subtitle_edit.as_mut() {
             // Where the cursor was, restored once the cues have been read back — the list
             // is rebuilt from the rewritten file, so there is nothing to select yet.
             state.restore_selection(reopen.cue);
@@ -2714,12 +2714,12 @@ impl App {
         }
     }
 
-    /// Opens the subtitle timing page for the selected track.
+    /// Opens the subtitle edit page for the selected track.
     ///
     /// Only SubRip opens for now. Everything else — the other text formats as much as
     /// the bitmap ones — is turned away by the same guard, since nothing here converts:
     /// the page reads the track exactly as it is stored.
-    pub fn open_subtitle_sync(&mut self) {
+    pub fn open_subtitle_edit(&mut self) {
         if self.layer != Layer::Streams || self.dialog.is_some() {
             return;
         }
@@ -2790,7 +2790,7 @@ impl App {
         };
 
         self.notice = None;
-        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.page_generation = self.page_generation.wrapping_add(1);
         // Decided here rather than per frame: neither of these changes while the page is
         // open, and the page has to be able to say why it is empty without waiting for a
         // request it is never going to make. `start_pending_preview` gates on the same two
@@ -2806,8 +2806,8 @@ impl App {
         } else {
             PreviewSupport::Available
         };
-        let state = SubtitleSyncState::new(
-            self.sync_generation,
+        let state = SubtitleEditState::new(
+            self.page_generation,
             frames,
             source,
             duration,
@@ -2833,28 +2833,28 @@ impl App {
                 workspace: state.workspace().to_path_buf(),
             });
         }
-        self.subtitle_sync = Some(state);
-        self.layer = Layer::SubtitleSync;
+        self.subtitle_edit = Some(state);
+        self.layer = Layer::SubtitleEdit;
     }
 
-    /// Closes the timing page, releasing its scratch directory and abandoning any
+    /// Closes the subtitle edit page, releasing its scratch directory and abandoning any
     /// worker result still in flight for it.
     ///
-    /// The single place `subtitle_sync` is cleared, so there is one answer to "what
+    /// The single place `subtitle_edit` is cleared, so there is one answer to "what
     /// happens to the workspace" rather than one per exit path.
-    fn close_subtitle_sync(&mut self) {
-        if self.subtitle_sync.take().is_some() {
+    fn close_subtitle_edit(&mut self) {
+        if self.subtitle_edit.take().is_some() {
             // Before the page goes: dropping the state releases the audio device on its
             // own, but a span still being decoded for it would otherwise run to completion
             // with nowhere to go.
             self.abandon_playback();
-            self.sync_generation = self.sync_generation.wrapping_add(1);
+            self.page_generation = self.page_generation.wrapping_add(1);
             // Tell the worker the page is gone as well as marking its answers stale: an
             // extraction that has not finished is killed rather than left demuxing a
             // whole container — seconds locally, and far longer over a network mount —
             // for a page nobody is looking at.
             if let Some(preview) = self.preview.as_ref() {
-                preview.abandon(self.sync_generation);
+                preview.abandon(self.page_generation);
             }
         }
     }
@@ -2868,7 +2868,7 @@ impl App {
         let mut stopped_playback = false;
         while let Ok(event) = receiver.try_recv() {
             received = true;
-            let Some(state) = self.subtitle_sync.as_mut() else {
+            let Some(state) = self.subtitle_edit.as_mut() else {
                 continue;
             };
             match event {
@@ -2932,7 +2932,7 @@ impl App {
             }
         }
         // After the drain, not inside it: dispatching needs the workers and the settings,
-        // which are `self` fields the loop's borrow of `subtitle_sync` rules out.
+        // which are `self` fields the loop's borrow of `subtitle_edit` rules out.
         if prepared {
             self.start_warming();
         }
@@ -2961,7 +2961,7 @@ impl App {
             .is_some_and(PreviewHandles::draws_frames)
             && self.subtitle_capabilities.can_burn_subtitles();
         let request = {
-            let Some(state) = self.subtitle_sync.as_mut() else {
+            let Some(state) = self.subtitle_edit.as_mut() else {
                 return;
             };
             if !can_draw || state.cues.is_empty() {
@@ -3013,7 +3013,7 @@ impl App {
         if !preview.draws_frames() || !self.subtitle_capabilities.can_burn_subtitles() {
             return;
         }
-        let Some(state) = self.subtitle_sync.as_mut() else {
+        let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
         if !state.any_frame_requested() {
@@ -3028,7 +3028,7 @@ impl App {
         }
         // Only a request that named the selection asks for the selected cue. A refill
         // triggered by the background pass asks for the neighbours alone — see
-        // `SubtitleSyncState::refill_nearby`.
+        // `SubtitleEditState::refill_nearby`.
         let selected = if state.frame_requested() && !state.has_frame(state.selected) {
             state.frame_target(state.selected)
         } else {
@@ -3074,7 +3074,7 @@ impl App {
     }
 
     /// The subtitle track under the cursor, if the cursor is on one at all.
-    /// What the timing page says on a row it has nothing to offer. It names the kind of
+    /// What the subtitle edit page says on a row it has nothing to offer. It names the kind of
     /// track the reader actually picked and states the absence of a feature, rather than
     /// telling them to pick something else: `c` on a video track is a reasonable thing to
     /// try, and "select a subtitle track" reads as a correction of the reader for a gap in
@@ -3109,17 +3109,17 @@ impl App {
         }
     }
 
-    fn move_sync_cue(&mut self, delta: isize) {
-        if let Some(state) = self.subtitle_sync.as_mut() {
+    fn move_cue(&mut self, delta: isize) {
+        if let Some(state) = self.subtitle_edit.as_mut() {
             state.select(delta);
         }
     }
 
     /// Moves the cue cursor sideways, between the cues that share a moment with the one it
     /// is on. Does nothing on a cue that overlaps nothing, which has nowhere sideways to go.
-    pub fn move_sync_cue_within_group(&mut self, delta: isize) {
+    pub fn move_cue_within_group(&mut self, delta: isize) {
         self.notice = None;
-        if let Some(state) = self.subtitle_sync.as_mut() {
+        if let Some(state) = self.subtitle_edit.as_mut() {
             state.select_within_group(delta);
         }
     }
@@ -3174,7 +3174,7 @@ impl App {
         // provably the same answer rather than two computations that agree today.
         let capped_fps = self.effective_playback_fps();
         let request = {
-            let Some(state) = self.subtitle_sync.as_mut() else {
+            let Some(state) = self.subtitle_edit.as_mut() else {
                 return;
             };
             let Some(cue) = state.selected_cue().cloned() else {
@@ -3241,15 +3241,15 @@ impl App {
     /// is in exactly the same position a moment later.
     ///
     /// The answer is therefore to keep the two apart rather than to order them. A dialog the
-    /// user asked for is refused (`:` and `?` on the timing page); one that raises itself —
+    /// user asked for is refused (`:` and `?` on the subtitle edit page); one that raises itself —
     /// the conflict notice — stops the playback instead, since it cannot be refused.
     pub fn playback_in_progress(&self) -> bool {
-        self.subtitle_sync
+        self.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.playback_active() || state.preparing_playback().is_some())
     }
 
-    /// Opens the preview-settings popup over the timing page.
+    /// Opens the preview-settings popup over the subtitle edit page.
     ///
     /// Only from that page, only when nothing else is up — the same two gates every other
     /// settings popup applies — and only when nothing is playing, for the reason
@@ -3257,7 +3257,7 @@ impl App {
     /// `preview_settings` directly, so what it shows is always what a playback would
     /// actually be done with rather than a copy taken when it opened.
     pub fn open_preview_settings(&mut self) {
-        if self.layer != Layer::SubtitleSync || self.dialog.is_some() || self.playback_in_progress()
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
         {
             return;
         }
@@ -3278,11 +3278,11 @@ impl App {
     /// that understands override tags. Saying that is better than an editor that quietly
     /// ruins a typeset line.
     pub fn open_cue_editor(&mut self) {
-        if self.layer != Layer::SubtitleSync || self.dialog.is_some() || self.playback_in_progress()
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
         {
             return;
         }
-        let Some(state) = self.subtitle_sync.as_ref() else {
+        let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
         if self.subtitle_source_format(&state.source) != Some(SubtitleFormat::SubRip) {
@@ -3344,7 +3344,7 @@ impl App {
             move || file,
             move |edit| edit.text = staged,
         );
-        if let Some(state) = self.subtitle_sync.as_mut() {
+        if let Some(state) = self.subtitle_edit.as_mut() {
             state.edit_cue_text(editor.cue, text);
         }
     }
@@ -3363,7 +3363,7 @@ impl App {
         {
             return Some(staged.original.clone());
         }
-        let shown = self.subtitle_sync.as_ref()?.cues.get(cue)?;
+        let shown = self.subtitle_edit.as_ref()?.cues.get(cue)?;
         Some(CueSnapshot {
             text: shown.text.clone(),
             start: shown.start,
@@ -3410,13 +3410,13 @@ impl App {
     ///
     /// **Not gated on a playback**, unlike every dialog this page can raise. A mode is not
     /// drawn into the cell buffer a running span would wipe, and being usable *while* a span
-    /// plays is the reason it is a mode at all — see [`SubtitleSyncState::timing_mode`].
+    /// plays is the reason it is a mode at all — see [`SubtitleEditState::timing_mode`].
     pub fn toggle_cue_timing_mode(&mut self) {
-        if self.layer != Layer::SubtitleSync || self.dialog.is_some() {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
         }
         let Some(source) = self
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .map(|state| state.source.clone())
         else {
@@ -3426,7 +3426,7 @@ impl App {
             self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
             return;
         }
-        if let Some(state) = self.subtitle_sync.as_mut() {
+        if let Some(state) = self.subtitle_edit.as_mut() {
             state.timing_mode = !state.timing_mode;
         }
         self.notice = None;
@@ -3439,7 +3439,7 @@ impl App {
     /// reader walks past would put a number that never changes on the one line of the page
     /// with room for a number.
     pub fn selected_cue_shift(&self) -> Option<i64> {
-        let state = self.subtitle_sync.as_ref()?;
+        let state = self.subtitle_edit.as_ref()?;
         let edit = self
             .subtitle_changes
             .get(&state.source)?
@@ -3452,7 +3452,7 @@ impl App {
     /// Whether the open page's timing mode is on, which is what gives `h`/`l` their second
     /// meaning.
     pub fn cue_timing_mode(&self) -> bool {
-        self.subtitle_sync
+        self.subtitle_edit
             .as_ref()
             .is_some_and(|state| state.timing_mode)
     }
@@ -3462,17 +3462,17 @@ impl App {
     /// `Esc` peels this page one layer at a time, and the answer is what tells
     /// [`Self::back`] to stop there rather than go on to ask about leaving.
     pub fn leave_cue_timing_mode(&mut self) -> bool {
-        self.subtitle_sync
+        self.subtitle_edit
             .as_mut()
             .is_some_and(|state| std::mem::take(&mut state.timing_mode))
     }
 
     /// `h`/`l` and `H`/`L` in timing mode: shifts the selected cue and stages the result.
     pub fn nudge_selected_cue(&mut self, steps: i64) {
-        if self.layer != Layer::SubtitleSync || self.dialog.is_some() {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
         }
-        let Some(state) = self.subtitle_sync.as_ref() else {
+        let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
         if !state.timing_mode {
@@ -3484,7 +3484,7 @@ impl App {
         let Some(file) = self.file_cue_snapshot(&source, selected) else {
             return;
         };
-        let Some(state) = self.subtitle_sync.as_mut() else {
+        let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
         let Some((cue, start, end)) = state.nudge_selected(steps) else {
@@ -3510,10 +3510,10 @@ impl App {
     /// **The cue's words are left alone.** This is a key of the timing mode, and a reader who
     /// retimed *and* rewrote a cue has not asked for their typing back.
     pub fn reset_selected_cue_timing(&mut self) {
-        if self.layer != Layer::SubtitleSync || self.dialog.is_some() {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
         }
-        let Some(state) = self.subtitle_sync.as_ref() else {
+        let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
         if !state.timing_mode {
@@ -3529,7 +3529,7 @@ impl App {
             return;
         };
         let (start, end) = (original.start, original.end);
-        if let Some(state) = self.subtitle_sync.as_mut() {
+        if let Some(state) = self.subtitle_edit.as_mut() {
             state.set_cue_timing(cue, start, end);
         }
         self.stage_cue_edit(
@@ -3544,12 +3544,12 @@ impl App {
     }
 
     /// Whether the open file is carrying cue edits that have not been written to disk yet,
-    /// which is what makes leaving the timing page worth asking about.
+    /// which is what makes leaving the subtitle edit page worth asking about.
     pub fn has_unsaved_cue_edits(&self) -> bool {
         !self.staged_cue_edits().is_empty()
     }
 
-    /// Which cues of the *open timing page's* track have been rewritten and not yet written
+    /// Which cues of the *open subtitle edit page's* track have been rewritten and not yet written
     /// out, for the count on the cue panel's border and the mark on each edited row.
     ///
     /// Positions rather than a count, because the panel needs both and a count cannot be
@@ -3558,14 +3558,14 @@ impl App {
     /// would be about something not on screen. With the page closed there is no track to
     /// gather for, which is the empty set every caller outside it sees.
     pub fn staged_cue_edits(&self) -> BTreeSet<usize> {
-        self.subtitle_sync
+        self.subtitle_edit
             .as_ref()
             .and_then(|state| self.subtitle_changes.get(&state.source))
             .map(|change| change.cue_edits.keys().copied().collect())
             .unwrap_or_default()
     }
 
-    /// `Esc` on the timing page: leave, or ask first when cue edits would be thrown away.
+    /// `Esc` on the subtitle edit page: leave, or ask first when cue edits would be thrown away.
     ///
     /// This page is where cue edits are made and the only place they are visible, so
     /// leaving it is where they end. The question is asked because the answer is
@@ -3573,22 +3573,22 @@ impl App {
     /// a reader who left with edits still staged would have no way of seeing them again
     /// short of coming back here, and every Ctrl+S from anywhere else would write words
     /// they had stopped thinking about.
-    pub fn request_leave_subtitle_sync(&mut self) {
+    pub fn request_leave_subtitle_edit(&mut self) {
         if self.has_unsaved_cue_edits() {
             self.dialog = Some(Dialog::ConfirmLeaveCues);
             return;
         }
-        self.leave_subtitle_sync();
+        self.leave_subtitle_edit();
     }
 
     /// Closes the page and puts the cursor back on the track list.
-    fn leave_subtitle_sync(&mut self) {
-        self.close_subtitle_sync();
+    fn leave_subtitle_edit(&mut self) {
+        self.close_subtitle_edit();
         self.layer = Layer::Streams;
     }
 
     /// Answers the "discard the unwritten cue edits?" prompt.
-    pub fn resolve_leave_subtitle_sync(&mut self, leave: bool) {
+    pub fn resolve_leave_subtitle_edit(&mut self, leave: bool) {
         if self.dialog != Some(Dialog::ConfirmLeaveCues) {
             return;
         }
@@ -3596,7 +3596,7 @@ impl App {
         self.leave_cues_choice = LeaveCuesChoice::default();
         if leave {
             self.discard_cue_edits();
-            self.leave_subtitle_sync();
+            self.leave_subtitle_edit();
         }
     }
 
@@ -3610,7 +3610,7 @@ impl App {
     /// lingering as an empty entry that makes the file look modified.
     fn discard_cue_edits(&mut self) {
         let Some(source) = self
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .map(|state| state.source.clone())
         else {
@@ -3624,7 +3624,7 @@ impl App {
     }
 
     /// Moves the prompt's cursor between keeping the edits and discarding them.
-    pub fn choose_leave_subtitle_sync(&mut self, direction: isize) {
+    pub fn choose_leave_subtitle_edit(&mut self, direction: isize) {
         if self.dialog != Some(Dialog::ConfirmLeaveCues) || direction == 0 {
             return;
         }
@@ -3636,8 +3636,8 @@ impl App {
     }
 
     /// Takes whichever answer the cursor is on.
-    pub fn activate_leave_subtitle_sync(&mut self) {
-        self.resolve_leave_subtitle_sync(self.leave_cues_choice == LeaveCuesChoice::DiscardEdits);
+    pub fn activate_leave_subtitle_edit(&mut self) {
+        self.resolve_leave_subtitle_edit(self.leave_cues_choice == LeaveCuesChoice::DiscardEdits);
     }
 
     /// Types a character into the open cue editor.
@@ -4136,9 +4136,9 @@ impl App {
     /// Reports whether there was one, which is what makes the keybinding a toggle.
     fn stop_playback(&mut self) -> bool {
         let stopped = self
-            .subtitle_sync
+            .subtitle_edit
             .as_mut()
-            .is_some_and(SubtitleSyncState::stop_playback);
+            .is_some_and(SubtitleEditState::stop_playback);
         if stopped {
             self.abandon_playback();
         }
@@ -4158,12 +4158,12 @@ impl App {
     /// needs repainting.
     ///
     /// Called once per loop iteration, beside the other pumps. Also the single point that
-    /// reconciles the worker with the page: `SubtitleSyncState` drops a playback on its own
+    /// reconciles the worker with the page: `SubtitleEditState` drops a playback on its own
     /// whenever the cursor moves or the pane resizes, and this is where that becomes a
     /// running `ffmpeg` being killed rather than left decoding a span nobody will watch.
     pub fn advance_playback(&mut self) -> bool {
-        let Some(state) = self.subtitle_sync.as_mut() else {
-            // The page itself is gone, which `close_subtitle_sync` has already reported.
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            // The page itself is gone, which `close_subtitle_edit` has already reported.
             return false;
         };
         let dirty = state.advance_playback();
@@ -4176,9 +4176,9 @@ impl App {
     /// Whether a span is playing or being decoded, for the loop's poll interval and for
     /// the status row.
     pub fn playback_active(&self) -> bool {
-        self.subtitle_sync
+        self.subtitle_edit
             .as_ref()
-            .is_some_and(SubtitleSyncState::playback_active)
+            .is_some_and(SubtitleEditState::playback_active)
     }
 
     /// How long the event loop may block waiting for a key.
@@ -4207,7 +4207,7 @@ impl App {
                 self.layer = Layer::Files;
                 true
             }
-            Layer::SubtitleSync => {
+            Layer::SubtitleEdit => {
                 // Peeled one layer at a time, the same way Esc backs out of a file search
                 // before leaving the file list: a playback is something on screen the user
                 // may want gone without also losing the page they spent a second opening.
@@ -4225,7 +4225,7 @@ impl App {
                 // edits are not lost by going, but this page is the only place they are
                 // visible, so walking out silently is how a reader comes to believe they
                 // were written.
-                self.request_leave_subtitle_sync();
+                self.request_leave_subtitle_edit();
                 true
             }
             Layer::Files => false,
@@ -7904,8 +7904,8 @@ impl App {
         // Noted before anything is dispatched, because the page is about to be closed by
         // the rescan the save's own output triggers. `media` is filled in by
         // `finish_batch_if_done`, which is the first point that knows what the file
-        // became. See `SyncReopen`.
-        self.pending_sync_reopen = self.subtitle_sync.as_ref().map(|state| SyncReopen {
+        // became. See `SubtitleEditReopen`.
+        self.pending_reopen = self.subtitle_edit.as_ref().map(|state| SubtitleEditReopen {
             media: state.media().to_path_buf(),
             source: state.source.clone(),
             cue: state.selected,
@@ -8283,9 +8283,9 @@ impl App {
         matches!(self.dialog, Some(Dialog::BatchProcessing))
             || self.conflict_countdown().is_some()
             || self
-                .subtitle_sync
+                .subtitle_edit
                 .as_ref()
-                .is_some_and(SubtitleSyncState::is_busy)
+                .is_some_and(SubtitleEditState::is_busy)
             // A playback repaints because the picture moved, which `advance_playback`
             // already reports — but the frames *between* those, and the wait while a span
             // decodes, need the loop drawing too, or the page freezes on whatever was on
@@ -8643,7 +8643,7 @@ impl App {
                 }
             }
             Layer::StreamDetails => self.scroll_details_down(10),
-            Layer::SubtitleSync => self.move_sync_cue(10),
+            Layer::SubtitleEdit => self.move_cue(10),
         }
     }
 
@@ -8663,7 +8663,7 @@ impl App {
                 self.selected_stream = self.selected_stream.saturating_sub(10);
             }
             Layer::StreamDetails => self.scroll_details_up(10),
-            Layer::SubtitleSync => self.move_sync_cue(-10),
+            Layer::SubtitleEdit => self.move_cue(-10),
         }
     }
 
@@ -20880,19 +20880,19 @@ mod tests {
     }
 
     #[test]
-    fn open_subtitle_sync_should_open_the_page_for_an_embedded_subrip_track() {
+    fn open_subtitle_edit_should_open_the_page_for_an_embedded_subrip_track() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
-        let state = app.subtitle_sync.as_ref().expect("page should be open");
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        let state = app.subtitle_edit.as_ref().expect("page should be open");
         assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
-        assert_that!(state.status.clone()).is_equal_to(crate::sync::SyncStatus::Preparing);
+        assert_that!(state.status.clone()).is_equal_to(crate::subtitle_edit::LoadStatus::Preparing);
         assert_that!(state.workspace().exists()).is_true();
         assert_that!(app.notice.clone()).is_none();
 
@@ -20901,7 +20901,7 @@ mod tests {
     }
 
     #[test]
-    fn open_subtitle_sync_should_open_the_page_for_a_subrip_sidecar() {
+    fn open_subtitle_edit_should_open_the_page_for_a_subrip_sidecar() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
@@ -20915,11 +20915,11 @@ mod tests {
             .expect("sidecar should have a track row");
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().source.clone())
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
             .is_equal_to(SubtitleSource::Sidecar(path));
 
         // Cleanup
@@ -20930,7 +20930,7 @@ mod tests {
     /// itself so the message is about the track the user actually picked rather than about
     /// subtitles in general.
     #[test]
-    fn open_subtitle_sync_should_refuse_a_format_it_cannot_reach_cues_through() {
+    fn open_subtitle_edit_should_refuse_a_format_it_cannot_reach_cues_through() {
         for (codec, expected) in [
             ("ttml", "TTML"),
             ("hdmv_pgs_subtitle", "PGS"),
@@ -20942,11 +20942,11 @@ mod tests {
             app.subtitle_capabilities = full_subtitle_capabilities();
 
             // Act
-            app.open_subtitle_sync();
+            app.open_subtitle_edit();
 
             // Assert
             assert_that!(app.layer).is_equal_to(Layer::Streams);
-            assert_that!(app.subtitle_sync.is_none()).is_true();
+            assert_that!(app.subtitle_edit.is_none()).is_true();
             let notice = app.notice.clone().expect("a refusal should say why");
             assert_that!(notice.contains(expected)).is_true();
             assert_that!(notice.contains("not implemented yet")).is_true();
@@ -20960,18 +20960,18 @@ mod tests {
     /// it is refused separately — and without naming a format, since there is not one to
     /// name.
     #[test]
-    fn open_subtitle_sync_should_refuse_a_codec_it_does_not_recognise() {
+    fn open_subtitle_edit_should_refuse_a_codec_it_does_not_recognise() {
         // Arrange
         let mut app = app_with_subtitle_codec("nonsense_codec");
         let directory = app.directory.clone();
         app.subtitle_capabilities = full_subtitle_capabilities();
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
         assert_that!(app.layer).is_equal_to(Layer::Streams);
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone().unwrap().as_str()).contains("not one reel recognises");
 
         // Cleanup
@@ -20982,7 +20982,7 @@ mod tests {
     /// opens on them — but only on a build that can decode them, which is a different
     /// question from the encoder list the rest of the program asks about.
     #[test]
-    fn open_subtitle_sync_should_open_a_transcodable_track_only_when_ffmpeg_can_decode_it() {
+    fn open_subtitle_edit_should_open_a_transcodable_track_only_when_ffmpeg_can_decode_it() {
         for (codec, expected) in [("webvtt", "VTT"), ("mov_text", "MOVTXT")] {
             // Arrange: a build that can encode the format but not read it, which is the
             // case a check against `ffmpeg_encoders` would wave straight through.
@@ -20994,11 +20994,11 @@ mod tests {
             };
 
             // Act
-            app.open_subtitle_sync();
+            app.open_subtitle_edit();
 
             // Assert
             assert_that!(app.layer).is_equal_to(Layer::Streams);
-            assert_that!(app.subtitle_sync.is_none()).is_true();
+            assert_that!(app.subtitle_edit.is_none()).is_true();
             let notice = app.notice.clone().expect("a refusal should say why");
             assert_that!(notice.contains(expected)).is_true();
             assert_that!(notice.as_str()).contains("decode it");
@@ -21006,8 +21006,8 @@ mod tests {
             // Act / Assert: and a build that can read it opens the page.
             app.notice = None;
             app.subtitle_capabilities = full_subtitle_capabilities();
-            app.open_subtitle_sync();
-            assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+            app.open_subtitle_edit();
+            assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
             assert_that!(app.notice.clone()).is_none();
 
             // Cleanup
@@ -21018,7 +21018,7 @@ mod tests {
     /// A track the page cannot open is turned away by naming its own kind, so the reader is
     /// told which feature is missing rather than told to pick a different row.
     #[test]
-    fn open_subtitle_sync_should_refuse_a_track_that_is_not_a_subtitle() {
+    fn open_subtitle_edit_should_refuse_a_track_that_is_not_a_subtitle() {
         for (index, expected) in [(0, "video tracks"), (1, "audio tracks")] {
             // Arrange
             let mut app = app_with_subtitle_codec("subrip");
@@ -21026,11 +21026,11 @@ mod tests {
             select_embedded_row(&mut app, index);
 
             // Act
-            app.open_subtitle_sync();
+            app.open_subtitle_edit();
 
             // Assert
             assert_that!(app.layer).is_equal_to(Layer::Streams);
-            assert_that!(app.subtitle_sync.is_none()).is_true();
+            assert_that!(app.subtitle_edit.is_none()).is_true();
             assert_that!(app.notice.clone().unwrap().as_str())
                 .is_equal_to(format!("Editing {expected} is not implemented yet.").as_str());
 
@@ -21043,17 +21043,17 @@ mod tests {
     /// its shape and falls back to the row itself rather than to a message about
     /// subtitles.
     #[test]
-    fn open_subtitle_sync_should_refuse_a_selection_that_names_no_track() {
+    fn open_subtitle_edit_should_refuse_a_selection_that_names_no_track() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
         app.selected_stream = app.track_rows().len();
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone().unwrap().as_str())
             .is_equal_to("Editing this track is not implemented yet.");
 
@@ -21062,7 +21062,7 @@ mod tests {
     }
 
     #[test]
-    fn open_subtitle_sync_should_refuse_the_container_row() {
+    fn open_subtitle_edit_should_refuse_the_container_row() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
@@ -21073,10 +21073,10 @@ mod tests {
             .expect("container should have a track row");
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone().unwrap().as_str())
             .is_equal_to("Editing the container is not implemented yet.");
 
@@ -21085,17 +21085,17 @@ mod tests {
     }
 
     #[test]
-    fn open_subtitle_sync_should_refuse_a_track_marked_for_deletion() {
+    fn open_subtitle_edit_should_refuse_a_track_marked_for_deletion() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
         app.deleted_streams.insert(2);
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone().unwrap().contains("deletion")).is_true();
 
         // Cleanup
@@ -21103,22 +21103,22 @@ mod tests {
     }
 
     #[test]
-    fn open_subtitle_sync_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
+    fn open_subtitle_edit_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
 
         // Act / Assert: wrong layer.
         app.layer = Layer::Files;
-        app.open_subtitle_sync();
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        app.open_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone()).is_none();
 
         // Act / Assert: right layer, but a dialog owns the keyboard.
         app.layer = Layer::Streams;
         app.dialog = Some(Dialog::Keybindings);
-        app.open_subtitle_sync();
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        app.open_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.notice.clone()).is_none();
 
         // Cleanup
@@ -21128,13 +21128,13 @@ mod tests {
     /// The scratch directory lives exactly as long as the page. Leaving it behind would
     /// accumulate a copy of every previewed subtitle for the session's life.
     #[test]
-    fn back_should_leave_the_sync_page_and_delete_its_workspace() {
+    fn back_should_leave_the_edit_page_and_delete_its_workspace() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let workspace = app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .unwrap()
             .workspace()
@@ -21147,7 +21147,7 @@ mod tests {
         // Assert
         assert_that!(handled).is_true();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(workspace.exists()).is_false();
 
         // Cleanup
@@ -21157,7 +21157,7 @@ mod tests {
     /// The page shows one track of one file. Selecting a different file has to close it,
     /// or it keeps showing cues belonging to a file that is no longer open.
     #[test]
-    fn selecting_another_file_should_close_the_sync_page() {
+    fn selecting_another_file_should_close_the_edit_page() {
         // Arrange
         let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
         let directory = app.directory.clone();
@@ -21169,9 +21169,9 @@ mod tests {
             ]),
         );
         select_embedded_row(&mut app, 2);
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let workspace = app
-            .subtitle_sync
+            .subtitle_edit
             .as_ref()
             .unwrap()
             .workspace()
@@ -21182,7 +21182,7 @@ mod tests {
         app.select_next();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(workspace.exists()).is_false();
 
         // Cleanup
@@ -21190,9 +21190,9 @@ mod tests {
     }
 
     /// `j`/`k` reach `App` with no layer guard of their own, so without an arm of its
-    /// own the timing page would silently scroll the file list behind it instead.
+    /// own the subtitle edit page would silently scroll the file list behind it instead.
     #[test]
-    fn select_next_should_move_the_cue_cursor_rather_than_the_file_list_on_the_sync_page() {
+    fn select_next_should_move_the_cue_cursor_rather_than_the_file_list_on_the_edit_page() {
         // Arrange
         let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
         let directory = app.directory.clone();
@@ -21204,8 +21204,8 @@ mod tests {
             ]),
         );
         select_embedded_row(&mut app, 2);
-        app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![
                 crate::cue::Cue {
                     index: 0,
@@ -21232,12 +21232,12 @@ mod tests {
         app.select_next();
 
         // Assert
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
         assert_that!(app.list_state.selected()).is_equal_to(file_before);
 
         // Act / Assert: and back up again.
         app.select_previous();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
         assert_that!(app.list_state.selected()).is_equal_to(file_before);
 
         // Cleanup
@@ -21245,11 +21245,11 @@ mod tests {
     }
 
     #[test]
-    fn paging_and_jumping_should_move_the_cue_cursor_on_the_sync_page() {
+    fn paging_and_jumping_should_move_the_cue_cursor_on_the_edit_page() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let cues = (0..30)
             .map(|index| crate::cue::Cue {
                 index,
@@ -21260,27 +21260,27 @@ mod tests {
                 events: 1,
             })
             .collect();
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_prepared(cues, CueStyle::SubRip);
 
         // Act / Assert
         app.scroll_down();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(10);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(10);
         app.scroll_up();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
         app.select_last();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(29);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(29);
         app.select_first();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// A timing page with two cues on it, for the cue editor's tests.
-    fn sync_cue_at(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+    /// A subtitle edit page with two cues on it, for the cue editor's tests.
+    fn edit_cue_at(start: u64, end: u64, text: &str) -> crate::cue::Cue {
         crate::cue::Cue {
             index: 0,
             start: Duration::from_secs(start),
@@ -21294,11 +21294,11 @@ mod tests {
     fn cue_editing_app() -> (App, PathBuf) {
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![
-                sync_cue_at(1, 2, "First line"),
-                sync_cue_at(3, 4, "Second line"),
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line"),
             ],
             CueStyle::SubRip,
         );
@@ -21409,7 +21409,7 @@ mod tests {
         let edit = change.cue_edits.get(&0).expect("cue zero should be staged");
         assert_that!(edit.original.text.as_str()).is_equal_to("First line");
         assert_that!(edit.text.as_str()).is_equal_to("First line!");
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].text.as_str())
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].text.as_str())
             .is_equal_to("First line!");
         assert_that!(app.has_unsaved_cue_edits()).is_true();
         assert_that!(
@@ -21451,7 +21451,7 @@ mod tests {
                 .contains_key(&SubtitleSource::Embedded(2))
         )
         .is_false();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].text.as_str())
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].text.as_str())
             .is_equal_to("First line");
 
         // Cleanup
@@ -21466,8 +21466,8 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("ass");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
                 start: Duration::from_secs(1),
@@ -21521,7 +21521,7 @@ mod tests {
         assert_that!(edit.original.text.as_str()).is_equal_to("First line");
 
         // Assert: and the page, the count and the shift readout all agree.
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].start)
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
             .is_equal_to(Duration::from_millis(1150));
         assert_that!(app.selected_cue_shift()).is_equal_to(Some(150));
         assert_that!(app.has_unsaved_cue_edits()).is_true();
@@ -21549,7 +21549,7 @@ mod tests {
         app.nudge_selected_cue(4);
         app.nudge_selected_cue(3);
         app.reset_selected_cue_timing();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].start)
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
             .is_equal_to(Duration::from_secs(1));
         assert_that!(app.has_unsaved_cue_edits()).is_false();
         assert_that!(app.selected_cue_shift()).is_none();
@@ -21557,7 +21557,7 @@ mod tests {
         // Act / Assert: with nothing staged there is nothing for `0` to restore, and it
         // must not invent a timing of its own.
         app.reset_selected_cue_timing();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].start)
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
             .is_equal_to(Duration::from_secs(1));
         assert_that!(app.has_unsaved_cue_edits()).is_false();
 
@@ -21602,11 +21602,11 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("ass");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        app.subtitle_sync
+        app.open_subtitle_edit();
+        app.subtitle_edit
             .as_mut()
             .unwrap()
-            .apply_prepared(vec![sync_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
 
         // Act
         app.toggle_cue_timing_mode();
@@ -21617,7 +21617,7 @@ mod tests {
 
         // Act / Assert: and the keys the mode would have given meaning to stay inert.
         app.nudge_selected_cue(1);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().cues[0].start)
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
             .is_equal_to(Duration::from_secs(1));
         assert_that!(app.has_unsaved_cue_edits()).is_false();
 
@@ -21641,7 +21641,7 @@ mod tests {
         assert_that!(app.dialog).is_equal_to(None);
         app.back();
         assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
-        app.resolve_leave_subtitle_sync(true);
+        app.resolve_leave_subtitle_edit(true);
 
         // Assert: gone, and the track is not left looking modified by an empty change.
         assert_that!(app.layer).is_equal_to(Layer::Streams);
@@ -21669,22 +21669,22 @@ mod tests {
         // Assert: still on the page, with the question up and the safe answer under the
         // cursor.
         assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.leave_cues_choice).is_equal_to(LeaveCuesChoice::StayHere);
 
         // Act / Assert: saying no puts the reader back on the page with their edits.
-        app.activate_leave_subtitle_sync();
+        app.activate_leave_subtitle_edit();
         assert_that!(app.dialog).is_equal_to(None);
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.has_unsaved_cue_edits()).is_true();
 
         // Act / Assert: and discarding leaves with the words gone — nothing staged against
         // the track, so the file is not carrying an edit nowhere shows.
         app.back();
-        app.choose_leave_subtitle_sync(1);
-        app.activate_leave_subtitle_sync();
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(
             app.subtitle_changes
                 .contains_key(&SubtitleSource::Embedded(2))
@@ -21722,8 +21722,8 @@ mod tests {
 
         // Act: leave, discarding.
         app.back();
-        app.choose_leave_subtitle_sync(1);
-        app.activate_leave_subtitle_sync();
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
 
         // Assert: the words are gone, the tag is not.
         let change = app
@@ -21758,7 +21758,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Writing a cue edit rewrites the file the timing page is reading, so the page is
+    /// Writing a cue edit rewrites the file the subtitle edit page is reading, so the page is
     /// closed and the file re-probed — but the reader asked to save a cue, not to leave.
     /// The page comes back on the same track, and the cursor lands on the cue it was on.
     #[test]
@@ -21766,34 +21766,34 @@ mod tests {
         // Arrange: the page open on the second cue, then a save closing it the way the
         // rescan of its own output does.
         let (mut app, directory) = cue_editing_app();
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         let media = app.selected_file().unwrap().path.clone();
-        app.pending_sync_reopen = Some(SyncReopen {
+        app.pending_reopen = Some(SubtitleEditReopen {
             media,
             source: SubtitleSource::Embedded(2),
             cue: 1,
         });
-        app.close_subtitle_sync();
+        app.close_subtitle_edit();
         app.layer = Layer::Files;
 
         // Act
-        app.reopen_subtitle_sync();
+        app.reopen_subtitle_edit();
 
         // Assert: the page is up again, on the track it was about.
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
-        let state = app.subtitle_sync.as_ref().expect("the page should be open");
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        let state = app.subtitle_edit.as_ref().expect("the page should be open");
         assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
-        assert_that!(app.pending_sync_reopen.clone()).is_none();
+        assert_that!(app.pending_reopen.clone()).is_none();
 
         // And the cursor goes back where it was, once the rewritten file has been read.
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![
-                sync_cue_at(1, 2, "First line"),
-                sync_cue_at(3, 4, "Second line!"),
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line!"),
             ],
             CueStyle::SubRip,
         );
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -21806,21 +21806,21 @@ mod tests {
     fn saving_should_not_drag_the_reader_back_from_another_file() {
         // Arrange
         let (mut app, directory) = cue_editing_app();
-        app.close_subtitle_sync();
+        app.close_subtitle_edit();
         app.layer = Layer::Files;
-        app.pending_sync_reopen = Some(SyncReopen {
+        app.pending_reopen = Some(SubtitleEditReopen {
             media: directory.join("something-else.mkv"),
             source: SubtitleSource::Embedded(2),
             cue: 0,
         });
 
         // Act
-        app.reopen_subtitle_sync();
+        app.reopen_subtitle_edit();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::Files);
-        assert_that!(app.pending_sync_reopen.clone()).is_none();
+        assert_that!(app.pending_reopen.clone()).is_none();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -21833,20 +21833,20 @@ mod tests {
         // Arrange
         let (mut app, directory) = cue_editing_app();
         let media = app.selected_file().unwrap().path.clone();
-        app.close_subtitle_sync();
+        app.close_subtitle_edit();
         app.layer = Layer::Files;
-        app.pending_sync_reopen = Some(SyncReopen {
+        app.pending_reopen = Some(SubtitleEditReopen {
             media,
             source: SubtitleSource::Embedded(7),
             cue: 0,
         });
 
         // Act
-        app.reopen_subtitle_sync();
+        app.reopen_subtitle_edit();
 
         // Assert
-        assert_that!(app.subtitle_sync.is_none()).is_true();
-        assert_that!(app.pending_sync_reopen.clone()).is_none();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.pending_reopen.clone()).is_none();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -21860,9 +21860,9 @@ mod tests {
         // Arrange: the file selected, its probe still out.
         let (mut app, directory) = cue_editing_app();
         let media = app.selected_file().unwrap().path.clone();
-        app.close_subtitle_sync();
+        app.close_subtitle_edit();
         app.layer = Layer::Files;
-        app.pending_sync_reopen = Some(SyncReopen {
+        app.pending_reopen = Some(SubtitleEditReopen {
             media,
             source: SubtitleSource::Embedded(2),
             cue: 0,
@@ -21871,25 +21871,25 @@ mod tests {
         app.loading = true;
 
         // Act / Assert: nothing yet, and the request is still owed.
-        app.reopen_subtitle_sync();
-        assert_that!(app.subtitle_sync.is_none()).is_true();
-        assert_that!(app.pending_sync_reopen.is_some()).is_true();
+        app.reopen_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.pending_reopen.is_some()).is_true();
 
         // Act / Assert: and it is honoured the moment the answer lands.
         app.loading = false;
         app.outcome = outcome;
-        app.reopen_subtitle_sync();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        app.reopen_subtitle_edit();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // A page already open owes nothing, and holding the request would spring one open
         // later on something else entirely.
-        app.pending_sync_reopen = Some(SyncReopen {
+        app.pending_reopen = Some(SubtitleEditReopen {
             media: directory.join("movie.mkv"),
             source: SubtitleSource::Embedded(2),
             cue: 0,
         });
-        app.reopen_subtitle_sync();
-        assert_that!(app.pending_sync_reopen.clone()).is_none();
+        app.reopen_subtitle_edit();
+        assert_that!(app.pending_reopen.clone()).is_none();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -21981,16 +21981,16 @@ mod tests {
     /// The page draws a loader while its cues are being read, and `main` only repaints
     /// while something reports itself as animating.
     #[test]
-    fn is_animating_should_hold_while_the_sync_page_is_preparing() {
+    fn is_animating_should_hold_while_the_edit_page_is_preparing() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
 
         // Act / Assert
         assert_that!(app.is_animating()).is_false();
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         assert_that!(app.is_animating()).is_true();
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_prepared(Vec::new(), CueStyle::SubRip);
@@ -22005,7 +22005,7 @@ mod tests {
     /// A per-type `0:s:N` index here would extract whichever track happens to be Nth
     /// among the subtitles, which is a different track on most real files.
     #[test]
-    fn opening_the_sync_page_should_ask_the_worker_for_the_embedded_track() {
+    fn opening_the_edit_page_should_ask_the_worker_for_the_embedded_track() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
@@ -22014,10 +22014,10 @@ mod tests {
         app.set_preview_handles(Some(preview.handles));
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
-        let state = app.subtitle_sync.as_ref().expect("page should be open");
+        let state = app.subtitle_edit.as_ref().expect("page should be open");
         let request = requests.try_recv().expect("the worker should be asked");
         assert_that!(request.generation).is_equal_to(state.generation);
         assert_that!(request.input.clone()).is_equal_to(state.media().to_path_buf());
@@ -22031,7 +22031,7 @@ mod tests {
     /// A sidecar is read straight off disk: the request has to point at the `.srt`
     /// itself, not at the media, and ask for no extraction at all.
     #[test]
-    fn opening_the_sync_page_should_ask_the_worker_for_a_sidecar_by_its_own_path() {
+    fn opening_the_edit_page_should_ask_the_worker_for_a_sidecar_by_its_own_path() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
@@ -22048,7 +22048,7 @@ mod tests {
         app.set_preview_handles(Some(preview.handles));
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert
         let request = requests.try_recv().expect("the worker should be asked");
@@ -22063,14 +22063,14 @@ mod tests {
     /// extraction demuxes the whole container, which over a network mount runs long
     /// after the page it was for is gone.
     #[test]
-    fn leaving_the_sync_page_should_tell_the_worker_to_stop() {
+    fn leaving_the_edit_page_should_tell_the_worker_to_stop() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
         let preview = crate::preview::test_handles();
         let (requests, live) = (preview.prepare_rx, preview.live_generation);
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let request = requests.try_recv().expect("the worker should be asked");
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
             .is_equal_to(request.generation);
@@ -22091,8 +22091,8 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
 
         // Act / Assert: an empty drain is not a redraw.
@@ -22119,8 +22119,8 @@ mod tests {
 
         // Assert
         assert_that!(drained).is_true();
-        let state = app.subtitle_sync.as_ref().unwrap();
-        assert_that!(state.status.clone()).is_equal_to(crate::sync::SyncStatus::Ready);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.status.clone()).is_equal_to(crate::subtitle_edit::LoadStatus::Ready);
         assert_that!(state.cues.len()).is_equal_to(1);
 
         // Cleanup
@@ -22132,8 +22132,8 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
 
         // Act
@@ -22146,8 +22146,8 @@ mod tests {
         app.receive_preview_events(&receiver);
 
         // Assert
-        assert_that!(app.subtitle_sync.as_ref().unwrap().status.clone()).is_equal_to(
-            crate::sync::SyncStatus::Failed("ffmpeg said no".to_string()),
+        assert_that!(app.subtitle_edit.as_ref().unwrap().status.clone()).is_equal_to(
+            crate::subtitle_edit::LoadStatus::Failed("ffmpeg said no".to_string()),
         );
 
         // Cleanup
@@ -22161,10 +22161,10 @@ mod tests {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
-        app.open_subtitle_sync();
-        let stale = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let stale = app.subtitle_edit.as_ref().unwrap().generation;
         app.back();
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let (sender, receiver) = std::sync::mpsc::channel();
         let cues = || PrepareOutcome::Ready {
             style: CueStyle::SubRip,
@@ -22188,8 +22188,8 @@ mod tests {
         app.receive_preview_events(&receiver);
 
         // Assert: the newly opened page is still waiting on its own extraction.
-        assert_that!(app.subtitle_sync.as_ref().unwrap().status.clone())
-            .is_equal_to(crate::sync::SyncStatus::Preparing);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().status.clone())
+            .is_equal_to(crate::subtitle_edit::LoadStatus::Preparing);
 
         // Act / Assert: and an answer arriving after the page is closed entirely is
         // drained rather than panicking or reopening anything.
@@ -22201,7 +22201,7 @@ mod tests {
             })
             .unwrap();
         assert_that!(app.receive_preview_events(&receiver)).is_true();
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -22210,8 +22210,8 @@ mod tests {
     /// A page whose cues have loaded, with the pane measured and the debounce waited out,
     /// which is the state every frame request is made from.
     fn app_ready_for_a_frame(app: &mut App) {
-        app.open_subtitle_sync();
-        let state = app.subtitle_sync.as_mut().unwrap();
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             vec![
                 crate::cue::Cue {
@@ -22234,7 +22234,7 @@ mod tests {
             CueStyle::SubRip,
         );
         state.set_preview_cells(ratatui::layout::Size::new(40, 20));
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
     }
 
     /// The worker cannot see the page, so everything it needs has to be in the request:
@@ -22255,7 +22255,7 @@ mod tests {
         app.start_pending_preview();
 
         // Assert
-        let state = app.subtitle_sync.as_ref().unwrap();
+        let state = app.subtitle_edit.as_ref().unwrap();
         let request = frames.try_recv().expect("a frame should be asked for");
         assert_that!(request.generation).is_equal_to(state.generation);
         assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
@@ -22293,8 +22293,8 @@ mod tests {
         let preview = crate::preview::test_handles();
         let frames = preview.frame_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
-        let state = app.subtitle_sync.as_mut().unwrap();
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.duration = Duration::from_secs(10);
         state.apply_prepared(
             vec![crate::cue::Cue {
@@ -22308,7 +22308,7 @@ mod tests {
             CueStyle::SubRip,
         );
         state.set_preview_cells(ratatui::layout::Size::new(40, 20));
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
 
         // Act
         app.start_pending_preview();
@@ -22344,14 +22344,14 @@ mod tests {
         assert_that!(frames.try_recv().is_ok()).is_true();
         // The second cue's picture is on disk, as it would be once the background pass
         // had walked past it.
-        let state = app.subtitle_sync.as_ref().unwrap();
+        let state = app.subtitle_edit.as_ref().unwrap();
         let target = state.frame_target(1).expect("the second cue has a target");
         let key = state.frames.key(&target.cue, &target.on_screen);
         crate::framecache::store(&key.0, &key.1, b"stand-in for a rendered frame");
 
         // Act: the selection moves and the dispatch runs immediately, with none of the
         // debounce waited out.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.start_pending_preview();
 
         // Assert
@@ -22388,7 +22388,7 @@ mod tests {
         assert_that!(frames.try_recv().is_ok()).is_true();
 
         // Act
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.start_pending_preview();
 
         // Assert: the selected cue is held back, but the neighbours ride out anyway —
@@ -22409,7 +22409,7 @@ mod tests {
 
         // Act / Assert: and the held-back request is still owed, so the grab goes out
         // once the movement settles rather than being forgotten with the refill.
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
         app.start_pending_preview();
         let request = frames
             .try_recv()
@@ -22441,8 +22441,8 @@ mod tests {
         let preview = crate::preview::test_handles();
         let frames = preview.frame_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
-        let state = app.subtitle_sync.as_mut().unwrap();
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
@@ -22461,10 +22461,10 @@ mod tests {
 
         // Assert: nothing was sent, and the request was not thrown away with it.
         assert_that!(frames.try_recv().is_err()).is_true();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().frame_requested()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame_requested()).is_true();
 
         // Act / Assert: so the grab still goes out when the debounce expires.
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
         app.start_pending_preview();
         let request = frames
             .try_recv()
@@ -22525,7 +22525,7 @@ mod tests {
 
         // Act: both cues answered, which is the whole window for this two-cue track.
         for cue_index in 0..2 {
-            app.subtitle_sync
+            app.subtitle_edit
                 .as_mut()
                 .unwrap()
                 .apply_frame(cue_index, test_protocol());
@@ -22534,7 +22534,7 @@ mod tests {
 
         // Assert
         assert_that!(frames.try_recv().is_err()).is_true();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().frame_requested()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame_requested()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -22578,8 +22578,8 @@ mod tests {
         let preview = crate::preview::test_handles();
         let frames = preview.frame_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
                 start: Duration::from_secs(1),
@@ -22590,7 +22590,7 @@ mod tests {
             }],
             CueStyle::SubRip,
         );
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
 
         // Act
         app.start_pending_preview();
@@ -22599,11 +22599,11 @@ mod tests {
         assert_that!(frames.try_recv().is_err()).is_true();
 
         // Act / Assert: and the request survives until the pane has been measured.
-        app.subtitle_sync
+        app.subtitle_edit
             .as_mut()
             .unwrap()
             .set_preview_cells(ratatui::layout::Size::new(40, 20));
-        std::thread::sleep(crate::sync::FRAME_DEBOUNCE + Duration::from_millis(20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
         app.start_pending_preview();
         assert_that!(frames.try_recv().is_ok()).is_true();
 
@@ -22643,7 +22643,7 @@ mod tests {
         let directory = app.directory.clone();
         app.subtitle_capabilities = full_subtitle_capabilities();
         app_ready_for_a_frame(&mut app);
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
 
         // Act
@@ -22658,7 +22658,7 @@ mod tests {
 
         // Assert
         assert_that!(drained).is_true();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().frame().is_some()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame().is_some()).is_true();
 
         // Act / Assert: a frame that could not be drawn replaces it with its reason.
         sender
@@ -22669,7 +22669,7 @@ mod tests {
             })
             .unwrap();
         app.receive_preview_events(&receiver);
-        let state = app.subtitle_sync.as_ref().unwrap();
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(state.frame().is_some()).is_false();
         assert_that!(state.frame_error()).is_equal_to(Some("no libass"));
 
@@ -22686,7 +22686,7 @@ mod tests {
         let directory = app.directory.clone();
         app.subtitle_capabilities = full_subtitle_capabilities();
         app_ready_for_a_frame(&mut app);
-        let stale = app.subtitle_sync.as_ref().unwrap().generation;
+        let stale = app.subtitle_edit.as_ref().unwrap().generation;
         app.back();
         app_ready_for_a_frame(&mut app);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -22702,7 +22702,7 @@ mod tests {
         app.receive_preview_events(&receiver);
 
         // Assert
-        assert_that!(app.subtitle_sync.as_ref().unwrap().frame().is_some()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame().is_some()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -22732,8 +22732,8 @@ mod tests {
         let preview = crate::preview::test_handles();
         let warms = preview.warm_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let cues = vec![
             crate::cue::Cue {
                 index: 0,
@@ -22770,7 +22770,7 @@ mod tests {
         let request = warms.try_recv().expect("the whole track should be queued");
         assert_that!(request.generation).is_equal_to(generation);
         assert_that!(request.cues.clone()).is_equal_to(cues);
-        let state = app.subtitle_sync.as_ref().unwrap();
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
         assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
         assert_that!(request.duration).is_equal_to(state.duration);
@@ -22802,11 +22802,11 @@ mod tests {
         let directory = app.directory.clone();
 
         // Act
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Assert: the source's own size, which is inside the cache's cap — not the cap,
         // and not the pane, which is not even measured yet.
-        let state = app.subtitle_sync.as_ref().unwrap();
+        let state = app.subtitle_edit.as_ref().unwrap();
         assert_that!(state.frames.pixels).is_equal_to((640, 360));
 
         // Cleanup
@@ -22892,8 +22892,8 @@ mod tests {
         // Act / Assert: libass, but a track with no cues in it.
         app.subtitle_capabilities = full_subtitle_capabilities();
         app.back();
-        app.open_subtitle_sync();
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(PreviewEvent::Prepared {
@@ -22905,7 +22905,7 @@ mod tests {
             })
             .unwrap();
         app.receive_preview_events(&receiver);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().warm).is_equal_to(WarmState::Off);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().warm).is_equal_to(WarmState::Off);
         assert_that!(warms.try_recv().is_err()).is_true();
 
         // Cleanup
@@ -22915,8 +22915,8 @@ mod tests {
     /// Opens a page and hands it two cues, answering with what the background pass made
     /// of them.
     fn prepared_page(app: &mut App) -> WarmState {
-        app.open_subtitle_sync();
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(PreviewEvent::Prepared {
@@ -22945,7 +22945,7 @@ mod tests {
             })
             .unwrap();
         app.receive_preview_events(&receiver);
-        app.subtitle_sync.as_ref().unwrap().warm
+        app.subtitle_edit.as_ref().unwrap().warm
     }
 
     /// The count on screen comes from the worker, and a count for a page the user has
@@ -22957,7 +22957,7 @@ mod tests {
         let directory = app.directory.clone();
         app.subtitle_capabilities = full_subtitle_capabilities();
         app_ready_for_a_frame(&mut app);
-        let generation = app.subtitle_sync.as_ref().unwrap().generation;
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (sender, receiver) = std::sync::mpsc::channel();
 
         // Act
@@ -22979,7 +22979,7 @@ mod tests {
 
         // Assert: the live page's count landed and the older page's did not overwrite it.
         assert_that!(drained).is_true();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().warm)
+        assert_that!(app.subtitle_edit.as_ref().unwrap().warm)
             .is_equal_to(WarmState::Working { done: 1, total: 2 });
 
         // Cleanup
@@ -23018,7 +23018,7 @@ mod tests {
         let (playbacks, live) = (preview.playback_rx, preview.live_playback);
         app.set_preview_handles(Some(preview.handles));
         app_ready_for_a_frame(&mut app);
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
 
         // Act
         app.toggle_playback();
@@ -23036,13 +23036,13 @@ mod tests {
         assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 11));
         assert_that!(request.pixels).is_equal_to((400, 220));
         assert_that!(request.source.media.clone())
-            .is_equal_to(app.subtitle_sync.as_ref().unwrap().media().to_path_buf());
+            .is_equal_to(app.subtitle_edit.as_ref().unwrap().media().to_path_buf());
         // And the worker is told this is the span it should be decoding for.
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
             .is_equal_to(request.generation);
 
         // Assert: the page says it is waiting, so `p` does not look like it did nothing.
-        assert_that!(app.subtitle_sync.as_ref().unwrap().preparing_playback()).is_equal_to(Some(1));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback()).is_equal_to(Some(1));
         assert_that!(app.playback_active()).is_true();
 
         // Cleanup
@@ -23113,7 +23113,7 @@ mod tests {
         let preview = crate::preview::test_handles();
         let playbacks = preview.playback_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
         let cue = |index: usize, start: u64, end: u64, text: &str| crate::cue::Cue {
             index,
             start: Duration::from_millis(start),
@@ -23122,7 +23122,7 @@ mod tests {
             dialogue: Vec::new(),
             events: 1,
         };
-        let state = app.subtitle_sync.as_mut().unwrap();
+        let state = app.subtitle_edit.as_mut().unwrap();
         // The selected line, two effect cues over its middle, and one far enough away that
         // even a second of padding either side cannot reach it.
         state.apply_prepared(
@@ -23174,7 +23174,7 @@ mod tests {
         let playbacks = preview.playback_rx;
         app.set_preview_handles(Some(preview.handles));
         app_ready_for_a_frame(&mut app);
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.open_preview_settings();
 
         // Act: half speed, looping, silent, no padding, and a lower rate.
@@ -23255,7 +23255,7 @@ mod tests {
     fn a_preview_dropdown_should_open_on_the_value_in_force_and_commit_the_one_chosen() {
         // Arrange
         let (mut app, settings_directory) = preview_settings_app();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.open_preview_settings();
 
         // Act / Assert: opening and committing without moving changes nothing.
@@ -23319,7 +23319,7 @@ mod tests {
     fn a_preview_dropdown_should_offer_its_values_and_whatever_the_config_file_asked_for() {
         // Arrange: a config holding a rate and a padding the popup does not offer.
         let (mut app, settings_directory) = preview_settings_app();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.set_preview_settings(PreviewSettings {
             playback_fps: 25,
             playback_pad: Duration::from_millis(750),
@@ -23390,7 +23390,7 @@ mod tests {
     fn a_reset_should_restore_the_config_files_answer_rather_than_the_built_in_one() {
         // Arrange: a config that differs from the built-in defaults.
         let (mut app, settings_directory) = preview_settings_app();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.set_preview_settings(PreviewSettings {
             playback_fps: 24,
             playback_pad: Duration::from_millis(1_500),
@@ -23523,7 +23523,7 @@ mod tests {
         );
         select_embedded_row(&mut app, 2);
         let directory = app.directory.clone();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.open_preview_settings();
 
         // Act / Assert: nothing above the source's own rate is on the list.
@@ -23567,7 +23567,7 @@ mod tests {
         );
         select_embedded_row(&mut app, 2);
         let directory = app.directory.clone();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.open_preview_settings();
 
         // Act / Assert: half speed halves the ceiling. Twelve is on no curated list, but it
@@ -23627,7 +23627,7 @@ mod tests {
         );
         select_embedded_row(&mut app, 2);
         let directory = app.directory.clone();
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.open_preview_settings();
 
         // Act / Assert
@@ -23772,7 +23772,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The popup belongs to the timing page, and every settings popup in the application
+    /// The popup belongs to the subtitle edit page, and every settings popup in the application
     /// refuses to open over another one.
     #[test]
     fn the_preview_settings_popup_should_open_only_from_the_timing_page() {
@@ -23786,7 +23786,7 @@ mod tests {
         assert_that!(app.preview_settings_popup.is_none()).is_true();
 
         // Act / Assert: not over another dialog.
-        app.layer = Layer::SubtitleSync;
+        app.layer = Layer::SubtitleEdit;
         app.dialog = Some(Dialog::Keybindings);
         app.open_preview_settings();
         assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
@@ -23912,14 +23912,14 @@ mod tests {
         let preview = crate::preview::test_handles();
         let playbacks = preview.playback_rx;
         app.set_preview_handles(Some(preview.handles));
-        app.open_subtitle_sync();
+        app.open_subtitle_edit();
 
         // Act / Assert: cues have not arrived.
         app.toggle_playback();
         assert_that!(playbacks.try_recv().is_err()).is_true();
 
         // Arrange / Act / Assert: cues, but a pane nobody has measured.
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
                 start: Duration::from_secs(1),
@@ -23965,7 +23965,7 @@ mod tests {
             .unwrap();
         app.receive_preview_events(&receiver);
         assert_that!(
-            app.subtitle_sync
+            app.subtitle_edit
                 .as_ref()
                 .unwrap()
                 .playback_frame()
@@ -23982,7 +23982,7 @@ mod tests {
             })
             .unwrap();
         app.receive_preview_events(&receiver);
-        assert_that!(app.subtitle_sync.as_ref().unwrap().preparing_playback()).is_equal_to(Some(0));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback()).is_equal_to(Some(0));
 
         // Act: the one that was actually asked for.
         sender
@@ -23997,7 +23997,7 @@ mod tests {
         // Assert: playing, and drawing a picture once stepped.
         assert_that!(app.advance_playback()).is_true();
         assert_that!(
-            app.subtitle_sync
+            app.subtitle_edit
                 .as_ref()
                 .unwrap()
                 .playback_frame()
@@ -24038,7 +24038,7 @@ mod tests {
 
         // Assert
         assert_that!(app.playback_active()).is_false();
-        assert_that!(app.subtitle_sync.as_ref().unwrap().playback_error())
+        assert_that!(app.subtitle_edit.as_ref().unwrap().playback_error())
             .is_equal_to(Some("Could not play this cue: nope"));
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
             .is_false();
@@ -24065,9 +24065,9 @@ mod tests {
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
             .is_equal_to(request.generation);
 
-        // Act: the cursor moves, which `SubtitleSyncState` drops the playback for without
+        // Act: the cursor moves, which `SubtitleEditState` drops the playback for without
         // knowing anything about the worker.
-        app.subtitle_sync.as_mut().unwrap().select(1);
+        app.subtitle_edit.as_mut().unwrap().select(1);
         app.advance_playback();
 
         // Assert
@@ -24100,11 +24100,11 @@ mod tests {
         // Act / Assert: the playback goes, the page stays.
         assert_that!(app.back()).is_true();
         assert_that!(app.playback_active()).is_false();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // Act / Assert: and again closes it.
         assert_that!(app.back()).is_true();
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
 
         // Cleanup
@@ -24127,7 +24127,7 @@ mod tests {
         let request = playbacks.try_recv().expect("a span should be asked for");
 
         // Act: straight out of the page, without stopping the playback first.
-        app.close_subtitle_sync();
+        app.close_subtitle_edit();
 
         // Assert
         assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)

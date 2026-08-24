@@ -2,7 +2,7 @@
 //!
 //! A frame is expensive: an accurate `ffmpeg` seek into the container plus a libass burn,
 //! which is a fraction of a second locally and seconds over a network mount. Without this
-//! the timing page paid that cost again for every cue the cursor came back to, and again
+//! the subtitle edit page paid that cost again for every cue the cursor came back to, and again
 //! for every cue when the page was re-opened.
 //!
 //! Content-addressed: the path *is* the hash of everything the frame depends on, so there

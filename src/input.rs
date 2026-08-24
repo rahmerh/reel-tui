@@ -11,7 +11,7 @@ use crate::app::{
     App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
     VideoSettingsMode,
 };
-use crate::sync;
+use crate::subtitle_edit;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -121,21 +121,21 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
         Some(Dialog::ConfirmLeaveCues) => match (key.code, key.modifiers) {
             (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
                 input.reset_sequence();
-                app.choose_leave_subtitle_sync(-1);
+                app.choose_leave_subtitle_edit(-1);
             }
             (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
                 input.reset_sequence();
-                app.choose_leave_subtitle_sync(1);
+                app.choose_leave_subtitle_edit(1);
             }
             (KeyCode::Enter, _) => {
                 input.reset_sequence();
-                app.activate_leave_subtitle_sync();
+                app.activate_leave_subtitle_edit();
             }
             // `Esc` out of the question is not an answer to it: it puts the reader back on
             // the page with their edits, which is the safe half of the choice.
             _ if is_back_key(key) => {
                 input.reset_sequence();
-                app.resolve_leave_subtitle_sync(false);
+                app.resolve_leave_subtitle_edit(false);
             }
             _ => {}
         },
@@ -1006,7 +1006,7 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.reset_focused_field();
         }
-        // Named layers rather than "anything but Files": on the subtitle timing page
+        // Named layers rather than "anything but Files": on the subtitle edit page
         // this would otherwise discard the open file's staged edits, which is both
         // destructive and completely unrelated to what that page does.
         (KeyCode::Char('R'), KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -1017,14 +1017,14 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         }
         (KeyCode::Char('c'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
-            app.open_subtitle_sync();
+            app.open_subtitle_edit();
         }
         // `p` rather than Space, which is otherwise the obvious key for this: the help
         // text is asserted to contain no "Space" binding
         // (`keybindings_text_should_exclude_space_binding_when_space_action_is_removed`),
         // and reintroducing one to save a keystroke would mean overriding a guard about
         // something else entirely.
-        (KeyCode::Char('p'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char('p'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.toggle_playback();
         }
@@ -1032,7 +1032,7 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         // line for anything else to be confused with. Modifiers are `_` rather than `NONE`:
         // `:` is a shifted key on most layouts and arrives carrying `SHIFT` from terminals
         // that report it, the same reason the `?` and `G` arms do not spell one out.
-        (KeyCode::Char(':'), _) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char(':'), _) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.open_preview_settings();
         }
@@ -1040,20 +1040,20 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         // it and the caret in it. `c` would be the other vim answer and is taken — it is
         // what opens this page from the track list, and reusing it one layer deeper reads
         // worse than the key that already means "type here".
-        (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char('i'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.open_cue_editor();
         }
         // The same key that processes staged files everywhere else, from the page where the
         // cue edits were made: they are staged edits like any other, so the key that writes
         // them is the key that writes those.
-        (KeyCode::Char('s'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.request_process_all();
         }
-        // `t` for timing, the one thing this page is named for that it could not do. Free
+        // `t` for timing, the half of editing a subtitle track that is not its words. Free
         // on every layer, so it needs no modifier to keep it apart from anything.
-        (KeyCode::Char('t'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char('t'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.toggle_cue_timing_mode();
         }
@@ -1067,44 +1067,44 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         // reader in the mode is pointing at one cue rather than choosing between several.
         // Sideways movement inside a group comes back with `Esc`.
         (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE)
-            if app.layer == Layer::SubtitleSync =>
+            if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
             if app.cue_timing_mode() {
                 app.nudge_selected_cue(-1);
             } else {
-                app.move_sync_cue_within_group(-1);
+                app.move_cue_within_group(-1);
             }
         }
         (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE)
-            if app.layer == Layer::SubtitleSync =>
+            if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
             if app.cue_timing_mode() {
                 app.nudge_selected_cue(1);
             } else {
-                app.move_sync_cue_within_group(1);
+                app.move_cue_within_group(1);
             }
         }
         // Modifiers are `NONE | SHIFT` rather than `SHIFT` alone, the same allowance the
         // `R` arm above makes: a shifted letter arrives carrying `SHIFT` from terminals
         // that report it and bare from those that do not.
         (KeyCode::Char('H'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-            if app.layer == Layer::SubtitleSync =>
+            if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            app.nudge_selected_cue(-sync::TIMING_LEAP);
+            app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP);
         }
         (KeyCode::Char('L'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-            if app.layer == Layer::SubtitleSync =>
+            if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
-            app.nudge_selected_cue(sync::TIMING_LEAP);
+            app.nudge_selected_cue(subtitle_edit::TIMING_LEAP);
         }
         // `r` for the timing this cue started at, which is what `r` already means one layer
         // up: on the track list it puts the focused field back to what the file says. Inert
         // outside the timing mode, where this page has nothing to reset.
-        (KeyCode::Char('r'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+        (KeyCode::Char('r'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
             app.reset_selected_cue_timing();
         }
@@ -1643,7 +1643,7 @@ mod tests {
             (Layer::Streams, Some(Dialog::BatchProcessing)),
             (Layer::Streams, Some(Dialog::ConfirmCancel)),
             (Layer::Streams, Some(Dialog::Error)),
-            (Layer::SubtitleSync, Some(Dialog::PreviewSettings)),
+            (Layer::SubtitleEdit, Some(Dialog::PreviewSettings)),
         ];
 
         for (layer, dialog) in contexts {
@@ -3465,10 +3465,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
-    /// Two cues an hour apart on the open timing page, so nothing the timing tests do can
+    /// Two cues an hour apart on the open subtitle edit page, so nothing the timing tests do can
     /// bring them into one overlap group and change what `h`/`l` mean out of the mode.
     fn timed_cues(app: &mut App) {
-        let state = app.subtitle_sync.as_mut().expect("the page should be open");
+        let state = app.subtitle_edit.as_mut().expect("the page should be open");
         state.apply_prepared(
             [(1, 2), (3600, 3601)]
                 .into_iter()
@@ -3488,7 +3488,7 @@ mod tests {
 
     /// Where the page currently believes the selected cue starts.
     fn selected_cue_start(app: &App) -> std::time::Duration {
-        app.subtitle_sync
+        app.subtitle_edit
             .as_ref()
             .and_then(|state| state.selected_cue())
             .expect("the page should be on a cue")
@@ -3529,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn c_should_open_the_subtitle_sync_page_from_the_streams_layer() {
+    fn c_should_open_the_subtitle_edit_page_from_the_streams_layer() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3538,8 +3538,8 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
 
         // Assert
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
-        assert_that!(app.subtitle_sync.is_some()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.is_some()).is_true();
 
         // Cleanup
         drop(app);
@@ -3550,7 +3550,7 @@ mod tests {
     /// the file list it is a plain character with no binding, and binding it globally would
     /// have taken a letter away from every layer for the sake of one.
     #[test]
-    fn p_should_start_a_playback_only_on_the_subtitle_sync_page() {
+    fn p_should_start_a_playback_only_on_the_subtitle_edit_page() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3571,7 +3571,7 @@ mod tests {
 
         // Arrange: open the page and get it into a state a span can be asked for from.
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        let state = app.subtitle_sync.as_mut().unwrap();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
@@ -3596,12 +3596,12 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// `i` opens the cue editor on the timing page, and everything typed after that has to
+    /// `i` opens the cue editor on the subtitle edit page, and everything typed after that has to
     /// reach the buffer rather than the page underneath — `j`, `k` and `p` are ordinary
     /// characters inside a subtitle.
     #[test]
     fn i_should_open_the_cue_editor_and_send_every_key_to_it() {
-        // Arrange: the timing page, with a cue on it.
+        // Arrange: the subtitle edit page, with a cue on it.
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
         app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
@@ -3612,7 +3612,7 @@ mod tests {
             ..crate::subtitle::ToolCapabilities::default()
         };
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        app.subtitle_sync.as_mut().unwrap().apply_prepared(
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
                 start: std::time::Duration::from_secs(1),
@@ -3635,13 +3635,13 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Enter));
         handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
         assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("linejkp\nx");
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
         assert_that!(app.playback_active()).is_false();
 
         // Act / Assert: `Esc` keeps the typing rather than throwing it away.
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(app.dialog).is_equal_to(None);
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.has_unsaved_cue_edits()).is_true();
 
         // Cleanup
@@ -3653,7 +3653,7 @@ mod tests {
     /// anywhere else — and, because `:` is shifted on most layouts, it has to be answered
     /// whether or not the terminal reports the modifier.
     #[test]
-    fn colon_should_open_the_preview_settings_only_on_the_subtitle_sync_page() {
+    fn colon_should_open_the_preview_settings_only_on_the_subtitle_edit_page() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3662,9 +3662,9 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
         assert_that!(app.dialog).is_none();
 
-        // Arrange: open the timing page.
+        // Arrange: open the subtitle edit page.
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // Act / Assert: and there it opens, shift reported or not.
         handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
@@ -3687,7 +3687,7 @@ mod tests {
     /// cues sharing one. Bound on this page only — everywhere else `h`/`l` change a
     /// horizontal choice, and on the streams layer `h` is also the way back.
     #[test]
-    fn h_and_l_should_move_between_overlapping_cues_only_on_the_subtitle_sync_page() {
+    fn h_and_l_should_move_between_overlapping_cues_only_on_the_subtitle_edit_page() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3696,14 +3696,14 @@ mod tests {
         // back, and the arrows are the subtitle columns'.
         handle_key(&mut app, &mut input, key(KeyCode::Right));
         handle_key(&mut app, &mut input, key(KeyCode::Left));
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
         handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
         assert_that!(app.layer).is_equal_to(Layer::Files);
         app.layer = Layer::Streams;
 
-        // Arrange: the timing page, holding a lone cue and then two that overlap.
+        // Arrange: the subtitle edit page, holding a lone cue and then two that overlap.
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        let state = app.subtitle_sync.as_mut().unwrap();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             [(0, 2), (4, 8), (6, 10)]
                 .into_iter()
@@ -3722,22 +3722,22 @@ mod tests {
 
         // Act / Assert: sideways does nothing on the lone cue, which has no company.
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
 
         // Act / Assert: `j` into the group, then `l` and `h` across it.
         handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(2);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
         handle_key(&mut app, &mut input, key(KeyCode::Right));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(2);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
         handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
         handle_key(&mut app, &mut input, key(KeyCode::Left));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
 
         // Act / Assert: and the page is still left by `Esc`, not by `h`.
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // Cleanup
         drop(app);
@@ -3746,7 +3746,7 @@ mod tests {
 
     /// `t` turns the timing mode on and off, and only on the page that has one.
     #[test]
-    fn t_should_toggle_the_timing_mode_only_on_the_subtitle_sync_page() {
+    fn t_should_toggle_the_timing_mode_only_on_the_subtitle_edit_page() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -3757,7 +3757,7 @@ mod tests {
         assert_that!(app.cue_timing_mode()).is_false();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
 
-        // Arrange: the timing page, on a cue.
+        // Arrange: the subtitle edit page, on a cue.
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
         timed_cues(&mut app);
 
@@ -3798,7 +3798,7 @@ mod tests {
         // Act / Assert: `h` takes one back, and the cursor has not moved off the cue.
         handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
 
         // Act / Assert: `L` is ten of them, reported with the shift or without it.
         handle_key(&mut app, &mut input, shifted(KeyCode::Char('L')));
@@ -3865,7 +3865,7 @@ mod tests {
         // Act / Assert: the first `Esc` takes the mode and nothing else.
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(app.cue_timing_mode()).is_false();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.dialog).is_none();
 
         // Act / Assert: the next one reaches the question about the edits.
@@ -3896,7 +3896,7 @@ mod tests {
         let preview = crate::preview::test_handles();
         app.set_preview_handles(Some(preview.handles));
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        let state = app.subtitle_sync.as_mut().unwrap();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             vec![crate::cue::Cue {
                 index: 0,
@@ -3934,12 +3934,12 @@ mod tests {
     /// cannot see behind the popup they are still reading.
     #[test]
     fn the_preview_settings_popup_should_swallow_the_pages_own_keys() {
-        // Arrange: the popup open over the timing page, with more than one cue to move
+        // Arrange: the popup open over the subtitle edit page, with more than one cue to move
         // between so a leaked `j` would be visible.
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        let state = app.subtitle_sync.as_mut().unwrap();
+        let state = app.subtitle_edit.as_mut().unwrap();
         state.apply_prepared(
             (0..3)
                 .map(|index| crate::cue::Cue {
@@ -3961,7 +3961,7 @@ mod tests {
 
         // Assert: the cursor stayed on the first cue and nothing started playing — `j` moved
         // the popup's own cursor instead.
-        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
         assert_that!(app.playback_active()).is_false();
         assert_that!(app.preview_settings_popup.map(|popup| popup.field))
             .is_equal_to(Some(crate::app::PreviewSettingsField::Loop));
@@ -4051,7 +4051,7 @@ mod tests {
         assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
         assert_that!(app.dialog).is_none();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.preview_settings().playback_speed)
             .is_equal_to(crate::preview::PlaybackSpeed::STEPS[2]);
 
@@ -4061,22 +4061,22 @@ mod tests {
     }
 
     /// `R` discards the open file's staged edits. It used to be bound to "any layer that
-    /// is not Files", which would have made it fire on the timing page — a destructive
+    /// is not Files", which would have made it fire on the subtitle edit page — a destructive
     /// action with nothing to do with previewing subtitles.
     #[test]
-    fn reset_current_file_should_not_be_reachable_from_the_subtitle_sync_page() {
+    fn reset_current_file_should_not_be_reachable_from_the_subtitle_edit_page() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
         handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // Act
         handle_key(&mut app, &mut input, key(KeyCode::Char('R')));
 
         // Assert: no reset dialog, and the page is still up.
         assert_that!(app.dialog).is_none();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
         // Cleanup
         drop(app);
@@ -4095,7 +4095,7 @@ mod tests {
 
         // Assert
         assert_that!(app.layer).is_equal_to(Layer::Files);
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
 
         // Cleanup
         drop(app);
@@ -4105,7 +4105,7 @@ mod tests {
     /// Esc leaves the page through the ordinary back-key path rather than a binding of
     /// its own, so it has to land on Streams and not fall through to quitting.
     #[test]
-    fn escape_should_leave_the_subtitle_sync_page_for_the_streams_layer() {
+    fn escape_should_leave_the_subtitle_edit_page_for_the_streams_layer() {
         // Arrange
         let (mut app, directory) = subtitle_track_app();
         let mut input = InputState::default();
@@ -4117,7 +4117,7 @@ mod tests {
         // Assert
         assert_that!(outcome).is_equal_to(InputOutcome::Continue);
         assert_that!(app.layer).is_equal_to(Layer::Streams);
-        assert_that!(app.subtitle_sync.is_none()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
 
         // Cleanup
         drop(app);

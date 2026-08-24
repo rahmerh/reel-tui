@@ -209,7 +209,7 @@ impl SubtitleMetadata {
     }
 }
 
-/// What one cue was when the timing page last looked at it.
+/// What one cue was when the subtitle edit page last looked at it.
 ///
 /// The half of a [`CueEdit`] that describes the file rather than the reader's intent, and
 /// the whole cue rather than the part they changed: retiming a cue whose *words* moved
@@ -222,7 +222,7 @@ pub struct CueSnapshot {
     pub end: Duration,
 }
 
-/// One cue as the timing page rewrote it — its words, its timing, or both.
+/// One cue as the subtitle edit page rewrote it — its words, its timing, or both.
 ///
 /// **One entry per cue rather than one per kind of change.** A cue is what the reader edits,
 /// what the panel's border counts and what leaving the page discards, so a second map keyed
@@ -279,7 +279,7 @@ pub struct SubtitleChange {
     pub import_into_media: bool,
     pub ocr_language: Option<String>,
     pub metadata: Option<SubtitleMetadata>,
-    /// Cues rewritten on the timing page — words, timing, or both — keyed by the cue's
+    /// Cues rewritten on the subtitle edit page — words, timing, or both — keyed by the cue's
     /// position in the parsed list. Empty for every change staged from the track list,
     /// which is every change that existed before the editor did.
     pub cue_edits: BTreeMap<usize, CueEdit>,
@@ -332,7 +332,7 @@ impl SubtitleChange {
     }
 }
 
-/// Applies the timing page's cue edits to a SubRip file's text.
+/// Applies the subtitle edit page's cue edits to a SubRip file's text.
 ///
 /// The file is re-parsed here rather than the page's cue list being written out, and the two
 /// are not the same thing: the list was parsed when the page opened, and what is being
@@ -518,11 +518,11 @@ pub struct ToolCapabilities {
     pub ffmpeg: bool,
     pub ffmpeg_encoders: BTreeSet<String>,
     pub ffmpeg_muxers: BTreeSet<String>,
-    /// Filter names from `ffmpeg -filters`, consulted only by the subtitle timing page's
+    /// Filter names from `ffmpeg -filters`, consulted only by the subtitle edit page's
     /// frame preview. A build without libass has no `subtitles` filter, and asking one to
     /// burn a cue in fails per keypress rather than once.
     pub ffmpeg_filters: BTreeSet<String>,
-    /// Decoder names from `ffmpeg -decoders`, consulted by the subtitle timing page.
+    /// Decoder names from `ffmpeg -decoders`, consulted by the subtitle edit page.
     ///
     /// Separate from `ffmpeg_encoders` because the page reads where the rest of the
     /// program writes: previewing a WebVTT or MOV Text track transcodes it *to* SubRip on
@@ -579,14 +579,14 @@ impl ToolCapabilities {
     /// Whether `ffmpeg` can draw a subtitle onto a video frame.
     ///
     /// `subtitles` is the libass one, present only in a build configured with it;
-    /// `scale` is what fits the result to the preview pane. Without both, the timing page
+    /// `scale` is what fits the result to the preview pane. Without both, the subtitle edit page
     /// asks for no frames at all and leaves its preview pane empty, which is also what a
     /// terminal with no image protocol gets.
     pub fn can_burn_subtitles(&self) -> bool {
         self.ffmpeg_filters.contains("subtitles") && self.ffmpeg_filters.contains("scale")
     }
 
-    /// Why the timing page cannot be opened on a track of this format, if it cannot.
+    /// Why the subtitle edit page cannot be opened on a track of this format, if it cannot.
     ///
     /// Checked before the page opens rather than reported by a worker afterwards, so a
     /// missing tool reads as a refusal with a reason instead of a page that loads, sits on
@@ -2056,7 +2056,7 @@ mod tests {
         assert_that!(filters.len()).is_equal_to(4);
     }
 
-    /// The timing page reads where the rest of the program writes, so it has to ask about
+    /// The subtitle edit page reads where the rest of the program writes, so it has to ask about
     /// decoders rather than encoders. FFmpeg ships plenty of one without the other — TTML
     /// most notably, which is why that format does not take this road at all.
     #[test]
@@ -2139,7 +2139,7 @@ mod tests {
         }
     }
 
-    /// A build without libass has no `subtitles` filter at all, and the timing page has
+    /// A build without libass has no `subtitles` filter at all, and the subtitle edit page has
     /// to notice before it starts one doomed `ffmpeg` per settled selection.
     #[test]
     fn can_burn_subtitles_should_require_both_filters_the_frame_grab_uses() {

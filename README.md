@@ -59,7 +59,7 @@ reel /path/to/media
 ## Future planned
 
 - **Advanced subtitle editing**: More in depth editing of subtitles: timing, text, style and hopefully more.
-  - **Waveform visualizer**: An audio waveform on the timing page, so a cue's timing can be judged against the speech it belongs to rather than against the picture alone.
+  - **Waveform visualizer**: An audio waveform on the subtitle edit page, so a cue's timing can be judged against the speech it belongs to rather than against the picture alone.
   - **ASS/SSA cue editing**: Add support for in depth ASS/SSA subtitle track editing and styling.
 - **Track importing and exporting**: Importing and exporting of any track, using a file picker.
 - **Automatic subtitle syncing**: Automatic syncing of subtitles to an audio track, maybe using AI?
