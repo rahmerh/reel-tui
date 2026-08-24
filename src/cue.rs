@@ -106,9 +106,22 @@ pub fn on_screen_at(cues: &[Cue], at: usize, instant: Duration) -> Vec<Cue> {
 pub fn on_screen_between(cues: &[Cue], at: usize, start: Duration, end: Duration) -> Vec<Cue> {
     cues.iter()
         .enumerate()
-        .filter(|(position, cue)| *position == at || (cue.start < end && cue.end > start))
+        .filter(|(position, cue)| *position == at || shares_screen(cue, start, end))
         .map(|(_, cue)| cue.clone())
         .collect()
+}
+
+/// Whether `cue` is on screen at any point during `start..end`.
+///
+/// Half-open at both ends, the boundary [`pack_lanes`] and [`group_overlaps`] also draw: a
+/// cue ending exactly as the span begins is never on screen with it, and treating it as
+/// though it were would make most of an ordinary dialogue track one continuous overlap.
+///
+/// Its own function because two callers need the rule for spans that are *not* a cue's:
+/// [`on_screen_between`] asks it of a playback's stretch, and the timing page asks it of a
+/// cue's span before and after a nudge, to find whose pictures the move invalidated.
+pub fn shares_screen(cue: &Cue, start: Duration, end: Duration) -> bool {
+    cue.start < end && cue.end > start
 }
 
 /// The tail every parse ends with: sort by time, fold the runs that are one line, number

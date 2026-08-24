@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
+    time::Duration,
 };
 
 use isolang::{Language, languages};
@@ -208,21 +209,65 @@ impl SubtitleMetadata {
     }
 }
 
-/// One cue's text as the timing page's editor rewrote it.
+/// What one cue was when the timing page last looked at it.
+///
+/// The half of a [`CueEdit`] that describes the file rather than the reader's intent, and
+/// the whole cue rather than the part they changed: retiming a cue whose *words* moved
+/// underneath it is as wrong as rewriting a cue whose timing did, because in both cases the
+/// cue standing at that position is no longer the cue that was on screen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueSnapshot {
+    pub text: String,
+    pub start: Duration,
+    pub end: Duration,
+}
+
+/// One cue as the timing page rewrote it — its words, its timing, or both.
+///
+/// **One entry per cue rather than one per kind of change.** A cue is what the reader edits,
+/// what the panel's border counts and what leaving the page discards, so a second map keyed
+/// the same way would have to be kept in step at every one of those places and at every one
+/// added later.
 ///
 /// **`original` is what makes applying this safe.** The edit is addressed by the cue's
 /// *position* in the parsed list, since a cue has no identity of its own — no id in the
-/// file, and its text is exactly what is being changed. A position is only meaningful
-/// against the list it was taken from, so the writer re-parses the file it is about to
-/// rewrite and refuses when the cue standing at that position no longer says what the reader
-/// was looking at. Without the check, a sidecar edited in another program between staging
-/// and saving would have this text land on whichever line happened to move into that slot.
+/// file, and its text and timing are exactly what is being changed. A position is only
+/// meaningful against the list it was taken from, so the writer re-parses the file it is
+/// about to rewrite and refuses when the cue standing at that position is not the one the
+/// reader was looking at. Without the check, a sidecar edited in another program between
+/// staging and saving would have this edit land on whichever line moved into that slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CueTextEdit {
-    /// What the cue said when the editor opened, verbatim.
-    pub original: String,
+pub struct CueEdit {
+    /// The cue as the file had it, verbatim.
+    pub original: CueSnapshot,
     /// What it should say instead.
     pub text: String,
+    /// When it should come in and go out instead.
+    pub start: Duration,
+    pub end: Duration,
+}
+
+impl CueEdit {
+    /// An edit that starts out changing nothing, for the caller about to change one part.
+    pub fn unchanged(original: CueSnapshot) -> Self {
+        Self {
+            text: original.text.clone(),
+            start: original.start,
+            end: original.end,
+            original,
+        }
+    }
+
+    /// Whether this edit still asks for anything.
+    ///
+    /// Edits that match the file are dropped from the map rather than stored, so a cue
+    /// nudged back to where it started — or typed back to its own words — stops being an
+    /// edit, and the track stops looking modified.
+    pub fn is_effective(&self) -> bool {
+        self.text != self.original.text
+            || self.start != self.original.start
+            || self.end != self.original.end
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,10 +279,10 @@ pub struct SubtitleChange {
     pub import_into_media: bool,
     pub ocr_language: Option<String>,
     pub metadata: Option<SubtitleMetadata>,
-    /// Cue text rewritten on the timing page, keyed by the cue's position in the parsed
-    /// list. Empty for every change staged from the track list, which is every change that
-    /// existed before the editor did.
-    pub cue_text: BTreeMap<usize, CueTextEdit>,
+    /// Cues rewritten on the timing page — words, timing, or both — keyed by the cue's
+    /// position in the parsed list. Empty for every change staged from the track list,
+    /// which is every change that existed before the editor did.
+    pub cue_edits: BTreeMap<usize, CueEdit>,
 }
 
 impl SubtitleChange {
@@ -252,7 +297,7 @@ impl SubtitleChange {
             SubtitleSource::Embedded(_) => {
                 self.removes_from_media()
                     || self.metadata.is_some()
-                    || !self.cue_text.is_empty()
+                    || !self.cue_edits.is_empty()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -269,7 +314,7 @@ impl SubtitleChange {
             SubtitleSource::Sidecar(_) => {
                 self.import_into_media
                     || self.metadata.is_some()
-                    || !self.cue_text.is_empty()
+                    || !self.cue_edits.is_empty()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -300,10 +345,12 @@ impl SubtitleChange {
 /// The whole file is rewritten rather than patched in place, because SubRip's counters are
 /// positional: a cue whose text gained or lost a line leaves every byte offset after it
 /// wrong, and `cue::write_srt` renumbers from one for free.
-pub fn rewrite_srt_cues(
-    source: &str,
-    edits: &BTreeMap<usize, CueTextEdit>,
-) -> Result<String, String> {
+///
+/// **The cues are re-sorted before they are written**, because a retimed cue can pass its
+/// neighbour and a SubRip file is expected to run in order. Sorting *after* the edits have
+/// been applied is what keeps the position keys meaningful: they address the file as it was
+/// read, and the new order only exists once every edit has landed.
+pub fn rewrite_srt_cues(source: &str, edits: &BTreeMap<usize, CueEdit>) -> Result<String, String> {
     let mut cues = crate::cue::parse_srt(source);
     for (position, edit) in edits {
         let Some(cue) = cues.get_mut(*position) else {
@@ -312,15 +359,27 @@ pub fn rewrite_srt_cues(
                 position + 1
             ));
         };
-        if cue.text != edit.original {
+        if cue.text != edit.original.text {
             return Err(format!(
                 "Cue #{} no longer reads the way it did when it was edited; \
                  it may have been changed elsewhere.",
                 position + 1
             ));
         }
+        if cue.start != edit.original.start || cue.end != edit.original.end {
+            return Err(format!(
+                "Cue #{} is no longer timed the way it was when it was edited; \
+                 it may have been changed elsewhere.",
+                position + 1
+            ));
+        }
         cue.text = edit.text.clone();
+        cue.start = edit.start;
+        cue.end = edit.end;
     }
+    // Stable, so cues that end up sharing a timing keep the order the file put them in —
+    // the same tie-break `cue::parse_srt` applies when it reads this back.
+    cues.sort_by_key(|cue| (cue.start, cue.end));
     Ok(crate::cue::write_srt(&cues))
 }
 
@@ -1055,7 +1114,7 @@ mod tests {
         for embedded_target in &targets {
             for export_target in &targets {
                 let change = SubtitleChange {
-                    cue_text: Default::default(),
+                    cue_edits: Default::default(),
                     source: SubtitleSource::Embedded(7),
                     source_format: SubtitleFormat::SubRip,
                     embedded_target: *embedded_target,
@@ -1096,7 +1155,7 @@ mod tests {
         for embedded_target in targets {
             for import_into_media in [false, true] {
                 let change = SubtitleChange {
-                    cue_text: Default::default(),
+                    cue_edits: Default::default(),
                     source: SubtitleSource::Sidecar(PathBuf::from("/media/movie.eng.srt")),
                     source_format: SubtitleFormat::SubRip,
                     embedded_target,
@@ -2150,10 +2209,37 @@ fra
         assert_that!(langs).contains_exactly_in_given_order(["eng".to_string(), "fra".to_string()]);
     }
 
-    fn cue_edit(original: &str, text: &str) -> CueTextEdit {
-        CueTextEdit {
-            original: original.to_string(),
+    /// A cue as `THREE_CUES` has it: `n` seconds in, one second long.
+    fn snapshot(text: &str, at: u64) -> CueSnapshot {
+        CueSnapshot {
             text: text.to_string(),
+            start: Duration::from_secs(at),
+            end: Duration::from_secs(at + 1),
+        }
+    }
+
+    /// A rewrite of one cue's words, leaving its timing alone.
+    fn cue_edit(original: &str, at: u64, text: &str) -> CueEdit {
+        CueEdit {
+            text: text.to_string(),
+            ..CueEdit::unchanged(snapshot(original, at))
+        }
+    }
+
+    /// A shift of one cue through time, leaving its words alone.
+    fn cue_shift(text: &str, at: u64, by: i64) -> CueEdit {
+        let original = snapshot(text, at);
+        let shift = |base: Duration| {
+            if by.is_negative() {
+                base - Duration::from_millis(by.unsigned_abs())
+            } else {
+                base + Duration::from_millis(by as u64)
+            }
+        };
+        CueEdit {
+            start: shift(original.start),
+            end: shift(original.end),
+            ..CueEdit::unchanged(original)
         }
     }
 
@@ -2166,7 +2252,7 @@ fra
     #[test]
     fn rewrite_srt_cues_should_change_the_edited_cue_and_nothing_else() {
         // Arrange
-        let edits = BTreeMap::from([(1, cue_edit("two", "two, rewritten\nover two lines"))]);
+        let edits = BTreeMap::from([(1, cue_edit("two", 3, "two, rewritten\nover two lines"))]);
 
         // Act
         let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the edit should apply");
@@ -2182,6 +2268,104 @@ fra
         assert_that!(cues[2].start).is_equal_to(std::time::Duration::from_secs(5));
     }
 
+    /// A retimed cue is written with its new timing, and nothing else about the file moves.
+    ///
+    /// Asserted on the cues parsed back rather than on the string, so the check covers the
+    /// timestamps actually being re-emitted rather than the edit merely being accepted —
+    /// and on the neighbours too, since a rewrite that renumbers and re-serialises the whole
+    /// file has every opportunity to round a cue nobody touched.
+    #[test]
+    fn rewrite_srt_cues_should_move_a_retimed_cue_and_leave_the_rest_where_they_are() {
+        // Arrange: the middle cue, a quarter of a second later.
+        let edits = BTreeMap::from([(1, cue_shift("two", 3, 250))]);
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the shift should apply");
+
+        // Assert: the cue moved, kept its length, and kept its words.
+        let cues = crate::cue::parse_srt(&written);
+        assert_that!(cues[1].start).is_equal_to(Duration::from_millis(3250));
+        assert_that!(cues[1].end).is_equal_to(Duration::from_millis(4250));
+        assert_that!(cues[1].text.as_str()).is_equal_to("two");
+
+        // Assert: and the two nobody touched are exactly as they were.
+        assert_that!(cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(cues[0].end).is_equal_to(Duration::from_secs(2));
+        assert_that!(cues[2].start).is_equal_to(Duration::from_secs(5));
+        assert_that!(cues[2].end).is_equal_to(Duration::from_secs(6));
+        assert_that!(&written).contains("00:00:03,250 --> 00:00:04,250");
+    }
+
+    /// A cue nudged past its neighbour comes out of the file in the new order, renumbered.
+    ///
+    /// SubRip is read in order and its counters are positional, so a file left with cue 2
+    /// starting before cue 1 is a file that says something the reader did not ask for. The
+    /// sort has to happen *after* the edits are applied, since the positions the edits are
+    /// keyed by address the file as it was read.
+    #[test]
+    fn rewrite_srt_cues_should_reorder_a_cue_nudged_past_its_neighbour() {
+        // Arrange: the first cue, pushed three seconds later — past the second, not the third.
+        let edits = BTreeMap::from([(0, cue_shift("one", 1, 3_000))]);
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the shift should apply");
+
+        // Assert: the file runs in time order, and the counters follow the new order.
+        let cues = crate::cue::parse_srt(&written);
+        let texts: Vec<&str> = cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["two", "one", "three"]);
+        assert_that!(&written).contains("1\n00:00:03,000 --> 00:00:04,000\ntwo");
+        assert_that!(&written).contains("2\n00:00:04,000 --> 00:00:05,000\none");
+    }
+
+    /// Words and timing staged against the same cue both land, in one pass.
+    #[test]
+    fn rewrite_srt_cues_should_apply_a_cues_words_and_timing_together() {
+        // Arrange
+        let edits = BTreeMap::from([(
+            1,
+            CueEdit {
+                text: "two, later and rewritten".to_string(),
+                start: Duration::from_millis(3_500),
+                end: Duration::from_millis(4_500),
+                ..CueEdit::unchanged(snapshot("two", 3))
+            },
+        )]);
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the edit should apply");
+
+        // Assert
+        let cues = crate::cue::parse_srt(&written);
+        assert_that!(cues[1].text.as_str()).is_equal_to("two, later and rewritten");
+        assert_that!(cues[1].start).is_equal_to(Duration::from_millis(3_500));
+        assert_that!(cues[1].end).is_equal_to(Duration::from_millis(4_500));
+    }
+
+    /// A cue whose *timing* moved underneath the reader is refused, exactly as one whose
+    /// words did.
+    ///
+    /// The two halves of the snapshot are checked separately and both have to be, because
+    /// each fails invisibly on its own: a cue retimed elsewhere still says what the reader
+    /// read, so a text-only check would drop their timing onto a line that has already
+    /// moved, and a timing-only check would do the reverse.
+    #[test]
+    fn rewrite_srt_cues_should_refuse_a_cue_whose_timing_moved_underneath_it() {
+        // Arrange: staged against a cue this file times differently.
+        let stale = CueEdit {
+            text: "two, rewritten".to_string(),
+            ..CueEdit::unchanged(snapshot("two", 30))
+        };
+
+        // Act
+        let refused = rewrite_srt_cues(THREE_CUES, &BTreeMap::from([(1, stale)]));
+
+        // Assert: refused, and by the timing rather than by the words.
+        let message = refused.unwrap_err();
+        assert_that!(message.as_str()).contains("no longer timed the way it was");
+        assert_that!(message.as_str()).contains("Cue #2");
+    }
+
     /// A cue has no identity in the file, so an edit is addressed by position — which is
     /// only meaningful against the list it was taken from. A file changed elsewhere between
     /// staging and saving must stop the save rather than have this text land on whichever
@@ -2191,12 +2375,13 @@ fra
         // Act / Assert: the cue at that position now says something else.
         let moved = rewrite_srt_cues(
             THREE_CUES,
-            &BTreeMap::from([(1, cue_edit("SOMETHING ELSE", "x"))]),
+            &BTreeMap::from([(1, cue_edit("SOMETHING ELSE", 3, "x"))]),
         );
         assert_that!(moved.clone().unwrap_err().as_str()).contains("changed elsewhere");
 
         // Act / Assert: and the cue is gone from the file entirely.
-        let missing = rewrite_srt_cues(THREE_CUES, &BTreeMap::from([(9, cue_edit("nine", "x"))]));
+        let missing =
+            rewrite_srt_cues(THREE_CUES, &BTreeMap::from([(9, cue_edit("nine", 9, "x"))]));
         assert_that!(missing.unwrap_err().as_str()).contains("no longer has a cue");
     }
 }

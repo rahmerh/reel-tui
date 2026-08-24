@@ -11,6 +11,7 @@ use crate::app::{
     App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
     VideoSettingsMode,
 };
+use crate::sync;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -1050,20 +1051,61 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.request_process_all();
         }
+        // `t` for timing, the one thing this page is named for that it could not do. Free
+        // on every layer, so it needs no modifier to keep it apart from anything.
+        (KeyCode::Char('t'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.toggle_cue_timing_mode();
+        }
         // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
         // move between rows and these move between the cues sharing one. Ahead of the
         // generic `h`/`l` arms below, which are about horizontal choices on other layers.
+        //
+        // **In timing mode they move the cue itself instead**, which is why the two
+        // meanings share one pair of keys rather than the second pair being bound
+        // elsewhere: left and right is what moving through time *is* on this page, and a
+        // reader in the mode is pointing at one cue rather than choosing between several.
+        // Sideways movement inside a group comes back with `Esc`.
         (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE)
             if app.layer == Layer::SubtitleSync =>
         {
             input.reset_sequence();
-            app.move_sync_cue_within_group(-1);
+            if app.cue_timing_mode() {
+                app.nudge_selected_cue(-1);
+            } else {
+                app.move_sync_cue_within_group(-1);
+            }
         }
         (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE)
             if app.layer == Layer::SubtitleSync =>
         {
             input.reset_sequence();
-            app.move_sync_cue_within_group(1);
+            if app.cue_timing_mode() {
+                app.nudge_selected_cue(1);
+            } else {
+                app.move_sync_cue_within_group(1);
+            }
+        }
+        // Modifiers are `NONE | SHIFT` rather than `SHIFT` alone, the same allowance the
+        // `R` arm above makes: a shifted letter arrives carrying `SHIFT` from terminals
+        // that report it and bare from those that do not.
+        (KeyCode::Char('H'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if app.layer == Layer::SubtitleSync =>
+        {
+            input.reset_sequence();
+            app.nudge_selected_cue(-sync::TIMING_LEAP);
+        }
+        (KeyCode::Char('L'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if app.layer == Layer::SubtitleSync =>
+        {
+            input.reset_sequence();
+            app.nudge_selected_cue(sync::TIMING_LEAP);
+        }
+        // `0` for the timing this cue started at, the way `0` is the start of the line in
+        // vim. Inert outside the timing mode, where a bare digit means nothing on this page.
+        (KeyCode::Char('0'), KeyModifiers::NONE) if app.layer == Layer::SubtitleSync => {
+            input.reset_sequence();
+            app.reset_selected_cue_timing();
         }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
@@ -3417,6 +3459,41 @@ mod tests {
 
     /// A file on disk with one SubRip track, sitting in the Streams layer — the exact
     /// state `c` is pressed from.
+    /// A shifted letter as the terminals that report the modifier send it.
+    fn shifted(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    /// Two cues an hour apart on the open timing page, so nothing the timing tests do can
+    /// bring them into one overlap group and change what `h`/`l` mean out of the mode.
+    fn timed_cues(app: &mut App) {
+        let state = app.subtitle_sync.as_mut().expect("the page should be open");
+        state.apply_prepared(
+            [(1, 2), (3600, 3601)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (start, end))| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(start),
+                    end: std::time::Duration::from_secs(end),
+                    text: format!("line {index}"),
+                    dialogue: Vec::new(),
+                    events: 1,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+    }
+
+    /// Where the page currently believes the selected cue starts.
+    fn selected_cue_start(app: &App) -> std::time::Duration {
+        app.subtitle_sync
+            .as_ref()
+            .and_then(|state| state.selected_cue())
+            .expect("the page should be on a cue")
+            .start
+    }
+
     fn subtitle_track_app() -> (App, PathBuf) {
         let (mut app, directory) = test_app();
         fs::write(directory.join("movie.mkv"), b"media").unwrap();
@@ -3660,6 +3737,139 @@ mod tests {
 
         // Act / Assert: and the page is still left by `Esc`, not by `h`.
         assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `t` turns the timing mode on and off, and only on the page that has one.
+    #[test]
+    fn t_should_toggle_the_timing_mode_only_on_the_subtitle_sync_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: nothing on the streams layer, where there is no page to be in a
+        // mode on.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Arrange: the timing page, on a cue.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+
+        // Act / Assert: on, then off again with the same key.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        assert_that!(app.cue_timing_mode()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        assert_that!(app.cue_timing_mode()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `h`/`l` are two things on this page and the mode is what picks between them: they
+    /// move the *cursor* through a group of overlapping cues, and they move the *cue* through
+    /// time. `H`/`L` are ten steps of the second thing and nothing at all of the first.
+    #[test]
+    fn h_and_l_should_nudge_the_cue_in_timing_mode_and_move_the_cursor_out_of_it() {
+        // Arrange: the page, and a cue at 1.0s → 2.0s.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+
+        // Act / Assert: out of the mode the capitals do nothing at all, and the cue holds
+        // still — so a stray `L` on a page nobody is retiming cannot edit the file.
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('L')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: in the mode, `l` and the right arrow each move one step later.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1100));
+
+        // Act / Assert: `h` takes one back, and the cursor has not moved off the cue.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+        assert_that!(app.subtitle_sync.as_ref().unwrap().selected).is_equal_to(0);
+
+        // Act / Assert: `L` is ten of them, reported with the shift or without it.
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('L')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1550));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('H')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `0` undoes the whole burst rather than one press, because the file's timing is the
+    /// only one worth going back to — and it is inert outside the mode, where a bare digit
+    /// means nothing on this page.
+    #[test]
+    fn zero_should_put_the_cue_back_to_the_timing_the_file_gives_it() {
+        // Arrange: the page, in the mode, three steps on.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        for _ in 0..3 {
+            handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        }
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1150));
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('0')));
+
+        // Assert: back where the file has it, and staged as nothing rather than as a
+        // round trip — a cue returned to its own timing is not an edit.
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: and out of the mode it does nothing, so it cannot undo a nudge the
+        // reader has already walked away from.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.cue_timing_mode()).is_false();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('0')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` peels the page one layer at a time, and the timing mode is one of the layers:
+    /// it comes off before the page does, so leaving the mode does not also cost the reader
+    /// the page — or raise the "discard your edits?" question they have not asked for yet.
+    #[test]
+    fn escape_should_leave_the_timing_mode_before_it_leaves_the_page() {
+        // Arrange: the page, in the mode, with an edit staged.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: the first `Esc` takes the mode and nothing else.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleSync);
+        assert_that!(app.dialog).is_none();
+
+        // Act / Assert: the next one reaches the question about the edits.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
 
         // Cleanup
         drop(app);
