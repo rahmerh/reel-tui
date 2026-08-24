@@ -2834,7 +2834,7 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
-        "0",
+        "r",
         "Put the cue back to the timing the file gives it, while timing",
     );
     keybinding(
