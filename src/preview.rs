@@ -1300,15 +1300,26 @@ pub fn drawing_picker(picker: Picker) -> Option<Picker> {
 
 /// Where in the media to grab the frame for `cue`.
 ///
-/// The midpoint, held back from the very end: seeking to the last instant of a file lands
-/// past the final frame, and `-frames:v 1` then writes nothing at all. Only when the
-/// duration is actually known, though — a file whose duration would not parse arrives here
-/// as zero, and clamping against that would preview the first frame for every cue.
+/// The moment the cue comes in. That instant is what the reader is judging on this page —
+/// a line that appears a beat late appears late *here*, and nowhere else in the cue's
+/// span — so the still has to be the frame the line arrives on. The midpoint stood here
+/// first and answered a different question: it showed a frame the line is comfortably on
+/// top of, which says nothing about whether it came in with the shot.
+///
+/// Held back from the very end: seeking to the last instant of a file lands past the final
+/// frame, and `-frames:v 1` then writes nothing at all. Only when the duration is actually
+/// known, though — a file whose duration would not parse arrives here as zero, and
+/// clamping against that would preview the first frame of the media for every cue.
+///
+/// Grabbing exactly at the start is only safe because [`CueStyle::stage`] stretches every
+/// cue in the group across [`BURN_WINDOW`]: at the cue's own timing, a seek landing a
+/// rounding error before its first frame would draw nothing at all — precisely the frame
+/// this is aiming at.
 pub fn seek_for(cue: &Cue, duration: Duration) -> Duration {
     if duration.is_zero() {
-        cue.midpoint()
+        cue.start
     } else {
-        cue.midpoint()
+        cue.start
             .min(duration.saturating_sub(Duration::from_millis(200)))
     }
 }
@@ -4591,19 +4602,20 @@ mod tests {
     /// The interactive path and the background pass have to seek to the same instant for
     /// the same cue, or the two would write different pictures under one cache key.
     #[test]
-    fn a_seek_should_be_the_cues_midpoint_held_back_from_the_end_of_the_media() {
-        // Act / Assert: the midpoint, not the start — a cue's first frame is often the
-        // last frame of the previous shot.
+    fn a_seek_should_be_the_moment_the_cue_comes_in_held_back_from_the_end_of_the_media() {
+        // Act / Assert: the moment the line arrives, which is what the reader is judging,
+        // rather than the midpoint — a frame the line is comfortably on top of says
+        // nothing about whether it came in with the shot.
         assert_that!(seek_for(&cue(1000, 3000, "a"), Duration::from_secs(60)))
-            .is_equal_to(Duration::from_secs(2));
-        // A cue running past the end lands before the final frame, not on it: `-frames:v
+            .is_equal_to(Duration::from_secs(1));
+        // A cue coming in past the end lands before the final frame, not on it: `-frames:v
         // 1` writes nothing at all past the end.
-        assert_that!(seek_for(&cue(8000, 12_000, "a"), Duration::from_secs(10)))
+        assert_that!(seek_for(&cue(11_000, 12_000, "a"), Duration::from_secs(10)))
             .is_equal_to(Duration::from_millis(9800));
         // A duration that would not parse arrives as zero, and clamping against that
         // would preview the first frame of the media for every cue in the track.
-        assert_that!(seek_for(&cue(8000, 12_000, "a"), Duration::ZERO))
-            .is_equal_to(Duration::from_secs(10));
+        assert_that!(seek_for(&cue(11_000, 12_000, "a"), Duration::ZERO))
+            .is_equal_to(Duration::from_secs(11));
     }
 
     fn warm_request(media: &Path, workspace: &Path, cues: Vec<Cue>) -> WarmRequest {

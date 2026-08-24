@@ -57,11 +57,12 @@ pub struct Cue {
 }
 
 impl Cue {
-    /// The moment to grab a preview frame for.
+    /// The middle of the cue's span.
     ///
-    /// The midpoint rather than the start: a cue's start frequently coincides with a
-    /// scene cut, so the frame at `start` is often the last frame of the *previous*
-    /// shot — technically correct and visually useless.
+    /// What the timeline window is centred on, so that a selected cue sits in the middle
+    /// of the pane rather than against one of its edges. The preview's still is grabbed at
+    /// the cue's *start* instead — see [`crate::preview::seek_for`], which is the question
+    /// this page exists to answer and a different one from where the cue sits.
     pub fn midpoint(&self) -> Duration {
         self.start + (self.end.saturating_sub(self.start)) / 2
     }

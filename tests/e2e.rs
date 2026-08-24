@@ -3845,6 +3845,87 @@ fn a_cues_frame_should_show_everything_on_screen_with_it() {
     );
 }
 
+/// Two cues of identical words and identical length, one coming in while the picture is
+/// black and one after it has turned white, both of whose *midpoints* fall in the white
+/// stretch.
+const SHOT_CHANGE_CUES: &str = "1\n00:00:01,000 --> 00:00:05,000\nSHARED WORDS\n\n\
+                                2\n00:00:05,000 --> 00:00:09,000\nSHARED WORDS\n\n";
+
+/// A cue's still is the frame it comes in on, which is the only frame that says whether it
+/// came in with the shot.
+///
+/// The picture turns from black to white two seconds in, and the two cues are identical in
+/// every other way — same words, same length, and both midpoints in the white stretch. So a
+/// grab at the midpoint draws two white frames and the difference the reader came here to
+/// see is invisible; a grab at the start draws one black and one white.
+///
+/// Asserted on the cached pictures rather than on the seek, because every layer short of
+/// the pixels agrees either way: the cue list is the same, the cache holds a frame per cue,
+/// and the commands differ only in one `-ss`.
+#[test]
+fn a_cues_still_should_be_the_frame_it_comes_in_on() {
+    // Serialised against the other frame-cache scenarios: they share one cache and
+    // prune each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "a_cues_still_should_be_the_frame_it_comes_in_on";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("subtitle-sync-shot-change");
+    write_shot_change_media(&scratch.join("clip.mkv"));
+    fs::write(scratch.join("clip.eng.srt"), SHOT_CHANGE_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_timing_page(&mut app);
+
+    // Act: render the whole track.
+    wait_for_frames(&mut app);
+    let state = app.app.subtitle_sync.as_ref().unwrap();
+    assert_eq!(state.cues.len(), 2, "both cues should parse");
+    let before = mean_luminance(&cached_frame(state, 0));
+    let after = mean_luminance(&cached_frame(state, 1));
+
+    // Assert: the cue that comes in while the shot is still black was grabbed there. At the
+    // midpoint both of these are the same white frame.
+    assert!(
+        before < 64.0,
+        "the first cue comes in two seconds before the picture turns white, so its still \
+         should be the black frame it arrives on — mean luminance was {before:.1}"
+    );
+    assert!(
+        after > 192.0,
+        "the second cue comes in after the picture has turned white, so its still should be \
+         white — mean luminance was {after:.1}"
+    );
+}
+
+/// A clip whose picture turns from black to white two seconds in, so the frame a grab lands
+/// on can be read off the picture itself. Built here rather than through `MediaSpec`, whose
+/// video source is a single flat colour for the whole file.
+fn write_shot_change_media(path: &std::path::Path) {
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg("color=c=black:s=320x240:r=10:d=12")
+        .args([
+            "-vf",
+            "drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='gte(t,2)'",
+        ])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(path)
+        .status()
+        .expect("ffmpeg should run");
+    assert!(status.success(), "building {} failed", path.display());
+}
+
+/// The average brightness of a rendered frame, as a number the assertions can read.
+fn mean_luminance(frame: &std::path::Path) -> f64 {
+    let image = image::open(frame)
+        .unwrap_or_else(|error| panic!("{} should be a readable frame: {error}", frame.display()))
+        .to_luma8();
+    let total: u64 = image.pixels().map(|pixel| u64::from(pixel.0[0])).sum();
+    total as f64 / (image.width() * image.height()) as f64
+}
+
 /// A karaoke effect as a file really carries it: one visible line spread over four
 /// `Dialogue:` events that share a timing and a set of words, each scaling the text a little
 /// further so that together they animate. Plus one ordinary line over the top of them, whose
