@@ -868,7 +868,7 @@ fn render_edit_cue(
 
 fn render_edit_timeline(
     frame: &mut Frame,
-    state: &SubtitleEditState,
+    state: &mut SubtitleEditState,
     shift: Option<String>,
     cursor: Option<Duration>,
     area: Rect,
@@ -940,11 +940,25 @@ fn render_edit_timeline(
         inner.width,
         state.layout.lane_count,
     );
-    // The cursor is free to walk out of the window the selected cue chose, and a cursor drawn
-    // nowhere is a cursor the reader cannot follow. Slid rather than re-centred — see
-    // `TimelineWindow::containing`.
+    // **While the timeline holds the cursor the window is the reader's, not the selected
+    // cue's.** `fitted` anchors on the selection and is rebuilt from it every draw, so sliding
+    // *that* the minimum needed to hold the cursor parks the cursor against whichever edge it
+    // left by, on every frame — and moving back the other way then drags the whole track under
+    // a cursor that never leaves the edge. Restoring where the window actually was first is
+    // what makes the cursor travel through it and reach an edge before anything scrolls.
+    //
+    // The length still comes from `fitted`, because the pane's width and the track's density
+    // decide that and both can change mid-scroll; only the start is the reader's. Before the
+    // first draw of a visit there is nothing remembered and the selection's own window stands,
+    // which is what makes arriving in the pane change nothing on screen.
     let window = match cursor {
-        Some(at) => window.containing(at, state.duration),
+        Some(at) => {
+            let held = match state.window_start() {
+                Some(start) => window.starting_at(start),
+                None => window,
+            };
+            held.containing(at, state.duration)
+        }
         None => window,
     };
     let mut lines = timeline_lines(
@@ -958,6 +972,11 @@ fn render_edit_timeline(
     );
     lines.push(timeline_ruler(&window, window.span(cue), cursor, retiming));
     frame.render_widget(Paragraph::new(lines), inner);
+    // Last, once every read of the page above is done with — this is the one place that knows
+    // both how long a window is and where this one ended up.
+    if cursor.is_some() {
+        state.set_window_start(window.start);
+    }
 }
 
 /// What the timeline cursor is drawn in.
@@ -15578,6 +15597,110 @@ mod tests {
         // had stayed where it was.
         assert_that!(screen.as_str()).contains("Timeline (00:01:30.00)");
         assert_that!(screen.matches('▼').count()).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Coming back the other way, the cursor has to travel *through* the window before
+    /// anything scrolls.
+    ///
+    /// `fitted` anchors a window on the selected cue and is rebuilt from it on every draw, so
+    /// sliding that the minimum needed to hold the cursor parked the cursor against the edge
+    /// it had left by — every frame. Moving back then dragged the whole track underneath a
+    /// cursor stuck to the right-hand edge, which is the opposite of scrolling. The scroll
+    /// position is the reader's while they hold the cursor, not the selection's.
+    #[test]
+    fn a_cursor_coming_back_should_cross_the_window_before_it_scrolls() {
+        // Arrange: a cue at the very start of a two-minute file, so the window opens on it —
+        // and stays anchored there if the selection is what decides.
+        let (mut app, directory) =
+            edit_page_app("edit-scroll-back", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+        // The ruler's readings, and where the cursor's mark sits along them. The marks are
+        // blanked out of the first half: they are what is expected to move, and leaving them
+        // in would make every comparison below differ for that reason alone.
+        let axis = |app: &mut App| -> (String, usize) {
+            let row = draw(app, 100, 24)
+                .into_iter()
+                .find(|line| line.contains('▼'))
+                .expect("the focused timeline marks its cursor");
+            let column = row
+                .chars()
+                .position(|glyph| glyph == '▼')
+                .expect("the row was found by that mark");
+            let readings = row
+                .chars()
+                .map(|glyph| {
+                    if matches!(glyph, '▲' | '▼') {
+                        ' '
+                    } else {
+                        glyph
+                    }
+                })
+                .collect();
+            (readings, column)
+        };
+        let leap = |app: &mut App, steps: i32| {
+            app.move_timeline_cursor(steps, crate::subtitle_edit::TIMELINE_STEP)
+        };
+
+        // Act: ninety seconds on, well past the sixty-second window, which drags it right.
+        for _ in 0..18 {
+            leap(&mut app, crate::subtitle_edit::TIMELINE_LEAP);
+        }
+        let (scrolled, at_edge) = axis(&mut app);
+
+        // Act: five seconds back the other way.
+        leap(&mut app, -crate::subtitle_edit::TIMELINE_LEAP);
+        let (unmoved, stepped_back) = axis(&mut app);
+
+        // Assert: the axis held still and the cursor moved along it — the whole defect was
+        // this pair coming out the other way round.
+        assert_that!(unmoved.as_str()).is_equal_to(scrolled.as_str());
+        assert_that!(stepped_back < at_edge).is_true();
+
+        // Act: back past the window's left edge, which is where scrolling starts again.
+        for _ in 0..14 {
+            leap(&mut app, -crate::subtitle_edit::TIMELINE_LEAP);
+        }
+        let (dragged, at_left_edge) = axis(&mut app);
+
+        // Assert: this time the axis moved, and the cursor is pinned to the left of it.
+        assert_that!(dragged.as_str() != unmoved.as_str()).is_true();
+        assert_that!(at_left_edge < stepped_back).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the pane forgets the scroll, so a later visit opens on the selected cue again
+    /// rather than wherever the reader last stopped — the rule the cursor's own seed follows.
+    #[test]
+    fn re_entering_the_timeline_should_open_on_the_selected_cue_again() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-scroll-reset", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+        let opened = draw(&mut app, 100, 24).join("\n");
+
+        // Act: scroll well away, leave, and come back.
+        for _ in 0..18 {
+            app.move_timeline_cursor(
+                crate::subtitle_edit::TIMELINE_LEAP,
+                crate::subtitle_edit::TIMELINE_STEP,
+            );
+        }
+        let scrolled = draw(&mut app, 100, 24).join("\n");
+        app.focus_cues();
+        app.focus_timeline();
+        let returned = draw(&mut app, 100, 24).join("\n");
+
+        // Assert
+        assert_that!(scrolled.as_str() != opened.as_str()).is_true();
+        assert_that!(returned.as_str()).is_equal_to(opened.as_str());
 
         // Cleanup
         drop(app);

@@ -937,6 +937,29 @@ impl TimelineWindow {
         }
     }
 
+    /// The same window moved to begin at `start`, keeping its length exactly.
+    ///
+    /// How a remembered scroll position is restored onto a window whose *length* is still
+    /// worked out per draw — the pane's width and the track's density decide that, and both
+    /// can change while the reader is scrolling. [`Self::containing`] is what runs next and
+    /// what does all the clamping: the two are separate because only the caller knows whether
+    /// the start it is handing over is one the reader scrolled to or one derived from the
+    /// selected cue.
+    ///
+    /// Unclamped on purpose. Every start this is given came from a window `containing`
+    /// already clamped, and a start left stale by a resize is corrected by the `containing`
+    /// that follows it — the cursor is inside the media, so a window that has run off the end
+    /// no longer holds it and gets dragged back. Clamping here as well would need a media
+    /// length this does not reliably have (an unprobed file reports zero), and clamping
+    /// against a wrong one would pin the window to the start of the file.
+    pub fn starting_at(self, start: Duration) -> Self {
+        Self {
+            start,
+            end: start + self.end.saturating_sub(self.start),
+            width: self.width,
+        }
+    }
+
     /// The same window slid the least it can to hold `at`, or unchanged if it already does.
     ///
     /// For the timeline cursor, which is free to walk out of the window the selected cue chose.
@@ -2385,6 +2408,40 @@ mod tests {
         assert_that!(forced.len()).is_equal_to(2);
         assert_that!(forced[1].start).is_equal_to(milliseconds(5000));
         assert_that!(on_screen_now(&cues, milliseconds(500)).len()).is_equal_to(1);
+    }
+
+    /// Restoring a remembered scroll position keeps the length the pane and the track's
+    /// density just decided, and moves only the start. Unclamped on purpose — the
+    /// `containing` that always follows is what holds the window inside the media, and it
+    /// has the one number needed to do it.
+    #[test]
+    fn starting_at_should_move_a_window_and_keep_its_length() {
+        // Arrange: a thirty-second window a minute in.
+        let window = TimelineWindow {
+            start: Duration::from_secs(60),
+            end: Duration::from_secs(90),
+            width: 60,
+        };
+
+        // Act / Assert: moved back, moved on, and left where it is.
+        let earlier = window.starting_at(Duration::from_secs(10));
+        assert_that!(earlier.start).is_equal_to(Duration::from_secs(10));
+        assert_that!(earlier.end).is_equal_to(Duration::from_secs(40));
+        assert_that!(earlier.width).is_equal_to(60);
+        let later = window.starting_at(Duration::from_secs(200));
+        assert_that!(later.start).is_equal_to(Duration::from_secs(200));
+        assert_that!(later.end).is_equal_to(Duration::from_secs(230));
+        assert_that!(window.starting_at(Duration::from_secs(60)).end)
+            .is_equal_to(Duration::from_secs(90));
+
+        // Act / Assert: a start left past the end of the media by a resize is not clamped
+        // here — the `containing` that follows drags it back, because the cursor is inside
+        // the media and a window out there no longer holds it.
+        let stale = window
+            .starting_at(Duration::from_secs(600))
+            .containing(Duration::from_secs(75), Duration::from_secs(300));
+        assert_that!(stale.start).is_equal_to(Duration::from_secs(75));
+        assert_that!(stale.end).is_equal_to(Duration::from_secs(105));
     }
 
     /// The timeline cursor walks out of the window the selected cue chose, and a cursor drawn

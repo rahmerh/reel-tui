@@ -605,6 +605,22 @@ pub struct SubtitleEditState {
     /// shows — where a remembered position would come back pointing at wherever the reader
     /// happened to leave it, which after a few `j`s is nowhere near what they are looking at.
     cursor: Duration,
+    /// Where the timeline's window begins while the cursor is in it, once a draw has settled
+    /// on one.
+    ///
+    /// **The scroll position stops belonging to the selected cue the moment the timeline
+    /// takes the cursor.** `TimelineWindow::fitted` anchors a window on the selection, and a
+    /// window rebuilt from it on every draw and then slid the minimum needed to hold the
+    /// cursor puts the cursor hard against whichever edge it left by — *every frame*. Moving
+    /// back the other way then drags the whole track under a cursor that never leaves the
+    /// edge, which is the opposite of scrolling. Remembering where the window was is what
+    /// makes the cursor move *through* it and reach an edge before anything scrolls.
+    ///
+    /// `None` until the first draw after entering, so the window the reader arrives on is the
+    /// one the selected cue had chosen — the same rule [`Self::cursor`]'s seed follows — and
+    /// `None` again on the way out, so a later visit is a fresh arrival rather than a return
+    /// to a position the cue list has since moved away from.
+    window_start: Option<Duration>,
     /// The frame at [`Self::cursor`], encoded and ready to draw.
     ///
     /// Exactly one, and **kept until a newer one replaces it**. Nothing caches these (see
@@ -674,6 +690,7 @@ impl SubtitleEditState {
             refill_nearby: false,
             focus: EditFocus::Cues,
             cursor: Duration::ZERO,
+            window_start: None,
             scrub: None,
             scrub_pending_since: None,
             scrub_error: None,
@@ -1036,6 +1053,9 @@ impl SubtitleEditState {
         };
         self.focus = EditFocus::Timeline;
         self.cursor = seed.min(self.cursor_ceiling());
+        // Left for the first draw to fill in, so the reader arrives on the window the
+        // selected cue had already chosen rather than on one left over from a previous visit.
+        self.window_start = None;
         // Nothing is asked for here on purpose: the cursor is standing on the selected cue's
         // own moment, and `scrub_frame` falls through to that cue's frame until the reader
         // moves off it. Grabbing a second copy of a picture already on screen would spend an
@@ -1062,9 +1082,27 @@ impl SubtitleEditState {
     fn leave_timeline(&mut self) {
         self.focus = EditFocus::Cues;
         self.cursor = Duration::ZERO;
+        self.window_start = None;
         self.scrub = None;
         self.scrub_pending_since = None;
         self.scrub_error = None;
+    }
+
+    /// Where the timeline's window begins, once a draw has settled on one.
+    ///
+    /// `None` before the first draw of a visit, which is the drawing code's cue to use the
+    /// window the selected cue chose. See [`Self::window_start`].
+    pub fn window_start(&self) -> Option<Duration> {
+        self.window_start
+    }
+
+    /// Remembers where the window the reader is looking at begins.
+    ///
+    /// Called by the drawing code, which is the only place that knows how wide the pane is
+    /// and therefore how long a window is — the state cannot work it out, and a scroll
+    /// position is meaningless without it.
+    pub fn set_window_start(&mut self, start: Duration) {
+        self.window_start = Some(start);
     }
 
     /// Where the timeline cursor stands, or `None` when the cue panel holds the cursor.
@@ -4066,9 +4104,34 @@ mod tests {
         assert_that!(state.cursor()).is_equal_to(Some(Duration::from_millis(3000)));
     }
 
-    /// A page that read its cues and then had them taken away draws no timeline at all, so
-    /// there is nothing for the cursor to stand in — and no cue to seed it from either. The
-    /// status alone does not answer that, which is why the seed is what decides.
+    /// The window's scroll belongs to the visit, not to the page: it starts unset so the
+    /// selected cue's own window is what the reader arrives on, and it is dropped on the way
+    /// out so a later visit is an arrival rather than a return.
+    #[test]
+    fn the_scroll_position_should_last_a_visit_and_no_longer() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act / Assert: nothing remembered before the first draw of a visit, so the window
+        // the selected cue chose is what the reader arrives on.
+        state.focus_timeline();
+        assert_that!(state.window_start()).is_none();
+
+        // Act / Assert: the drawing code hands back where the window settled, and moving the
+        // cursor leaves that alone — only a draw changes it.
+        state.set_window_start(Duration::from_secs(30));
+        state.move_cursor(1, TIMELINE_STEP);
+        assert_that!(state.window_start()).is_equal_to(Some(Duration::from_secs(30)));
+
+        // Act / Assert: and it is forgotten on the way out, so the next visit is a fresh
+        // arrival rather than a return to a position the cue list has moved away from.
+        state.focus_cues();
+        assert_that!(state.window_start()).is_none();
+        state.focus_timeline();
+        assert_that!(state.window_start()).is_none();
+    }
+
+    /// A page that read its cues and then had them taken away draws no timeline at all.
     #[test]
     fn the_cursor_should_be_refused_a_timeline_with_no_cues_left_in_it() {
         // Arrange
