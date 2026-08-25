@@ -991,6 +991,29 @@ fn axis_tick(span: Duration) -> u64 {
         .unwrap_or(TICKS[TICKS.len() - 1])
 }
 
+/// Every tick of the axis that lands inside the window, as its moment and its column.
+///
+/// Shared by the ruler that labels the ticks and the lanes that rule a line down each one,
+/// so the two cannot come to disagree about where a tick is. A gridline standing under no
+/// reading is merely unlabelled — the ruler drops a reading that would crowd its neighbour
+/// or paint through a mark — but a gridline standing *beside* a reading would be the axis
+/// contradicting itself, and deriving the columns twice is how that happens.
+fn axis_columns(window: &TimelineWindow) -> Vec<(Duration, u16)> {
+    let tick = axis_tick(window.end.saturating_sub(window.start));
+    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(tick) * tick);
+    let mut columns = Vec::new();
+    while at <= window.end {
+        let moment = at;
+        // Before the `continue`, so a moment the window has no column for still advances
+        // the walk. `TICKS` has no zero in it, so this always terminates.
+        at += Duration::from_secs(tick);
+        if let Some(column) = window.column(moment) {
+            columns.push((moment, column));
+        }
+    }
+    columns
+}
+
 fn timeline_ruler(
     window: &TimelineWindow,
     selected: Option<(u16, u16)>,
@@ -1017,15 +1040,8 @@ fn timeline_ruler(
         .chain(cursor_column)
         .collect();
 
-    let tick = axis_tick(window.end.saturating_sub(window.start));
-    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(tick) * tick);
     let mut written_to = None;
-    while at <= window.end {
-        let moment = at;
-        at += Duration::from_secs(tick);
-        let Some(column) = window.column(moment) else {
-            continue;
-        };
+    for (moment, column) in axis_columns(window) {
         let reading = format_clock(moment, with_hours);
         let span = column..=column + reading.chars().count() as u16 - 1;
         // Dropped whole rather than clipped or crowded: half a timestamp is a different,
@@ -1119,6 +1135,30 @@ fn timeline_lines(
     // there is nothing to clamp here.
     let lanes = layout.lane_count;
     let mut grid = vec![vec![(' ', Style::default()); width]; lanes];
+
+    // Ruled first, so everything with something to say wins the column over them: a cue's
+    // bracket, the playhead and the cursor are all painted on top. They exist because the
+    // ruler's readings sit *below* the lanes, and judging which second a cue starts on by
+    // eye across four lanes of blank space is the one thing this pane is read for.
+    //
+    // Dark gray and unbolded, the same style the reading under each one carries, because a
+    // gridline and its number are one thing seen twice rather than two marks to tell apart.
+    // The columns come from `axis_columns` for the same reason.
+    //
+    // **Dashed rather than the solid `│` the playhead and the cursor use.** Three vertical
+    // bars separated only by colour is one distinction too many for a pane that is read at a
+    // glance and can carry all three at once, and the two that mark a *moment* are the ones
+    // that have to stand out — a gridline is scenery. It also keeps `│` unambiguous in the
+    // tests, which read the buffer's glyphs and cannot see a colour without asking for it.
+    for (_, column) in axis_columns(window) {
+        for lane in &mut grid {
+            // Bounds-checked for the reason the playhead below is: `column` answers for any
+            // moment inside the window, which is not the same as any column of this grid.
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('┊', Style::default().fg(Color::DarkGray));
+            }
+        }
+    }
 
     // The selected cue is painted last so that it stays visible where a crowded lane has
     // stacked another cue on top of it.
@@ -14215,10 +14255,20 @@ mod tests {
         // Assert
         assert_that!(text.len()).is_equal_to(2);
         // Both cues span 10 s of a 60 s window drawn 61 columns wide, so both are 11
-        // columns; the second starts five columns in.
+        // columns; the second starts five columns in. Read at their columns rather than
+        // off the front of the row, since the axis rules a gridline down every tenth
+        // second and the lead-in is no longer blank.
         let expected = cue_glyphs(11);
         assert_that!(text[0].starts_with(&expected)).is_true();
-        assert_that!(text[1].starts_with(&format!("     {expected}"))).is_true();
+        assert_that!(
+            text[1]
+                .chars()
+                .skip(5)
+                .take(11)
+                .collect::<String>()
+                .as_str()
+        )
+        .is_equal_to(expected.as_str());
     }
 
     /// A cue too brief to fill a column still has to mark the column it falls on, or the
@@ -14239,9 +14289,16 @@ mod tests {
             &cues, &layout, &window, 0, None, None, false,
         ));
 
-        // Assert
+        // Assert: the one column it falls on carries the cue, and nothing but the axis's
+        // own gridlines is drawn anywhere else.
         assert_that!(text[0].contains('|')).is_true();
-        assert_that!(text[0].trim().chars().count()).is_equal_to(1);
+        assert_that!(
+            text[0]
+                .chars()
+                .filter(|glyph| !matches!(glyph, ' ' | '┊'))
+                .count()
+        )
+        .is_equal_to(1);
     }
 
     #[test]
@@ -14427,6 +14484,78 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A gridline stands under every reading the axis places, on every lane, so a cue's
+    /// position can be read against the clock without the eye travelling down four rows of
+    /// blank space to the numbers.
+    #[test]
+    fn the_lanes_should_be_ruled_at_every_reading_of_the_axis() {
+        // Arrange: an empty track over a minute, which is a reading every ten seconds.
+        let layout = crate::cue::pack_lanes(&[], crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lane =
+            timeline_text(&timeline_lines(&[], &layout, &window, 0, None, None, false)).remove(0);
+
+        // Assert: one every ten columns, at the same columns the ruler puts its readings on.
+        let ruled: Vec<usize> = lane
+            .chars()
+            .enumerate()
+            .filter(|(_, glyph)| *glyph == '┊')
+            .map(|(column, _)| column)
+            .collect();
+        assert_that!(ruled.as_slice()).contains_exactly_in_given_order([0, 10, 20, 30, 40, 50, 60]);
+        assert_that!(
+            axis_columns(&window)
+                .into_iter()
+                .map(|(_, column)| usize::from(column))
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order(ruled);
+    }
+
+    /// The gridlines are scenery: anything that marks a moment or a cue is painted over
+    /// them, or the pane would be ruled through the very thing it is being read for.
+    #[test]
+    fn anything_with_something_to_say_should_win_a_ruled_column() {
+        // Arrange: a cue starting exactly on the twenty-second reading, with the playhead
+        // on the thirty-second one and the timeline cursor on the fortieth.
+        let cues = vec![edit_cue(20_000, 25_000, "on the line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lane = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            0,
+            Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(40)),
+            false,
+        ))
+        .remove(0);
+
+        // Assert: the cue, the playhead and the cursor each took their column back.
+        let at = |column: usize| lane.chars().nth(column);
+        assert_that!(at(20)).is_equal_to(Some('|'));
+        assert_that!(at(30)).is_equal_to(Some('│'));
+        assert_that!(at(40)).is_equal_to(Some('│'));
+        // And the readings nothing landed on are still ruled.
+        assert_that!(at(0)).is_equal_to(Some('┊'));
+        assert_that!(at(10)).is_equal_to(Some('┊'));
+        assert_that!(at(50)).is_equal_to(Some('┊'));
+    }
+
     /// The selected index is walked unconditionally so it can be painted last, so a
     /// selection pointing past the end of the list must be skipped rather than indexed.
     #[test]
@@ -14442,9 +14571,15 @@ mod tests {
         // Act: an empty track, with the cursor still sitting on cue zero.
         let lines = timeline_lines(&[], &layout, &window, 0, None, None, false);
 
-        // Assert: one blank lane rather than an index panic.
+        // Assert: one lane carrying nothing but the axis's gridlines, rather than an index
+        // panic or a cue drawn for a selection that does not exist.
         assert_that!(lines.len()).is_equal_to(1);
-        assert_that!(timeline_text(&lines)[0].trim().is_empty()).is_true();
+        assert_that!(
+            timeline_text(&lines)[0]
+                .chars()
+                .all(|glyph| matches!(glyph, ' ' | '┊'))
+        )
+        .is_true();
     }
 
     /// The count is the only sign the background pass is running, and it goes away when
