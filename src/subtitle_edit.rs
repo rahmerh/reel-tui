@@ -70,6 +70,15 @@ pub const TIMELINE_STEP: Duration = Duration::from_millis(500);
 /// Five seconds a press, which crosses a scene rather than a line.
 pub const TIMELINE_LEAP: i32 = 10;
 
+/// How far one press of `Ctrl+H`/`Ctrl+L` moves the timeline cursor.
+///
+/// **Exactly [`TIMING_STEP`], and that is the point rather than a coincidence.** The coarse
+/// step reaches a shot and this one reaches a frame, which is what the reader needs once the
+/// shot is found — and the workflow the whole pane exists for is scrubbing onto the frame a
+/// line should land on and then nudging the cue there. Moving the two by different amounts
+/// would mean the cursor could stand where no number of nudges can put the cue.
+pub const TIMELINE_FINE_STEP: Duration = TIMING_STEP;
+
 /// Which pane of the subtitle edit page holds the cursor.
 ///
 /// The cue panel by default, which is every movement the page had before: `Ctrl+J` hands the
@@ -1066,7 +1075,13 @@ impl SubtitleEditState {
         (self.focus == EditFocus::Timeline).then_some(self.cursor)
     }
 
-    /// Moves the timeline cursor by `steps` of [`TIMELINE_STEP`], reporting whether it moved.
+    /// Moves the timeline cursor by `steps` of `step`, reporting whether it moved.
+    ///
+    /// The size comes from the caller rather than from a constant here because the pane has
+    /// three of them — [`TIMELINE_FINE_STEP`] for `Ctrl+H`/`Ctrl+L`, [`TIMELINE_STEP`] for
+    /// `h`/`l`, and [`TIMELINE_LEAP`] of the latter for `H`/`L`. They differ only in how far
+    /// one press reaches, so they are one movement taken at three scales rather than three
+    /// movements, and every rule below has to hold for all of them.
     ///
     /// **A move stops a playback**, for the reason retiming a cue does
     /// ([`Self::set_cue_timing`]): a span decoded around one cue, still playing while the
@@ -1075,11 +1090,11 @@ impl SubtitleEditState {
     ///
     /// A press against either end reports `false` and asks for nothing, so a held `h` at 0:00
     /// does not re-grab the same frame per repeat.
-    pub fn move_cursor(&mut self, steps: i32) -> bool {
+    pub fn move_cursor(&mut self, steps: i32, step: Duration) -> bool {
         if self.focus != EditFocus::Timeline {
             return false;
         }
-        let shift = TIMELINE_STEP.saturating_mul(steps.unsigned_abs());
+        let shift = step.saturating_mul(steps.unsigned_abs());
         let moved = if steps.is_negative() {
             self.cursor.saturating_sub(shift)
         } else {
@@ -2462,7 +2477,7 @@ mod tests {
         // Arrange
         let mut state = ready(2);
         state.focus_timeline();
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         state.apply_scrub_frame(state.cursor().unwrap(), protocol(10, 5));
 
         // Act
@@ -3915,7 +3930,7 @@ mod tests {
         // Arrange
         let mut state = ready(3);
         state.focus_timeline();
-        state.move_cursor(4);
+        state.move_cursor(4, TIMELINE_STEP);
         let at = state.cursor();
 
         // Act
@@ -3958,7 +3973,7 @@ mod tests {
 
         // Act / Assert: and something to take back.
         state.focus_timeline();
-        state.move_cursor(2);
+        state.move_cursor(2, TIMELINE_STEP);
         assert_that!(state.focus_cues()).is_true();
         assert_that!(state.cursor()).is_none();
         assert_that!(state.scrub_requested()).is_false();
@@ -3974,14 +3989,38 @@ mod tests {
         state.focus_timeline();
 
         // Act
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         let one = state.cursor().unwrap();
-        state.move_cursor(TIMELINE_LEAP);
+        state.move_cursor(TIMELINE_LEAP, TIMELINE_STEP);
 
         // Assert
         assert_that!(one).is_equal_to(TIMELINE_STEP);
         assert_that!(state.cursor())
             .is_equal_to(Some(TIMELINE_STEP + TIMELINE_STEP * TIMELINE_LEAP as u32));
+    }
+
+    /// The three scales are one movement with the size handed in, so the fine step obeys
+    /// every rule the coarse one does — including the clamp at zero, which is where the
+    /// finest step is most likely to be pressed against the end of the file.
+    #[test]
+    fn the_fine_step_should_move_the_cursor_by_the_cue_nudge_and_clamp_like_the_rest() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        state.move_cursor(-i32::from(u16::MAX), TIMELINE_STEP);
+        state.clear_scrub_request();
+
+        // Act
+        assert_that!(state.move_cursor(1, TIMELINE_FINE_STEP)).is_true();
+        let one = state.cursor().unwrap();
+        assert_that!(state.move_cursor(-1, TIMELINE_FINE_STEP)).is_true();
+
+        // Assert: one nudge on and back to the floor, which then refuses to go further.
+        assert_that!(one).is_equal_to(TIMING_STEP);
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
+        state.clear_scrub_request();
+        assert_that!(state.move_cursor(-1, TIMELINE_FINE_STEP)).is_false();
+        assert_that!(state.scrub_requested()).is_false();
     }
 
     /// A press that would move nothing has to report so, or a held `h` at 0:00 spends an
@@ -3993,17 +4032,17 @@ mod tests {
         state.focus_timeline();
 
         // Act / Assert: the floor.
-        assert_that!(state.move_cursor(-1)).is_false();
+        assert_that!(state.move_cursor(-1, TIMELINE_STEP)).is_false();
         assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
         state.clear_scrub_request();
 
         // Act / Assert: and the ceiling, which is held back from the very last instant so
         // the grab lands on a frame that exists.
         let ceiling = seek_ceiling(state.duration).unwrap();
-        assert_that!(state.move_cursor(i32::from(u16::MAX))).is_true();
+        assert_that!(state.move_cursor(i32::from(u16::MAX), TIMELINE_STEP)).is_true();
         assert_that!(state.cursor()).is_equal_to(Some(ceiling));
         state.clear_scrub_request();
-        assert_that!(state.move_cursor(1)).is_false();
+        assert_that!(state.move_cursor(1, TIMELINE_STEP)).is_false();
     }
 
     /// A container whose duration would not parse arrives here as zero. Clamping against
@@ -4021,7 +4060,7 @@ mod tests {
         state.focus_timeline();
 
         // Act
-        state.move_cursor(i32::from(u16::MAX));
+        state.move_cursor(i32::from(u16::MAX), TIMELINE_STEP);
 
         // Assert
         assert_that!(state.cursor()).is_equal_to(Some(Duration::from_millis(3000)));
@@ -4050,7 +4089,7 @@ mod tests {
         let mut state = ready(3);
 
         // Act / Assert
-        assert_that!(state.move_cursor(1)).is_false();
+        assert_that!(state.move_cursor(1, TIMELINE_STEP)).is_false();
         assert_that!(state.cursor()).is_none();
         assert_that!(state.scrub_requested()).is_false();
         assert_that!(state.scrub_target()).is_none();
@@ -4071,7 +4110,7 @@ mod tests {
         assert_that!(state.playback_active()).is_true();
 
         // Act / Assert: and the first press stops it.
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         assert_that!(state.playback_active()).is_false();
     }
 
@@ -4087,7 +4126,7 @@ mod tests {
         state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
 
         // Act: the cursor moves on, and the next frame has not arrived.
-        state.move_cursor(2);
+        state.move_cursor(2, TIMELINE_STEP);
 
         // Assert
         assert_that!(state.scrub_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
@@ -4106,7 +4145,7 @@ mod tests {
         // Arrange
         let mut state = ready(3);
         state.focus_timeline();
-        state.move_cursor(2);
+        state.move_cursor(2, TIMELINE_STEP);
 
         // Act
         state.apply_scrub_frame(Duration::from_secs(30), protocol(8, 4));
@@ -4123,7 +4162,7 @@ mod tests {
         let mut state = ready(3);
         state.focus_timeline();
         state.apply_scrub_frame(Duration::ZERO, protocol(8, 4));
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         let at = state.cursor().unwrap();
 
         // Act
@@ -4134,7 +4173,7 @@ mod tests {
         assert_that!(state.scrub_error()).is_equal_to(Some("Could not draw this frame"));
 
         // Act / Assert: a failure reported against a moment already left says nothing.
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         assert_that!(state.scrub_error()).is_none();
         state.fail_scrub_frame(Duration::from_secs(45), "stale".to_string());
         assert_that!(state.scrub_error()).is_none();
@@ -4207,7 +4246,7 @@ mod tests {
         // Arrange
         let mut state = ready(3);
         state.focus_timeline();
-        state.move_cursor(3);
+        state.move_cursor(3, TIMELINE_STEP);
         state.apply_scrub_frame(state.cursor().unwrap(), protocol(8, 4));
 
         // Act
@@ -4229,14 +4268,14 @@ mod tests {
         state.focus_timeline();
 
         // Act / Assert: a moment inside the second cue carries it and nothing else.
-        state.move_cursor(5);
+        state.move_cursor(5, TIMELINE_STEP);
         let target = state.scrub_target().expect("the timeline holds the cursor");
         assert_that!(target.at).is_equal_to(Duration::from_millis(2500));
         assert_that!(target.on_screen.len()).is_equal_to(1);
         assert_that!(target.on_screen[0].text.as_str()).is_equal_to("line 1");
 
         // Act / Assert: and a moment in the gap between two carries none.
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         let target = state.scrub_target().expect("the timeline holds the cursor");
         assert_that!(target.at).is_equal_to(Duration::from_millis(3000));
         assert_that!(target.on_screen.as_slice()).is_empty();
@@ -4252,7 +4291,7 @@ mod tests {
         state.focus_timeline();
 
         // Act / Assert: asked for, but not yet due.
-        state.move_cursor(1);
+        state.move_cursor(1, TIMELINE_STEP);
         assert_that!(state.scrub_requested()).is_true();
         assert_that!(state.scrub_request_due()).is_false();
         assert_that!(state.any_frame_requested()).is_true();

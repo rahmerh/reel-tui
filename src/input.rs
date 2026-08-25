@@ -1082,6 +1082,22 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.focus_cues();
         }
+        // `Ctrl+H`/`Ctrl+L` are the same movement as `h`/`l` below at the finest of the
+        // pane's three scales: the coarse step finds a shot and this one finds the frame
+        // inside it. Deliberately the *cue nudge's* step, so a moment the cursor can stand
+        // on is always a timing a cue can be nudged onto — which is the pair of movements
+        // this pane exists to be used with.
+        //
+        // Inert while the cue panel holds the cursor rather than guarded here: the pair has
+        // no second meaning to reach on this layer, and `move_cursor` already refuses.
+        (KeyCode::Char('h'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.move_timeline_cursor(-1, subtitle_edit::TIMELINE_FINE_STEP);
+        }
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.move_timeline_cursor(1, subtitle_edit::TIMELINE_FINE_STEP);
+        }
         // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
         // move between rows and these move between the cues sharing one. Ahead of the
         // generic `h`/`l` arms below, which are about horizontal choices on other layers.
@@ -1097,7 +1113,7 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         {
             input.reset_sequence();
             if app.timeline_focused() {
-                app.move_timeline_cursor(-1);
+                app.move_timeline_cursor(-1, subtitle_edit::TIMELINE_STEP);
             } else if app.cue_timing_mode() {
                 app.nudge_selected_cue(-1);
             } else {
@@ -1109,7 +1125,7 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         {
             input.reset_sequence();
             if app.timeline_focused() {
-                app.move_timeline_cursor(1);
+                app.move_timeline_cursor(1, subtitle_edit::TIMELINE_STEP);
             } else if app.cue_timing_mode() {
                 app.nudge_selected_cue(1);
             } else {
@@ -1124,7 +1140,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         {
             input.reset_sequence();
             if app.timeline_focused() {
-                app.move_timeline_cursor(-subtitle_edit::TIMELINE_LEAP);
+                app.move_timeline_cursor(
+                    -subtitle_edit::TIMELINE_LEAP,
+                    subtitle_edit::TIMELINE_STEP,
+                );
             } else {
                 app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP);
             }
@@ -1134,7 +1153,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         {
             input.reset_sequence();
             if app.timeline_focused() {
-                app.move_timeline_cursor(subtitle_edit::TIMELINE_LEAP);
+                app.move_timeline_cursor(
+                    subtitle_edit::TIMELINE_LEAP,
+                    subtitle_edit::TIMELINE_STEP,
+                );
             } else {
                 app.nudge_selected_cue(subtitle_edit::TIMING_LEAP);
             }
@@ -4260,6 +4282,76 @@ mod tests {
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
         assert_that!(app.selected_cue_shift()).is_equal_to(Some(50));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The finest of the pane's three scales, and the one that has to match the cue nudge:
+    /// scrubbing onto the frame a line should land on and then nudging the cue there is the
+    /// workflow the cursor exists for, and a cursor that could stand between two nudges
+    /// would point at a timing no number of presses can reach.
+    #[test]
+    fn ctrl_h_and_ctrl_l_should_move_the_cursor_by_the_cue_nudge() {
+        // Arrange
+        let (mut app, directory, mut input) = timeline_app();
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        let started = app.subtitle_edit.as_ref().unwrap().cursor().unwrap();
+
+        // Act: three fine steps on, one back.
+        for _ in 0..3 {
+            handle_key(
+                &mut app,
+                &mut input,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            );
+        }
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+
+        // Assert: two of the cue nudge's own step, not of the coarse one.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cursor())
+            .is_equal_to(Some(started + crate::subtitle_edit::TIMING_STEP * 2));
+        assert_that!(crate::subtitle_edit::TIMELINE_FINE_STEP)
+            .is_equal_to(crate::subtitle_edit::TIMING_STEP);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The pair belongs to the timeline, so with the cue panel holding the cursor they must
+    /// do nothing at all — not nudge the selected cue, and not walk an invisible cursor.
+    #[test]
+    fn ctrl_h_and_ctrl_l_should_be_inert_while_the_cue_panel_holds_the_cursor() {
+        // Arrange: the timing mode on, which is where a stray nudge would land.
+        let (mut app, directory, mut input) = timeline_app();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+
+        // Act
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+
+        // Assert
+        assert_that!(app.selected_cue_shift()).is_none();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor()).is_none();
 
         // Cleanup
         drop(app);
