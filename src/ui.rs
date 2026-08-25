@@ -2923,6 +2923,11 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
+        "Ctrl-h / Ctrl-l",
+        "Move the timeline cursor 0.05s back or on, the same step a cue is nudged by",
+    );
+    keybinding(
+        &mut lines,
         "r",
         "Put the cue back to the timing the file gives it, while timing",
     );
@@ -15367,7 +15372,7 @@ mod tests {
         app.toggle_cue_timing_mode();
         app.nudge_selected_cue(3);
         app.focus_timeline();
-        app.move_timeline_cursor(4);
+        app.move_timeline_cursor(4, crate::subtitle_edit::TIMELINE_STEP);
         let screen = draw(&mut app, 100, 24).join("\n");
 
         // Assert: all three readings, in one title.
@@ -15390,7 +15395,10 @@ mod tests {
 
         // Act: ninety seconds on, which is well past a sixty-second window opened at zero.
         for _ in 0..18 {
-            app.move_timeline_cursor(crate::subtitle_edit::TIMELINE_LEAP);
+            app.move_timeline_cursor(
+                crate::subtitle_edit::TIMELINE_LEAP,
+                crate::subtitle_edit::TIMELINE_STEP,
+            );
         }
         let screen = draw(&mut app, 100, 24).join("\n");
 

@@ -3164,11 +3164,11 @@ impl App {
             .is_some_and(SubtitleEditState::focus_cues)
     }
 
-    /// Moves the timeline cursor by `steps` of `subtitle_edit::TIMELINE_STEP`, for `h`/`l`
-    /// and `H`/`L` while the timeline holds the cursor.
-    pub fn move_timeline_cursor(&mut self, steps: i32) {
+    /// Moves the timeline cursor by `steps` of `step`, for `Ctrl+H`/`Ctrl+L`, `h`/`l` and
+    /// `H`/`L` while the timeline holds the cursor.
+    pub fn move_timeline_cursor(&mut self, steps: i32, step: Duration) {
         if let Some(state) = self.subtitle_edit.as_mut()
-            && state.move_cursor(steps)
+            && state.move_cursor(steps, step)
         {
             self.notice = None;
         }
@@ -24262,7 +24262,7 @@ mod tests {
 
         // Act: into the timeline, then two presses to 2:00 — inside the first cue, 1s to 3s.
         app.focus_timeline();
-        app.move_timeline_cursor(2);
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
 
         // Assert: the moment does not go out until the cursor has settled. A request may
         // still leave carrying the neighbours, which are cache-only and cost nothing —
@@ -24304,7 +24304,7 @@ mod tests {
         app.set_preview_handles(Some(preview.handles));
         app_ready_for_a_frame(&mut app);
         app.focus_timeline();
-        app.move_timeline_cursor(2);
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
         let generation = app.subtitle_edit.as_ref().unwrap().generation;
         let (events, receiver) = std::sync::mpsc::channel();
 

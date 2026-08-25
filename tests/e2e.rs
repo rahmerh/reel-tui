@@ -4920,6 +4920,23 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
          {cue_frame}:\n{screen}"
     );
 
+    // Act: four presses of the fine step, which is the cue nudge's own fifty milliseconds
+    // rather than the half second `l` moves — the scale for finding a frame inside a shot
+    // once the coarse keys have found the shot.
+    for _ in 0..4 {
+        app.press(ctrl('l'));
+    }
+    app.pump();
+
+    // Assert: two tenths on, not two whole seconds. The picture cannot tell the two scales
+    // apart here — both land in the clip's black stretch — so the title is what says which
+    // step was taken.
+    let screen = app.screen();
+    assert!(
+        screen.contains("▼ 00:00:00.2"),
+        "four fine steps from 0:00 should put the cursor two tenths in:\n{screen}"
+    );
+
     // Act: the cursor back to the cue list.
     app.press(ctrl('k'));
     app.pump();
