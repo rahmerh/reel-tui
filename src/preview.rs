@@ -1646,14 +1646,7 @@ fn scrub(source: &FrameSource, target: &ScrubTarget, abandoned: Abandoned<'_>) -
         &source.workspace,
         staged.as_deref(),
     );
-    match run_cancellable(&mut command, abandoned) {
-        RunOutcome::Abandoned => PngOutcome::Abandoned,
-        RunOutcome::Failed(message) => PngOutcome::Failed(message),
-        RunOutcome::Finished(output) if !output.status.success() => {
-            PngOutcome::Failed(command_failure("Could not draw this frame", &output.stderr))
-        }
-        RunOutcome::Finished(output) => PngOutcome::Ready(output.stdout),
-    }
+    drawn_frame(run_cancellable(&mut command, abandoned))
 }
 
 /// Encodes the cues around the cursor, from the frame cache only.
@@ -1826,25 +1819,33 @@ fn render(
 /// giving up part-way and failing to start are endings a test cannot reliably steer a
 /// real `ffmpeg` into, and they are the two that must not be mistaken for a blank frame.
 fn grabbed(run: RunOutcome, media_key: &str, cue_key: &str) -> PngOutcome {
-    let output = match run {
-        RunOutcome::Abandoned => return PngOutcome::Abandoned,
-        RunOutcome::Failed(message) => return PngOutcome::Failed(message),
-        RunOutcome::Finished(output) if !output.status.success() => {
-            return PngOutcome::Failed(command_failure(
-                "Could not draw this frame",
-                &output.stderr,
-            ));
-        }
-        RunOutcome::Finished(output) => output,
-    };
+    let outcome = drawn_frame(run);
     // A successful run that wrote nothing is what seeking past the end of the media looks
     // like. Not cached — there is nothing to cache, and storing an empty file would turn
     // one bad grab into a permanently blank cue — but still passed on, so the decoder
     // reports it as the unreadable frame it is.
-    if !output.stdout.is_empty() {
-        framecache::store(media_key, cue_key, &output.stdout);
+    if let PngOutcome::Ready(bytes) = &outcome
+        && !bytes.is_empty()
+    {
+        framecache::store(media_key, cue_key, bytes);
     }
-    PngOutcome::Ready(output.stdout)
+    outcome
+}
+
+/// What a finished grab means, before anything decides whether to keep it.
+///
+/// Split out because the timeline cursor's grab reads it the same way and stores nothing —
+/// see [`scrub`]. Caching is then the *only* difference between the two paths, rather than
+/// two copies of this match that could come to disagree about what a failed run is.
+fn drawn_frame(run: RunOutcome) -> PngOutcome {
+    match run {
+        RunOutcome::Abandoned => PngOutcome::Abandoned,
+        RunOutcome::Failed(message) => PngOutcome::Failed(message),
+        RunOutcome::Finished(output) if !output.status.success() => {
+            PngOutcome::Failed(command_failure("Could not draw this frame", &output.stderr))
+        }
+        RunOutcome::Finished(output) => PngOutcome::Ready(output.stdout),
+    }
 }
 
 /// Turns PNG bytes into something the page can draw.
@@ -7031,5 +7032,113 @@ mod tests {
 
         forget(&source(&media, &directory), wanted(&request));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A staging write that fails is reported as a failure rather than grabbed anyway.
+    /// Burning nothing would hand back a picture of the moment with the lines missing from
+    /// it, which on this page is the one answer that must never be given wrongly.
+    #[test]
+    fn a_cursor_grab_that_cannot_stage_its_cues_should_fail_rather_than_burn_nothing() {
+        // Arrange: a workspace that does not exist, so the write cannot land.
+        let _guard = cache_guard();
+        let directory = scratch("scrub-unstageable");
+        let source = source(&directory.join("clip.mkv"), &directory.join("gone"));
+        let target = ScrubTarget {
+            at: Duration::from_millis(2500),
+            on_screen: vec![cue(2000, 3000, "ON THE SCREEN")],
+        };
+
+        // Act
+        let drawn = scrub(&source, &target, &|| false);
+
+        // Assert
+        let PngOutcome::Failed(message) = drawn else {
+            panic!("a cue that could not be staged should fail the grab");
+        };
+        assert_that!(message.as_str()).contains("Could not stage the cue to burn in");
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The page closing part-way through the cursor's grab drops the rest of the window
+    /// with it, exactly as it does for a cue's: the moment being waited on is gone, and so
+    /// is the cursor the neighbours were being got ready around.
+    #[test]
+    fn a_page_that_closes_mid_cursor_grab_should_publish_nothing() {
+        // Arrange
+        let _guard = cache_guard();
+        require_ffmpeg("a_page_that_closes_mid_cursor_grab_should_publish_nothing");
+        let directory = scratch("scrub-mid-grab");
+        let media = video(&directory);
+        let source = source(&media, &directory);
+        let ahead = cue(4000, 5000, "the cue behind it");
+        seed(&source, &ahead, &frame_bytes(64, 48));
+        let request = FrameRequest {
+            generation: 1,
+            source: source.clone(),
+            wanted: None,
+            scrub: Some(ScrubTarget {
+                at: Duration::from_millis(2500),
+                on_screen: Vec::new(),
+            }),
+            nearby: vec![alone(1, ahead.clone(), Duration::from_millis(4500))],
+            cells: Size::new(20, 10),
+        };
+        let (events_tx, events) = mpsc::channel();
+        let checks = AtomicUsize::new(0);
+        // The worker's own check is the first; everything after it is `ffmpeg` being
+        // polled, and by then the page has gone.
+        let closes_during_the_grab = || checks.fetch_add(1, Ordering::Relaxed) >= 1;
+
+        // Act
+        let alive = frame_window(
+            &request,
+            &Picker::halfblocks(),
+            &closes_during_the_grab,
+            &events_tx,
+        );
+        drop(events_tx);
+
+        // Assert: still serving, and neither the moment nor the neighbour was published.
+        assert_that!(alive).is_true();
+        assert_that!(events.into_iter().count()).is_equal_to(0);
+
+        // Cleanup
+        forget(&source, &ahead);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker stops entirely once its answers have nowhere to go — the application has
+    /// exited — and the cursor's lane is no exception. Proven with a media file that does
+    /// not exist, so the grab fails fast and the send is still attempted: a failure is an
+    /// answer the page would want, which is what makes the dropped channel the thing that
+    /// ends the worker rather than the failed grab.
+    #[test]
+    fn a_cursor_frame_with_nobody_listening_should_stop_the_worker() {
+        // Arrange
+        let _guard = cache_guard();
+        let directory = scratch("scrub-deaf");
+        std::fs::create_dir_all(&directory).unwrap();
+        let request = FrameRequest {
+            generation: 1,
+            source: source(&directory.join("never-existed.mkv"), &directory),
+            wanted: None,
+            scrub: Some(ScrubTarget {
+                at: Duration::from_millis(1500),
+                on_screen: Vec::new(),
+            }),
+            nearby: Vec::new(),
+            cells: Size::new(20, 10),
+        };
+        let (events_tx, events) = mpsc::channel();
+        drop(events);
+
+        // Act
+        let alive = frame_window(&request, &Picker::halfblocks(), &|| false, &events_tx);
+
+        // Assert
+        assert_that!(alive).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

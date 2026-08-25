@@ -3166,7 +3166,7 @@ impl App {
 
     /// Moves the timeline cursor by `steps` of `subtitle_edit::TIMELINE_STEP`, for `h`/`l`
     /// and `H`/`L` while the timeline holds the cursor.
-    pub fn move_timeline_cursor(&mut self, steps: i64) {
+    pub fn move_timeline_cursor(&mut self, steps: i32) {
         if let Some(state) = self.subtitle_edit.as_mut()
             && state.move_cursor(steps)
         {

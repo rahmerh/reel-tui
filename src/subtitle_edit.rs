@@ -68,7 +68,7 @@ pub const TIMELINE_STEP: Duration = Duration::from_millis(500);
 /// How many steps `H`/`L` move the timeline cursor in one press.
 ///
 /// Five seconds a press, which crosses a scene rather than a line.
-pub const TIMELINE_LEAP: i64 = 10;
+pub const TIMELINE_LEAP: i32 = 10;
 
 /// Which pane of the subtitle edit page holds the cursor.
 ///
@@ -1075,14 +1075,11 @@ impl SubtitleEditState {
     ///
     /// A press against either end reports `false` and asks for nothing, so a held `h` at 0:00
     /// does not re-grab the same frame per repeat.
-    pub fn move_cursor(&mut self, steps: i64) -> bool {
+    pub fn move_cursor(&mut self, steps: i32) -> bool {
         if self.focus != EditFocus::Timeline {
             return false;
         }
-        let Ok(steps_abs) = u32::try_from(steps.unsigned_abs()) else {
-            return false;
-        };
-        let shift = TIMELINE_STEP.saturating_mul(steps_abs);
+        let shift = TIMELINE_STEP.saturating_mul(steps.unsigned_abs());
         let moved = if steps.is_negative() {
             self.cursor.saturating_sub(shift)
         } else {
@@ -2454,6 +2451,26 @@ mod tests {
 
         // Assert
         assert_that!(described.as_str()).contains("cue_index: 1");
+        assert_that!(described.as_str()).contains("width: 10");
+        assert_that!(described.as_str()).contains("height: 5");
+    }
+
+    /// The cursor's frame is printed in the same dumps and names a moment rather than a
+    /// cue, which is the whole reason it is a second type instead of a `Frame`.
+    #[test]
+    fn the_cursors_frame_should_describe_itself_by_moment_and_size() {
+        // Arrange
+        let mut state = ready(2);
+        state.focus_timeline();
+        state.move_cursor(1);
+        state.apply_scrub_frame(state.cursor().unwrap(), protocol(10, 5));
+
+        // Act
+        let described = format!("{:?}", state.scrub);
+
+        // Assert
+        assert_that!(described.as_str()).contains("ScrubFrame");
+        assert_that!(described.as_str()).contains("500ms");
         assert_that!(described.as_str()).contains("width: 10");
         assert_that!(described.as_str()).contains("height: 5");
     }
@@ -3983,7 +4000,7 @@ mod tests {
         // Act / Assert: and the ceiling, which is held back from the very last instant so
         // the grab lands on a frame that exists.
         let ceiling = seek_ceiling(state.duration).unwrap();
-        assert_that!(state.move_cursor(i64::from(u16::MAX))).is_true();
+        assert_that!(state.move_cursor(i32::from(u16::MAX))).is_true();
         assert_that!(state.cursor()).is_equal_to(Some(ceiling));
         state.clear_scrub_request();
         assert_that!(state.move_cursor(1)).is_false();
@@ -4004,10 +4021,25 @@ mod tests {
         state.focus_timeline();
 
         // Act
-        state.move_cursor(i64::from(u16::MAX));
+        state.move_cursor(i32::from(u16::MAX));
 
         // Assert
         assert_that!(state.cursor()).is_equal_to(Some(Duration::from_millis(3000)));
+    }
+
+    /// A page that read its cues and then had them taken away draws no timeline at all, so
+    /// there is nothing for the cursor to stand in — and no cue to seed it from either. The
+    /// status alone does not answer that, which is why the seed is what decides.
+    #[test]
+    fn the_cursor_should_be_refused_a_timeline_with_no_cues_left_in_it() {
+        // Arrange
+        let mut state = ready(3);
+        state.cues = Vec::new();
+
+        // Act / Assert
+        assert_that!(state.focus_timeline()).is_false();
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.scrub_requested()).is_false();
     }
 
     /// The keys belong to the pane holding the cursor, so a move asked for while the cue
