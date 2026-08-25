@@ -611,6 +611,24 @@ pub fn format_timestamp(at: Duration) -> String {
     )
 }
 
+/// Renders a moment to a hundredth of a second, for the timeline cursor's readout.
+///
+/// The widest of the display formats, and the only place the extra digit earns its column:
+/// the cursor's fine step is fifty milliseconds, so a tenths reading would sit still for
+/// every other press and leave the reader unable to tell a press that moved from one that
+/// was refused at the end of the media. [`format_timestamp`]'s argument for tenths is about
+/// the cue list, which draws one of these per row; this is drawn once, in a title.
+pub fn format_precise(at: Duration) -> String {
+    let seconds = at.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}.{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+        at.subsec_millis() / 10
+    )
+}
+
 /// Renders a moment as a clock reading for the timeline axis: `1:23` or `1:02:03`.
 ///
 /// The third and most compact of the three time formats here, because an axis reading is
@@ -1836,6 +1854,20 @@ mod tests {
         assert_that!(format_timestamp(Duration::ZERO).as_str()).is_equal_to("00:00:00.0");
         assert_that!(format_timestamp(milliseconds(62_300)).as_str()).is_equal_to("00:01:02.3");
         assert_that!(format_timestamp(milliseconds(3_723_999)).as_str()).is_equal_to("01:02:03.9");
+    }
+
+    /// The timeline cursor's readout. Hundredths rather than tenths because its fine step
+    /// is fifty milliseconds, which a tenths reading shows on every *other* press — and the
+    /// second digit is padded, or 7.05 would be drawn as the 7.5 it is not.
+    #[test]
+    fn format_precise_should_render_hundredths_and_pad_them() {
+        // Act / Assert
+        assert_that!(format_precise(Duration::ZERO).as_str()).is_equal_to("00:00:00.00");
+        assert_that!(format_precise(milliseconds(7_050)).as_str()).is_equal_to("00:00:07.05");
+        assert_that!(format_precise(milliseconds(7_200)).as_str()).is_equal_to("00:00:07.20");
+        // Truncated rather than rounded, the same way every other format here reads a
+        // subsecond: a cursor at 7.199 has not reached 7.20 yet.
+        assert_that!(format_precise(milliseconds(3_723_999)).as_str()).is_equal_to("01:02:03.99");
     }
 
     /// The comma is what makes it SubRip. `ffmpeg`'s demuxer reads the file this writes,

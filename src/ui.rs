@@ -27,7 +27,8 @@ use crate::{
         VideoSettingsMode, describe_track_groups,
     },
     cue::{
-        Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_timestamp,
+        Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_precise,
+        format_timestamp,
     },
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -893,28 +894,36 @@ fn render_edit_timeline(
     // the reader is a tenth of a second in or a whole one, which is the only question they
     // are asking. Yellow in the timing mode, matching the cue the keys are pointing at.
     let retiming = state.timing_mode;
-    // The cursor's own moment is appended rather than replacing anything: the cue's times say
-    // what is being judged and the cursor's moment says where the picture in the pane comes
-    // from, and with the cursor free to walk out of the cue's neighbourhood the two answers
-    // can be far apart. The `▼` is the same glyph the ruler marks the column with, so the two
-    // read as one thing seen twice rather than as two separate readouts.
-    let readings = [
-        Some(format!(
-            "{} → {}",
-            format_timestamp(cue.start),
-            format_timestamp(cue.end)
-        )),
-        shift,
-        cursor.map(|at| format!("▼ {}", format_timestamp(at))),
-    ];
-    let title = format!(
-        " Timeline ({}) ",
-        readings
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ")
-    );
+    // **The title answers for whichever pane holds the cursor, never for both at once.** The
+    // two readouts answer different questions — the cue's times say what is being judged, the
+    // cursor's moment says where the picture in the pane comes from — and only one of them is
+    // the one being moved. Showing both put three timestamps in a row that changes shape as
+    // the focus does, and the reader had to work out which two belonged together before
+    // reading either. The cue's own times are on its row in the panel throughout, so nothing
+    // is lost by standing them down while the timeline is being walked.
+    //
+    // Hundredths here where the cue's times carry tenths (`cue::format_precise`): the cursor's
+    // fine step is fifty milliseconds, and a tenths readout would sit still for every other
+    // press.
+    //
+    // The moment stands bare rather than behind a `▼` matching the ruler's mark. Now that the
+    // title carries one reading at a time there is nothing for a glyph to tell it apart from,
+    // and a triangle inside a parenthesised title reads as debris rather than as a label.
+    let readings = match cursor {
+        Some(at) => vec![format_precise(at)],
+        None => [
+            Some(format!(
+                "{} → {}",
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            )),
+            shift,
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
+    let title = format!(" Timeline ({}) ", readings.join(" · "));
     let block = Block::bordered()
         .border_style(focus_border(cursor.is_some()))
         .title(if retiming {
@@ -15344,9 +15353,11 @@ mod tests {
         app.focus_timeline();
         let timeline_focused = draw(&mut app, 90, 24);
 
-        // Assert: the title says where the cursor is, and the two draws differ.
+        // Assert: the title says where the cursor is, the ruler marks its column, and the
+        // two draws differ.
         assert_that!(cues_focused.join("\n").as_str()).does_not_contain("▼");
-        assert_that!(timeline_focused.join("\n").as_str()).contains("▼ 00:00:00.0");
+        assert_that!(timeline_focused.join("\n").as_str()).contains("Timeline (00:00:00.00)");
+        assert_that!(timeline_focused.join("\n").as_str()).contains("▼");
         assert_that!(cues_focused != timeline_focused).is_true();
 
         // Cleanup
@@ -15354,11 +15365,12 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The cursor's moment is appended to the timeline's title rather than replacing the
-    /// cue's times: with the cursor free to walk out of the cue's neighbourhood, what is
-    /// being judged and where the picture came from are two different answers.
+    /// The title answers for whichever pane holds the cursor and never for both at once.
+    /// Three timestamps in a row that changed shape with the focus made the reader work out
+    /// which two belonged together before they could read either, and the cue's own times
+    /// are on its row in the panel the whole time.
     #[test]
-    fn the_timelines_title_should_carry_the_cue_the_shift_and_the_cursor_together() {
+    fn the_timelines_title_should_read_for_one_pane_at_a_time() {
         // Arrange
         let (mut app, directory) = edit_page_app(
             "edit-title",
@@ -15368,17 +15380,41 @@ mod tests {
             ],
         );
 
-        // Act: nudge the cue, then take the cursor into the timeline and move it.
+        // The cue's times are on its row in the panel throughout, so the title is what has
+        // to be read on its own — a whole-screen assertion would find them either way.
+        let title = |app: &mut App| {
+            draw(app, 100, 24)
+                .into_iter()
+                .find(|line| line.contains("Timeline ("))
+                .expect("the timeline draws a title")
+        };
+
+        // Act: nudge the cue, with the cue panel still holding the cursor.
         app.toggle_cue_timing_mode();
         app.nudge_selected_cue(3);
+
+        // Assert: the cue's live times and how far it has moved, and no cursor reading.
+        let cues = title(&mut app);
+        assert_that!(cues.as_str()).contains("00:00:05.1 → 00:00:07.1");
+        assert_that!(cues.as_str()).contains("+0.15s");
+
+        // Act: the cursor into the timeline, four coarse steps on from the nudged cue's own
+        // moment of 5.15.
         app.focus_timeline();
         app.move_timeline_cursor(4, crate::subtitle_edit::TIMELINE_STEP);
-        let screen = draw(&mut app, 100, 24).join("\n");
 
-        // Assert: all three readings, in one title.
-        assert_that!(screen.as_str()).contains("00:00:05.1 → 00:00:07.1");
-        assert_that!(screen.as_str()).contains("+0.15s");
-        assert_that!(screen.as_str()).contains("▼ 00:00:07.1");
+        // Assert: the moment alone, to a hundredth — and the cue's readings stood down.
+        let timeline = title(&mut app);
+        assert_that!(timeline.as_str()).contains("Timeline (00:00:07.15)");
+        assert_that!(timeline.as_str()).does_not_contain("→");
+        assert_that!(timeline.as_str()).does_not_contain("+0.15s");
+        // No `▼` in front of it: with one reading at a time there is nothing for a glyph to
+        // tell it apart from, and the ruler below is where the mark belongs.
+        assert_that!(timeline.as_str()).does_not_contain("▼");
+
+        // Act / Assert: one fine step, which a tenths readout could not have shown at all.
+        app.move_timeline_cursor(1, crate::subtitle_edit::TIMELINE_FINE_STEP);
+        assert_that!(title(&mut app).as_str()).contains("Timeline (00:00:07.20)");
 
         // Cleanup
         drop(app);
@@ -15402,9 +15438,11 @@ mod tests {
         }
         let screen = draw(&mut app, 100, 24).join("\n");
 
-        // Assert: the cursor is on screen, and the axis has moved with it.
-        assert_that!(screen.as_str()).contains("▼ 00:01:30.0");
-        assert_that!(screen.matches('▼').count() >= 2).is_true();
+        // Assert: the cursor is on screen, and the axis has moved with it — the title says
+        // the moment and the ruler carries a mark for it, which it could not if the window
+        // had stayed where it was.
+        assert_that!(screen.as_str()).contains("Timeline (00:01:30.00)");
+        assert_that!(screen.matches('▼').count()).is_equal_to(1);
 
         // Cleanup
         drop(app);

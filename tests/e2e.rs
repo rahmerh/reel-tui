@@ -4906,7 +4906,7 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
     });
     let screen = app.screen();
     assert!(
-        screen.contains("▼ 00:00:00.0"),
+        screen.contains("Timeline (00:00:00.00)"),
         "the timeline should say the moment its cursor stands on:\n{screen}"
     );
 
@@ -4933,7 +4933,7 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
     // step was taken.
     let screen = app.screen();
     assert!(
-        screen.contains("▼ 00:00:00.2"),
+        screen.contains("Timeline (00:00:00.20)"),
         "four fine steps from 0:00 should put the cursor two tenths in:\n{screen}"
     );
 
