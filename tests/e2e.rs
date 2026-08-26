@@ -4953,6 +4953,21 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
         "the preview should be showing the selected cue's still again, but the brightest \
          shade drawn was {returned}:\n{screen}"
     );
+
+    // Act: back into the timeline, and then `q` — which is a page the reader entered once
+    // and so a page one press should leave, whichever of its two panes holds the cursor.
+    app.press(ctrl('j'));
+    app.pump();
+    app.press(key(KeyCode::Char('q')));
+    app.pump();
+
+    // Assert: out on the track list rather than back in the cue panel.
+    assert_eq!(
+        app.app.layer,
+        Layer::Streams,
+        "`q` from the timeline should leave the page, not the pane:\n{}",
+        app.screen()
+    );
 }
 
 /// The brightest channel of any colour the preview pane painted.
