@@ -242,6 +242,29 @@ pub(crate) fn is_attached_picture(stream: &BTreeMap<String, Value>) -> bool {
         == Some(1)
 }
 
+/// The QuickTime chapter track: the `text`-tagged data stream MP4 and MOV keep their
+/// chapter titles in, which the `mov` demuxer reports *twice* — once as the chapters
+/// `-show_chapters` lists, and once as an opaque `bin_data` stream in `streams`.
+///
+/// It is not a track a reader has any business seeing or Reel any business copying.
+/// Mapping it explicitly is wrong in both directions: `ffmpeg -map_chapters 0` writes
+/// the chapters back out as a fresh text track of its own, so an MP4 remuxed with it
+/// mapped comes out carrying the same chapters twice, while Matroska stores chapters
+/// outside the stream table entirely and refuses the stream outright — "Only audio,
+/// video, and subtitles are supported for Matroska" — which turned every MP4 with
+/// chapters into a file that could not be converted to MKV at all.
+///
+/// Keyed on the container's own tag rather than on the codec, because `bin_data` is
+/// simply what FFmpeg calls a stream it cannot interpret: GoPro telemetry (`gpmd`)
+/// reads as `bin_data` too and is a real track that MP4 both stores and preserves.
+/// The chapter list is required to be non-empty, so a `text` stream a demuxer read no
+/// chapters out of is still carried rather than silently dropped.
+pub(crate) fn is_chapter_track(info: &MediaInfo, stream: &BTreeMap<String, Value>) -> bool {
+    !info.chapters.is_empty()
+        && stream.get("codec_type").and_then(Value::as_str) == Some("data")
+        && stream.get("codec_tag_string").and_then(Value::as_str) == Some("text")
+}
+
 pub(crate) fn is_still_image(
     stream: &BTreeMap<String, Value>,
     format: &BTreeMap<String, Value>,
@@ -825,6 +848,41 @@ mod tests {
         assert!(is_attached_picture(&cover));
         assert!(!is_attached_picture(&ordinary));
         assert!(!is_attached_picture(&missing));
+    }
+
+    #[test]
+    fn is_chapter_track_should_only_match_the_text_data_stream_a_chaptered_file_carries() {
+        // Arrange: the same MP4 with and without chapters, plus the two streams that
+        // look like the chapter track without being it — GoPro telemetry, which is also
+        // `bin_data`, and a QuickTime text *subtitle*, which is a track the reader edits.
+        let with_chapters = |streams: Value| {
+            MediaInfo::from_json_unchecked(serde_json::json!({
+                "streams": streams,
+                "chapters": [{"id": 0, "start_time": "0.0"}],
+            }))
+            .unwrap()
+        };
+        let chapter_stream = serde_json::json!({
+            "index": 1, "codec_type": "data", "codec_name": "bin_data", "codec_tag_string": "text",
+        });
+        let telemetry = serde_json::json!({
+            "index": 1, "codec_type": "data", "codec_name": "bin_data", "codec_tag_string": "gpmd",
+        });
+        let subtitle = serde_json::json!({
+            "index": 1, "codec_type": "subtitle", "codec_name": "mov_text", "codec_tag_string": "text",
+        });
+        let chaptered = with_chapters(serde_json::json!([chapter_stream.clone()]));
+        let unchaptered =
+            MediaInfo::from_json_unchecked(serde_json::json!({"streams": [chapter_stream]}))
+                .unwrap();
+
+        // Act / Assert
+        assert!(is_chapter_track(&chaptered, &chaptered.streams[0]));
+        assert!(!is_chapter_track(&unchaptered, &unchaptered.streams[0]));
+        let telemetry = with_chapters(serde_json::json!([telemetry]));
+        assert!(!is_chapter_track(&telemetry, &telemetry.streams[0]));
+        let subtitle = with_chapters(serde_json::json!([subtitle]));
+        assert!(!is_chapter_track(&subtitle, &subtitle.streams[0]));
     }
 
     #[test]
