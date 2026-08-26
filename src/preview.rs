@@ -481,7 +481,25 @@ pub struct WarmRequest {
     pub cache_tracks: usize,
 }
 
-/// One cue's span to play: a stretch of video, decoded and rendered ahead of time.
+/// What a span being played is *about*, which is also how the page recognises it coming back.
+///
+/// The subtitle edit page has two cursors and either of them can ask for a playback, so a
+/// span cannot be identified by a cue index alone: the timeline cursor names a moment no cue
+/// points at. One enum rather than an index and an optional moment, because exactly one of
+/// the two is true of any span and a pair of fields would let both — or neither — be set.
+///
+/// It is also the test a returning span is dropped by. A cue's span is stale once the cursor
+/// has moved to another line; the cursor's is stale once the cursor has moved at all, which
+/// is why the moment itself is the identity rather than something standing in for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackAnchor {
+    /// A cue's own span, named by its position in the page's cue list.
+    Cue(usize),
+    /// A stretch around the moment the timeline cursor stands on.
+    Cursor(Duration),
+}
+
+/// One span to play: a stretch of video, decoded and rendered ahead of time.
 ///
 /// Nothing here is cached. The frame cache keys on a *cue* and evicts whole tracks, and a
 /// playback is a run of frames keyed on time — storing them would fill the cache with
@@ -493,15 +511,15 @@ pub struct PlaybackRequest {
     /// playback must not abandon the background pass that is still filling the track in.
     pub generation: u64,
     pub source: FrameSource,
-    /// Which cue in the page's list this span is around, so a span that arrives after the
-    /// cursor has moved on can be discarded rather than played under the wrong line.
-    pub cue_index: usize,
-    pub cue: Cue,
-    /// Every cue that appears at some point in the span, this one among them, in file order.
+    /// What this span is around, so one that arrives after the page has moved on can be
+    /// discarded rather than played under a line — or a moment — it is not about.
+    pub anchor: PlaybackAnchor,
+    /// Every cue that appears at some point in the span, in file order.
     ///
     /// What gets burned in, so the playback shows the stretch of media as a viewer would
     /// see it rather than with everything but one line removed. See
-    /// [`crate::cue::on_screen_between`].
+    /// [`crate::cue::on_screen_between`] for a cue's span and
+    /// [`crate::cue::on_screen_during`] for the cursor's, which forces nothing into the list.
     pub on_screen: Vec<Cue>,
     /// Where the span starts in the media, which is also where its timestamps are reset to
     /// by `-ss` — so the cues are staged relative to it.
@@ -741,10 +759,13 @@ pub enum PreviewEvent {
         done: usize,
         total: usize,
     },
-    /// A cue's span, decoded and ready to play, or why there is none.
+    /// A span, decoded and ready to play, or why there is none.
+    ///
+    /// Carries what it was asked for rather than a cue index, because either cursor on the
+    /// page can ask for one — see [`PlaybackAnchor`].
     Playback {
         generation: u64,
-        cue_index: usize,
+        anchor: PlaybackAnchor,
         outcome: PlaybackOutcome,
     },
 }
@@ -1267,6 +1288,41 @@ pub fn affordable_fps(fps: u32, span: Duration, speed: PlaybackSpeed, pixels: (u
 pub fn playback_span(cue: &Cue, pad: Duration, duration: Duration) -> (Duration, Duration) {
     let start = cue.start.saturating_sub(pad);
     let end = cue.end.saturating_add(pad);
+    let end = if duration.is_zero() {
+        end
+    } else {
+        end.min(duration)
+    };
+    (start, end.max(start))
+}
+
+/// How far either side of the timeline cursor its playback reaches, before padding.
+///
+/// **Half a second each way, and deliberately not configurable.** A cue's span is a thing
+/// with a length of its own, so how much context to put round it is a matter of taste and
+/// the preview-settings popup asks. A moment is not: the cursor names one instant, and a
+/// playback of an instant is nothing at all — so this is the length the moment is *given*,
+/// which is a property of the feature rather than a preference. A second is long enough to
+/// tell whether a line lands with the shot and short enough that a press of `p` starts
+/// playing rather than starts decoding.
+pub const CURSOR_PLAYBACK_REACH: Duration = Duration::from_millis(500);
+
+/// The stretch of media a playback from the timeline cursor covers.
+///
+/// [`CURSOR_PLAYBACK_REACH`] either side of the moment, **plus the configured padding on top
+/// of that** — the two are added rather than one replacing the other, so a reader who has
+/// widened the padding to see more around a cue sees the same extra either side of a moment.
+///
+/// Clamped at both ends for the reason [`playback_span`] is, and against the same zero-length
+/// duration meaning "unknown" rather than "empty file".
+pub fn cursor_playback_span(
+    at: Duration,
+    pad: Duration,
+    duration: Duration,
+) -> (Duration, Duration) {
+    let reach = CURSOR_PLAYBACK_REACH.saturating_add(pad);
+    let start = at.saturating_sub(reach);
+    let end = at.saturating_add(reach);
     let end = if duration.is_zero() {
         end
     } else {
@@ -1913,7 +1969,7 @@ fn playback(
     events
         .send(PreviewEvent::Playback {
             generation: request.generation,
-            cue_index: request.cue_index,
+            anchor: request.anchor,
             outcome,
         })
         .is_ok()
@@ -1938,15 +1994,24 @@ fn decoded(
     // `-ss` before `-i` resets the output's timestamps to. Staging them at their original
     // times instead would put the lines minutes past the end of a span a few seconds long,
     // and the playback would show a silent picture with no subtitle in it at all.
-    let staged = request.source.staged_name(CueSlot::Playback);
-    let path = request.source.workspace.join(&staged);
-    let text = request
-        .source
-        .stage_span(&request.on_screen, request.span_start);
-    if let Err(error) = std::fs::write(&path, text) {
-        return Some(PlaybackOutcome::Failed(format!(
-            "Could not stage the cue to burn in: {error}"
-        )));
+    //
+    // **Nothing at all is an ordinary answer**, and it is the timeline cursor's answer for
+    // most of a film: a span the reader pointed at need not hold a single line. Staged as an
+    // empty file it would be a subtitle file libass refuses, failing a playback that simply
+    // has nothing to burn — the same reason `frame_command` takes an `Option`, arrived at
+    // from the other end of the page.
+    let staged =
+        (!request.on_screen.is_empty()).then(|| request.source.staged_name(CueSlot::Playback));
+    if let Some(staged) = staged.as_deref() {
+        let path = request.source.workspace.join(staged);
+        let text = request
+            .source
+            .stage_span(&request.on_screen, request.span_start);
+        if let Err(error) = std::fs::write(&path, text) {
+            return Some(PlaybackOutcome::Failed(format!(
+                "Could not stage the cue to burn in: {error}"
+            )));
+        }
     }
     // **Cleared before the run, not after it.** Every playback of this page writes its sound
     // to the same name in the same workspace, and a run that asks for no sound — a muted
@@ -1957,7 +2022,7 @@ fn decoded(
     // sound, which is the same guarantee arrived at from the other side.
     let audio_path = request.source.workspace.join(AUDIO_FILE);
     let _ = std::fs::remove_file(&audio_path);
-    let mut command = playback_command(request, span, &staged);
+    let mut command = playback_command(request, span, staged.as_deref());
     let pixels = match played(run_cancellable(&mut command, abandoned)) {
         SpanOutcome::Abandoned => return None,
         SpanOutcome::Failed(message) => return Some(PlaybackOutcome::Failed(message)),
@@ -2037,7 +2102,7 @@ fn played(run: RunOutcome) -> SpanOutcome {
 /// text out against the source's own resolution before anything shrinks it, so the burn is
 /// legible at a size where a scaled-down overlay would not be. `fps` before `scale`, so the
 /// frames thrown away are thrown away before they are resized rather than after.
-fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> Command {
+fn playback_command(request: &PlaybackRequest, span: Duration, staged: Option<&str>) -> Command {
     let mut command = Command::new("ffmpeg");
     command
         .current_dir(&request.source.workspace)
@@ -2088,14 +2153,24 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: &str) -> 
 /// At normal speed no `setpts` is emitted at all, so the command is byte-identical to the
 /// one this feature was added to — which is what keeps the default path free of a filter it
 /// would only ever be a no-op in.
-fn video_filters(request: &PlaybackRequest, staged: &str) -> String {
+///
+/// `staged` is `None` for a span with nothing on screen anywhere in it, which is what the
+/// timeline cursor's playback reaches most of the time. The burn is dropped rather than
+/// pointed at an empty file, for the reason [`frame_command`] drops it.
+fn video_filters(request: &PlaybackRequest, staged: Option<&str>) -> String {
     let (width, height) = request.pixels;
-    let mut filters = format!("subtitles={staged}");
-    if !request.speed.is_normal() {
-        filters.push_str(&format!(",setpts=PTS/{}", request.speed.as_f64()));
+    // Collected and joined rather than pushed onto a string, so a chain that starts with no
+    // burn cannot open on a comma — which `ffmpeg` rejects outright as an empty filter.
+    let mut filters = Vec::new();
+    if let Some(staged) = staged {
+        filters.push(format!("subtitles={staged}"));
     }
-    filters.push_str(&format!(",fps={},scale={width}:{height}", request.fps));
-    filters
+    if !request.speed.is_normal() {
+        filters.push(format!("setpts=PTS/{}", request.speed.as_f64()));
+    }
+    filters.push(format!("fps={}", request.fps));
+    filters.push(format!("scale={width}:{height}"));
+    filters.join(",")
 }
 
 /// The narrowest and widest ratio one `atempo` is reliable over.
@@ -5648,6 +5723,79 @@ mod tests {
         assert_that!(end).is_equal_to(start);
     }
 
+    /// A moment has no length of its own, so the cursor's playback is given one — half a
+    /// second either side — and the configured padding is added *on top* of that rather
+    /// than replacing it, so widening the padding widens this span too.
+    #[test]
+    fn the_cursors_span_should_be_a_second_around_the_moment_plus_the_padding() {
+        // Act / Assert: with no padding configured it is exactly the second.
+        let (start, end) = cursor_playback_span(
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::from_millis(29_500));
+        assert_that!(end).is_equal_to(Duration::from_millis(30_500));
+        assert_that!(end - start).is_equal_to(Duration::from_secs(1));
+
+        // Act / Assert: and the padding is added either side of that, not instead of it.
+        let (start, end) = cursor_playback_span(
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::from_millis(27_500));
+        assert_that!(end).is_equal_to(Duration::from_millis(32_500));
+    }
+
+    /// Both edges are real, the same way a cue's span's are: there is nothing before 0:00
+    /// and nothing past the end of the file, and an unknown length clamps neither.
+    #[test]
+    fn the_cursors_span_should_stop_at_the_medias_edges() {
+        // Act / Assert: a moment closer to the start than the reach is long.
+        let (start, end) = cursor_playback_span(
+            Duration::from_millis(200),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::ZERO);
+        assert_that!(end).is_equal_to(Duration::from_millis(700));
+
+        // Act / Assert: and one at the very end of it.
+        let (start, end) = cursor_playback_span(
+            Duration::from_millis(59_900),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        assert_that!(start).is_equal_to(Duration::from_millis(59_400));
+        assert_that!(end).is_equal_to(Duration::from_secs(60));
+
+        // Act / Assert: a length that would not parse arrives as zero and clamps nothing,
+        // for the reason `playback_span` does not clamp against one either.
+        let (start, end) =
+            cursor_playback_span(Duration::from_secs(30), Duration::ZERO, Duration::ZERO);
+        assert_that!(start).is_equal_to(Duration::from_millis(29_500));
+        assert_that!(end).is_equal_to(Duration::from_millis(30_500));
+    }
+
+    /// A cursor standing past the end of the media — which a track whose length ffprobe
+    /// misreported can put it at — must not produce a span that ends before it starts: an
+    /// inverted one becomes a negative `-t`, which `ffmpeg` reads as "no limit" and decodes
+    /// the rest of the file into memory.
+    #[test]
+    fn a_cursor_span_past_the_end_of_the_media_should_collapse_rather_than_invert() {
+        // Act
+        let (start, end) = cursor_playback_span(
+            Duration::from_secs(90),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+
+        // Assert
+        assert_that!(start).is_equal_to(Duration::from_millis(89_500));
+        assert_that!(end).is_equal_to(start);
+    }
+
     /// The whole span is decoded before a frame of it is shown — that is what buys a
     /// slideshow that never stutters — so it is real resident memory, and the frame rate is
     /// the only one of its three inputs that is not the user's to choose.
@@ -5849,7 +5997,7 @@ mod tests {
         let arguments = arguments_of(&playback_command(
             &request,
             Duration::from_secs(3),
-            "playback.srt",
+            Some("playback.srt"),
         ));
 
         // Assert: `setpts` sits between the burn and the rate filter — behind `subtitles`,
@@ -5868,11 +6016,42 @@ mod tests {
         let ordinary = arguments_of(&playback_command(
             &request,
             Duration::from_secs(3),
-            "playback.srt",
+            Some("playback.srt"),
         ));
         assert_that!(filter_graph(&ordinary).as_str())
             .is_equal_to("subtitles=playback.srt,fps=10,scale=320:240");
         assert_that!(ordinary.iter().any(|argument| argument == "-af")).is_false();
+    }
+
+    /// Most of a film has no subtitle on it, and the timeline cursor's playback reaches
+    /// those stretches constantly. The burn is dropped rather than pointed at an empty file
+    /// — which is not a subtitle file libass will read — and the chain must not open on the
+    /// comma the burn left behind either, since `ffmpeg` refuses an empty filter outright.
+    #[test]
+    fn a_span_with_nothing_on_screen_should_be_decoded_with_no_burn_at_all() {
+        // Arrange
+        let directory = PathBuf::from("/tmp/reel-tui-preview/playback-bare");
+        let mut request = playback_request_at(
+            Path::new("/media/show.mkv"),
+            &directory,
+            cue(2000, 3000, "line"),
+            PlaybackSpeed::NORMAL,
+        );
+        request.on_screen.clear();
+
+        // Act
+        let ordinary = arguments_of(&playback_command(&request, Duration::from_secs(3), None));
+
+        // Assert: no `subtitles`, and no leading comma where it used to be.
+        assert_that!(argument_after(&ordinary, "-vf"))
+            .is_equal_to(Some("fps=10,scale=320:240".to_string()));
+
+        // Act / Assert: and the same with a speed filter in the chain, which is the other
+        // way the graph could come to start on a comma.
+        request.speed = PlaybackSpeed::HALF;
+        let slowed = arguments_of(&playback_command(&request, Duration::from_secs(3), None));
+        assert_that!(argument_after(&slowed, "-vf"))
+            .is_equal_to(Some("setpts=PTS/0.5,fps=10,scale=320:240".to_string()));
     }
 
     /// One `atempo` cannot halve a span twice, so a quarter speed has to come out as two of
@@ -5925,7 +6104,7 @@ mod tests {
         let arguments = arguments_of(&playback_command(
             &request,
             Duration::from_secs(3),
-            "playback.srt",
+            Some("playback.srt"),
         ));
 
         // Assert: no second output at all — not a silenced one.
@@ -6089,9 +6268,9 @@ mod tests {
         PlaybackRequest {
             generation: 1,
             source: source(media, workspace),
-            cue_index: 0,
-            on_screen: vec![cue.clone()],
-            cue,
+            anchor: PlaybackAnchor::Cue(0),
+            on_screen: vec![cue],
+
             span_start: Duration::from_secs(1),
             span_end: Duration::from_secs(4),
             fps: 10,
@@ -6129,7 +6308,7 @@ mod tests {
         );
 
         // Act
-        let command = playback_command(&request, Duration::from_secs(3), "playback.srt");
+        let command = playback_command(&request, Duration::from_secs(3), Some("playback.srt"));
         let arguments: Vec<String> = command
             .get_args()
             .map(|argument| argument.to_string_lossy().to_string())
@@ -6193,7 +6372,7 @@ mod tests {
         });
 
         // Act
-        let command = playback_command(&request, Duration::from_secs(3), "playback.srt");
+        let command = playback_command(&request, Duration::from_secs(3), Some("playback.srt"));
         let arguments: Vec<String> = command
             .get_args()
             .map(|argument| argument.to_string_lossy().to_string())
@@ -6764,14 +6943,14 @@ mod tests {
         let event = events.try_recv().expect("a live playback reports its span");
         let PreviewEvent::Playback {
             generation,
-            cue_index,
+            anchor,
             outcome: PlaybackOutcome::Ready(frames),
         } = event
         else {
             panic!("the span should have decoded");
         };
         assert_that!(generation).is_equal_to(1);
-        assert_that!(cue_index).is_equal_to(0);
+        assert_that!(anchor).is_equal_to(PlaybackAnchor::Cue(0));
         assert_that!(frames.count() > 0).is_true();
 
         // Act / Assert: the same request against a generation that has moved on says

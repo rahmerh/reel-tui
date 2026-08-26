@@ -19,8 +19,8 @@ use ratatui_image::{FilterType, Resize};
 use crate::audio::{AudioOutput, AudioSource, frame_index_at};
 use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes, shares_screen};
 use crate::preview::{
-    CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackFrames, ScrubTarget,
-    seek_ceiling, seek_for,
+    CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackAnchor, PlaybackFrames,
+    ScrubTarget, seek_ceiling, seek_for,
 };
 use crate::subtitle::SubtitleSource;
 
@@ -277,16 +277,17 @@ impl std::fmt::Debug for ScrubFrame {
     }
 }
 
-/// One cue's span, decoded and playing.
+/// One span, decoded and playing.
 ///
 /// Holds the whole span's raw pixels rather than encoding them all up front: a protocol is
 /// several times the size of the pixels it came from, and only one of them is ever on
 /// screen. The frame under the playhead is encoded as it is reached and kept until the
 /// playhead leaves it, so a step that does not cross a frame boundary costs nothing at all.
 pub struct Playback {
-    /// Which cue this span was played for. A span that arrives after the cursor has moved
-    /// is dropped rather than played under a line it is not about.
-    cue_index: usize,
+    /// What this span was played for — a cue, or a moment the timeline cursor stood on. A
+    /// span that arrives after the page has moved on is dropped rather than played under
+    /// something it is not about.
+    anchor: PlaybackAnchor,
     frames: PlaybackFrames,
     /// Where the sound is, which is the only clock here — see [`crate::audio`]. Held so
     /// that dropping the page stops the device, whichever way the page was left.
@@ -326,7 +327,7 @@ pub enum PlaybackStep {
 
 impl Playback {
     pub fn new(
-        cue_index: usize,
+        anchor: PlaybackAnchor,
         frames: PlaybackFrames,
         source: Box<dyn AudioSource>,
         looping: bool,
@@ -334,7 +335,7 @@ impl Playback {
         let cells = frames.cells;
         let output = source.open();
         Self {
-            cue_index,
+            anchor,
             frames,
             output,
             source,
@@ -345,8 +346,8 @@ impl Playback {
         }
     }
 
-    pub fn cue_index(&self) -> usize {
-        self.cue_index
+    pub fn anchor(&self) -> PlaybackAnchor {
+        self.anchor
     }
 
     /// Where in the media the playhead is, or `None` before the sound has started.
@@ -453,19 +454,19 @@ impl Playback {
 }
 
 /// `Protocol` has no `Debug` and the frame buffer is megabytes of pixels, so this reports
-/// what a reader of a failure message actually wants: which cue, how far in, out of what.
+/// what a reader of a failure message actually wants: what it is of, how far in, out of what.
 impl std::fmt::Debug for Playback {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Playback")
-            .field("cue_index", &self.cue_index)
+            .field("anchor", &self.anchor)
             .field("shown", &self.shown)
             .field("frames", &self.frames)
             .finish()
     }
 }
 
-/// Whether the page is playing a cue's span, getting ready to, or neither.
+/// Whether the page is playing a span, getting ready to, or neither.
 ///
 /// One field rather than a set of flags, so the audio device is released by every way of
 /// leaving the page — the same reason the page itself is one `Option` on `App`.
@@ -476,7 +477,7 @@ pub enum PlaybackState {
     /// The span is being decoded. The still frame stays on screen throughout, so the page
     /// does not blank for the second or two this takes.
     Preparing {
-        cue_index: usize,
+        anchor: PlaybackAnchor,
     },
     Playing(Playback),
 }
@@ -645,12 +646,12 @@ pub struct SubtitleEditState {
     /// reason a moment the reader has left could not be drawn says nothing about the one they
     /// are on now.
     scrub_error: Option<(Duration, String)>,
-    /// Why the last playback of the cue at this index could not run.
+    /// Why the last playback of this cue — or of this moment — could not run.
     ///
-    /// Keyed on the cue for the same reason `frame_error` is, and on the status row for the
-    /// same reason too: a playback is asked for by a keypress against one line, and the
-    /// reason it failed says nothing about the next one.
-    playback_error: Option<(usize, String)>,
+    /// Keyed on what was asked for, for the same reason `frame_error` is, and on the status
+    /// row for the same reason too: a playback is asked for by a keypress against one line
+    /// or one moment, and the reason it failed says nothing about the next one.
+    playback_error: Option<(PlaybackAnchor, String)>,
     workspace: PreviewWorkspace,
 }
 
@@ -813,6 +814,31 @@ impl SubtitleEditState {
     /// as the burn-in being wrong.
     pub fn frame(&self) -> Option<&Protocol> {
         self.frame_for(self.selected)
+    }
+
+    /// The still the preview pane may fall back on, which is not always the selected cue's.
+    ///
+    /// With the cue panel holding the cursor the two are the same question: the selection is
+    /// what the page points at, so its frame is the picture.
+    ///
+    /// With the *timeline* holding it they are not. The cue's frame stands in only while the
+    /// cursor is still on the moment [`Self::focus_timeline`] seeded it with — which is why
+    /// `Ctrl+J` costs no grab at all, the picture already on screen being the right one. Once
+    /// the cursor has moved, that frame is a picture of another moment, and handing it to a
+    /// pane whose title names the moment the cursor is on is the page contradicting itself.
+    ///
+    /// **This is what `p` used to fall through to.** Announcing a playback puts "Preparing
+    /// playback…" on the status row, that row comes out of the preview pane's height, and the
+    /// resize drops the cursor's frame ([`Self::set_preview_cells`]) — so for the second or
+    /// two a span takes to decode the pane showed the selected cue's still, which on a page
+    /// entered and left alone is the first cue of the track. Nothing is drawn there now: an
+    /// empty pane is a page a little behind, where the wrong frame is a page answering the
+    /// wrong question.
+    pub fn still_frame(&self) -> Option<&Protocol> {
+        match self.cursor() {
+            Some(at) if self.cursor_seed() != Some(at) => None,
+            _ => self.frame(),
+        }
     }
 
     fn frame_for(&self, cue_index: usize) -> Option<&Protocol> {
@@ -1048,11 +1074,16 @@ impl SubtitleEditState {
         if self.focus == EditFocus::Timeline || self.status != LoadStatus::Ready {
             return false;
         }
-        let Some(seed) = self.selected_cue().map(|cue| seek_for(cue, self.duration)) else {
+        let Some(seed) = self.cursor_seed() else {
             return false;
         };
         self.focus = EditFocus::Timeline;
-        self.cursor = seed.min(self.cursor_ceiling());
+        self.cursor = seed;
+        // A span playing for the cue the reader has just stopped pointing at is the same
+        // defect `select_cue` exists to prevent, arrived at from the other direction: the
+        // cue panel no longer marks a selection while the cursor is here, so a playback
+        // still running would be about a line nothing on screen names.
+        self.stop_playback();
         // Left for the first draw to fill in, so the reader arrives on the window the
         // selected cue had already chosen rather than on one left over from a previous visit.
         self.window_start = None;
@@ -1081,6 +1112,9 @@ impl SubtitleEditState {
     /// moment measured against cues that no longer exist.
     fn leave_timeline(&mut self) {
         self.focus = EditFocus::Cues;
+        // The cursor is about to stop existing, so a span playing around where it stood is
+        // about a moment the page no longer points at — see [`Self::focus_timeline`].
+        self.stop_playback();
         self.cursor = Duration::ZERO;
         self.window_start = None;
         self.scrub = None;
@@ -1160,6 +1194,18 @@ impl SubtitleEditState {
                 .map(|cue| cue.end)
                 .unwrap_or(Duration::ZERO)
         })
+    }
+
+    /// The moment the cursor is seeded on when the timeline takes it: the selected cue's own.
+    ///
+    /// [`crate::preview::seek_for`] rather than the cue's start, because that is the instant
+    /// the still in the pane was grabbed at — see [`Self::focus_timeline`]. Written down once
+    /// rather than at each of its two callers, since the other is [`Self::still_frame`], which
+    /// asks whether the cursor is *still* standing here: two spellings of the same moment that
+    /// drifted apart would leave the pane showing a picture of a moment the cursor has left.
+    fn cursor_seed(&self) -> Option<Duration> {
+        self.selected_cue()
+            .map(|cue| seek_for(cue, self.duration).min(self.cursor_ceiling()))
     }
 
     /// What the frame worker needs in order to draw the moment the cursor stands on.
@@ -1362,17 +1408,17 @@ impl SubtitleEditState {
         }
     }
 
-    /// Records that a span is being decoded for `cue_index`, clearing any earlier reason.
-    pub fn prepare_playback(&mut self, cue_index: usize) {
+    /// Records that a span is being decoded for `anchor`, clearing any earlier reason.
+    pub fn prepare_playback(&mut self, anchor: PlaybackAnchor) {
         self.playback_error = None;
-        self.playback = PlaybackState::Preparing { cue_index };
+        self.playback = PlaybackState::Preparing { anchor };
     }
 
-    /// Whether a span is being decoded, and for which cue — so one arriving for a cue the
-    /// cursor has since left can be dropped.
-    pub fn preparing_playback(&self) -> Option<usize> {
+    /// Whether a span is being decoded, and what for — so one arriving for a cue the cursor
+    /// has since left, or a moment it has since moved off, can be dropped.
+    pub fn preparing_playback(&self) -> Option<PlaybackAnchor> {
         match self.playback {
-            PlaybackState::Preparing { cue_index } => Some(cue_index),
+            PlaybackState::Preparing { anchor } => Some(anchor),
             _ => None,
         }
     }
@@ -1383,27 +1429,45 @@ impl SubtitleEditState {
     /// looping playback can open another when it comes round — see [`Playback`].
     pub fn begin_playback(
         &mut self,
-        cue_index: usize,
+        anchor: PlaybackAnchor,
         frames: PlaybackFrames,
         source: Box<dyn AudioSource>,
         looping: bool,
     ) {
         self.playback_error = None;
-        self.playback = PlaybackState::Playing(Playback::new(cue_index, frames, source, looping));
+        self.playback = PlaybackState::Playing(Playback::new(anchor, frames, source, looping));
     }
 
     /// Records why a span could not be played, and stops waiting for it.
-    pub fn fail_playback(&mut self, cue_index: usize, message: String) {
+    pub fn fail_playback(&mut self, anchor: PlaybackAnchor, message: String) {
         self.playback = PlaybackState::Idle;
-        self.playback_error = Some((cue_index, message));
+        self.playback_error = Some((anchor, message));
     }
 
-    /// Why the cue under the cursor could not be played, if that is why it is not playing.
+    /// Why what the page is pointing at could not be played, if that is why nothing is.
+    ///
+    /// Kept only while the reader is still pointing at what failed, the same way
+    /// [`Self::frame_error`] is: a message about a cue is stale the moment the cursor moves
+    /// to another one, and a message about a moment is stale the moment the cursor leaves it.
+    /// The pane the cursor is in has to match too — a failure about a cue says nothing about
+    /// the moment being scrubbed, and vice versa.
     pub fn playback_error(&self) -> Option<&str> {
         self.playback_error
             .as_ref()
-            .filter(|(cue_index, _)| *cue_index == self.selected)
+            .filter(|(anchor, _)| self.anchor_is_current(*anchor))
             .map(|(_, message)| message.as_str())
+    }
+
+    /// Whether `anchor` still names what the page is pointing at.
+    ///
+    /// The one place the two cursors' staleness rules are written down, read by everything
+    /// that has to decide whether a span — or a message about one — is still about what the
+    /// reader is looking at.
+    pub fn anchor_is_current(&self, anchor: PlaybackAnchor) -> bool {
+        match anchor {
+            PlaybackAnchor::Cue(index) => self.focus == EditFocus::Cues && index == self.selected,
+            PlaybackAnchor::Cursor(at) => self.focus == EditFocus::Timeline && at == self.cursor,
+        }
     }
 
     /// Stops any playback, releasing the audio device with it. Reports whether there was
@@ -3341,7 +3405,7 @@ mod tests {
         looping: bool,
     ) {
         state.set_preview_cells(Size::new(frames.cells.width, frames.cells.height * 4));
-        state.begin_playback(cue_index, frames, source, looping);
+        state.begin_playback(PlaybackAnchor::Cue(cue_index), frames, source, looping);
     }
 
     /// The silent path, asked for by name — the same `SilentOutput` a machine with no sound
@@ -3662,7 +3726,7 @@ mod tests {
         let mut state = ready(3);
         state.set_preview_cells(Size::new(8, 4));
         state.begin_playback(
-            0,
+            PlaybackAnchor::Cue(0),
             span(30, Size::new(8, 4), 10),
             Box::new(SilentSource),
             false,
@@ -3699,7 +3763,7 @@ mod tests {
         let mut state = ready(3);
         state.set_preview_cells(cells);
         state.begin_playback(
-            0,
+            PlaybackAnchor::Cue(0),
             PlaybackFrames::new(
                 vec![0; frame_bytes(cells) * 3],
                 test_shape(cells),
@@ -3751,7 +3815,7 @@ mod tests {
         let mut state = ready(3);
         state.set_preview_cells(cells);
         state.begin_playback(
-            0,
+            PlaybackAnchor::Cue(0),
             PlaybackFrames::new(
                 vec![120; stride * 3],
                 test_shape(cells),
@@ -3791,7 +3855,7 @@ mod tests {
         let cells = Size::new(4, 2);
         state.set_preview_cells(Size::new(4, 8));
         state.begin_playback(
-            0,
+            PlaybackAnchor::Cue(0),
             PlaybackFrames::new(
                 vec![0; frame_bytes(cells) * 2],
                 test_shape(cells),
@@ -3817,7 +3881,7 @@ mod tests {
         // Arrange: a page nothing has drawn yet.
         let mut state = ready(3);
         state.begin_playback(
-            0,
+            PlaybackAnchor::Cue(0),
             span(4, Size::new(4, 2), 10),
             Box::new(SilentSource),
             false,
@@ -3841,11 +3905,11 @@ mod tests {
     fn a_playback_should_be_stoppable_before_it_has_started() {
         // Arrange
         let mut state = ready(3);
-        state.prepare_playback(0);
+        state.prepare_playback(PlaybackAnchor::Cue(0));
 
         // Assert: waiting, and saying so.
         assert_that!(state.playback_active()).is_true();
-        assert_that!(state.preparing_playback()).is_equal_to(Some(0));
+        assert_that!(state.preparing_playback()).is_equal_to(Some(PlaybackAnchor::Cue(0)));
         assert_that!(state.playback_frame().is_none()).is_true();
 
         // Act
@@ -3866,10 +3930,13 @@ mod tests {
     fn a_playback_that_failed_should_explain_itself_under_the_cue_it_was_asked_for() {
         // Arrange
         let mut state = ready(3);
-        state.prepare_playback(0);
+        state.prepare_playback(PlaybackAnchor::Cue(0));
 
         // Act
-        state.fail_playback(0, "Could not play this cue: no such file".to_string());
+        state.fail_playback(
+            PlaybackAnchor::Cue(0),
+            "Could not play this cue: no such file".to_string(),
+        );
 
         // Assert
         assert_that!(state.playback_active()).is_false();
@@ -3881,7 +3948,59 @@ mod tests {
         assert_that!(state.playback_error()).is_none();
 
         // Act / Assert: asking again clears it, so a retry that works leaves nothing behind.
-        state.prepare_playback(1);
+        state.prepare_playback(PlaybackAnchor::Cue(1));
+        assert_that!(state.playback_error()).is_none();
+    }
+
+    /// The cursor's playback fails against a moment rather than a line, so the reason keeps
+    /// the moment's company: it stays only while the reader is still pointing at it, and it
+    /// belongs to the timeline rather than to whatever cue happens to be selected underneath.
+    #[test]
+    fn a_playback_that_failed_should_explain_itself_under_the_moment_it_was_asked_for() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        let at = state.cursor().expect("the timeline holds the cursor");
+
+        // Act
+        state.fail_playback(
+            PlaybackAnchor::Cursor(at),
+            "Could not play this moment: no video".to_string(),
+        );
+
+        // Assert
+        assert_that!(state.playback_error())
+            .is_equal_to(Some("Could not play this moment: no video"));
+
+        // Act / Assert: it does not follow the cursor onto a moment it is not about.
+        assert_that!(state.move_cursor(1, TIMELINE_STEP)).is_true();
+        assert_that!(state.playback_error()).is_none();
+    }
+
+    /// Each anchor is answered for by the pane that owns it. A reason about a cue says
+    /// nothing about the moment being scrubbed and vice versa, so the focus is half of the
+    /// test rather than an afterthought — without it, leaving the timeline would leave a
+    /// message about a moment on screen under a cue.
+    #[test]
+    fn a_reason_should_belong_to_the_pane_that_holds_the_cursor() {
+        // Arrange
+        let mut state = ready(3);
+        state.fail_playback(PlaybackAnchor::Cue(0), "about the cue".to_string());
+
+        // Act / Assert: it is about the selected cue while the cue panel holds the cursor.
+        assert_that!(state.playback_error()).is_equal_to(Some("about the cue"));
+
+        // Act / Assert: and stands down the moment the timeline takes it, where no cue is
+        // being pointed at at all.
+        state.focus_timeline();
+        assert_that!(state.playback_error()).is_none();
+
+        // Act / Assert: the other way round, a reason about a moment is not shown under a
+        // cue once the cursor has gone home.
+        let at = state.cursor().expect("the timeline holds the cursor");
+        state.fail_playback(PlaybackAnchor::Cursor(at), "about the moment".to_string());
+        assert_that!(state.playback_error()).is_equal_to(Some("about the moment"));
+        state.focus_cues();
         assert_that!(state.playback_error()).is_none();
     }
 
@@ -3895,11 +4014,11 @@ mod tests {
 
         // Act / Assert
         assert_that!(state.preparing_playback()).is_none();
-        state.prepare_playback(2);
-        assert_that!(state.preparing_playback()).is_equal_to(Some(2));
+        state.prepare_playback(PlaybackAnchor::Cue(2));
+        assert_that!(state.preparing_playback()).is_equal_to(Some(PlaybackAnchor::Cue(2)));
         play(&mut state, 2, span(4, Size::new(4, 2), 10));
         assert_that!(state.preparing_playback()).is_none();
-        assert_that!(playing(&mut state).cue_index()).is_equal_to(2);
+        assert_that!(playing(&mut state).anchor()).is_equal_to(PlaybackAnchor::Cue(2));
     }
 
     /// The page's state is printed whole in every test failure and in the harness's timeout
@@ -3915,7 +4034,7 @@ mod tests {
         let described = format!("{:?}", state.playback);
 
         // Assert
-        assert_that!(described.as_str()).contains("cue_index: 1");
+        assert_that!(described.as_str()).contains("anchor: Cue(1)");
         assert_that!(described.as_str()).contains("frames: 6");
         assert_that!(described.contains("bytes")).is_false();
     }
@@ -4158,23 +4277,94 @@ mod tests {
         assert_that!(state.scrub_target()).is_none();
     }
 
-    /// Moving the cursor is looking somewhere else, and a span decoded around one cue that
-    /// keeps playing under it is a picture in the pane that is not about what the cursor
-    /// points at. Arriving in the pane changes nothing on screen, so it must not stop one.
+    /// Both ways of stopping pointing at a cue stop the span that was playing for it.
+    /// Arriving in the timeline drops the selection altogether — no cue is marked in either
+    /// pane while the cursor is there — so a span decoded around one would go on playing
+    /// under nothing the reader can see, and moving the cursor afterwards is looking
+    /// somewhere else again.
     #[test]
-    fn moving_the_cursor_should_stop_a_playback_where_entering_the_pane_should_not() {
+    fn leaving_a_cue_for_the_timeline_should_stop_the_span_playing_for_it() {
         // Arrange
         let mut state = ready(3);
         let cells = Size::new(4, 2);
         play(&mut state, 0, span(4, cells, 10));
 
-        // Act / Assert: arriving leaves it running.
+        // Act / Assert: arriving in the pane stops it, because the cue it was about is no
+        // longer being pointed at.
         state.focus_timeline();
+        assert_that!(state.playback_active()).is_false();
+
+        // Act / Assert: and so does going back the other way, with the cursor's own span.
+        play(&mut state, 0, span(4, cells, 10));
+        state.focus_cues();
+        assert_that!(state.playback_active()).is_false();
+    }
+
+    /// A span playing for a moment is about that moment, so the first press that moves off
+    /// it stops the span rather than leaving a picture up that the cursor has left behind.
+    #[test]
+    fn moving_the_timeline_cursor_should_stop_a_playback() {
+        // Arrange
+        let mut state = ready(3);
+        let cells = Size::new(4, 2);
+        state.focus_timeline();
+        play(&mut state, 0, span(4, cells, 10));
         assert_that!(state.playback_active()).is_true();
 
-        // Act / Assert: and the first press stops it.
+        // Act
         state.move_cursor(1, TIMELINE_STEP);
+
+        // Assert
         assert_that!(state.playback_active()).is_false();
+    }
+
+    /// The selected cue's still stands in for the cursor's only while the cursor is standing
+    /// on that cue's own moment.
+    ///
+    /// A regression test. Pressing `p` from the timeline flashed the selected cue's picture
+    /// into the pane — on a page entered and left alone, the first cue of the track: saying
+    /// "Preparing playback…" puts a status row on the page, that row comes out of the preview
+    /// pane's height, and the resize drops the cursor's frame. The pane then fell through to
+    /// `frame()`, which knows only about the selection, and the cheap cache read that refills
+    /// it beat the accurate seek the cursor's replacement costs.
+    #[test]
+    fn a_cues_still_should_not_stand_in_for_a_moment_the_cursor_has_left() {
+        // Arrange: the selected cue's picture, which is what the pane falls back on.
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        state.apply_frame(0, protocol(8, 4));
+        assert_that!(state.still_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
+
+        // Act / Assert: arriving in the timeline changes nothing. The cursor is seeded on the
+        // cue's own moment, so that still *is* the right picture for it — which is why
+        // `Ctrl+J` asks for no grab at all.
+        state.focus_timeline();
+        assert_that!(state.still_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
+
+        // Act: one press away from that moment, answered with a frame of its own.
+        state.move_cursor(1, TIMELINE_STEP);
+        state.apply_scrub_frame(state.cursor().unwrap(), protocol(6, 3));
+        assert_that!(state.scrub_frame().map(Protocol::size)).is_equal_to(Some(Size::new(6, 3)));
+
+        // Act: the resize `p`'s status row causes, and the cue's frame coming back first —
+        // it is a cached JPEG re-encoded, where the cursor's is an accurate seek.
+        state.set_preview_cells(Size::new(40, 19));
+        state.apply_frame(0, protocol(8, 4));
+
+        // Assert: the cursor's frame went with the resize, and the cue's does not take its
+        // place. The pane draws nothing until this moment has a picture again.
+        assert_that!(state.scrub_frame().is_none()).is_true();
+        assert_that!(state.frame().is_some()).is_true();
+        assert_that!(state.still_frame().is_none()).is_true();
+
+        // Act / Assert: back on the cue's own moment, it is the right picture once more —
+        // whether the cursor walks back to it or the cue panel takes the cursor.
+        state.move_cursor(-1, TIMELINE_STEP);
+        assert_that!(state.still_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
+        state.move_cursor(2, TIMELINE_STEP);
+        assert_that!(state.still_frame().is_none()).is_true();
+        state.focus_cues();
+        assert_that!(state.still_frame().map(Protocol::size)).is_equal_to(Some(Size::new(8, 4)));
     }
 
     /// Nothing caches these frames, so every settled position is an `ffmpeg` seek. Blanking

@@ -29,8 +29,9 @@ use crate::{
     files::{DirectorySnapshot, FileEntry, scan_directory},
     framecache::{self, FrameKeyParts},
     preview::{
-        CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackOutcome, PlaybackRequest,
-        PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent, PreviewHandles, WarmRequest,
+        CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackAnchor, PlaybackOutcome,
+        PlaybackRequest, PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent,
+        PreviewHandles, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -2908,15 +2909,15 @@ impl App {
                     FrameOutcome::Failed(message) => state.fail_scrub_frame(at, message),
                 },
                 // Two gates, not one. The generation says the span is for the playback that
-                // is still wanted; the cue index says the page has not moved to another
-                // line since — which it can have, because moving the cursor is one of the
-                // things that stops a playback.
+                // is still wanted; the anchor says the page has not moved off what it was
+                // asked for since — another line, or another moment — which it can have,
+                // because moving either cursor is one of the things that stops a playback.
                 PreviewEvent::Playback {
                     generation,
-                    cue_index,
+                    anchor,
                     outcome,
                 } if generation == self.playback_generation
-                    && state.preparing_playback() == Some(cue_index) =>
+                    && state.preparing_playback() == Some(anchor) =>
                 {
                     match outcome {
                         PlaybackOutcome::Ready(mut frames) => {
@@ -2928,14 +2929,14 @@ impl App {
                             let sound = frames.take_samples();
                             let source = crate::audio::DeviceSource::new(self.audio_format, sound);
                             state.begin_playback(
-                                cue_index,
+                                anchor,
                                 frames,
                                 Box::new(source),
                                 self.preview_settings.playback_loop,
                             );
                         }
                         PlaybackOutcome::Failed(message) => {
-                            state.fail_playback(cue_index, message);
+                            state.fail_playback(anchor, message);
                             stopped_playback = true;
                         }
                     }
@@ -3193,12 +3194,19 @@ impl App {
         }
     }
 
-    /// Starts or stops the scrub playback of the selected cue.
+    /// Starts or stops the scrub playback of whatever the page is pointing at.
     ///
-    /// A span is `PLAYBACK_PAD` either side of the cue, played as a slideshow of frames the
-    /// worker decodes in one pass. Pressing the key again while one is running — or while
-    /// one is still decoding — stops it, which is what makes the same key both the way in
-    /// and the way out of something that takes a second or two to start.
+    /// With the cue panel holding the cursor that is the selected cue, and the span is the
+    /// configured padding either side of it. With the timeline holding it there is no
+    /// selected cue at all, and the span is `preview::CURSOR_PLAYBACK_REACH` either side of
+    /// the moment the cursor stands on, plus that same padding on top — a moment has no
+    /// length of its own, so the second it is given is a property of the feature rather
+    /// than a preference.
+    ///
+    /// Either way it is played as a slideshow of frames the worker decodes in one pass.
+    /// Pressing the key again while one is running — or while one is still decoding — stops
+    /// it, which is what makes the same key both the way in and the way out of something
+    /// that takes a second or two to start.
     pub fn toggle_playback(&mut self) {
         if self.stop_playback() {
             return;
@@ -3246,9 +3254,6 @@ impl App {
             let Some(state) = self.subtitle_edit.as_mut() else {
                 return;
             };
-            let Some(cue) = state.selected_cue().cloned() else {
-                return;
-            };
             let cells = crate::preview::playback_cells(
                 state.preview_cells,
                 state.frames.pixels,
@@ -3258,22 +3263,56 @@ impl App {
                 return;
             }
             let pixels = crate::preview::playback_pixels(cells, picker.font_size());
-            let (span_start, span_end) =
-                crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
-            // Every cue that appears anywhere in the span, not this one alone. A span that
-            // burned in only the selected line would play the stretch of media with
-            // everything else stripped out of it — and for a typeset or karaoke line, whose
-            // cues share a moment and each draw part of one effect, the selected line on its
-            // own is a fraction of a picture nobody will ever see.
-            let cue_index = state.selected;
-            let on_screen =
-                crate::cue::on_screen_between(&state.cues, cue_index, span_start, span_end);
-            state.prepare_playback(cue_index);
+            // **Whichever pane holds the cursor is what `p` plays.** The two answer different
+            // questions and the page can only be pointing at one of them: with the cue panel
+            // holding the cursor there is a selected line and its span is what is being
+            // judged, while with the timeline holding it there is no selection at all and the
+            // only thing the reader is pointing at is a moment. Playing the cue's span from
+            // the timeline would play a stretch of media the cursor may be nowhere near.
+            //
+            // Both arms end at the same three things — an anchor, a span, and the cues to
+            // burn into it — so everything below is one decision taken once.
+            let (anchor, span_start, span_end, on_screen) = match state.cursor() {
+                Some(at) => {
+                    let (span_start, span_end) = crate::preview::cursor_playback_span(
+                        at,
+                        settings.playback_pad,
+                        state.duration,
+                    );
+                    // Unanchored, the same way the cursor's still grab is: the reader pointed
+                    // at a stretch of media rather than at a line, so what belongs on it is
+                    // exactly what a viewer would see — which for most of a film is nothing.
+                    let on_screen = crate::cue::on_screen_during(&state.cues, span_start, span_end);
+                    (PlaybackAnchor::Cursor(at), span_start, span_end, on_screen)
+                }
+                None => {
+                    let Some(cue) = state.selected_cue().cloned() else {
+                        return;
+                    };
+                    let (span_start, span_end) =
+                        crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
+                    // Every cue that appears anywhere in the span, not this one alone. A span
+                    // that burned in only the selected line would play the stretch of media
+                    // with everything else stripped out of it — and for a typeset or karaoke
+                    // line, whose cues share a moment and each draw part of one effect, the
+                    // selected line on its own is a fraction of a picture nobody will ever
+                    // see.
+                    let cue_index = state.selected;
+                    let on_screen =
+                        crate::cue::on_screen_between(&state.cues, cue_index, span_start, span_end);
+                    (
+                        PlaybackAnchor::Cue(cue_index),
+                        span_start,
+                        span_end,
+                        on_screen,
+                    )
+                }
+            };
+            state.prepare_playback(anchor);
             PlaybackRequest {
                 generation: self.playback_generation.wrapping_add(1),
                 source: state.frames.clone(),
-                cue_index,
-                cue,
+                anchor,
                 on_screen,
                 span_start,
                 span_end,
@@ -23101,8 +23140,7 @@ mod tests {
 
         // Assert: the cue under the cursor, with a second either side of it.
         let request = playbacks.try_recv().expect("a span should be asked for");
-        assert_that!(request.cue_index).is_equal_to(1);
-        assert_that!(request.cue.text.as_str()).is_equal_to("two");
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cue(1));
         assert_that!(request.span_start).is_equal_to(Duration::from_secs(4));
         assert_that!(request.span_end).is_equal_to(Duration::from_secs(8));
         assert_that!(request.fps).is_equal_to(30);
@@ -23118,7 +23156,8 @@ mod tests {
             .is_equal_to(request.generation);
 
         // Assert: the page says it is waiting, so `p` does not look like it did nothing.
-        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback()).is_equal_to(Some(1));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cue(1)));
         assert_that!(app.playback_active()).is_true();
 
         // Cleanup
@@ -23230,8 +23269,89 @@ mod tests {
             "effect two".to_string(),
         ]);
         // Still the span *for* the selected cue, whatever else plays inside it.
-        assert_that!(request.cue_index).is_equal_to(0);
-        assert_that!(request.cue.text.as_str()).is_equal_to("under");
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cue(0));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the timeline holding the cursor there is no selected cue anywhere on the page,
+    /// so `p` cannot mean "play the selection" — it plays the moment being pointed at, which
+    /// is the only thing the reader is moving. The span is a second around it plus whatever
+    /// padding is configured, and what is burned in is what a viewer would see there rather
+    /// than the nearest line dragged in to keep it company.
+    #[test]
+    fn playing_from_the_timeline_should_cover_the_cursors_moment_rather_than_a_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        // Padding out of the way, so what is left is the second the moment is given — the
+        // test below is the one about the two adding up.
+        app.preview_settings.playback_pad = Duration::ZERO;
+        app.subtitle_edit.as_mut().unwrap().duration = Duration::from_secs(30);
+        // Onto the timeline, then out to a moment neither cue (1 s–3 s and 5 s–7 s) covers.
+        app.focus_timeline();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor()).is_some();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        while state.cursor() != Some(Duration::from_secs(10)) {
+            assert_that!(state.move_cursor(1, crate::subtitle_edit::TIMELINE_STEP)).is_true();
+        }
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: anchored on the moment, and a second wide around it.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cursor(Duration::from_secs(10)));
+        assert_that!(request.span_start).is_equal_to(Duration::from_millis(9_500));
+        assert_that!(request.span_end).is_equal_to(Duration::from_millis(10_500));
+
+        // Assert: bare picture burns nothing in — no cue is dragged onto a moment the
+        // viewer would see none at.
+        assert_that!(request.on_screen).is_empty();
+
+        // Assert: and the page is waiting for that span rather than for a cue's.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cursor(Duration::from_secs(10))));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The padding the popup sets is added to the second the cursor's playback is given
+    /// rather than replacing it, so a reader who widened it sees the same extra either side
+    /// of a moment as they do either side of a cue.
+    #[test]
+    fn the_cursors_span_should_carry_the_configured_padding_on_top_of_its_own_second() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.preview_settings.playback_pad = Duration::from_secs(2);
+        app.subtitle_edit.as_mut().unwrap().duration = Duration::from_secs(30);
+        app.focus_timeline();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor()).is_some();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        while state.cursor() != Some(Duration::from_secs(10)) {
+            assert_that!(state.move_cursor(1, crate::subtitle_edit::TIMELINE_STEP)).is_true();
+        }
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: two and a half seconds either side, not two.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.span_start).is_equal_to(Duration::from_millis(7_500));
+        assert_that!(request.span_end).is_equal_to(Duration::from_millis(12_500));
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
@@ -23771,7 +23891,7 @@ mod tests {
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation,
-                cue_index: request.cue_index,
+                anchor: request.anchor,
                 outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
             })
             .unwrap();
@@ -23817,7 +23937,7 @@ mod tests {
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation,
-                cue_index: request.cue_index,
+                anchor: request.anchor,
                 outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
             })
             .unwrap();
@@ -24035,7 +24155,7 @@ mod tests {
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation.wrapping_sub(1),
-                cue_index: request.cue_index,
+                anchor: request.anchor,
                 outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
             })
             .unwrap();
@@ -24053,18 +24173,19 @@ mod tests {
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation,
-                cue_index: request.cue_index + 1,
+                anchor: PlaybackAnchor::Cue(1),
                 outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
             })
             .unwrap();
         app.receive_preview_events(&receiver);
-        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback()).is_equal_to(Some(0));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cue(0)));
 
         // Act: the one that was actually asked for.
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation,
-                cue_index: request.cue_index,
+                anchor: request.anchor,
                 outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
             })
             .unwrap();
@@ -24106,7 +24227,7 @@ mod tests {
         sender
             .send(PreviewEvent::Playback {
                 generation: request.generation,
-                cue_index: request.cue_index,
+                anchor: request.anchor,
                 outcome: PlaybackOutcome::Failed("Could not play this cue: nope".to_string()),
             })
             .unwrap();

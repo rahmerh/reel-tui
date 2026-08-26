@@ -138,6 +138,23 @@ pub fn on_screen_between(cues: &[Cue], at: usize, start: Duration, end: Duration
         .collect()
 }
 
+/// Every cue on the screen at some point during `start..end`, with no cue forced into the
+/// list.
+///
+/// [`on_screen_between`] without its anchor, and the span form of [`on_screen_now`]: it is
+/// what the timeline cursor's playback burns in. That playback covers a stretch the reader
+/// pointed at rather than a cue's own span, so there is no cue to force — and forcing one
+/// would put a line on the picture the viewer would not see there.
+///
+/// Empty is an ordinary answer. Most of a film has no subtitle on it, and a second of it
+/// played from the cursor is routinely a second of bare picture.
+pub fn on_screen_during(cues: &[Cue], start: Duration, end: Duration) -> Vec<Cue> {
+    cues.iter()
+        .filter(|cue| shares_screen(cue, start, end))
+        .cloned()
+        .collect()
+}
+
 /// Whether `cue` is on screen at any point during `start..end`.
 ///
 /// Half-open at both ends, the boundary [`pack_lanes`] and [`group_overlaps`] also draw: a
@@ -1257,6 +1274,41 @@ mod tests {
             milliseconds(5000)
         )))
         .is_equal_to(vec!["before", "after"]);
+    }
+
+    /// The timeline cursor's playback covers a stretch the reader pointed at rather than a
+    /// cue's own span, so nothing is forced into the list — and a second of media with no
+    /// subtitle on it legitimately answers with nothing at all.
+    #[test]
+    fn what_appears_in_a_span_should_force_no_cue_in_when_nobody_anchors_it() {
+        // Arrange
+        let cues = overlapping_track();
+
+        // Act / Assert: the same stretch `on_screen_between` was asked for above, without
+        // the anchor it kept — "before" is gone, because it is not on screen there.
+        assert_that!(texts(&on_screen_during(
+            &cues,
+            milliseconds(4000),
+            milliseconds(5000)
+        )))
+        .is_equal_to(vec!["after"]);
+
+        // Act / Assert: the overlapping run comes back whole, in file order.
+        assert_that!(texts(&on_screen_during(
+            &cues,
+            milliseconds(1000),
+            milliseconds(4000)
+        )))
+        .is_equal_to(vec!["under", "effect one", "effect two"]);
+
+        // Act / Assert: and a stretch of bare picture answers with nothing rather than with
+        // the nearest line.
+        assert_that!(on_screen_during(
+            &cues,
+            milliseconds(3000),
+            milliseconds(4000)
+        ))
+        .is_empty();
     }
 
     /// The shape `ffmpeg`'s own ASS muxer writes, which is what an extracted track looks

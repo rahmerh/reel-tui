@@ -234,9 +234,17 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // one holds the cursor — the timeline draws it, the cue panel gives its border up, and
     // the preview shows that moment instead of the selected cue's.
     let cursor = state.cursor();
+    // **While the timeline holds the cursor, no cue is marked anywhere.** The selection is
+    // where the *other* pane's cursor is parked, and drawing it while the reader is walking
+    // a moment puts two things on screen that both look like "here" — one of which no key
+    // being pressed is moving. Both panes are told by the same `None`, so the filled block
+    // in the list and the cyan bracket on the track cannot disagree about whether there is a
+    // selection at all. The page still has a `selected` underneath, which is what `Ctrl+K`
+    // comes back to and what the timeline's window is fitted around.
+    let selected = cursor.is_none().then_some(state.selected);
     render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
-    render_edit_cues(frame, state, columns[1], &edited, cursor.is_none());
-    render_edit_timeline(frame, state, shift, cursor, rows[1]);
+    render_edit_cues(frame, state, columns[1], &edited, selected);
+    render_edit_timeline(frame, state, shift, cursor, selected, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -421,11 +429,14 @@ fn render_edit_preview(
     // The timeline cursor's frame sits between the two: a playback is the most recent thing
     // the reader asked for and wins outright, and the selected cue's frame is the fallback
     // that keeps `Ctrl+J` from blanking the pane — the cursor lands on that cue's own moment,
-    // so until it moves, the cue's frame *is* the right picture for it.
+    // so until it moves, the cue's frame *is* the right picture for it. **Only until it
+    // moves**, which is `still_frame` rather than `frame`: past that the cue's still is a
+    // picture of a moment the cursor has left, and the pane would be showing it under a title
+    // naming a different one.
     if let Some(protocol) = state
         .playback_frame()
         .or_else(|| state.scrub_frame())
-        .or_else(|| state.frame())
+        .or_else(|| state.still_frame())
         .filter(|protocol| protocol.size().width <= inner.width)
         .filter(|protocol| protocol.size().height <= inner.height)
     {
@@ -506,13 +517,17 @@ fn render_edit_cues(
     state: &mut SubtitleEditState,
     area: Rect,
     edited: &BTreeSet<usize>,
-    focused: bool,
+    selected: Option<usize>,
 ) {
     // The same border the file list and the track list wear when they hold the cursor. Two
     // panes on this page now take keys, and without this there is nothing on screen saying
     // which of them `h` is about to talk to.
+    //
+    // Whether this panel is focused and whether it marks a cue are one question rather than
+    // two, which is why they arrive as one value: a filled block in an unfocused panel would
+    // be a cursor in a pane that has none.
     let mut block = Block::bordered()
-        .border_style(focus_border(focused))
+        .border_style(focus_border(selected.is_some()))
         .title(" Cues ");
     // The background pass's count sits on this panel's border rather than on the status
     // row: it is a count of *these* rows' frames, and the status row carries one message at
@@ -562,6 +577,7 @@ fn render_edit_cues(
             group,
             timing,
             edited,
+            selected,
             Rect {
                 x: inner.x,
                 y: top,
@@ -620,6 +636,7 @@ fn render_edit_group(
     group: CueGroup,
     timing: GroupTiming,
     edited: &BTreeSet<usize>,
+    selected: Option<usize>,
     area: Rect,
 ) {
     // Fetched as one slice and matched on rather than indexed twice: `cues` is public and
@@ -635,7 +652,7 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            first == state.selected,
+            selected == Some(first),
             edited.contains(&first),
             &format!(
                 " {} → {} ",
@@ -682,7 +699,7 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            position == state.selected,
+            selected == Some(position),
             edited.contains(&position),
             &timing.title(cue),
             Rect {
@@ -871,6 +888,7 @@ fn render_edit_timeline(
     state: &mut SubtitleEditState,
     shift: Option<String>,
     cursor: Option<Duration>,
+    selected: Option<usize>,
     area: Rect,
 ) {
     let Some(cue) = state.selected_cue() else {
@@ -965,12 +983,20 @@ fn render_edit_timeline(
         &state.cues,
         &state.layout,
         &window,
-        state.selected,
+        selected,
         state.playback_position(),
         cursor,
         retiming,
     );
-    lines.push(timeline_ruler(&window, window.span(cue), cursor, retiming));
+    // The selection's two `▲` marks go with the selection: while the cursor is here, the one
+    // moment being pointed at is the cursor's, and a second pair of marks under a cue nobody
+    // is on would be the axis naming a position no key moves.
+    lines.push(timeline_ruler(
+        &window,
+        selected.and_then(|_| window.span(cue)),
+        cursor,
+        retiming,
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
     // Last, once every read of the page above is done with — this is the one place that knows
     // both how long a window is and where this one ended up.
@@ -1144,7 +1170,7 @@ fn timeline_lines(
     cues: &[Cue],
     layout: &LaneLayout,
     window: &TimelineWindow,
-    selected: usize,
+    selected: Option<usize>,
     playhead: Option<Duration>,
     cursor: Option<Duration>,
     retiming: bool,
@@ -1180,10 +1206,11 @@ fn timeline_lines(
     }
 
     // The selected cue is painted last so that it stays visible where a crowded lane has
-    // stacked another cue on top of it.
+    // stacked another cue on top of it. With no selection there is nothing to keep on top,
+    // and the ordinary order is the whole list once.
     let order = (0..cues.len())
-        .filter(|index| *index != selected)
-        .chain(std::iter::once(selected));
+        .filter(|index| Some(*index) != selected)
+        .chain(selected);
     for index in order {
         let Some(cue) = cues.get(index) else {
             continue;
@@ -1197,7 +1224,7 @@ fn timeline_lines(
             .copied()
             .unwrap_or(0)
             .min(lanes.saturating_sub(1));
-        let style = if index == selected {
+        let style = if Some(index) == selected {
             Style::default().fg(selection_colour(retiming)).bold()
         } else if layout.overflowed.get(index).copied().unwrap_or(false) {
             Style::default().fg(Color::Magenta)
@@ -2959,7 +2986,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "p",
-        "Play a few seconds around the selected cue, with sound",
+        "Play a few seconds around the selected cue — or around the timeline cursor",
     );
     keybinding(
         &mut lines,
@@ -13549,6 +13576,60 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The pane draws the selected cue's still only while the cursor is on that cue's moment.
+    ///
+    /// Arriving in the timeline must not blank the pane — the cursor is seeded on the moment
+    /// the still already shows — but a press away from it makes that picture a picture of
+    /// somewhere else, and the pane's own title names where the cursor now is. Drawing
+    /// nothing is a page a little behind; drawing the cue's frame is a page contradicting
+    /// itself, which is what `p` from the timeline used to do for the second or two its span
+    /// took to decode.
+    #[test]
+    fn the_pane_should_stop_drawing_a_cues_still_once_the_cursor_leaves_its_moment() {
+        // Arrange: a page with the selected cue's frame on screen.
+        let (mut app, directory) = edit_page_app(
+            "edit-frame-cursor",
+            vec![edit_cue(0, 1000, "spoken"), edit_cue(4000, 5000, "later")],
+        );
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: the timeline takes the cursor and the picture stays — the cursor is
+        // standing on the very moment that still was grabbed at.
+        app.focus_timeline();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: one press away from it and the pane goes quiet, rather than showing
+        // the cue's moment under a title naming another.
+        app.move_timeline_cursor(1, crate::subtitle_edit::TIMELINE_STEP);
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_true();
+
+        // Act / Assert: and the cue panel taking the cursor back brings it out again.
+        app.focus_cues();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// A frame encoded for a pane that has since shrunk is left out rather than handed to
     /// `Image`, which renders nothing at all — not even clipped — when the protocol is
     /// bigger than the area, and would leave the pane's own border painted over.
@@ -14268,7 +14349,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None, None, false);
+        let lines = timeline_lines(&cues, &layout, &window, Some(0), None, None, false);
         let text = timeline_text(&lines);
 
         // Assert
@@ -14305,7 +14386,13 @@ mod tests {
 
         // Act
         let text = timeline_text(&timeline_lines(
-            &cues, &layout, &window, 0, None, None, false,
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            false,
         ));
 
         // Assert: the one column it falls on carries the cue, and nothing but the axis's
@@ -14336,7 +14423,13 @@ mod tests {
 
         // Act
         let text = timeline_text(&timeline_lines(
-            &cues, &layout, &window, 0, None, None, false,
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            false,
         ));
 
         // Assert: one cue drawn, and nothing wrapped around from the other.
@@ -14364,7 +14457,7 @@ mod tests {
         };
         let at = Some(std::time::Duration::from_secs(15));
         let colours = |retiming: bool| {
-            let lines = timeline_lines(&cues, &layout, &window, 0, at, None, retiming);
+            let lines = timeline_lines(&cues, &layout, &window, Some(0), at, None, retiming);
             let cells: Vec<(char, Option<Color>)> = lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
@@ -14419,6 +14512,39 @@ mod tests {
         assert_that!(colour_of_marks(true)).is_equal_to(Some(Color::Yellow));
     }
 
+    /// With no selection there is no cue to paint in the selection colour and none to keep
+    /// on top of a crowded lane — every cue is drawn the same way, which is exactly what the
+    /// pane looks like while the timeline holds the cursor.
+    #[test]
+    fn timeline_lines_should_paint_no_cue_as_selected_when_nothing_is() {
+        // Arrange: two cues sharing a lane's worth of the window, drawn with and without a
+        // selection so the only difference is the one being tested.
+        let cues = vec![
+            edit_cue(10_000, 20_000, "one"),
+            edit_cue(30_000, 40_000, "two"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = window_over(0, 60, 61);
+        let selection_spans = |selected: Option<usize>| {
+            timeline_lines(&cues, &layout, &window, selected, None, None, false)
+                .iter()
+                .flat_map(|line| line.spans.clone())
+                .filter(|span| span.style.fg == Some(Color::Cyan))
+                .count()
+        };
+
+        // Act / Assert
+        assert_that!(selection_spans(Some(0)) > 0).is_true();
+        assert_that!(selection_spans(None)).is_equal_to(0);
+
+        // Act / Assert: and the cues themselves are still all there, so standing the
+        // selection down is not standing the track down.
+        let text = timeline_text(&timeline_lines(
+            &cues, &layout, &window, None, None, None, false,
+        ));
+        assert_that!(text.join("").matches('|').count()).is_equal_to(4);
+    }
+
     /// The shift is what the reader is actually reading after three presses: the two
     /// timestamps alone cannot say whether they are a tenth of a second in or a whole one.
     #[test]
@@ -14445,7 +14571,7 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, 0, None, None, false);
+        let lines = timeline_lines(&cues, &layout, &window, Some(0), None, None, false);
 
         // Assert: the overflowed cue is the only one painted magenta.
         let magenta = lines
@@ -14517,8 +14643,16 @@ mod tests {
         };
 
         // Act
-        let lane =
-            timeline_text(&timeline_lines(&[], &layout, &window, 0, None, None, false)).remove(0);
+        let lane = timeline_text(&timeline_lines(
+            &[],
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            false,
+        ))
+        .remove(0);
 
         // Assert: one every ten columns, at the same columns the ruler puts its readings on.
         let ruled: Vec<usize> = lane
@@ -14557,7 +14691,7 @@ mod tests {
             &cues,
             &layout,
             &window,
-            0,
+            Some(0),
             Some(std::time::Duration::from_secs(30)),
             Some(std::time::Duration::from_secs(40)),
             false,
@@ -14588,7 +14722,7 @@ mod tests {
         };
 
         // Act: an empty track, with the cursor still sitting on cue zero.
-        let lines = timeline_lines(&[], &layout, &window, 0, None, None, false);
+        let lines = timeline_lines(&[], &layout, &window, Some(0), None, None, false);
 
         // Assert: one lane carrying nothing but the axis's gridlines, rather than an index
         // panic or a cue drawn for a selection that does not exist.
@@ -14925,7 +15059,10 @@ mod tests {
         app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
 
         // Act
-        app.subtitle_edit.as_mut().unwrap().prepare_playback(0);
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .prepare_playback(crate::preview::PlaybackAnchor::Cue(0));
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
         // Assert
@@ -14948,10 +15085,10 @@ mod tests {
         app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
 
         // Act
-        app.subtitle_edit
-            .as_mut()
-            .unwrap()
-            .fail_playback(0, "Could not play this cue: no video".to_string());
+        app.subtitle_edit.as_mut().unwrap().fail_playback(
+            crate::preview::PlaybackAnchor::Cue(0),
+            "Could not play this cue: no video".to_string(),
+        );
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
 
         // Assert
@@ -15224,7 +15361,7 @@ mod tests {
             })
             .collect();
         app.subtitle_edit.as_mut().unwrap().begin_playback(
-            0,
+            crate::preview::PlaybackAnchor::Cue(0),
             crate::preview::PlaybackFrames::new(
                 striped,
                 crate::preview::SpanShape {
@@ -15279,7 +15416,7 @@ mod tests {
             &cues,
             &layout,
             &window,
-            0,
+            Some(0),
             Some(std::time::Duration::from_secs(18)),
             None,
             false,
@@ -15295,7 +15432,13 @@ mod tests {
 
         // Act / Assert: and no playback means no mark, rather than one parked at zero.
         let text = timeline_text(&timeline_lines(
-            &cues, &layout, &window, 0, None, None, false,
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            false,
         ));
         for lane in &text {
             assert_that!(lane.contains('│')).is_false();
@@ -15325,7 +15468,7 @@ mod tests {
                 &cues,
                 &layout,
                 &window,
-                0,
+                Some(0),
                 Some(at),
                 None,
                 false,
@@ -15359,7 +15502,7 @@ mod tests {
         let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
         let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
         app.subtitle_edit.as_mut().unwrap().begin_playback(
-            0,
+            crate::preview::PlaybackAnchor::Cue(0),
             crate::preview::PlaybackFrames::new(
                 vec![40; stride * 20],
                 crate::preview::SpanShape {
@@ -15439,7 +15582,7 @@ mod tests {
         let at = Duration::from_secs(20);
 
         // Act: the playhead and the cursor on the same column.
-        let lines = timeline_lines(&cues, &layout, &window, 0, Some(at), Some(at), false);
+        let lines = timeline_lines(&cues, &layout, &window, Some(0), Some(at), Some(at), false);
 
         // Assert: the cursor wins the column, and it is green.
         let text = timeline_text(&lines);
@@ -15453,7 +15596,13 @@ mod tests {
 
         // Act / Assert: and with the cue panel holding the cursor there is no mark at all.
         let text = timeline_text(&timeline_lines(
-            &cues, &layout, &window, 0, None, None, false,
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            false,
         ));
         assert_that!(text[0].contains('│')).is_false();
     }
@@ -15513,6 +15662,56 @@ mod tests {
         assert_that!(timeline_focused.join("\n").as_str()).contains("Timeline (00:00:00.00)");
         assert_that!(timeline_focused.join("\n").as_str()).contains("▼");
         assert_that!(cues_focused != timeline_focused).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// **No cue is marked anywhere while the timeline holds the cursor.** The selection is
+    /// where the *other* pane's cursor is parked, and leaving it drawn puts two things on
+    /// screen that both look like "here" — one of which no key being pressed is moving.
+    /// Both panes have to stand it down together, or the filled block in the list and the
+    /// cyan bracket on the track disagree about whether there is a selection at all.
+    #[test]
+    fn no_cue_should_be_marked_in_either_pane_while_the_timeline_holds_the_cursor() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-no-selection",
+            vec![edit_cue(1_000, 3_000, "one"), edit_cue(5_000, 7_000, "two")],
+        );
+        // The selected block is the one thing on this page drawn on a cyan *background*, so
+        // counting those cells answers "is a cue marked" without reading the glyphs.
+        let filled_cells = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buffer[(*x, *y)].style().bg == Some(Color::Cyan))
+                .count()
+        };
+
+        // Act / Assert: with the cue panel holding the cursor, the selection is drawn and
+        // its two ends are marked on the ruler.
+        assert_that!(filled_cells(&mut app) > 0).is_true();
+        assert_that!(draw(&mut app, 90, 24).join("\n").as_str()).contains("▲");
+
+        // Act
+        app.focus_timeline();
+
+        // Assert: nothing filled in the cue panel, and no `▲` under a cue on the ruler —
+        // the only mark left is the cursor's own `▼`.
+        assert_that!(filled_cells(&mut app)).is_equal_to(0);
+        let drawn = draw(&mut app, 90, 24).join("\n");
+        assert_that!(drawn.as_str()).does_not_contain("▲");
+        assert_that!(drawn.as_str()).contains("▼");
+
+        // Act / Assert: and `Ctrl+K` brings both back, so nothing was lost by looking away.
+        app.focus_cues();
+        assert_that!(filled_cells(&mut app) > 0).is_true();
+        assert_that!(draw(&mut app, 90, 24).join("\n").as_str()).contains("▲");
 
         // Cleanup
         drop(app);
