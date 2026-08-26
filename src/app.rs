@@ -3157,7 +3157,10 @@ impl App {
         }
     }
 
-    /// Takes the cursor back to the cue panel, for `Ctrl+K` and for `Esc`.
+    /// Takes the cursor back to the cue panel, for `Ctrl+K`.
+    ///
+    /// Deliberately not what `Esc`/`q` do: the timeline is the other half of this page
+    /// rather than a level below it, so backing out of it means backing out of the page.
     pub fn focus_cues(&mut self) -> bool {
         self.subtitle_edit
             .as_mut()
@@ -4280,13 +4283,13 @@ impl App {
                 if self.stop_playback() {
                     return true;
                 }
-                // The cursor comes home next. After the playback because the two are
-                // independent — a span may well be running while the reader scrubs — and
-                // before the timing mode because the cursor is the thing they moved most
-                // recently and so the thing `Esc` is most likely aimed at.
-                if self.focus_cues() {
-                    return true;
-                }
+                // The timeline cursor is deliberately *not* peeled here. The two panes are
+                // one page rather than a page and a page inside it, so a reader who moved
+                // the cursor down into the timeline is no deeper in than one who never did —
+                // and answering their `q` with "back to the cue panel" makes them press it
+                // twice to leave a page they only ever entered once. `Ctrl+K` is how the
+                // cursor comes home; leaving the page takes it home too.
+                //
                 // The timing mode is the next layer down, and it is peeled *after* the
                 // playback rather than before: the two are meant to be used together, so an
                 // `Esc` aimed at a span that is playing must not also cost the reader the
@@ -24347,11 +24350,11 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// `Esc` peels one layer at a time. The cursor comes home after a playback is stopped —
-    /// the two are independent and a span may well be running while the reader scrubs — and
-    /// before the timing mode, which is the older of the two states they are holding.
+    /// `Esc`/`q` peel one layer at a time, and the timeline cursor is not one of them: the
+    /// two panes are one page, so a reader who moved the cursor into the timeline is no
+    /// deeper in than one who never did. The timing mode still peels, ahead of the page.
     #[test]
-    fn back_should_bring_the_cursor_home_before_it_leaves_the_timing_mode() {
+    fn back_should_leave_the_timing_mode_and_then_the_page_whoever_holds_the_cursor() {
         // Arrange
         let mut app = app_with_subtitle_codec("subrip");
         let directory = app.directory.clone();
@@ -24361,20 +24364,17 @@ mod tests {
         app.toggle_cue_timing_mode();
         app.focus_timeline();
 
-        // Act / Assert: the first press takes the cursor back to the cues, leaving the mode.
-        assert_that!(app.back()).is_true();
-        assert_that!(app.timeline_focused()).is_false();
-        assert_that!(app.cue_timing_mode()).is_true();
-        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
-
-        // Act / Assert: the second leaves the mode, still on the page.
+        // Act / Assert: the first press leaves the mode and nothing else — the cursor stays
+        // where the reader put it.
         assert_that!(app.back()).is_true();
         assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timeline_focused()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
-        // Act / Assert: and the third leaves the page.
+        // Act / Assert: and the second leaves the page rather than the timeline pane.
         assert_that!(app.back()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.timeline_focused()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
