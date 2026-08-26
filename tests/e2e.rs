@@ -5070,6 +5070,159 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
     );
 }
 
+/// `p` from the timeline plays the moment the cursor is on, not the selected cue's span.
+///
+/// With the timeline holding the cursor there is no selected cue anywhere on the page — the
+/// filled block in the list and the `▲` marks under the track both stand down — so `p` cannot
+/// mean "play the selection". It plays the second around the moment being pointed at, the one
+/// thing the reader is actually moving, with the configured padding on top of it.
+///
+/// Asserted on the picture for the reason the cursor's own preview is: every layer short of
+/// the pixels agrees whether the right stretch was decoded. The clip is black for its first
+/// two seconds and white after, and its one cue sits at 0:03 in the white stretch — so a
+/// playback from a cursor parked at 0:00 must be black throughout, where the cue's own span
+/// is white.
+#[test]
+fn playing_from_the_timeline_should_cover_the_cursors_moment_rather_than_the_cue() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "playing_from_the_timeline_should_cover_the_cursors_moment_rather_than_the_cue";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("subtitle-cursor-playback");
+    write_shot_change_media(&scratch.join("clip.mkv"));
+    fs::write(scratch.join("clip.eng.srt"), LONE_LATE_CUE).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    app.wait_until("the selected cue's frame", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+    });
+    let cue_still = brightest_preview_shade(&app);
+    assert!(
+        cue_still > 192,
+        "the cue at 0:03 sits in the clip's white stretch, so its still should be bright, but \
+         the brightest shade drawn was {cue_still}:\n{}",
+        app.screen()
+    );
+
+    // Act: the cursor into the timeline, then one leap back — five seconds from the cue's
+    // moment, which the floor of the media clamps to 0:00.
+    app.press(ctrl('j'));
+    app.press(key(KeyCode::Char('H')));
+    app.pump();
+
+    // Assert: no cue is marked in either pane while the cursor is here. The `▲` marks name
+    // the selection's two ends on the ruler, and the `▼` that replaces them is the cursor's.
+    let screen = app.screen();
+    assert!(
+        !screen.contains('▲'),
+        "no cue should be marked while the timeline holds the cursor:\n{screen}"
+    );
+    assert!(
+        screen.contains('▼'),
+        "the timeline should mark where its own cursor stands:\n{screen}"
+    );
+
+    // Act
+    app.press(key(KeyCode::Char('p')));
+    app.pump();
+
+    // Assert: the page says it is working, so the key does not read as having done nothing
+    // while the span decodes.
+    let screen = app.screen();
+    assert!(
+        screen.contains("Preparing playback"),
+        "pressing p should say a playback is being prepared:\n{screen}"
+    );
+
+    // Assert: nothing bright reaches the pane while the span decodes, up to and including
+    // the moment the selected cue's own still comes back.
+    //
+    // Announcing the playback resizes the pane — the status row comes out of its height —
+    // and the resize drops both the cursor's frame and the cue's. The cue's is a cached JPEG
+    // re-encoded and comes back almost at once, where the cursor's costs an accurate seek, so
+    // this is the window in which the cue's still used to be handed to the pane: a picture of
+    // 0:03, in the clip's white stretch, under a title naming the 0:00 the cursor is on.
+    let started = Instant::now();
+    let mut refilled = false;
+    while started.elapsed() < harness::DEFAULT_TIMEOUT {
+        app.pump();
+        let waiting = brightest_preview_shade(&app);
+        assert!(
+            waiting < 64,
+            "only the cursor's own moment should reach the pane while a span decodes, but a \
+             shade of {waiting} was drawn against the cue still's {cue_still}:\n{}",
+            app.screen()
+        );
+        if app
+            .app
+            .subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.frame().is_some())
+        {
+            refilled = true;
+            break;
+        }
+    }
+    assert!(
+        refilled,
+        "the resize should send the selected cue's still off to be re-rendered:\n{}",
+        app.screen()
+    );
+
+    // Assert: the span arrives and starts drawing.
+    app.wait_until("the span to start playing", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.playback_frame().is_some())
+    });
+    let state = app.app.subtitle_edit.as_ref().unwrap();
+    let first = state
+        .playback_position()
+        .expect("a playing span knows where it is");
+    assert!(
+        first < Duration::from_secs(2),
+        "the span should be around the cursor at 0:00, not around the cue at 0:03, but the \
+         playhead opened at {first:?}:\n{}",
+        app.screen()
+    );
+
+    // Assert: and the pixels agree. Every frame of the span falls in the clip's black
+    // stretch, where the cue's own span is white throughout — which is the one assertion the
+    // request, the cue list and the frame cache cannot make.
+    let started = Instant::now();
+    let mut ended = false;
+    while started.elapsed() < harness::DEFAULT_TIMEOUT {
+        app.pump();
+        let Some(state) = app.app.subtitle_edit.as_ref() else {
+            break;
+        };
+        if !state.playback_active() {
+            ended = true;
+            break;
+        }
+        if state.playback_frame().is_some() {
+            let shade = brightest_preview_shade(&app);
+            assert!(
+                shade < 64,
+                "a playback from 0:00 should stay inside the clip's black stretch, but a \
+                 frame drew a shade of {shade} against the cue still's {cue_still}:\n{}",
+                app.screen()
+            );
+        }
+    }
+    assert!(
+        ended,
+        "a span of a second and a half should finish on its own well inside the timeout:\n{}",
+        app.screen()
+    );
+}
+
 /// The brightest channel of any colour the preview pane painted.
 ///
 /// `preview_shades` is as much of a decoded picture as `TestBackend` can be asked about, and
