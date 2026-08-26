@@ -17,7 +17,9 @@ use serde_json::Value;
 use crate::{
     app::TrackRef,
     files::FileFingerprint,
-    probe::{MediaInfo, ProbeOutcome, is_attached_picture, probe_any_file, probe_file},
+    probe::{
+        MediaInfo, ProbeOutcome, is_attached_picture, is_chapter_track, probe_any_file, probe_file,
+    },
     subtitle::{
         CueEdit, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
         SubtitleSource, canonical_language_code, language_choice, sidecar_filename, stream_cc,
@@ -414,6 +416,11 @@ impl ContainerFormat {
                 matches!(codec, "aac" | "alac" | "ac3" | "eac3" | "mp3" | "opus")
             }
             (Self::Mp4, "subtitle") => codec == "mov_text",
+            // ISO-BMFF stores an opaque timed stream as a `gpmd` data track, so a data
+            // stream copied out of one MP4 goes back into another — measured, not
+            // assumed. Matroska takes none at all ("Only audio, video, and subtitles are
+            // supported for Matroska"), which is why this is not simply `true` for both.
+            (Self::Mp4 | Self::Mov, "data") => codec == "bin_data",
             (Self::Mov, "video") => matches!(
                 codec,
                 "h264" | "hevc" | "av1" | "mpeg4" | "mjpeg" | "prores"
@@ -1538,6 +1545,12 @@ fn container_conflict_entries(
         else {
             continue;
         };
+        // The chapter track is never mapped into the output (`output_track_plan`), so
+        // there is nothing for the target container to refuse. Left in, an ordinary MP4
+        // with chapters reported a conflict against the container it was already in.
+        if is_chapter_track(info, stream) {
+            continue;
+        }
         let kind = stream_kind(stream).unwrap_or("other");
         let source_codec = stream
             .get("codec_name")
@@ -1587,6 +1600,7 @@ fn container_conflict_message(
     kind: &str,
     codec: &str,
 ) -> String {
+    let source_codec = codec;
     let codec = codec.to_ascii_uppercase();
     let resolution = match kind {
         "video" => {
@@ -1634,7 +1648,27 @@ fn container_conflict_message(
                 .collect::<Vec<_>>();
             format!("Encode it as {} or remove the track.", targets.join(" or "))
         }
-        _ => "Choose MKV or remove the track.".to_string(),
+        // `data` and `attachment` streams have no row of their own: nothing to convert
+        // and nothing to delete, so the only resolution left is a container that takes
+        // them. Naming which one matters, because the fixed "Choose MKV" this replaced
+        // was advice given to a reader who had *already* chosen MKV — MKV is the
+        // container that takes attachments and refuses data streams, and MP4 is the one
+        // that does the reverse, so a single suggestion is exactly backwards half the
+        // time.
+        _ => {
+            let targets = ContainerFormat::TARGETS
+                .into_iter()
+                .filter(|candidate| {
+                    *candidate != target && candidate.supports_codec(kind, source_codec, false)
+                })
+                .map(ContainerFormat::label)
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                "No available container can store it.".to_string()
+            } else {
+                format!("Choose {} instead.", targets.join(" or "))
+            }
+        }
     };
     format!(
         "{} can't contain {codec} {kind} track #{index}. {resolution}",
@@ -1852,6 +1886,16 @@ fn apply_edits(
                     change.source == SubtitleSource::Embedded(*index) && change.removes_from_media()
                 })
             })
+            // The chapter track is not a track the output carries — `output_track_plan`
+            // never maps it, and `-map_chapters 0` writes the chapters out on its own —
+            // so counting it here would expect one more stream than was asked for.
+            .filter(|index| {
+                source_info
+                    .streams
+                    .iter()
+                    .find(|stream| stream_index(stream) == Some(*index))
+                    .is_none_or(|stream| !is_chapter_track(&source_info, stream))
+            })
             .collect::<Vec<_>>();
         // Cross-checks the extension against ffprobe's own `format_name` (just
         // reprobed into `source_info` above) rather than trusting a possibly
@@ -2053,10 +2097,17 @@ fn apply_edits(
                 .map_err(EditError::Failed)?;
         }
         let expected_count = output_stream_order.len() + prepared.imports.len();
-        if output_info.streams.len() != expected_count {
+        // The muxer's own chapter track is left out on both sides of the count, exactly
+        // as `validate_result` leaves it out: the `mov` muxer writes one from
+        // `-map_chapters 0` whether or not anything was mapped to it.
+        let written_count = output_info
+            .streams
+            .iter()
+            .filter(|stream| !is_chapter_track(&output_info, stream))
+            .count();
+        if written_count != expected_count {
             return Err(EditError::Failed(format!(
-                "The remuxed file has {} tracks; expected {expected_count}.",
-                output_info.streams.len()
+                "The remuxed file has {written_count} tracks; expected {expected_count}.",
             )));
         }
         validate_result(
@@ -3499,6 +3550,22 @@ fn output_track_plan(
     subtitle_imports: &[SubtitleImport],
     sidecars: &[SidecarEntry],
 ) -> Vec<OutputTrack> {
+    // The chapter track is dropped before anything else looks at the order: `ffmpeg`
+    // is told `-map_chapters 0`, which writes the chapters back out as a text track of
+    // its own, so mapping the source's would store them twice — and Matroska refuses
+    // the stream outright, which is what stopped an MP4 with chapters converting to MKV.
+    let stream_order = stream_order
+        .iter()
+        .copied()
+        .filter(|index| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream_index(stream) == Some(*index))
+                .is_none_or(|stream| !is_chapter_track(source, stream))
+        })
+        .collect::<Vec<_>>();
+    let stream_order = stream_order.as_slice();
     if left_subtitle_order.is_empty() {
         let insert_at = stream_order
             .iter()
@@ -3650,10 +3717,18 @@ fn validate_result(
             OutputTrack::Imported(_) => Some("subtitle"),
         })
         .collect::<Vec<_>>();
-    let output_kinds = output
+    // The output's own chapter track is left out for the reason the source's is: the
+    // `mov` muxer writes one from `-map_chapters 0` whether or not anything was mapped
+    // to it, so counting it here would report every chaptered MP4 as having grown a
+    // track the plan never asked for.
+    let output_streams = output
         .streams
         .iter()
-        .filter_map(stream_kind)
+        .filter(|stream| !is_chapter_track(output, stream))
+        .collect::<Vec<_>>();
+    let output_kinds = output_streams
+        .iter()
+        .filter_map(|stream| stream_kind(stream))
         .collect::<Vec<_>>();
     if output_kinds != expected_kinds {
         return Err("The remuxed tracks are not in the requested order.".to_string());
@@ -3666,7 +3741,7 @@ fn validate_result(
         })
         .collect::<Vec<_>>();
     let muxer_defaults = muxer_forced_default_positions(output, &expected_defaults, container);
-    for (position, stream) in output.streams.iter().enumerate() {
+    for (position, stream) in output_streams.iter().copied().enumerate() {
         let Some(track) = output_tracks.get(position) else {
             return Err("The remuxed file has an unexpected extra track.".to_string());
         };
@@ -3854,7 +3929,14 @@ fn muxer_forced_default_positions(
     }
     let mut first_of_kind: BTreeMap<&str, usize> = BTreeMap::new();
     let mut kinds_with_a_default: BTreeSet<&str> = BTreeSet::new();
-    for (position, stream) in output.streams.iter().enumerate() {
+    // Positions are the plan's, so the muxer's own chapter track — which the plan never
+    // asked for — is skipped here exactly as `validate_result` skips it.
+    for (position, stream) in output
+        .streams
+        .iter()
+        .filter(|stream| !is_chapter_track(output, stream))
+        .enumerate()
+    {
         let Some(kind) = stream_kind(stream) else {
             continue;
         };
@@ -5699,6 +5781,132 @@ mod tests {
         assert_that!(compatible).is_empty();
     }
 
+    /// A file shaped like the MP4 that exposed all of this: an H.264 film with three
+    /// AAC tracks, a VobSub subtitle, and the QuickTime chapter track the `mov` demuxer
+    /// hands back as an opaque `bin_data` stream tagged `text` alongside the chapters it
+    /// read out of it.
+    fn chaptered_mp4(data_tag: &str) -> MediaInfo {
+        MediaInfo::from_json(serde_json::json!({
+            "streams": [
+                track(0, "video", "h264"),
+                track(1, "audio", "aac"),
+                track(2, "audio", "aac"),
+                track(3, "audio", "aac"),
+                track(4, "subtitle", "dvd_subtitle"),
+                {
+                    "index": 5,
+                    "codec_type": "data",
+                    "codec_name": "bin_data",
+                    "codec_tag_string": data_tag,
+                },
+            ],
+            "chapters": [{"id": 0, "start_time": "0.0"}],
+        }))
+        .unwrap()
+    }
+
+    /// Reel used to report a conflict against the container the file was *already* in —
+    /// "MP4 can't contain BIN_DATA data track #5" on an untouched MP4 — and then refuse
+    /// the conversion to MKV outright, advising the reader to "Choose MKV or remove the
+    /// track": a container they had already chosen and a track the page does not list,
+    /// so neither half could be acted on. The stream is the chapter list, which
+    /// `-map_chapters 0` writes out on its own.
+    #[test]
+    fn a_chapter_track_should_be_left_out_of_the_remux_and_raise_no_conflict() {
+        // Arrange: the same film twice, differing only in what the data stream is —
+        // the chapter list, or GoPro telemetry, which is a real track MP4 does store.
+        let chapters = chaptered_mp4("text");
+        let telemetry = chaptered_mp4("gpmd");
+        let order = [0, 1, 2, 3, 4, 5];
+        let conflicts = |info: &MediaInfo, target| {
+            container_conflicts(
+                info,
+                &order,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                target,
+            )
+        };
+        // Which streams are flagged, rather than every message: MP4's shortlist has its
+        // own opinion about the VobSub track, and this is about the data one.
+        let flagged = |info: &MediaInfo, target| {
+            container_conflict_streams(
+                info,
+                &order,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                target,
+            )
+        };
+
+        // Act
+        let mapped = output_track_plan(&chapters, &order, &[], &[], &[]);
+        let mapped_telemetry = output_track_plan(&telemetry, &order, &[], &[], &[]);
+
+        // Assert: the chapter track is neither mapped nor complained about, in the
+        // container the file is already in or in the one it is being converted to.
+        assert_that!(mapped).is_equal_to(
+            (0..=4)
+                .map(OutputTrack::Existing)
+                .collect::<Vec<OutputTrack>>(),
+        );
+        assert_that!(flagged(&chapters, ContainerFormat::Mp4)).is_equal_to(BTreeSet::from([4]));
+        assert_that!(conflicts(&chapters, ContainerFormat::Matroska)).is_empty();
+
+        // Assert: telemetry is a track like any other — carried into the remux, stored
+        // by MP4, and reported once against the container that genuinely refuses it.
+        assert_that!(mapped_telemetry).is_equal_to(
+            (0..=5)
+                .map(OutputTrack::Existing)
+                .collect::<Vec<OutputTrack>>(),
+        );
+        assert_that!(flagged(&telemetry, ContainerFormat::Mp4)).is_equal_to(BTreeSet::from([4]));
+        assert_that!(conflicts(&telemetry, ContainerFormat::Matroska)).is_equal_to(vec![
+            "MKV can't contain BIN_DATA data track #5. Choose MP4 or MOV instead.".to_string(),
+        ]);
+    }
+
+    /// The other half of the same defect: the `mov` muxer writes the chapters back out
+    /// as a text track of its own, so an MP4 remuxed to MP4 comes back with a data
+    /// stream the plan never asked for. Counted, it read as "The remuxed tracks are not
+    /// in the requested order." and threw away a save that had in fact succeeded.
+    #[test]
+    fn validation_should_ignore_the_chapter_track_the_muxer_writes_for_itself() {
+        // Arrange: five mapped tracks in, five mapped tracks out — plus the muxer's own
+        // chapter track, which no plan can contain.
+        let source = chaptered_mp4("text");
+        let output = MediaInfo::from_json(serde_json::json!({
+            "streams": [
+                defaulted(track(0, "video", "h264")),
+                defaulted(track(1, "audio", "aac")),
+                track(2, "audio", "aac"),
+                track(3, "audio", "aac"),
+                defaulted(track(4, "subtitle", "dvd_subtitle")),
+                {
+                    "index": 5,
+                    "codec_type": "data",
+                    "codec_name": "bin_data",
+                    "codec_tag_string": "text",
+                },
+            ],
+            "chapters": [{"id": 0, "start_time": "0.0"}],
+        }))
+        .unwrap();
+
+        // Act
+        let result = validate_plain(
+            &source,
+            &output,
+            &[0, 1, 2, 3, 4, 5],
+            &BTreeSet::from([0, 1, 4]),
+        );
+
+        // Assert
+        assert_that!(result).is_ok();
+    }
+
     #[test]
     fn output_track_plan_should_insert_imports_after_embedded_subtitles() {
         // Arrange
@@ -6982,7 +7190,11 @@ mod tests {
         let video = container_conflict_message(ContainerFormat::Mp4, 0, "video", "vp9");
         let audio = container_conflict_message(ContainerFormat::Mp4, 1, "audio", "vorbis");
         let subtitle = container_conflict_message(ContainerFormat::Mp4, 2, "subtitle", "subrip");
-        let other = container_conflict_message(ContainerFormat::Mp4, 3, "data", "bin_data");
+        // A track with no editor of its own: the advice can only be another container,
+        // and it must never be the one already chosen.
+        let data = container_conflict_message(ContainerFormat::Matroska, 3, "data", "bin_data");
+        let attachment = container_conflict_message(ContainerFormat::Mp4, 4, "attachment", "ttf");
+        let nowhere = container_conflict_message(ContainerFormat::WebM, 5, "data", "klv");
 
         // Assert
         assert_that!(video.as_str())
@@ -6990,8 +7202,12 @@ mod tests {
         assert_that!(audio.as_str()).contains("Encode it as AAC");
         assert_that!(subtitle.as_str()).contains("Convert it to ");
         assert_that!(subtitle.as_str()).contains("MOV Text");
-        assert_that!(other.as_str()).is_equal_to(
-            "MP4 can't contain BIN_DATA data track #3. Choose MKV or remove the track.",
+        assert_that!(data.as_str())
+            .is_equal_to("MKV can't contain BIN_DATA data track #3. Choose MP4 or MOV instead.");
+        assert_that!(attachment.as_str())
+            .is_equal_to("MP4 can't contain TTF attachment track #4. Choose MKV instead.");
+        assert_that!(nowhere.as_str()).is_equal_to(
+            "WebM can't contain KLV data track #5. No available container can store it.",
         );
     }
 

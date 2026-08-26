@@ -27,8 +27,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::KeyCode;
 use fixtures::{
-    MediaSpec, SubtitleSpec, write_media, write_media_with_chapter_and_attachment,
-    write_solid_frame, write_vobsub_media,
+    MediaSpec, SubtitleSpec, write_chaptered_mp4, write_media,
+    write_media_with_chapter_and_attachment, write_solid_frame, write_vobsub_media,
 };
 use harness::{
     Harness, Scratch, codec_names, ctrl, key, languages, probe, require_tools,
@@ -2001,6 +2001,106 @@ fn remuxing_tracks_should_preserve_chapters_and_attachments() {
     );
     assert_eq!(stream_tag(attachments[0], "filename"), Some("notes.txt"));
     assert_eq!(stream_tag(attachments[0], "mimetype"), Some("text/plain"));
+}
+
+/// An MP4 with chapter marks keeps them in a QuickTime `text` track, which the `mov`
+/// demuxer reports both as the file's chapters and as an opaque `bin_data` data stream.
+/// Reel mapped that stream into every remux, and both directions were wrong: `ffmpeg`
+/// writes the chapters back out from `-map_chapters 0` anyway, so an MP4 came out
+/// carrying them twice and failed validation, while Matroska refuses the stream
+/// outright — so the file simply could not be converted to MKV.
+///
+/// What the reader saw was worse than the failure: an untouched MP4 was labelled
+/// "⚠ 1 compatibility conflict" against the container it was already in, and choosing
+/// MKV refused with "MKV can't contain BIN_DATA data track #5. Choose MKV or remove the
+/// track." — a container they had just chosen, and a track the page does not list.
+#[test]
+fn an_mp4_with_chapters_should_remux_and_convert_without_a_phantom_conflict() {
+    let test = "an_mp4_with_chapters_should_remux_and_convert_without_a_phantom_conflict";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("chaptered-mp4");
+    write_chaptered_mp4(&scratch.join("clip.mp4"));
+    let before = probe(&scratch.join("clip.mp4"));
+    assert_eq!(before.chapters.len(), 1, "fixture should carry one chapter");
+    assert_eq!(
+        stream_indices_of_type(&before, "data").len(),
+        1,
+        "fixture should expose the chapter track as a data stream; codecs: {:?}",
+        codec_names(&before)
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mp4");
+
+    // The file as it stands is a valid MP4, so nothing about it is in conflict with MP4.
+    assert!(
+        app.app.selected_container_conflicts().is_empty(),
+        "an untouched MP4 reported a conflict against its own container: {:?}",
+        app.app.selected_container_conflicts()
+    );
+    assert!(
+        !app.screen().contains("compatibility conflict"),
+        "the overview warned about a conflict:\n{}",
+        app.screen()
+    );
+
+    // First an ordinary MP4 → MP4 rewrite, which is where the muxer writes a chapter
+    // track of its own alongside the one that used to be mapped.
+    app.open_container_settings();
+    app.type_container_metadata(ContainerSettingsField::Title, "Chaptered");
+    app.close_container_settings();
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let rewritten = probe(&app.path("clip.mp4"));
+    assert_eq!(
+        rewritten.chapters.len(),
+        1,
+        "the chapter should survive the rewrite"
+    );
+    assert_eq!(
+        stream_indices_of_type(&rewritten, "data").len(),
+        1,
+        "the rewrite duplicated the chapter track; codecs: {:?}",
+        codec_names(&rewritten)
+    );
+
+    // Then the conversion the conflict used to refuse outright, from a fresh visit to
+    // the rewritten file.
+    app.press(key(KeyCode::Esc));
+    app.open("clip.mp4");
+    app.choose_container_format("MKV");
+    assert!(
+        app.app.selected_container_conflicts().is_empty(),
+        "converting to MKV was refused: {:?}",
+        app.app.selected_container_conflicts()
+    );
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    let converted = probe(&app.path("clip.mkv"));
+    assert_eq!(
+        converted.chapters.len(),
+        1,
+        "the chapter should survive the conversion"
+    );
+    assert_eq!(
+        converted.chapters[0]
+            .get("tags")
+            .and_then(|tags| tags.get("title"))
+            .and_then(serde_json::Value::as_str),
+        Some("Opening")
+    );
+    assert!(
+        stream_indices_of_type(&converted, "data").is_empty(),
+        "Matroska cannot hold a data stream, so none should have been mapped; codecs: {:?}",
+        codec_names(&converted)
+    );
+    assert_eq!(stream_indices_of_type(&converted, "video").len(), 1);
+    assert_eq!(stream_indices_of_type(&converted, "audio").len(), 1);
 }
 
 /// > SourceChanged: test2.mp4 — The file's tracks changed: track(s) [7] are both kept

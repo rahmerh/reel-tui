@@ -425,6 +425,45 @@ pub fn write_media_with_chapter_and_attachment(path: &Path) {
     fs::remove_file(attachment).unwrap();
 }
 
+/// An MP4 carrying chapters, which ISO-BMFF stores in a QuickTime `text` track — so the
+/// `mov` demuxer reports the file's chapters *and* an opaque `bin_data` data stream that
+/// holds the same thing. Every MP4 written by a consumer encoder with chapter marks
+/// looks like this, and Matroska refuses the stream outright, so it is the shape that
+/// decided whether such a file could be converted to MKV at all.
+pub fn write_chaptered_mp4(path: &Path) {
+    write_media(path, &MediaSpec::mp4().audio(&["eng"]));
+    let parent = path.parent().expect("fixture path needs a parent");
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("fixture path needs a stem");
+    let chapters = parent.join(format!(".fixture-{stem}-chapters.ffmeta"));
+    let enhanced = parent.join(format!(".fixture-{stem}-enhanced.mp4"));
+    fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Opening\n",
+    )
+    .unwrap();
+
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(path)
+        .args(["-f", "ffmetadata", "-i"])
+        .arg(&chapters)
+        .args(["-map", "0", "-map_chapters", "1", "-c", "copy"])
+        .arg(&enhanced)
+        .output()
+        .expect("ffmpeg should be runnable");
+    assert!(
+        output.status.success(),
+        "failed to add chapters to {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::rename(&enhanced, path).unwrap();
+    fs::remove_file(chapters).unwrap();
+}
+
 fn srt_body(language: &str, duration: f32) -> String {
     let end = duration.max(0.5);
     let whole = end as u32;
