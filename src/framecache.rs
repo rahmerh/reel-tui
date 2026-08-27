@@ -37,7 +37,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cache::DiskCache;
 use crate::cue::Cue;
@@ -76,6 +76,11 @@ const CACHE_FORMAT_VERSION: u32 = 4;
 ///
 /// Leading dot and no [`FRAME_EXTENSION`], so it can never be mistaken for a frame.
 const USED_MARKER: &str = ".used";
+
+/// Fed into [`moment_key`] and nothing else, so a moment's frame can never be mistaken for
+/// a cue's. The two kinds of key share a media directory and are read back by name alone,
+/// so the only thing keeping them apart is what goes into the hash.
+const MOMENT_TAG: u32 = 1;
 
 /// Everything about the media a cached frame depends on, hashed into its directory name.
 ///
@@ -148,6 +153,30 @@ pub fn cue_key(cue: &Cue, staged: &str) -> String {
     // different moments stage byte-for-byte identically.
     hash.number(u128::from(cue.start.as_millis() as u64));
     hash.number(u128::from(cue.end.as_millis() as u64));
+    hash.finish()
+}
+
+/// The filename the frame for one *moment* is stored under, as hex.
+///
+/// The timeline cursor names a moment rather than a cue, so there is no cue timing to key
+/// on and nothing is forced into the staging the way [`crate::cue::on_screen_at`] forces a
+/// cue's anchor: what is burned in is whatever a viewer would see there, which for most of
+/// a film is nothing at all. `staged` is therefore an `Option`, and `None` is an ordinary
+/// key rather than a missing one — it hashes as the empty file would, because a subtitle
+/// file with nothing in it and no subtitle file at all draw the same picture.
+///
+/// Held apart from [`cue_key`] by [`MOMENT_TAG`] rather than by merely being fed different
+/// fields. Both kinds of key name files in one media directory, and a moment that happened
+/// to hash into a cue's name would serve that cue's picture for a moment elsewhere in the
+/// film — the one thing this page must never do.
+pub fn moment_key(at: Duration, staged: Option<&str>) -> String {
+    let mut hash = Hasher::new();
+    hash.number(u128::from(MOMENT_TAG));
+    hash.bytes(staged.unwrap_or_default().as_bytes());
+    hash.separator();
+    // Millis for the reason `cue_key` uses them: it is the resolution the subtitle formats
+    // themselves store, and the cursor moves in whole milliseconds.
+    hash.number(u128::from(at.as_millis() as u64));
     hash.finish()
 }
 
@@ -555,6 +584,57 @@ mod tests {
 
         // Act / Assert
         assert_that!(cue_key(&early, file).as_str()).is_not_equal_to(cue_key(&late, file).as_str());
+    }
+
+    /// The timeline cursor's frames share a media directory with the track's cue frames and
+    /// are read back by name alone, so a moment that could take a cue's name would serve
+    /// that cue's picture for somewhere else in the film entirely.
+    ///
+    /// The tag is what keeps them apart. Fed the same staged file and a moment standing
+    /// exactly where the cue starts — the closest the two ever come — they still differ.
+    #[test]
+    fn a_moment_should_never_be_able_to_take_a_cues_name() {
+        // Arrange
+        let one = cue(1000, 2000, "hello");
+        let file = staged(&one);
+
+        // Act / Assert
+        assert_that!(moment_key(Duration::from_millis(1000), Some(&file)).as_str())
+            .is_not_equal_to(cue_key(&one, &file).as_str());
+        // Sixteen bytes of hex, the same shape every other key has.
+        assert_that!(moment_key(Duration::from_millis(1000), Some(&file)).len()).is_equal_to(32);
+    }
+
+    /// A moment is named by its instant and by whatever a viewer would see there, so both
+    /// have to move the key — and neither moving must move it, or nothing would ever hit.
+    #[test]
+    fn a_moment_should_key_by_its_instant_and_by_what_is_on_screen() {
+        // Arrange
+        let line = staged(&cue(1000, 2000, "hello"));
+        let other = staged(&cue(1000, 2000, "goodbye"));
+        let base = moment_key(Duration::from_millis(1500), Some(&line));
+
+        // Act / Assert
+        assert_that!(moment_key(Duration::from_millis(1500), Some(&line)).as_str())
+            .is_equal_to(base.as_str());
+        assert_that!(moment_key(Duration::from_millis(1501), Some(&line)).as_str())
+            .is_not_equal_to(base.as_str());
+        assert_that!(moment_key(Duration::from_millis(1500), Some(&other)).as_str())
+            .is_not_equal_to(base.as_str());
+        assert_that!(moment_key(Duration::from_millis(1500), None).as_str())
+            .is_not_equal_to(base.as_str());
+    }
+
+    /// Most of a film has no subtitle on it, so a moment with nothing on screen is the
+    /// ordinary case rather than a missing one. No subtitle file and an empty one draw the
+    /// same picture, so they are allowed to — and have to — share a key.
+    #[test]
+    fn a_moment_with_nothing_on_screen_should_key_as_the_empty_file_does() {
+        // Act / Assert
+        assert_that!(moment_key(Duration::from_millis(500), None).as_str())
+            .is_equal_to(moment_key(Duration::from_millis(500), Some("")).as_str());
+        assert_that!(moment_key(Duration::from_millis(500), None).as_str())
+            .is_not_equal_to(moment_key(Duration::from_millis(600), None).as_str());
     }
 
     /// The whole point of the key: change what the frame would look like, and the cache

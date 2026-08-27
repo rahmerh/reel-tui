@@ -398,6 +398,28 @@ impl FrameSource {
         )
     }
 
+    /// The subtitle file one *moment* is burned from, or `None` when nothing is on screen
+    /// there — which is most of a film, and is why the staging is an `Option` at all.
+    ///
+    /// Written down once rather than at the grab and at the key: staging a file the key did
+    /// not cover would file a picture under a name that does not describe it, and that is
+    /// the one mistake this cache cannot recover from.
+    pub fn stage_moment(&self, on_screen: &[Cue]) -> Option<String> {
+        (!on_screen.is_empty()).then(|| self.stage(on_screen))
+    }
+
+    /// Both halves of one moment's cache path.
+    ///
+    /// The moment's own instant stands where a cue's timing stands in [`Self::key`]: it is
+    /// what decides where the grab seeks to, and two moments staging identically still draw
+    /// different pictures. See [`framecache::moment_key`].
+    pub fn moment_key(&self, target: &ScrubTarget) -> (String, String) {
+        (
+            self.media_key(),
+            framecache::moment_key(target.at, self.stage_moment(&target.on_screen).as_deref()),
+        )
+    }
+
     /// The subtitle file for cues that have to come and go inside a span — the scrub
     /// playback's staging. See [`CueStyle::stage_span`].
     pub fn stage_span(&self, cues: &[Cue], span_start: Duration) -> String {
@@ -432,6 +454,10 @@ pub struct FrameTarget {
 /// no cue, which is the whole reason the timeline cursor exists. So it travels as its own
 /// field of [`FrameRequest`] and comes back as its own event, rather than borrowing a cue
 /// index that would collide with a real one in the page's frame window and in the cache.
+///
+/// Cached under a key of its own — [`framecache::moment_key`] — inside the same media
+/// directory as the track's cue frames, so a moment revisited costs a file read and the
+/// track's pictures are still evicted as one thing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScrubTarget {
     /// Where in the media to grab, already clamped inside it by the caller.
@@ -460,7 +486,7 @@ pub struct FrameRequest {
     /// Cues either side of the cursor, encoded only from the cache.
     pub nearby: Vec<FrameTarget>,
     /// The moment the timeline cursor stands on, when the reader has moved it since the last
-    /// grab. Rendered like `wanted` and never cached — see [`ScrubTarget`].
+    /// grab. Rendered and cached like `wanted` — see [`ScrubTarget`].
     pub scrub: Option<ScrubTarget>,
     /// The preview pane, in terminal cells, as the renderer measured it. Only the encode
     /// to a terminal protocol uses this — the picture itself is rendered at
@@ -1675,25 +1701,34 @@ fn frame_window(
 
 /// Grabs the frame at one moment of the media, with whatever is on screen there burned in.
 ///
-/// **Never cached, and that is the point of it being separate from [`png`].**
-/// [`crate::framecache`] keys on a cue and evicts whole media directories, so a run of
-/// frames keyed on time would compete with the track's real frames for the unit of eviction
-/// — the same reason the scrub playback's frames never go in either. A moment revisited is
-/// re-rendered, which the request debounce already makes rare.
+/// **Cached exactly as a cue's frame is**, under a key of its own ([`framecache::moment_key`])
+/// in the same media directory — so a moment the cursor comes back to costs a file read, and
+/// the whole track's pictures, cues and moments alike, are evicted as one thing when the
+/// track ages out. That grouping is what makes caching these safe: keyed on time they would
+/// otherwise be an unbounded set of frames with no unit of use to evict them by.
+///
+/// Only the *still* grab is cached. The scrub playback's frames still are not: it decodes a
+/// run of frames per span rather than one picture per moment, and a span is not something a
+/// key of this shape can name.
 ///
 /// **A moment with no cue on it is grabbed with no filter at all.** Staging an empty SubRip
 /// file instead would hand libass a file its demuxer rejects, failing a grab that has nothing
 /// to burn in the first place.
 fn scrub(source: &FrameSource, target: &ScrubTarget, abandoned: Abandoned<'_>) -> PngOutcome {
-    let staged = if target.on_screen.is_empty() {
-        None
-    } else {
-        let staged = source.staged_name(CueSlot::Scrub);
-        let path = source.workspace.join(&staged);
-        if let Err(error) = std::fs::write(&path, source.stage(&target.on_screen)) {
-            return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
+    let key = source.moment_key(target);
+    if let Some(bytes) = framecache::read(&key.0, &key.1) {
+        return PngOutcome::Ready(bytes);
+    }
+    let staged = match source.stage_moment(&target.on_screen) {
+        Some(contents) => {
+            let staged = source.staged_name(CueSlot::Scrub);
+            let path = source.workspace.join(&staged);
+            if let Err(error) = std::fs::write(&path, contents) {
+                return PngOutcome::Failed(format!("Could not stage the cue to burn in: {error}"));
+            }
+            Some(staged)
         }
-        Some(staged)
+        None => None,
     };
     let mut command = frame_command(
         &source.media,
@@ -1702,7 +1737,7 @@ fn scrub(source: &FrameSource, target: &ScrubTarget, abandoned: Abandoned<'_>) -
         &source.workspace,
         staged.as_deref(),
     );
-    drawn_frame(run_cancellable(&mut command, abandoned))
+    grabbed(run_cancellable(&mut command, abandoned), &key.0, &key.1)
 }
 
 /// Encodes the cues around the cursor, from the frame cache only.
@@ -1874,6 +1909,10 @@ fn render(
 /// Separated from `png` for the same reason `extracted` is separated from `prepare`:
 /// giving up part-way and failing to start are endings a test cannot reliably steer a
 /// real `ffmpeg` into, and they are the two that must not be mistaken for a blank frame.
+///
+/// The cue grab and the timeline cursor's both end here, which is what keeps them agreeing
+/// about what a failed run is and about what is worth keeping. The keys they arrive with
+/// are the only difference between them.
 fn grabbed(run: RunOutcome, media_key: &str, cue_key: &str) -> PngOutcome {
     let outcome = drawn_frame(run);
     // A successful run that wrote nothing is what seeking past the end of the media looks
@@ -1890,9 +1929,9 @@ fn grabbed(run: RunOutcome, media_key: &str, cue_key: &str) -> PngOutcome {
 
 /// What a finished grab means, before anything decides whether to keep it.
 ///
-/// Split out because the timeline cursor's grab reads it the same way and stores nothing —
-/// see [`scrub`]. Caching is then the *only* difference between the two paths, rather than
-/// two copies of this match that could come to disagree about what a failed run is.
+/// Split from [`grabbed`] so that reading a run and keeping its bytes are two decisions:
+/// the first is what a test can drive with a hand-made [`RunOutcome`], and the second is
+/// the one that touches the disk.
 fn drawn_frame(run: RunOutcome) -> PngOutcome {
     match run {
         RunOutcome::Abandoned => PngOutcome::Abandoned,
@@ -7095,28 +7134,27 @@ mod tests {
         }
     }
 
-    /// The cursor's frames are never written to the frame cache: it keys on a cue and evicts
-    /// whole media directories, so a run of pictures keyed on time would compete with the
-    /// track's real frames for the unit of eviction. Asserted against a real grab, because
-    /// the only way to be sure nothing was stored is to render one and look.
+    /// The cursor's frames go into the frame cache like every other still, under a key of
+    /// their own inside the track's own media directory — so a moment the reader comes back
+    /// to costs a file read, and the track's pictures are still evicted as one thing.
+    ///
+    /// The second grab is made with the media file deleted, because that is the only way to
+    /// be sure the answer came off the disk rather than out of `ffmpeg`.
     #[test]
-    fn a_moment_the_cursor_reached_should_be_drawn_and_never_cached() {
+    fn a_moment_the_cursor_reached_should_be_cached_under_its_own_key() {
         // Arrange
         let _guard = cache_guard();
-        require_ffmpeg("a_moment_the_cursor_reached_should_be_drawn_and_never_cached");
+        require_ffmpeg("a_moment_the_cursor_reached_should_be_cached_under_its_own_key");
         let directory = scratch("scrub-grab");
         let media = video(&directory);
         let source = source(&media, &directory);
-        let before = framecache::path(&source.media_key(), "any")
-            .and_then(|path| path.parent().map(std::fs::read_dir))
-            .and_then(Result::ok)
-            .map(Iterator::count)
-            .unwrap_or(0);
         let live = AtomicU64::new(1);
+        let on_screen = cue(2000, 3000, "ON THE SCREEN");
         let target = ScrubTarget {
             at: Duration::from_millis(2500),
-            on_screen: vec![cue(2000, 3000, "ON THE SCREEN")],
+            on_screen: vec![on_screen.clone()],
         };
+        let key = source.moment_key(&target);
 
         // Act
         let drawn = scrub(&source, &target, &|| live.load(Ordering::Relaxed) != 1);
@@ -7128,13 +7166,18 @@ mod tests {
         assert_that!(bytes.is_empty()).is_false();
         // ...the cue was staged under the cursor's own name...
         assert_that!(directory.join("scrub.srt").exists()).is_true();
-        // ...and the cache gained nothing at all.
-        let after = framecache::path(&source.media_key(), "any")
-            .and_then(|path| path.parent().map(std::fs::read_dir))
-            .and_then(Result::ok)
-            .map(Iterator::count)
-            .unwrap_or(0);
-        assert_that!(after).is_equal_to(before);
+        // ...it was filed in the track's own directory, so `prune` evicts it with the rest...
+        assert_that!(framecache::is_cached(&key.0, &key.1)).is_true();
+        assert_that!(key.0.as_str()).is_equal_to(source.media_key().as_str());
+        // ...under a name no cue of this track could take...
+        assert_that!(key.1 != source.key(&on_screen, std::slice::from_ref(&on_screen)).1).is_true();
+        // ...and the moment is answered again with the media gone.
+        std::fs::remove_file(&media).unwrap();
+        let again = scrub(&source, &target, &|| live.load(Ordering::Relaxed) != 1);
+        let PngOutcome::Ready(cached) = again else {
+            panic!("the cached moment should have been read back");
+        };
+        assert_that!(cached == bytes).is_true();
 
         std::fs::remove_dir_all(&directory).unwrap();
     }

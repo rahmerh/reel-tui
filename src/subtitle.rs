@@ -270,6 +270,59 @@ impl CueEdit {
     }
 }
 
+/// A cue the reader added that the file has no line for.
+///
+/// The half of [`CueChanges`] with no `original`, and that is the whole difference: an edit
+/// is addressed by the position of a cue the file already holds and is checked against what
+/// stood there, where an insertion names no existing line and so has nothing to be stale
+/// against. It carries what a SubRip cue is and nothing else — its words and its span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueInsert {
+    pub text: String,
+    pub start: Duration,
+    pub end: Duration,
+}
+
+/// Everything the subtitle edit page has staged against one track's cues: lines rewritten,
+/// and lines added.
+///
+/// **One type rather than two fields, because every gate in the application asks the same
+/// question of both.** Whether a track is modified, whether it changes the media, whether
+/// leaving the page throws work away, whether the save has to rewrite the file at all — each
+/// is `is_empty()` here, and a second collection sitting beside this one would have to be
+/// remembered at every one of those places and at every one added later.
+///
+/// Rewrites are keyed by the cue's *position* in the parsed list and insertions by an id of
+/// their own, because a cue that does not exist in the file has no position to be keyed by
+/// and two insertions at the same moment are two cues rather than one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CueChanges {
+    /// Cues the file already holds, rewritten — keyed by position in the parsed list.
+    pub edits: BTreeMap<usize, CueEdit>,
+    /// Cues the reader added, keyed by an id handed out when they were inserted. Ids rather
+    /// than positions for the same reason [`CueEdit`] uses positions: an inserted cue has no
+    /// place in the file yet, and the page has to be able to keep amending the one it made.
+    pub inserts: BTreeMap<usize, CueInsert>,
+}
+
+impl CueChanges {
+    /// Whether anything at all is staged against this track's cues.
+    pub fn is_empty(&self) -> bool {
+        self.edits.is_empty() && self.inserts.is_empty()
+    }
+
+    /// The next free insertion id.
+    ///
+    /// One past the highest handed out rather than the count, so an insertion removed from
+    /// the map cannot hand its id to a different cue.
+    pub fn next_insert_id(&self) -> usize {
+        self.inserts
+            .keys()
+            .next_back()
+            .map_or(0, |highest| highest + 1)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtitleChange {
     pub source: SubtitleSource,
@@ -279,10 +332,10 @@ pub struct SubtitleChange {
     pub import_into_media: bool,
     pub ocr_language: Option<String>,
     pub metadata: Option<SubtitleMetadata>,
-    /// Cues rewritten on the subtitle edit page — words, timing, or both — keyed by the cue's
-    /// position in the parsed list. Empty for every change staged from the track list,
-    /// which is every change that existed before the editor did.
-    pub cue_edits: BTreeMap<usize, CueEdit>,
+    /// What the subtitle edit page has staged against this track's cues — lines rewritten,
+    /// lines retimed, lines added. Empty for every change staged from the track list, which
+    /// is every change that existed before the editor did.
+    pub cues: CueChanges,
 }
 
 impl SubtitleChange {
@@ -297,7 +350,7 @@ impl SubtitleChange {
             SubtitleSource::Embedded(_) => {
                 self.removes_from_media()
                     || self.metadata.is_some()
-                    || !self.cue_edits.is_empty()
+                    || !self.cues.is_empty()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -314,7 +367,7 @@ impl SubtitleChange {
             SubtitleSource::Sidecar(_) => {
                 self.import_into_media
                     || self.metadata.is_some()
-                    || !self.cue_edits.is_empty()
+                    || !self.cues.is_empty()
                     || self
                         .embedded_target
                         .is_some_and(|target| target != self.source_format)
@@ -350,9 +403,14 @@ impl SubtitleChange {
 /// neighbour and a SubRip file is expected to run in order. Sorting *after* the edits have
 /// been applied is what keeps the position keys meaningful: they address the file as it was
 /// read, and the new order only exists once every edit has landed.
-pub fn rewrite_srt_cues(source: &str, edits: &BTreeMap<usize, CueEdit>) -> Result<String, String> {
+///
+/// **Inserted cues are appended after every rewrite has landed, for that same reason.**
+/// Putting one at its place in time first would move every cue after it and leave the
+/// remaining edits addressing the wrong lines; the sort below is what actually puts it where
+/// it belongs, and `cue::write_srt` renumbers the file from one afterwards.
+pub fn rewrite_srt_cues(source: &str, changes: &CueChanges) -> Result<String, String> {
     let mut cues = crate::cue::parse_srt(source);
-    for (position, edit) in edits {
+    for (position, edit) in &changes.edits {
         let Some(cue) = cues.get_mut(*position) else {
             return Err(format!(
                 "This track no longer has a cue #{}; it may have been edited elsewhere.",
@@ -376,6 +434,19 @@ pub fn rewrite_srt_cues(source: &str, edits: &BTreeMap<usize, CueEdit>) -> Resul
         cue.text = edit.text.clone();
         cue.start = edit.start;
         cue.end = edit.end;
+    }
+    for insert in changes.inserts.values() {
+        cues.push(crate::cue::Cue {
+            // Overwritten by the renumbering `write_srt` does, and meaningless until the
+            // sort below has run: what this cue's position is, is exactly what is not
+            // decided yet.
+            index: cues.len(),
+            start: insert.start,
+            end: insert.end,
+            text: insert.text.clone(),
+            dialogue: Vec::new(),
+            events: 1,
+        });
     }
     // Stable, so cues that end up sharing a timing keep the order the file put them in —
     // the same tie-break `cue::parse_srt` applies when it reads this back.
@@ -1114,7 +1185,7 @@ mod tests {
         for embedded_target in &targets {
             for export_target in &targets {
                 let change = SubtitleChange {
-                    cue_edits: Default::default(),
+                    cues: Default::default(),
                     source: SubtitleSource::Embedded(7),
                     source_format: SubtitleFormat::SubRip,
                     embedded_target: *embedded_target,
@@ -1155,7 +1226,7 @@ mod tests {
         for embedded_target in targets {
             for import_into_media in [false, true] {
                 let change = SubtitleChange {
-                    cue_edits: Default::default(),
+                    cues: Default::default(),
                     source: SubtitleSource::Sidecar(PathBuf::from("/media/movie.eng.srt")),
                     source_format: SubtitleFormat::SubRip,
                     embedded_target,
@@ -2218,6 +2289,14 @@ fra
         }
     }
 
+    /// The staged cue changes that a bare map of rewrites amounts to.
+    fn rewrites(edits: BTreeMap<usize, CueEdit>) -> CueChanges {
+        CueChanges {
+            edits,
+            ..Default::default()
+        }
+    }
+
     /// A rewrite of one cue's words, leaving its timing alone.
     fn cue_edit(original: &str, at: u64, text: &str) -> CueEdit {
         CueEdit {
@@ -2255,7 +2334,8 @@ fra
         let edits = BTreeMap::from([(1, cue_edit("two", 3, "two, rewritten\nover two lines"))]);
 
         // Act
-        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the edit should apply");
+        let written =
+            rewrite_srt_cues(THREE_CUES, &rewrites(edits)).expect("the edit should apply");
 
         // Assert
         let cues = crate::cue::parse_srt(&written);
@@ -2280,7 +2360,8 @@ fra
         let edits = BTreeMap::from([(1, cue_shift("two", 3, 250))]);
 
         // Act
-        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the shift should apply");
+        let written =
+            rewrite_srt_cues(THREE_CUES, &rewrites(edits)).expect("the shift should apply");
 
         // Assert: the cue moved, kept its length, and kept its words.
         let cues = crate::cue::parse_srt(&written);
@@ -2308,7 +2389,8 @@ fra
         let edits = BTreeMap::from([(0, cue_shift("one", 1, 3_000))]);
 
         // Act
-        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the shift should apply");
+        let written =
+            rewrite_srt_cues(THREE_CUES, &rewrites(edits)).expect("the shift should apply");
 
         // Assert: the file runs in time order, and the counters follow the new order.
         let cues = crate::cue::parse_srt(&written);
@@ -2333,7 +2415,8 @@ fra
         )]);
 
         // Act
-        let written = rewrite_srt_cues(THREE_CUES, &edits).expect("the edit should apply");
+        let written =
+            rewrite_srt_cues(THREE_CUES, &rewrites(edits)).expect("the edit should apply");
 
         // Assert
         let cues = crate::cue::parse_srt(&written);
@@ -2358,7 +2441,7 @@ fra
         };
 
         // Act
-        let refused = rewrite_srt_cues(THREE_CUES, &BTreeMap::from([(1, stale)]));
+        let refused = rewrite_srt_cues(THREE_CUES, &rewrites(BTreeMap::from([(1, stale)])));
 
         // Assert: refused, and by the timing rather than by the words.
         let message = refused.unwrap_err();
@@ -2375,13 +2458,142 @@ fra
         // Act / Assert: the cue at that position now says something else.
         let moved = rewrite_srt_cues(
             THREE_CUES,
-            &BTreeMap::from([(1, cue_edit("SOMETHING ELSE", 3, "x"))]),
+            &rewrites(BTreeMap::from([(1, cue_edit("SOMETHING ELSE", 3, "x"))])),
         );
         assert_that!(moved.clone().unwrap_err().as_str()).contains("changed elsewhere");
 
         // Act / Assert: and the cue is gone from the file entirely.
-        let missing =
-            rewrite_srt_cues(THREE_CUES, &BTreeMap::from([(9, cue_edit("nine", 9, "x"))]));
+        let missing = rewrite_srt_cues(
+            THREE_CUES,
+            &rewrites(BTreeMap::from([(9, cue_edit("nine", 9, "x"))])),
+        );
         assert_that!(missing.unwrap_err().as_str()).contains("no longer has a cue");
+    }
+
+    /// An inserted cue is written at its place in time, and the file is renumbered around it.
+    #[test]
+    fn rewrite_srt_cues_should_write_an_inserted_cue_where_it_belongs_in_time() {
+        // Arrange: a cue placed between the file's first and second.
+        let changes = CueChanges {
+            inserts: BTreeMap::from([(
+                0,
+                CueInsert {
+                    text: "inserted".to_string(),
+                    start: Duration::from_millis(1500),
+                    end: Duration::from_millis(2500),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("the insertion should apply");
+
+        // Assert: in time order, with the file's own cues untouched around it.
+        let cues = crate::cue::parse_srt(&written);
+        let read: Vec<(&str, u128, u128)> = cues
+            .iter()
+            .map(|cue| {
+                (
+                    cue.text.as_str(),
+                    cue.start.as_millis(),
+                    cue.end.as_millis(),
+                )
+            })
+            .collect();
+        assert_that!(read).contains_exactly_in_given_order([
+            ("one", 1000, 2000),
+            ("inserted", 1500, 2500),
+            ("two", 3000, 4000),
+            ("three", 5000, 6000),
+        ]);
+        // Renumbered from one, so the counters describe the file that was written rather
+        // than the one that was read.
+        assert_that!(written.as_str()).contains("2\n00:00:01,500 --> 00:00:02,500\ninserted");
+    }
+
+    /// The two kinds of staged change land together, and the rewrites are addressed against
+    /// the file as it was *read* — so an insertion earlier in the track cannot shift the line
+    /// a rewrite was meant for.
+    #[test]
+    fn rewrite_srt_cues_should_apply_an_insertion_and_a_rewrite_together() {
+        // Arrange: a cue inserted before the file's second, and that second cue rewritten.
+        let changes = CueChanges {
+            edits: BTreeMap::from([(1, cue_edit("two", 3, "two, rewritten"))]),
+            inserts: BTreeMap::from([(
+                0,
+                CueInsert {
+                    text: "inserted".to_string(),
+                    start: Duration::from_millis(500),
+                    end: Duration::from_millis(900),
+                },
+            )]),
+        };
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("both should apply");
+
+        // Assert: the rewrite landed on the cue the reader was looking at, not on the one
+        // that would stand at position 1 once the insertion had moved everything down.
+        let cues = crate::cue::parse_srt(&written);
+        let texts: Vec<&str> = cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order([
+            "inserted",
+            "one",
+            "two, rewritten",
+            "three",
+        ]);
+    }
+
+    /// Insertion ids are handed out one past the highest ever used rather than by counting,
+    /// so an id cannot be reused by a different cue after one is dropped.
+    #[test]
+    fn next_insert_id_should_not_hand_back_an_id_already_given_out() {
+        // Arrange
+        let insert = CueInsert {
+            text: "x".to_string(),
+            start: Duration::ZERO,
+            end: Duration::from_secs(1),
+        };
+        let mut changes = CueChanges {
+            inserts: BTreeMap::from([(0, insert.clone()), (1, insert.clone())]),
+            ..Default::default()
+        };
+
+        // Act / Assert: past the highest, and still past it once the first is dropped.
+        assert_that!(changes.next_insert_id()).is_equal_to(2);
+        changes.inserts.remove(&0);
+        assert_that!(changes.next_insert_id()).is_equal_to(2);
+    }
+
+    /// A track carrying nothing but an inserted cue is a modified track: `is_empty` is the
+    /// one question every gate in the application asks of the staged cues.
+    #[test]
+    fn a_track_carrying_only_an_inserted_cue_should_still_have_an_effect() {
+        // Arrange
+        let mut change = SubtitleChange {
+            source: SubtitleSource::Sidecar(std::path::PathBuf::from("clip.srt")),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: false,
+            ocr_language: None,
+            metadata: None,
+            cues: Default::default(),
+        };
+        assert_that!(change.has_effect()).is_false();
+
+        // Act
+        change.cues.inserts.insert(
+            0,
+            CueInsert {
+                text: "new".to_string(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(1),
+            },
+        );
+
+        // Assert
+        assert_that!(change.has_effect()).is_true();
     }
 }

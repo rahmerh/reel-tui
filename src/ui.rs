@@ -20,11 +20,11 @@ use crate::{
     app::{
         App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
         ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
-        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer, LeaveCuesChoice,
-        PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState, StagedFileStatus,
-        SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode, SubtitleSettingsPopup,
-        TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
-        VideoSettingsMode, describe_track_groups,
+        ContainerSettingsPopup, CueTarget, CustomResolutionField, Dialog, InputReject, Layer,
+        LeaveCuesChoice, PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState,
+        StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
+        SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
+        VideoSettingsField, VideoSettingsMode, describe_track_groups,
     },
     cue::{
         Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_precise,
@@ -2730,19 +2730,25 @@ fn render_cue_editor(frame: &mut Frame, app: &App) {
     let Some(editor) = app.cue_editor.as_ref() else {
         return;
     };
-    let timing = app
-        .subtitle_edit
-        .as_ref()
-        .and_then(|state| state.cues.get(editor.cue))
-        .map(|cue| {
-            format!(
-                " Cue {} · {} → {} ",
-                editor.cue + 1,
-                format_timestamp(cue.start),
-                format_timestamp(cue.end)
-            )
-        })
-        .unwrap_or_else(|| " Cue ".to_string());
+    // A new cue is titled by the moment it will land on rather than by a number, because it
+    // has neither: it is not in the list yet, and until something is typed it never will be.
+    let timing = match editor.target {
+        CueTarget::New(at) => format!(" New cue · {} ", format_timestamp(at)),
+        CueTarget::Cue(origin) => app
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| {
+                let position = state.position_of(origin)?;
+                let cue = state.cues.get(position)?;
+                Some(format!(
+                    " Cue {} · {} → {} ",
+                    position + 1,
+                    format_timestamp(cue.start),
+                    format_timestamp(cue.end)
+                ))
+            })
+            .unwrap_or_else(|| " Cue ".to_string()),
+    };
 
     let area = centered_percent(
         frame.area(),
@@ -3029,7 +3035,8 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "i",
-        "Edit the selected cue's text (SubRip tracks); Esc keeps the edit, Ctrl-s writes it",
+        "Edit the selected cue's text, or add a cue at the timeline cursor (SubRip tracks); \
+         Esc keeps the edit, Ctrl-s writes it",
     );
     keybinding(
         &mut lines,
@@ -7017,7 +7024,7 @@ mod tests {
             Dialog::EditCue => {
                 app.cue_editor = Some(crate::app::CueEditor {
                     source: SubtitleSource::Embedded(2),
-                    cue: 0,
+                    target: CueTarget::Cue(crate::subtitle_edit::CueOrigin::File(0)),
                     original: "Hello there".to_string(),
                     lines: vec!["Hello there".to_string()],
                     row: 0,
@@ -8944,7 +8951,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -10075,7 +10082,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10127,7 +10134,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let imported = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -10146,7 +10153,7 @@ mod tests {
         )
         .unwrap();
         let exported = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10266,7 +10273,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10356,7 +10363,7 @@ mod tests {
 
             // Act: the embedded track, staying embedded.
             let change = SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -10381,7 +10388,7 @@ mod tests {
 
             // Act: the sidecar, being imported into the same container.
             let change = SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 import_into_media: true,
                 metadata: Some(metadata.clone()),
@@ -10439,7 +10446,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -11373,7 +11380,7 @@ mod tests {
         app.subtitle_changes.insert(
             embedded_source.clone(),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: embedded_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -11405,7 +11412,7 @@ mod tests {
         app.subtitle_changes.insert(
             sidecar_source.clone(),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: sidecar_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),

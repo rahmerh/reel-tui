@@ -21,7 +21,7 @@ use crate::{
         MediaInfo, ProbeOutcome, is_attached_picture, is_chapter_track, probe_any_file, probe_file,
     },
     subtitle::{
-        CueEdit, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
+        CueChanges, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata,
         SubtitleSource, canonical_language_code, language_choice, sidecar_filename, stream_cc,
         stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
         stream_original, stream_title,
@@ -2366,7 +2366,7 @@ fn prepare_subtitle_changes(
                 // replacement stream in the remux that was going to happen anyway. Copied
                 // out rather than transcoded (`-c:s copy`), so a track this page could open
                 // is a track this can rewrite.
-                if !change.cue_edits.is_empty() {
+                if !change.cues.is_empty() {
                     let subject = format!("subtitle #{index}");
                     let extracted = workspace.join(format!("cues-{job}-in.srt"));
                     extract_subtitle(
@@ -2381,13 +2381,7 @@ fn prepare_subtitle_changes(
                         report_progress,
                     )?;
                     let staged = workspace.join(format!("cues-{job}.srt"));
-                    rewrite_cue_file(
-                        &extracted,
-                        &change.cue_edits,
-                        &staged,
-                        &subject,
-                        report_progress,
-                    )?;
+                    rewrite_cue_file(&extracted, &change.cues, &staged, &subject, report_progress)?;
                     report_progress(EditProgress::new(EditPhase::ValidateSubtitle(
                         subject.clone(),
                     )));
@@ -2510,13 +2504,13 @@ fn prepare_subtitle_changes(
                 // imported must carry the new words into whatever it becomes, and the only
                 // way to guarantee that is for there to be one edited file that the rest of
                 // the branch cannot tell from the original.
-                let rewritten = if change.cue_edits.is_empty() {
+                let rewritten = if change.cues.is_empty() {
                     None
                 } else {
                     let staged = workspace.join(format!("cues-{job}.srt"));
                     rewrite_cue_file(
                         path,
-                        &change.cue_edits,
+                        &change.cues,
                         &staged,
                         path.file_name()
                             .and_then(|name| name.to_str())
@@ -2797,7 +2791,7 @@ fn convert_subtitle(
             report_progress,
         )?;
         let text_change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: change.source.clone(),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -2967,7 +2961,7 @@ fn extract_subtitle(
 /// would be the one edit in the application that could not be rolled back.
 fn rewrite_cue_file(
     source: &Path,
-    edits: &BTreeMap<usize, CueEdit>,
+    changes: &CueChanges,
     destination: &Path,
     subject: &str,
     report_progress: &mut ProgressReporter<'_>,
@@ -2981,7 +2975,7 @@ fn rewrite_cue_file(
             source.display()
         ))
     })?;
-    let rewritten = crate::subtitle::rewrite_srt_cues(&text, edits).map_err(EditError::Failed)?;
+    let rewritten = crate::subtitle::rewrite_srt_cues(&text, changes).map_err(EditError::Failed)?;
     std::fs::write(destination, rewritten).map_err(|error| {
         EditError::Failed(format!(
             "Could not stage the rewritten cues: {}: {error}",
@@ -5069,7 +5063,7 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
-    use crate::subtitle::CueSnapshot;
+    use crate::subtitle::{CueEdit, CueSnapshot};
     use std::process::Stdio;
 
     fn media(streams: Value) -> MediaInfo {
@@ -5176,7 +5170,7 @@ mod tests {
         ocr_language: Option<&str>,
     ) -> SubtitleChange {
         SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(PathBuf::from("movie.eng.sup")),
             source_format,
             embedded_target,
@@ -5668,7 +5662,7 @@ mod tests {
             },
         )]);
         let subtitle_changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -5702,7 +5696,7 @@ mod tests {
             {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
         ]));
         let subtitle_changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::VobSub),
@@ -5757,7 +5751,7 @@ mod tests {
             companion_fingerprint: None,
         }];
         let mut changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(path),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -6903,7 +6897,7 @@ mod tests {
 
     fn embedded_change(index: u64, source_format: SubtitleFormat) -> SubtitleChange {
         SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(index),
             source_format,
             embedded_target: None,
@@ -6969,7 +6963,7 @@ mod tests {
         let mut sidecar = sidecar_entry(&path, None, SubtitleFormat::SubRip);
         sidecar.fingerprint = FileFingerprint::for_path(&path).unwrap();
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -7066,7 +7060,7 @@ mod tests {
         let mut sidecar = sidecar_entry(&path, None, SubtitleFormat::SubRip);
         sidecar.language = "und".to_string();
         let mut retagged = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(path),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -7912,7 +7906,7 @@ mod tests {
             },
         )]);
         let exported = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8457,7 +8451,7 @@ mod tests {
         retagged.language = "dan".to_string();
         retagged.title = Some("Dansk".to_string());
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9303,7 +9297,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -9368,7 +9362,7 @@ mod tests {
                 audio_settings: &BTreeMap::new(),
                 video_settings: &BTreeMap::new(),
                 subtitle_changes: &[SubtitleChange {
-                    cue_edits: Default::default(),
+                    cues: Default::default(),
                     source: SubtitleSource::Embedded(1),
                     source_format: SubtitleFormat::MovText,
                     embedded_target: Some(SubtitleFormat::SubRip),
@@ -9633,7 +9627,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -9735,7 +9729,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::VobSub),
@@ -9955,7 +9949,7 @@ mod tests {
         assert_that!(original.streams[2]["codec_name"].as_str()).contains("dvd_subtitle");
 
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::VobSub,
             embedded_target: None,
@@ -10075,7 +10069,7 @@ mod tests {
             .unwrap();
         assert_that!(status.success()).is_true();
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10213,7 +10207,7 @@ mod tests {
         // real report's group structure (video, 2 audio, then subtitles) — "position
         // 3" in the output is the surviving subtitle.
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(5),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -10349,7 +10343,7 @@ mod tests {
 
         // Delete subtitle 3, keep 4 converted to MOV Text, and leave it non-default.
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(4),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -10493,7 +10487,7 @@ mod tests {
         let changes = sidecars
             .iter()
             .map(|sidecar| SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -10612,7 +10606,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar_path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -10736,7 +10730,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar_path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -10856,7 +10850,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let changes = [SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(ass_path.clone()),
             source_format: SubtitleFormat::Ass,
             embedded_target: Some(SubtitleFormat::SubRip),
@@ -12507,7 +12501,7 @@ mod tests {
             },
         );
         request.subtitle_changes.push(SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(3),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::MovText),
@@ -12570,7 +12564,7 @@ mod tests {
         // Left unset, so the "no container change" wording is exercised too.
         request.container = None;
         request.subtitle_changes.push(SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(PathBuf::from("/videos/movie.eng.srt")),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13431,7 +13425,10 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
-            cue_edits: BTreeMap::from([(1, cue_words("World", "World, rewritten", 3, 4))]),
+            cues: CueChanges {
+                edits: BTreeMap::from([(1, cue_words("World", "World, rewritten", 3, 4))]),
+                ..Default::default()
+            },
             source: SubtitleSource::Sidecar(source.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13522,7 +13519,10 @@ mod tests {
 
         // Act: rewrite the second cue and save.
         let change = SubtitleChange {
-            cue_edits: BTreeMap::from([(1, cue_words("World", "World, rewritten", 1, 2))]),
+            cues: CueChanges {
+                edits: BTreeMap::from([(1, cue_words("World", "World, rewritten", 1, 2))]),
+                ..Default::default()
+            },
             source: SubtitleSource::Embedded(1),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13615,7 +13615,10 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
-            cue_edits: BTreeMap::from([(0, cue_words("Hello", "Hello, rewritten", 1, 2))]),
+            cues: CueChanges {
+                edits: BTreeMap::from([(0, cue_words("Hello", "Hello, rewritten", 1, 2))]),
+                ..Default::default()
+            },
             source: SubtitleSource::Sidecar(source.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13677,7 +13680,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(source.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -13796,7 +13799,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         defaults.insert(subtitle_index);
         let change = SubtitleChange {
-            cue_edits: Default::default(),
+            cues: Default::default(),
             source: SubtitleSource::Embedded(subtitle_index),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,

@@ -4847,6 +4847,178 @@ fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
     );
 }
 
+/// A subtitle track is missing a line as often as it has a wrong one, and the moment that
+/// line belongs at is exactly what the timeline cursor names. `i` from the timeline therefore
+/// adds a cue there rather than rewriting the selection — which is a line nothing on screen
+/// marks while the cursor is in the other pane.
+///
+/// Driven end to end because every layer short of the file agrees while the feature is
+/// broken: the editor opens either way, the page's list can be right while the staged change
+/// is keyed against the wrong thing, and a save that never writes the cue leaves a file that
+/// still parses. So this presses the real keys, then reads the sidecar off disk.
+///
+/// The empty case is here for the same reason: `i` pressed by mistake has to cost nothing,
+/// and a track that quietly gained a blank cue would be a file the reader broke by exploring.
+#[test]
+fn adding_a_cue_from_the_timeline_should_stage_it_and_ctrl_s_should_write_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "adding_a_cue_from_the_timeline_should_stage_it_and_ctrl_s_should_write_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-insert");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(9.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // edited-count uses, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    // Act / Assert: opening the editor from the timeline and typing nothing must leave the
+    // track exactly as it was.
+    app.press(harness::ctrl('j'));
+    assert!(
+        app.app.timeline_focused(),
+        "Ctrl+J should hand the cursor to the timeline"
+    );
+    app.press(key(KeyCode::Char('i')));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::EditCue),
+        "i should open the editor from the timeline too"
+    );
+    app.press(key(KeyCode::Esc));
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "an editor closed without words in it should stage nothing"
+    );
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().cues.len(),
+        2,
+        "and should add no row to the list"
+    );
+
+    // Act: walk the cursor to 4.5s — a stretch of the clip no cue reaches — and put a line
+    // there. The cursor is seeded on the selected cue's own moment, 1.0s, and `l` is 0.5s.
+    app.press(harness::ctrl('j'));
+    for _ in 0..7 {
+        app.press(key(KeyCode::Char('l')));
+    }
+    app.press(key(KeyCode::Char('i')));
+    for character in "Added line".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+
+    // Assert: staged, drawn, and the cursor is back in the panel on the cue that was made —
+    // a new cue nothing on screen pointed at would be a cue the reader could not retime.
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "an added cue should stage like every other cue edit"
+    );
+    let state = app.app.subtitle_edit.as_ref().expect("the page is open");
+    assert_eq!(
+        state.cues.len(),
+        3,
+        "the added cue should be a row of its own"
+    );
+    assert_eq!(
+        state.selected, 2,
+        "the added cue is the last in time, and is what the cursor should be on"
+    );
+    assert!(
+        state.cursor().is_none(),
+        "the cue panel should hold the cursor once a cue has been made"
+    );
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("Added line") && screen.contains("1 edited"),
+        "the page should draw the new cue and say it is unwritten:\n{screen}"
+    );
+
+    // Act / Assert: it retimes like any other cue the moment it exists.
+    app.press(key(KeyCode::Char('t')));
+    app.press(key(KeyCode::Char('l')));
+    let moved = app
+        .app
+        .subtitle_edit
+        .as_ref()
+        .unwrap()
+        .selected_cue()
+        .expect("the added cue should still be selected")
+        .start;
+    assert_eq!(
+        moved,
+        Duration::from_millis(4550),
+        "a nudge should move the added cue the same 0.05s it moves any other"
+    );
+    app.press(key(KeyCode::Esc));
+
+    // Act: write it.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: the file carries three cues, renumbered, in time order, with the added one
+    // between the others and the media — and the cues that were already there untouched.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert_eq!(
+        written,
+        "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
+         2\n00:00:03,000 --> 00:00:04,000\nSecond line\n\n\
+         3\n00:00:04,550 --> 00:00:06,550\nAdded line\n\n",
+        "the save should write the added cue in time order and renumber the file"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written cue should stop being unsaved work"
+    );
+
+    // Act / Assert: and a cue added but discarded on the way off the page never reaches the
+    // file, for the reason a discarded rewrite does not.
+    app.press(harness::ctrl('j'));
+    app.press(key(KeyCode::Char('i')));
+    for character in "Discarded".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "the second added cue should stage like the first"
+    );
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmLeaveCues));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Enter));
+    assert_eq!(app.app.layer, Layer::Streams, "discarding should leave");
+    assert!(
+        !app.app.has_track_edits(),
+        "discarding should take the added cue with it"
+    );
+    let after = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert_eq!(
+        after, written,
+        "a discarded cue should never reach the file"
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
@@ -5067,6 +5239,106 @@ fn the_timeline_cursor_should_preview_a_moment_no_cue_points_at() {
         Layer::Streams,
         "`q` from the timeline should leave the page, not the pane:\n{}",
         app.screen()
+    );
+}
+
+/// A moment the timeline cursor stopped on is cached like any other still.
+///
+/// The cursor's pictures used to be rendered on demand and thrown away, so every settled
+/// position cost an accurate seek — including one the reader had already been to a moment
+/// earlier. They now go into the track's own frame directory under a key of their own, which
+/// is what keeps the grouping the eviction policy is built on: the moments and the cues of
+/// one track are kept and discarded together, as one thing the reader opened.
+///
+/// Proven the way the cue cache is, by planting a picture the application could not have
+/// rendered — solid magenta where the moment's frame belongs — and coming back to that moment
+/// on a later visit to the page. A page that draws magenta is a page that read the cache.
+#[test]
+fn a_moment_the_timeline_cursor_stopped_on_should_be_cached_with_the_track() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "a_moment_the_timeline_cursor_stopped_on_should_be_cached_with_the_track";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("subtitle-edit-cursor-cache");
+    write_shot_change_media(&scratch.join("clip.mkv"));
+    fs::write(scratch.join("clip.eng.srt"), LONE_LATE_CUE).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    wait_for_frames(&mut app);
+
+    // Act: the cursor into the timeline and one leap back, which the floor clamps to 0:00 —
+    // a moment no cue points at, so nothing but this grab could ever have drawn it.
+    app.press(ctrl('j'));
+    app.press(key(KeyCode::Char('H')));
+    app.wait_until("the moment the cursor is on to be drawn", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.scrub_frame().is_some())
+    });
+
+    // Assert: the moment was kept, in the same directory as the track's cue frames — the
+    // unit `framecache::prune` evicts, so the two age out together or not at all.
+    let state = app.app.subtitle_edit.as_ref().unwrap();
+    let target = state
+        .scrub_target()
+        .expect("the timeline is holding the cursor");
+    assert_eq!(
+        target.at,
+        Duration::ZERO,
+        "the leap back should have clamped to the start of the media"
+    );
+    let moment = frame_path(&state.frames.moment_key(&target));
+    assert!(
+        moment.is_file(),
+        "the moment the cursor stopped on should have been cached at {}",
+        moment.display()
+    );
+    let cue_frame = cached_frame(state, 0);
+    assert_eq!(
+        moment.parent(),
+        cue_frame.parent(),
+        "a moment's frame belongs in the track's own directory, or eviction would part it \
+         from the cues it was rendered beside"
+    );
+    assert_ne!(
+        moment, cue_frame,
+        "a moment must never take a cue's name in the cache"
+    );
+
+    // Act: plant a picture the application could not have produced, leave the page, and come
+    // back to that same moment on a fresh visit.
+    app.press(key(KeyCode::Char('q')));
+    app.pump();
+    write_solid_frame(&moment, "magenta", 320, 240);
+    open_sidecar_edit_page(&mut app);
+    app.press(ctrl('j'));
+    app.press(key(KeyCode::Char('H')));
+    app.wait_until("the moment to be drawn again", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.scrub_frame().is_some())
+    });
+
+    // Assert: the planted frame is what the pane shows, so the second visit cost a file read
+    // rather than another seek into the container.
+    let shades = app.preview_shades();
+    assert!(
+        shades
+            .iter()
+            .any(|(red, green, blue)| *red > 200 && *green < 80 && *blue > 200),
+        "the moment should have been drawn from the cache rather than rendered again; \
+         shades: {shades:?}\nscreen:\n{}",
+        app.screen()
+    );
+
+    // Assert: and the cue's own frame is still there beside it, untouched by any of this.
+    assert!(
+        cue_frame.is_file(),
+        "caching moments must not cost the track its cue frames"
     );
 }
 

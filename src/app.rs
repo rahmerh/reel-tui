@@ -36,13 +36,15 @@ use crate::{
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
-        CueEdit, CueSnapshot, FormatChoice, LanguageChoice, SidecarEntry, SubtitleChange,
-        SubtitleFlag, SubtitleFormat, SubtitleMetadata, SubtitleSource, ToolCapabilities,
-        canonical_language_code, common_language_choices, language_choice, partition_sidecars,
-        path_extension, stream_cc, stream_commentary, stream_forced, stream_hearing_impaired,
-        stream_language, stream_original, stream_title,
+        CueChanges, CueEdit, CueInsert, CueSnapshot, FormatChoice, LanguageChoice, SidecarEntry,
+        SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata, SubtitleSource,
+        ToolCapabilities, canonical_language_code, common_language_choices, language_choice,
+        partition_sidecars, path_extension, stream_cc, stream_commentary, stream_forced,
+        stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
-    subtitle_edit::{PreviewSupport, PreviewWorkspace, SubtitleEditState, WarmState},
+    subtitle_edit::{
+        self, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, WarmState,
+    },
 };
 
 /// What the subtitle edit page's frame cache and background pass are allowed to do.
@@ -120,14 +122,37 @@ const CUE_EDITS_SUBRIP_ONLY: &str =
 ///
 /// The cursor is a row and a column in *characters*, not bytes, because the column is also
 /// where the caret is drawn and subtitle text is full of multi-byte characters.
+/// What the open cue editor is about.
+///
+/// The page's two panes ask two different questions of `i`, so it answers two different
+/// things: with the cursor in the cue panel there is a line under it to rewrite, and with the
+/// cursor in the timeline there is a *moment* under it and no line at all — which is exactly
+/// the case a reader hits when a subtitle is missing.
+///
+/// The two share the whole editor and differ only at the ends: what the buffer opens with,
+/// and what closing it does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CueTarget {
+    /// A cue already on the page, addressed by where it came from — see
+    /// [`crate::subtitle_edit::CueOrigin`].
+    Cue(CueOrigin),
+    /// No cue yet: a new one to be inserted at this moment, if anything is typed.
+    ///
+    /// **Nothing at all is staged until the editor closes with words in it.** Opening `i` by
+    /// mistake and pressing `Esc` must leave the track exactly as it was, and an empty cue
+    /// staged eagerly would be a line in the file that draws nothing and a row in the panel
+    /// with nothing on it. Whitespace counts as nothing for the same reason.
+    New(Duration),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CueEditor {
     /// Which subtitle track's cue this is, so an edit staged here cannot be applied to a
     /// track the page has since moved on from.
     pub source: SubtitleSource,
-    /// The cue's position in the page's parsed list, which is how the edit is addressed all
-    /// the way to the file — see [`crate::subtitle::CueEdit`].
-    pub cue: usize,
+    /// Which cue the typing is about: one already on the page, or one that does not exist
+    /// yet. See [`CueTarget`].
+    pub target: CueTarget,
     /// What the cue said when the editor opened, which is what "has anything changed"
     /// means here.
     ///
@@ -3058,14 +3083,19 @@ impl App {
         });
         let wanted = if held_back { None } else { selected };
         let nearby = state.nearby_frame_targets();
-        // Always debounced, unlike the selected cue: nothing the timeline cursor asks for is
-        // ever in the frame cache, so there is no cheap case to let straight through. Held
-        // back rather than dropped for the same reason `wanted` is — the request stands until
-        // it is actually sent, so a settling cursor still gets its frame.
-        let scrub = state
-            .scrub_request_due()
+        // Debounced by the same rule as the selected cue, and for the same reason: the wait
+        // exists to stop one `ffmpeg` per keystroke, so a moment already in the frame cache
+        // goes straight through — which is what makes scrubbing back over ground the cursor
+        // has already covered draw at once. Held back rather than dropped, so a settling
+        // cursor still gets its frame.
+        let moment = state
+            .scrub_requested()
             .then(|| state.scrub_target())
             .flatten();
+        let scrub = moment.filter(|target| {
+            let (media, key) = state.frames.moment_key(target);
+            framecache::is_cached(&media, &key) || state.scrub_request_due()
+        });
         let scrub_held_back = state.scrub_requested() && scrub.is_none();
         // Everything in the window is already encoded, which is the steady state while the
         // cursor sits still. Forgetting the request here is what stops the same window
@@ -3374,7 +3404,14 @@ impl App {
         self.dialog = Some(Dialog::PreviewSettings);
     }
 
-    /// Opens the cue editor on the selected cue, for `i`.
+    /// Opens the cue editor, for `i`: on the selected cue, or on a new one at the timeline
+    /// cursor's moment.
+    ///
+    /// **Which of the two it is follows the page's focus, because the focus is what `i` is
+    /// about.** With the cursor in the timeline no cue is marked anywhere — the panel draws
+    /// no filled block and the timeline no bracket — so "edit the selected cue" would rewrite
+    /// a line nothing on screen points at, from a pane whose whole subject is a moment. The
+    /// moment is what the reader is pointing at, so the moment is what gets a cue.
     ///
     /// Refused rather than queued while a playback runs, for the reason every dialog on this
     /// page is: a span's pixels reach the terminal through its own image protocol rather than
@@ -3397,17 +3434,26 @@ impl App {
             self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
             return;
         }
-        let Some(cue) = state.selected_cue() else {
-            return;
+        let (target, original) = match state.cursor() {
+            // The timeline holds the cursor: an empty buffer for a cue that does not exist.
+            Some(at) => (CueTarget::New(at), String::new()),
+            None => {
+                let Some(origin) = state.selected_origin() else {
+                    return;
+                };
+                let Some(cue) = state.selected_cue() else {
+                    return;
+                };
+                (CueTarget::Cue(origin), cue.text.clone())
+            }
         };
-        let original = cue.text.clone();
         let lines: Vec<String> = original.split('\n').map(str::to_string).collect();
         // The caret starts at the end of the text, the way the application's other text
         // fields do: the common edit is adding to a line or fixing its tail, and a caret at
         // the start would have to be walked past the whole cue to get there.
         let editor = CueEditor {
             source: state.source.clone(),
-            cue: state.selected,
+            target,
             row: lines.len() - 1,
             column: lines[lines.len() - 1].chars().count(),
             lines,
@@ -3424,13 +3470,70 @@ impl App {
     /// vim's insert mode does: staging costs nothing and is reversible by editing again,
     /// where a popup that threw work away on `Esc` would have to ask before closing — a
     /// second dialog over the one page that cannot hold two.
+    ///
+    /// **An editor opened on a new cue that closes empty stages nothing at all**, and
+    /// whitespace is empty for this purpose. `i` pressed by mistake has to cost nothing, and
+    /// a cue with no words in it is a line that draws nothing on the picture and a row with
+    /// nothing on it in the panel — neither is something a reader asked for by not typing.
     pub fn close_cue_editor(&mut self) {
         let Some(editor) = self.cue_editor.take() else {
             return;
         };
         self.dialog = None;
-        if editor.is_modified() {
-            self.stage_cue_text(&editor);
+        match editor.target {
+            CueTarget::Cue(origin) => {
+                if editor.is_modified() {
+                    self.stage_cue_text(&editor, origin);
+                }
+            }
+            CueTarget::New(at) => {
+                let text = editor.text();
+                if !text.trim().is_empty() {
+                    self.insert_cue(&editor.source, at, text);
+                }
+            }
+        }
+    }
+
+    /// Puts a cue the file has no line for into the staged edits and onto the page.
+    ///
+    /// Staged like every other change to a cue, which is what makes it savable by the same
+    /// `Ctrl+S`, discardable by the same question on the way off the page, and countable on
+    /// the same panel border. Nothing here writes a file.
+    ///
+    /// The end is [`subtitle_edit::INSERT_DURATION`] past the start, held inside the media so
+    /// a cue made near the end of a film cannot run past it — the same ceiling the timeline
+    /// cursor stops at, since a cue is only worth as much as the picture under it.
+    fn insert_cue(&mut self, source: &SubtitleSource, at: Duration, text: String) {
+        let Some(format) = self.subtitle_source_format(source) else {
+            return;
+        };
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let start = at.min(state.cue_ceiling());
+        let end = start + subtitle_edit::INSERT_DURATION;
+        // Held inside the media, but against its true end rather than the cursor's ceiling:
+        // nothing is seeked to a cue's end, so it may sit on the last frame. Left alone where
+        // the duration would not parse, since clamping to zero would make every cue empty.
+        let end = if state.duration.is_zero() {
+            end
+        } else {
+            end.min(state.duration)
+        };
+        let mut change = self.subtitle_change(source, format);
+        let insert = change.cues.next_insert_id();
+        change.cues.inserts.insert(
+            insert,
+            CueInsert {
+                text: text.clone(),
+                start,
+                end,
+            },
+        );
+        self.store_subtitle_change(source.clone(), change);
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.insert_cue(insert, start, end, text);
         }
     }
 
@@ -3440,20 +3543,22 @@ impl App {
     /// The edit's `original` is the *file's* text rather than what the editor opened with,
     /// so editing the same cue twice still checks against what is on disk — see
     /// [`crate::subtitle::CueEdit`].
-    fn stage_cue_text(&mut self, editor: &CueEditor) {
+    fn stage_cue_text(&mut self, editor: &CueEditor, origin: CueOrigin) {
         let text = editor.text();
-        let Some(file) = self.file_cue_snapshot(&editor.source, editor.cue) else {
+        let Some(position) = self
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| state.position_of(origin))
+        else {
             return;
         };
+        let file = self.file_cue_snapshot(&editor.source, position);
         let staged = text.clone();
-        self.stage_cue_edit(
-            &editor.source,
-            editor.cue,
-            move || file,
-            move |edit| edit.text = staged,
-        );
+        self.stage_cue_change(&editor.source, origin, file, move |words, _, _| {
+            *words = staged;
+        });
         if let Some(state) = self.subtitle_edit.as_mut() {
-            state.edit_cue_text(editor.cue, text);
+            state.edit_cue_text(position, text);
         }
     }
 
@@ -3463,15 +3568,23 @@ impl App {
     /// carries the staged words and timing, so a second edit built from the list would check
     /// the file for something the file never said. Only when nothing is staged are the two
     /// the same thing, which is what makes reading the page's cue right in that case.
-    fn file_cue_snapshot(&self, source: &SubtitleSource, cue: usize) -> Option<CueSnapshot> {
+    ///
+    /// `None` for a cue the reader added, which is not a fallback but the answer: an
+    /// insertion names no line in the file, so there is nothing for it to be checked against
+    /// and nothing to go stale under it.
+    fn file_cue_snapshot(&self, source: &SubtitleSource, position: usize) -> Option<CueSnapshot> {
+        let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.origin(position)? else {
+            return None;
+        };
         if let Some(staged) = self
             .subtitle_changes
             .get(source)
-            .and_then(|change| change.cue_edits.get(&cue))
+            .and_then(|change| change.cues.edits.get(&cue))
         {
             return Some(staged.original.clone());
         }
-        let shown = self.subtitle_edit.as_ref()?.cues.get(cue)?;
+        let shown = state.cues.get(position)?;
         Some(CueSnapshot {
             text: shown.text.clone(),
             start: shown.start,
@@ -3479,37 +3592,56 @@ impl App {
         })
     }
 
-    /// Folds one change to a cue into the staged edit for the open file.
+    /// Folds one change to a cue into the staged edits for the open file.
     ///
-    /// The one place a `CueEdit` is created, amended or dropped, so the rules that make the
-    /// map safe are stated once: the *file's* snapshot is carried forward across repeated
+    /// The one place a staged cue is created, amended or dropped, so the rules that make the
+    /// maps safe are stated once: the *file's* snapshot is carried forward across repeated
     /// edits of the same cue, and an edit that no longer asks for anything is removed rather
     /// than stored — `store_subtitle_change` then drops the whole change when nothing is
     /// left of it, so a track edited only here stops looking modified.
     ///
-    /// `file` is a closure because it is only needed for a cue with nothing staged yet, and
-    /// the caller that has to build one has already done the work of finding the cue.
-    fn stage_cue_edit(
+    /// **One function for a rewrite and for an insertion**, because a reader retiming a cue
+    /// is doing one thing whether the file has a line for it or not: the [`CueOrigin`] is all
+    /// that separates them, and it separates them here rather than at each of the three keys
+    /// that can reach this. The one asymmetry is what "asks for nothing" means — a rewrite
+    /// that matches the file stops being an edit, where an inserted cue *is* the ask and is
+    /// never dropped for saying the same thing twice.
+    ///
+    /// `file` is what the cue reads on disk, needed only for a rewrite the page has not
+    /// staged anything against yet — `None` for an inserted cue, which has no line there.
+    fn stage_cue_change(
         &mut self,
         source: &SubtitleSource,
-        cue: usize,
-        file: impl FnOnce() -> CueSnapshot,
-        amend: impl FnOnce(&mut CueEdit),
+        origin: CueOrigin,
+        file: Option<CueSnapshot>,
+        amend: impl FnOnce(&mut String, &mut Duration, &mut Duration),
     ) {
         let Some(format) = self.subtitle_source_format(source) else {
             return;
         };
         let mut change = self.subtitle_change(source, format);
-        let mut edit = change
-            .cue_edits
-            .get(&cue)
-            .cloned()
-            .unwrap_or_else(|| CueEdit::unchanged(file()));
-        amend(&mut edit);
-        if edit.is_effective() {
-            change.cue_edits.insert(cue, edit);
-        } else {
-            change.cue_edits.remove(&cue);
+        match origin {
+            CueOrigin::File(cue) => {
+                let mut edit = match change.cues.edits.get(&cue) {
+                    Some(staged) => staged.clone(),
+                    None => match file {
+                        Some(file) => CueEdit::unchanged(file),
+                        None => return,
+                    },
+                };
+                amend(&mut edit.text, &mut edit.start, &mut edit.end);
+                if edit.is_effective() {
+                    change.cues.edits.insert(cue, edit);
+                } else {
+                    change.cues.edits.remove(&cue);
+                }
+            }
+            CueOrigin::Inserted(id) => {
+                let Some(insert) = change.cues.inserts.get_mut(&id) else {
+                    return;
+                };
+                amend(&mut insert.text, &mut insert.start, &mut insert.end);
+            }
         }
         self.store_subtitle_change(source.clone(), change);
     }
@@ -3546,13 +3678,19 @@ impl App {
     /// timing did not: a shift of zero is not a shift, and drawing one on every cue the
     /// reader walks past would put a number that never changes on the one line of the page
     /// with room for a number.
+    /// `None` for an inserted cue too, and for the same reason: it was placed rather than
+    /// moved, so there is nothing it has been shifted *from*.
     pub fn selected_cue_shift(&self) -> Option<i64> {
         let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.selected_origin()? else {
+            return None;
+        };
         let edit = self
             .subtitle_changes
             .get(&state.source)?
-            .cue_edits
-            .get(&state.selected)?;
+            .cues
+            .edits
+            .get(&cue)?;
         let shift = edit.start.as_millis() as i64 - edit.original.start.as_millis() as i64;
         (shift != 0).then_some(shift)
     }
@@ -3587,26 +3725,22 @@ impl App {
             return;
         }
         let (source, selected) = (state.source.clone(), state.selected);
-        // Taken before the nudge, because with nothing staged yet the page's own copy of the
-        // cue is what it falls back to, and the nudge is about to move that.
-        let Some(file) = self.file_cue_snapshot(&source, selected) else {
+        let Some(origin) = state.selected_origin() else {
             return;
         };
+        // Taken before the nudge, because with nothing staged yet the page's own copy of the
+        // cue is what it falls back to, and the nudge is about to move that.
+        let file = self.file_cue_snapshot(&source, selected);
         let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
-        let Some((cue, start, end)) = state.nudge_selected(steps) else {
+        let Some((_, start, end)) = state.nudge_selected(steps) else {
             return;
         };
-        self.stage_cue_edit(
-            &source,
-            cue,
-            move || file,
-            move |edit| {
-                edit.start = start;
-                edit.end = end;
-            },
-        );
+        self.stage_cue_change(&source, origin, file, move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
     }
 
     /// `0` in timing mode: puts the selected cue back to the timing the file gives it.
@@ -3627,28 +3761,28 @@ impl App {
         if !state.timing_mode {
             return;
         }
-        let (source, cue) = (state.source.clone(), state.selected);
+        let (source, position) = (state.source.clone(), state.selected);
+        // An inserted cue has no timing in the file to be put back to, so `r` on one does
+        // nothing rather than guessing at where it "should" have gone.
+        let Some(origin @ CueOrigin::File(cue)) = state.selected_origin() else {
+            return;
+        };
         let Some(original) = self
             .subtitle_changes
             .get(&source)
-            .and_then(|change| change.cue_edits.get(&cue))
+            .and_then(|change| change.cues.edits.get(&cue))
             .map(|edit| edit.original.clone())
         else {
             return;
         };
         let (start, end) = (original.start, original.end);
         if let Some(state) = self.subtitle_edit.as_mut() {
-            state.set_cue_timing(cue, start, end);
+            state.set_cue_timing(position, start, end);
         }
-        self.stage_cue_edit(
-            &source,
-            cue,
-            move || original,
-            move |edit| {
-                edit.start = start;
-                edit.end = end;
-            },
-        );
+        self.stage_cue_change(&source, origin, Some(original), move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
     }
 
     /// Whether the open file is carrying cue edits that have not been written to disk yet,
@@ -3657,20 +3791,32 @@ impl App {
         !self.staged_cue_edits().is_empty()
     }
 
-    /// Which cues of the *open subtitle edit page's* track have been rewritten and not yet written
-    /// out, for the count on the cue panel's border and the mark on each edited row.
+    /// Which rows of the *open subtitle edit page's* cue list carry work that has not been
+    /// written out, for the count on the cue panel's border and the mark on each edited row.
     ///
     /// Positions rather than a count, because the panel needs both and a count cannot be
     /// recovered from a number. Gathered for that one track rather than the whole file: the
     /// panel is that track's cue list, and a mark on it that included another track's edits
     /// would be about something not on screen. With the page closed there is no track to
     /// gather for, which is the empty set every caller outside it sees.
+    ///
+    /// **Positions in the page's list, not in the file.** The two stop agreeing the moment a
+    /// cue is inserted, and it is rows the panel draws. An inserted cue is always one of
+    /// them: it exists nowhere but here until a save writes it.
     pub fn staged_cue_edits(&self) -> BTreeSet<usize> {
-        self.subtitle_edit
-            .as_ref()
-            .and_then(|state| self.subtitle_changes.get(&state.source))
-            .map(|change| change.cue_edits.keys().copied().collect())
-            .unwrap_or_default()
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return BTreeSet::new();
+        };
+        let Some(change) = self.subtitle_changes.get(&state.source) else {
+            return BTreeSet::new();
+        };
+        (0..state.cues.len())
+            .filter(|position| match state.origin(*position) {
+                Some(CueOrigin::File(cue)) => change.cues.edits.contains_key(&cue),
+                Some(CueOrigin::Inserted(id)) => change.cues.inserts.contains_key(&id),
+                None => false,
+            })
+            .collect()
     }
 
     /// `Esc` on the subtitle edit page: leave, or ask first when cue edits would be thrown away.
@@ -3727,7 +3873,7 @@ impl App {
         let Some(mut change) = self.subtitle_changes.get(&source).cloned() else {
             return;
         };
-        change.cue_edits.clear();
+        change.cues = CueChanges::default();
         self.store_subtitle_change(source, change);
     }
 
@@ -6136,7 +6282,7 @@ impl App {
             .get(&source)
             .cloned()
             .unwrap_or(SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -6266,7 +6412,7 @@ impl App {
             .get(source)
             .cloned()
             .unwrap_or(SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -12087,7 +12233,7 @@ mod tests {
         subtitles.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(2),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -12120,7 +12266,7 @@ mod tests {
         staged.original_stream_order = vec![0, 1, 2];
         let change = |source: SubtitleSource, embedded_target, export_target, import_into_media| {
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source,
                 source_format: SubtitleFormat::SubRip,
                 embedded_target,
@@ -12208,7 +12354,7 @@ mod tests {
         staged.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -12263,7 +12409,7 @@ mod tests {
         edit.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::SubRip),
@@ -13136,7 +13282,7 @@ mod tests {
         edit.subtitle_changes.insert(
             SubtitleSource::Sidecar(sidecar_path.clone()),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar_path),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -14498,7 +14644,7 @@ mod tests {
             BTreeMap::from([(
                 source.clone(),
                 SubtitleChange {
-                    cue_edits: Default::default(),
+                    cues: Default::default(),
                     source,
                     source_format: SubtitleFormat::SubRip,
                     embedded_target: None,
@@ -16566,7 +16712,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -16971,7 +17117,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -18094,7 +18240,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -18137,7 +18283,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
-                cue_edits: Default::default(),
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -21521,7 +21667,11 @@ mod tests {
             .subtitle_changes
             .get(&SubtitleSource::Embedded(2))
             .expect("the edit should be staged against the track");
-        let edit = change.cue_edits.get(&0).expect("cue zero should be staged");
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
         assert_that!(edit.original.text.as_str()).is_equal_to("First line");
         assert_that!(edit.text.as_str()).is_equal_to("First line!");
         assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].text.as_str())
@@ -21624,8 +21774,12 @@ mod tests {
             .subtitle_changes
             .get(&SubtitleSource::Embedded(2))
             .expect("the nudge should be staged against the track");
-        assert_that!(change.cue_edits.len()).is_equal_to(1);
-        let edit = change.cue_edits.get(&0).expect("cue zero should be staged");
+        assert_that!(change.cues.edits.len()).is_equal_to(1);
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
         assert_that!(edit.original.start).is_equal_to(Duration::from_secs(1));
         assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
         assert_that!(edit.start).is_equal_to(Duration::from_millis(1150));
@@ -21700,7 +21854,7 @@ mod tests {
         let edit = app
             .subtitle_changes
             .get(&SubtitleSource::Embedded(2))
-            .and_then(|change| change.cue_edits.get(&0))
+            .and_then(|change| change.cues.edits.get(&0))
             .expect("the rewrite should still be staged");
         assert_that!(edit.start).is_equal_to(Duration::from_secs(1));
         assert_that!(edit.text.as_str()).is_equal_to("First line!");
@@ -21845,7 +21999,7 @@ mod tests {
             .subtitle_changes
             .get(&source)
             .expect("the track should still be carrying its language tag");
-        assert_that!(change.cue_edits.is_empty()).is_true();
+        assert_that!(change.cues.is_empty()).is_true();
         assert_that!(change.metadata.as_ref().map(|data| data.language.as_str()))
             .is_equal_to(Some("fra"));
 
@@ -21867,6 +22021,230 @@ mod tests {
 
         // Assert
         assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the timeline holding the cursor there is no cue marked anywhere, so `i` cannot
+    /// mean "rewrite the selection": it opens an empty editor for a cue at the moment the
+    /// cursor stands on, and typing into it stages one.
+    #[test]
+    fn i_from_the_timeline_should_add_a_cue_at_the_cursor_rather_than_edit_the_selection() {
+        // Arrange: the cursor in the timeline, walked off the selected cue's own moment.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        let at = app
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| state.cursor())
+            .expect("the timeline should hold the cursor");
+
+        // Act
+        app.open_cue_editor();
+        // The editor opens empty, rather than on the selected cue's words.
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("");
+        for character in "New line".chars() {
+            app.cue_editor_insert(character);
+        }
+        app.close_cue_editor();
+
+        // Assert: staged as an insertion, at the cursor's moment and no other.
+        let source = SubtitleSource::Embedded(2);
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the insertion should be staged against the track");
+        assert_that!(change.cues.edits.is_empty()).is_true();
+        let inserted = change
+            .cues
+            .inserts
+            .values()
+            .next()
+            .expect("one cue should have been added");
+        assert_that!(inserted.text.as_str()).is_equal_to("New line");
+        assert_that!(inserted.start).is_equal_to(at);
+        assert_that!(inserted.end).is_equal_to(at + subtitle_edit::INSERT_DURATION);
+
+        // Assert: and it is on the page, selected, with the cursor back in the cue panel.
+        let state = app.subtitle_edit.as_ref().expect("the page should be open");
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.selected_cue().map(|cue| cue.text.clone()))
+            .is_equal_to(Some("New line".to_string()));
+        // The file's own cues were left exactly as they were.
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts.contains(&"First line")).is_true();
+        assert_that!(texts.contains(&"Second line")).is_true();
+        // The panel marks it, the way it marks every other staged-but-unwritten cue.
+        assert_that!(app.staged_cue_edits().contains(&state.selected)).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `i` pressed from the timeline by mistake has to cost nothing at all — and typing only
+    /// spaces is the same as typing nothing.
+    #[test]
+    fn an_empty_editor_opened_on_a_new_cue_should_stage_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+
+        // Act: opened and closed without typing.
+        app.open_cue_editor();
+        app.close_cue_editor();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(2);
+
+        // Act: and again with nothing but whitespace in it.
+        app.focus_timeline();
+        app.open_cue_editor();
+        app.cue_editor_insert(' ');
+        app.cue_editor_newline();
+        app.cue_editor_insert('\t');
+        app.close_cue_editor();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An added cue is a staged cue like any other: it retimes with `t` and `h`/`l`, it
+    /// re-opens in the editor, and neither amends the file's own cues.
+    #[test]
+    fn an_added_cue_should_be_retimeable_and_editable_the_moment_it_exists() {
+        // Arrange: a cue added at the timeline cursor.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        for character in "Added".chars() {
+            app.cue_editor_insert(character);
+        }
+        app.close_cue_editor();
+        let source = SubtitleSource::Embedded(2);
+        let (start, end) = {
+            let inserted = app.subtitle_changes[&source].cues.inserts[&0].clone();
+            (inserted.start, inserted.end)
+        };
+
+        // Act: nudge it two steps later.
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+
+        // Assert: the staged insertion moved, keeping its length, and so did the page's cue.
+        let moved = app.subtitle_changes[&source].cues.inserts[&0].clone();
+        assert_that!(moved.start).is_equal_to(start + 2 * subtitle_edit::TIMING_STEP);
+        assert_that!(moved.end).is_equal_to(end + 2 * subtitle_edit::TIMING_STEP);
+        assert_that!(app.subtitle_changes[&source].cues.edits.is_empty()).is_true();
+        let shown = app
+            .subtitle_edit
+            .as_ref()
+            .unwrap()
+            .selected_cue()
+            .expect("the added cue should still be selected");
+        assert_that!(shown.start).is_equal_to(moved.start);
+
+        // Act: re-open the editor on it and rewrite the words.
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("Added");
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Assert: the same insertion was amended rather than a second one made, and its
+        // timing survived the rewrite.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.inserts.len()).is_equal_to(1);
+        assert_that!(change.cues.inserts[&0].text.as_str()).is_equal_to("Added!");
+        assert_that!(change.cues.inserts[&0].start).is_equal_to(moved.start);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An added cue was placed rather than moved, so the two readouts that describe a *move*
+    /// have nothing to say about it: the timeline's shift, and the `r` that puts a cue back
+    /// to the timing the file gives it. Both must answer with nothing rather than guessing at
+    /// a timing the file never held.
+    #[test]
+    fn an_added_cue_should_have_no_shift_to_report_and_nothing_to_be_reset_to() {
+        // Arrange: a cue added at the timeline cursor, then nudged.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(3);
+        let source = SubtitleSource::Embedded(2);
+        let moved = app.subtitle_changes[&source].cues.inserts[&0].start;
+
+        // Act / Assert: no shift, because there is nothing it has been shifted from.
+        assert_that!(app.selected_cue_shift()).is_none();
+
+        // Act / Assert: and `r` leaves it exactly where the reader put it.
+        app.reset_selected_cue_timing();
+        assert_that!(app.subtitle_changes[&source].cues.inserts[&0].start).is_equal_to(moved);
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .selected_cue()
+                .unwrap()
+                .start
+        )
+        .is_equal_to(moved);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page is where staged cue work ends, and an added cue is staged cue work:
+    /// discarding has to take it with the rewrites rather than leave the track looking
+    /// modified over a cue nobody can see any more.
+    #[test]
+    fn discarding_on_the_way_off_the_page_should_take_the_added_cues_too() {
+        // Arrange: one cue rewritten and one added.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        let source = SubtitleSource::Embedded(2);
+        assert_that!(app.subtitle_changes[&source].cues.edits.len()).is_equal_to(1);
+        assert_that!(app.subtitle_changes[&source].cues.inserts.len()).is_equal_to(1);
+
+        // Act: leave, discarding.
+        app.back();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+
+        // Assert: the track carries nothing at all any more.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
 
         // Cleanup
@@ -24366,9 +24744,9 @@ mod tests {
     }
 
     /// The worker cannot see the cursor any more than it can see the cue list, so the moment
-    /// and everything on screen at it have to travel in the request. It waits out the
-    /// debounce every time — nothing it asks for is ever in the frame cache, so there is no
-    /// cheap case to let straight through.
+    /// and everything on screen at it have to travel in the request. A moment that has never
+    /// been drawn waits out the debounce, which is what stops a held `l` starting an accurate
+    /// seek per repeat.
     #[test]
     fn start_pending_preview_should_ask_for_the_moment_the_cursor_stands_on() {
         // Arrange
@@ -24411,6 +24789,50 @@ mod tests {
         // Act / Assert: and a settled cursor asks exactly once.
         app.start_pending_preview();
         assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A moment already in the frame cache skips the debounce, exactly as a cached cue does.
+    /// The wait is there to stop one `ffmpeg` per keystroke, and a moment the reader has been
+    /// to before costs a file read — making them wait a tenth of a second for it is a tenth
+    /// of a second of stale pane for nothing, on precisely the movement (scrubbing back over
+    /// ground already covered) this cache was added for.
+    #[test]
+    fn start_pending_preview_should_not_make_a_cached_moment_wait() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        while frames.try_recv().is_ok() {}
+        app.focus_timeline();
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
+        // Seed the cache with whatever this moment's picture would be filed under.
+        let state = app.subtitle_edit.as_ref().expect("the page is open");
+        let target = state.scrub_target().expect("the timeline holds the cursor");
+        let (media, key) = state.frames.moment_key(&target);
+        assert_that!(framecache::store(&media, &key, &[7u8; 64])).is_true();
+
+        // Act: no sleep at all, so the debounce has certainly not expired.
+        app.start_pending_preview();
+
+        // Assert
+        let scrub = frames
+            .try_iter()
+            .find_map(|request| request.scrub)
+            .expect("the cached moment should go out at once");
+        assert_that!(scrub.at).is_equal_to(Duration::from_secs(2));
+
+        // Act / Assert: and it is still asked for only once.
+        app.start_pending_preview();
+        assert_that!(frames.try_iter().any(|request| request.scrub.is_some())).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();

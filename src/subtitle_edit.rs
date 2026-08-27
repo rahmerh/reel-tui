@@ -93,6 +93,33 @@ pub enum EditFocus {
     Timeline,
 }
 
+/// Where one row of the page's cue list came from.
+///
+/// The page's list and the *file's* stop being the same list the moment a cue is inserted:
+/// the new row takes its place in time, and every file cue after it moves down one. A staged
+/// rewrite is addressed by the cue's position in the file ([`crate::subtitle::CueEdit`]), so
+/// something has to remember which is which — this is it, kept parallel to
+/// [`SubtitleEditState::cues`] so a row and its origin cannot come apart.
+///
+/// Renumbering the file positions on an insertion instead would be the same information
+/// stored twice, and would silently rewrite the keys of edits already staged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CueOrigin {
+    /// A cue the file holds, at this position in the parsed list.
+    File(usize),
+    /// A cue the reader added this session, under this insertion id.
+    Inserted(usize),
+}
+
+/// How long an inserted cue is given.
+///
+/// A cue has to have a length before it can be judged against the picture, and two seconds is
+/// about what an ordinary line of dialogue runs for — long enough to be visible on the
+/// timeline at any window the pane picks, short enough not to swallow its neighbours into one
+/// overlap group. It is a starting point rather than a guess at the reader's intent: the cue
+/// is retimed with `t` like any other from the moment it exists.
+pub const INSERT_DURATION: Duration = Duration::from_secs(2);
+
 /// How many cues of one overlap group the panel draws side by side.
 ///
 /// **Two is forced by the width, not chosen.** The cue panel is thirty to forty-eight
@@ -500,6 +527,9 @@ pub struct SubtitleEditState {
     /// How far the background frame pass has got, or why there is not one.
     pub warm: WarmState,
     pub cues: Vec<Cue>,
+    /// Where each entry of [`Self::cues`] came from, parallel to it and always the same
+    /// length. See [`CueOrigin`].
+    origins: Vec<CueOrigin>,
     /// Whether `h`/`l` move the selected cue through time rather than through its group.
     ///
     /// A mode rather than a dialog because it has to coexist with a playback: no dialog may
@@ -675,6 +705,7 @@ impl SubtitleEditState {
             support,
             warm: WarmState::Off,
             cues: Vec::new(),
+            origins: Vec::new(),
             timing_mode: false,
             layout: LaneLayout::default(),
             groups: Vec::new(),
@@ -758,6 +789,9 @@ impl SubtitleEditState {
         } else {
             LoadStatus::Ready
         };
+        // Every cue is the file's until the reader adds one: this is the reading the staged
+        // rewrites' positions are keyed against.
+        self.origins = (0..cues.len()).map(CueOrigin::File).collect();
         self.cues = cues;
         // Clamped rather than trusted: the cue the page is being restored to came from the
         // *previous* reading of a file that has since been rewritten, and a save can remove
@@ -797,6 +831,7 @@ impl SubtitleEditState {
         // this page is stopped by the generation bump that closing it performs.
         self.warm = WarmState::Off;
         self.cues.clear();
+        self.origins.clear();
         self.layout = LaneLayout::default();
         self.groups.clear();
         self.encoded.clear();
@@ -962,6 +997,118 @@ impl SubtitleEditState {
             self.frame_error = None;
         }
         self.request_frame();
+    }
+
+    /// Where the cue standing at `position` in the page's list came from.
+    ///
+    /// The one translation between what the reader is pointing at and what a staged change is
+    /// addressed by — see [`CueOrigin`].
+    pub fn origin(&self, position: usize) -> Option<CueOrigin> {
+        self.origins.get(position).copied()
+    }
+
+    /// Where the selected cue came from.
+    pub fn selected_origin(&self) -> Option<CueOrigin> {
+        self.origin(self.selected)
+    }
+
+    /// Which row of the page's list a staged change is about — [`Self::origin`] the other way
+    /// round.
+    ///
+    /// For the cue editor, which remembers what it was opened on as an origin rather than as
+    /// a row: a row is a fact about the list as it stands, and an origin is a fact about the
+    /// cue, which is what a reader who opened the editor was pointing at.
+    pub fn position_of(&self, origin: CueOrigin) -> Option<usize> {
+        self.origins.iter().position(|found| *found == origin)
+    }
+
+    /// Puts a cue the file has no line for into the page's list, and selects it.
+    ///
+    /// **At its place in time rather than at the end**, because the panel's groups and the
+    /// timeline's lanes both read the list as start-ordered: appended, a cue would be grouped
+    /// with whatever happened to precede it in the vector rather than with what shares its
+    /// moment. Every file cue after it keeps the position its staged rewrites are keyed by —
+    /// that is what [`Self::origins`] is for.
+    ///
+    /// Three things follow, and each is the same rule [`Self::set_cue_timing`] follows for a
+    /// cue that moved: the encoded frames are dropped for every cue now sharing the screen
+    /// with the new one, since a frame is burned with everything on screen at that moment;
+    /// the lanes are repacked; and a playback is stopped, because a span decoded before this
+    /// cue existed is a span of a picture the page no longer describes. The overlap *groups*
+    /// are recomputed here, unlike after a nudge, because a new row has to appear in the
+    /// panel at all — there is no drawing of this list that predates it.
+    ///
+    /// Reports where the new cue landed.
+    pub fn insert_cue(
+        &mut self,
+        insert: usize,
+        start: Duration,
+        end: Duration,
+        text: String,
+    ) -> usize {
+        // After every cue that starts no later, which is where the save's own sort will put
+        // it: a cue inserted onto the same moment as another reads after it, the way a cue
+        // typed into a file at that point would.
+        let at = self
+            .cues
+            .partition_point(|cue| (cue.start, cue.end) <= (start, end));
+        self.cues.insert(
+            at,
+            Cue {
+                index: at,
+                start,
+                end,
+                text,
+                // Empty because this is a SubRip-only feature: a cue with no `Dialogue:` line
+                // is staged as its own text, which is exactly what a SubRip cue is.
+                dialogue: Vec::new(),
+                events: 1,
+            },
+        );
+        // Kept as the list's own numbering, which every caller that reads `Cue::index`
+        // expects to be the position in this list.
+        for (position, cue) in self.cues.iter_mut().enumerate() {
+            cue.index = position;
+        }
+        self.origins.insert(at, CueOrigin::Inserted(insert));
+        // The window's indices are positions in `cues`, so everything at or after the new row
+        // has moved down one. Shifted rather than cleared, so the frames the reader was
+        // looking at survive an insertion somewhere else in the track.
+        for frame in &mut self.encoded {
+            if frame.cue_index >= at {
+                frame.cue_index += 1;
+            }
+        }
+        if let Some((cue, _)) = self.frame_error.as_mut()
+            && *cue >= at
+        {
+            *cue += 1;
+        }
+        let cues = &self.cues;
+        self.encoded.retain(|frame| {
+            frame.cue_index != at
+                && cues
+                    .get(frame.cue_index)
+                    .is_some_and(|other| !shares_screen(other, start, end))
+        });
+        self.layout = pack_lanes(&self.cues, MAX_LANES);
+        self.groups = group_overlaps(&self.cues);
+        // The keys are positions in `groups`, which has just been rebuilt around a row that
+        // was not in it — so every remembered place is about a group that may no longer be
+        // the same group.
+        self.group_memory.clear();
+        self.selected = at;
+        self.group_page = self
+            .groups
+            .get(self.group_of(at))
+            .map(|group| (at - group.first) / GROUP_COLUMNS)
+            .unwrap_or(0);
+        // The reader made a cue; the page has to be showing it. That means the cue panel,
+        // which is the only pane that marks a selection — the timeline draws no bracket while
+        // it holds the cursor, so a new cue made from there would land unmarked and invisible.
+        self.leave_timeline();
+        self.select_cue();
+        at
     }
 
     /// Shifts the selected cue through time, keeping its duration, and reports the new
@@ -1187,6 +1334,14 @@ impl SubtitleEditState {
     /// the still grab agree about where the end of the file is. Where it is not — a container
     /// whose duration would not parse — the last cue's end is the furthest point the page has
     /// any evidence for, and letting the cursor run past that would be inventing media.
+    /// The latest moment a cue may be placed at, which is the one the cursor stops at.
+    ///
+    /// The same answer for the same reason: a cue past the end of the media is a line over no
+    /// picture, on the page that exists to judge a line against the picture.
+    pub fn cue_ceiling(&self) -> Duration {
+        self.cursor_ceiling()
+    }
+
     fn cursor_ceiling(&self) -> Duration {
         seek_ceiling(self.duration).unwrap_or_else(|| {
             self.cues
@@ -1228,8 +1383,9 @@ impl SubtitleEditState {
 
     /// Whether that request has waited out [`FRAME_DEBOUNCE`].
     ///
-    /// Always consulted, unlike a cue's: nothing the cursor asks for is ever in the frame
-    /// cache, so there is no cheap case for the debounce to be skipped for.
+    /// Consulted only for a moment that would have to be rendered, exactly as a cue's is: a
+    /// moment already in the frame cache costs a read, and the cursor crossing ground it has
+    /// covered before is the ordinary case this makes instant.
     pub fn scrub_request_due(&self) -> bool {
         self.scrub_requested()
             && self
@@ -4555,5 +4711,90 @@ mod tests {
         state.clear_scrub_request();
         assert_that!(state.scrub_requested()).is_false();
         assert_that!(state.scrub_request_due()).is_false();
+    }
+
+    /// A cue added at a moment lands where that moment falls in the list, and the file's own
+    /// cues keep the positions their staged rewrites are addressed by.
+    #[test]
+    fn an_inserted_cue_should_land_in_time_order_without_moving_the_files_positions() {
+        // Arrange: cues at 0-1s, 2-3s and 4-5s.
+        let mut state = ready(3);
+
+        // Act: a cue in the gap between the second and the third.
+        let at = state.insert_cue(
+            7,
+            Duration::from_millis(3200),
+            Duration::from_millis(3800),
+            "new".to_string(),
+        );
+
+        // Assert: it is the third row of the list, and it is what the cursor is on.
+        assert_that!(at).is_equal_to(2);
+        assert_that!(state.selected).is_equal_to(2);
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["line 0", "line 1", "new", "line 2"]);
+        // The file's cues still answer for the positions the staged rewrites use, even the
+        // one that moved down a row.
+        assert_that!(state.origin(1)).is_equal_to(Some(CueOrigin::File(1)));
+        assert_that!(state.origin(2)).is_equal_to(Some(CueOrigin::Inserted(7)));
+        assert_that!(state.origin(3)).is_equal_to(Some(CueOrigin::File(2)));
+        assert_that!(state.position_of(CueOrigin::File(2))).is_equal_to(Some(3));
+        // The list's own numbering follows the list, which is what every reader of
+        // `Cue::index` expects.
+        let indices: Vec<usize> = state.cues.iter().map(|cue| cue.index).collect();
+        assert_that!(indices).contains_exactly_in_given_order([0, 1, 2, 3]);
+        // And the panel has a row to draw it on.
+        assert_that!(state.groups.len()).is_equal_to(4);
+    }
+
+    /// The cursor comes home when a cue is made from the timeline: the cue panel is the only
+    /// pane that marks a selection, so a new cue left behind in the timeline would be a cue
+    /// nothing on screen points at.
+    #[test]
+    fn a_cue_made_from_the_timeline_should_bring_the_cursor_back_to_the_panel() {
+        // Arrange
+        let mut state = ready(3);
+        state.focus_timeline();
+        assert_that!(state.cursor()).is_some();
+
+        // Act
+        state.insert_cue(
+            0,
+            Duration::from_millis(500),
+            Duration::from_millis(900),
+            "new".to_string(),
+        );
+
+        // Assert
+        assert_that!(state.focus).is_equal_to(EditFocus::Cues);
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.selected).is_equal_to(1);
+    }
+
+    /// A frame is burned with everything on screen at that moment, so a new cue makes its
+    /// neighbours' pictures wrong — and only its neighbours'.
+    #[test]
+    fn an_inserted_cue_should_drop_the_frames_it_now_shares_the_screen_with() {
+        // Arrange: frames for all three cues on hand.
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        for index in 0..3 {
+            state.apply_frame(index, protocol(40, 20));
+        }
+
+        // Act: a cue overlapping the second (2000-3000ms) and nothing else.
+        state.insert_cue(
+            0,
+            Duration::from_millis(2500),
+            Duration::from_millis(2800),
+            "new".to_string(),
+        );
+
+        // Assert: the first cue's frame survives at its own position, the third's survives
+        // at the position it moved down to, and the one it overlaps is gone.
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(1)).is_false();
+        assert_that!(state.has_frame(2)).is_false();
+        assert_that!(state.has_frame(3)).is_true();
     }
 }
