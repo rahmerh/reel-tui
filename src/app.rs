@@ -113,6 +113,22 @@ impl Default for PreviewSettings {
 const CUE_EDITS_SUBRIP_ONLY: &str =
     "Only SubRip cues can be edited here; this track is another format.";
 
+/// Why the cue editor and the timing mode refuse a cue that is marked to go.
+///
+/// The same refusal the track list gives for moving or re-encoding a track marked for
+/// deletion, in the same words: a reader who has said this line is leaving has not asked to
+/// rewrite it, and letting them would put a row on screen that was yellow for the words it
+/// will never say and red for the fact it will not be there to say them.
+const CUE_MARKED_FOR_DELETION: &str = "Unmark this cue for deletion before editing it.";
+
+/// Why the last cue a track has left cannot be marked to go.
+///
+/// A SubRip file with nothing in it is not a subtitle track, and remuxing one back into a
+/// container is a save that fails on something the reader did. Removing the track itself is
+/// what they are after, and the track list already does exactly that.
+const CUE_TRACK_NEEDS_A_CUE: &str =
+    "A subtitle track needs at least one cue; delete the track itself instead.";
+
 /// The subtitle edit page's cue editor: one cue's text, being rewritten.
 ///
 /// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
@@ -3438,6 +3454,11 @@ impl App {
             // The timeline holds the cursor: an empty buffer for a cue that does not exist.
             Some(at) => (CueTarget::New(at), String::new()),
             None => {
+                // A line the reader has said is leaving is not a line they asked to rewrite.
+                if self.selected_cue_is_deleted() {
+                    self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+                    return;
+                }
                 let Some(origin) = state.selected_origin() else {
                     return;
                 };
@@ -3646,6 +3667,102 @@ impl App {
         self.store_subtitle_change(source.clone(), change);
     }
 
+    /// `d`: marks the selected cue to be taken out of the track, or takes the mark back off.
+    ///
+    /// The same gesture the track list gives a track, at the same key and in the same colour
+    /// — see [`Self::toggle_delete_selected_stream`]. The mark is staged like every other cue
+    /// edit, so `Ctrl+S` writes it and leaving the page asks about it.
+    ///
+    /// **The row stays in the list, marked, until a save carries it out.** That is what makes
+    /// this a toggle rather than a one-way door, and it keeps the panel's positions still
+    /// while the reader works down a track. It also keeps the cue burned into the preview,
+    /// which is the point: judging whether a line should go means seeing it, and a still
+    /// grabbed at the moment it comes in would otherwise show nothing at all.
+    ///
+    /// **A cue the reader added this session is un-added instead**, row and all. It names no
+    /// line in the file to be marked against and there is nothing to restore it from, so a
+    /// mark on one would be storing a change that cancels itself.
+    ///
+    /// **A staged rewrite of the same cue is kept.** Marking a line to go must not silently
+    /// cost the reader typing they get back by unmarking it — which is where this diverges
+    /// from the track list, whose `d` drops that track's staged settings. The writer applies
+    /// the rewrite and then drops the line, so keeping it costs nothing.
+    ///
+    /// **Not gated on a playback**, unlike every dialog this page can raise: a mark changes
+    /// neither the picture nor the timing, so a span still running still describes the cue it
+    /// claims to.
+    ///
+    /// Marking advances the cursor by one cue and unmarking does not, the same asymmetry the
+    /// track list has: a run of `d` takes out a run of cues, while a second press on one row
+    /// takes the mark back off in place.
+    pub fn toggle_delete_selected_cue(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        // With the cursor in the timeline no cue is marked anywhere, so there is nothing for
+        // `d` to be about — the same reason the vertical movement keys are inert there.
+        if state.cursor().is_some() {
+            return;
+        }
+        let (source, position) = (state.source.clone(), state.selected);
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        if format != SubtitleFormat::SubRip {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        let marked = self.staged_cue_deletions();
+        let mut change = self.subtitle_change(&source, format);
+        match origin {
+            CueOrigin::Inserted(id) => {
+                change.cues.inserts.remove(&id);
+                self.store_subtitle_change(source, change);
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    state.remove_cue(position);
+                }
+                self.notice = None;
+            }
+            CueOrigin::File(cue) if change.cues.deletes.remove(&cue).is_some() => {
+                self.store_subtitle_change(source, change);
+                self.notice = None;
+            }
+            CueOrigin::File(cue) => {
+                // Counted over the page's rows rather than the file's, because an inserted
+                // cue survives the save and a row already marked does not.
+                let rows = self
+                    .subtitle_edit
+                    .as_ref()
+                    .map_or(0, |state| state.cues.len());
+                if rows.saturating_sub(marked.len()) <= 1 {
+                    self.notice = Some(CUE_TRACK_NEEDS_A_CUE.into());
+                    return;
+                }
+                // The *file's* cue, which `file_cue_snapshot` gives even for a row the page
+                // has already rewritten — what the reader marked is the line on disk.
+                let Some(file) = self.file_cue_snapshot(&source, position) else {
+                    return;
+                };
+                change.cues.deletes.insert(cue, file);
+                self.store_subtitle_change(source, change);
+                self.notice = None;
+                // One step, across the group boundary when there is one: the two movements
+                // `l` and `j` already make, composed, so there is no new cursor bookkeeping.
+                if let Some(state) = self.subtitle_edit.as_mut()
+                    && !state.select_within_group(1)
+                {
+                    state.select(1);
+                }
+            }
+        }
+    }
+
     /// `t`: turns the timing mode on or off for the open page.
     ///
     /// **Not gated on a playback**, unlike every dialog this page can raise. A mode is not
@@ -3724,6 +3841,15 @@ impl App {
         if !state.timing_mode {
             return;
         }
+        // A cue marked to go has no timing worth arguing about, and nudging one would put a
+        // shift readout on the title for a line that will not be in the file.
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
         let (source, selected) = (state.source.clone(), state.selected);
         let Some(origin) = state.selected_origin() else {
             return;
@@ -3761,6 +3887,13 @@ impl App {
         if !state.timing_mode {
             return;
         }
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
         let (source, position) = (state.source.clone(), state.selected);
         // An inserted cue has no timing in the file to be put back to, so `r` on one does
         // nothing rather than guessing at where it "should" have gone.
@@ -3787,8 +3920,11 @@ impl App {
 
     /// Whether the open file is carrying cue edits that have not been written to disk yet,
     /// which is what makes leaving the subtitle edit page worth asking about.
+    ///
+    /// A cue marked to go is work like any other: it is visible on this page and nowhere
+    /// else, so leaving without asking would throw it away silently.
     pub fn has_unsaved_cue_edits(&self) -> bool {
-        !self.staged_cue_edits().is_empty()
+        !self.staged_cue_edits().is_empty() || !self.staged_cue_deletions().is_empty()
     }
 
     /// Which rows of the *open subtitle edit page's* cue list carry work that has not been
@@ -3817,6 +3953,43 @@ impl App {
                 None => false,
             })
             .collect()
+    }
+
+    /// Which rows of the open page's cue list are marked to be taken out of the track, for
+    /// the count on the cue panel's border and the mark on each row.
+    ///
+    /// The twin of [`Self::staged_cue_edits`] and positions in the *page's* list for the same
+    /// reason: it is rows the panel draws, and the page's list stops agreeing with the file's
+    /// the moment a cue is inserted.
+    ///
+    /// An inserted cue is never one of them — un-adding one takes its row out of the list
+    /// rather than marking it, so there is no row left to be counted here.
+    pub fn staged_cue_deletions(&self) -> BTreeSet<usize> {
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return BTreeSet::new();
+        };
+        let Some(change) = self.subtitle_changes.get(&state.source) else {
+            return BTreeSet::new();
+        };
+        (0..state.cues.len())
+            .filter(|position| match state.origin(*position) {
+                Some(CueOrigin::File(cue)) => change.cues.deletes.contains_key(&cue),
+                Some(CueOrigin::Inserted(_)) | None => false,
+            })
+            .collect()
+    }
+
+    /// Whether the selected cue is marked to go, which is what `i`, `t` and `r` refuse on.
+    fn selected_cue_is_deleted(&self) -> bool {
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return false;
+        };
+        let Some(CueOrigin::File(cue)) = state.selected_origin() else {
+            return false;
+        };
+        self.subtitle_changes
+            .get(&state.source)
+            .is_some_and(|change| change.cues.deletes.contains_key(&cue))
     }
 
     /// `Esc` on the subtitle edit page: leave, or ask first when cue edits would be thrown away.
@@ -22240,6 +22413,384 @@ mod tests {
         // Act: leave, discarding.
         app.back();
         assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+
+        // Assert: the track carries nothing at all any more.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A subtitle edit page with three cues on it, for the deletion tests: two is enough to
+    /// stage one deletion but not enough to see the cursor move on to a third row, or to see
+    /// the last cue refused while another is already marked.
+    fn cue_deleting_app() -> (App, PathBuf) {
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line"),
+                edit_cue_at(5, 6, "Third line"),
+            ],
+            CueStyle::SubRip,
+        );
+        (app, directory)
+    }
+
+    /// `d` stages the deletion against the file's cue, carrying what the file says so the
+    /// writer can refuse if the line has moved — and moves the cursor on, so a run of `d`
+    /// takes out a run of cues.
+    #[test]
+    fn marking_a_cue_for_deletion_should_stage_it_and_move_the_cursor_on() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: staged against the track, with the file's own words and timing.
+        let deleted = app.subtitle_changes[&source]
+            .cues
+            .deletes
+            .get(&0)
+            .expect("cue zero should be marked");
+        assert_that!(deleted.text.as_str()).is_equal_to("First line");
+        assert_that!(deleted.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(deleted.end).is_equal_to(Duration::from_secs(2));
+        // The row is still there to be unmarked, and the panel knows which one it is.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(3);
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+        // A deletion is not a rewrite: the two counts on the border answer separately.
+        assert_that!(app.staged_cue_edits().is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(app.has_track_edits()).is_true();
+        // And the cursor moved on, ready for the next `d`.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A second press on the same row takes the mark back off and leaves the cursor where it
+    /// is — the same asymmetry the track list has, which is what lets `d` mean both "this one
+    /// too" and "no, not that one".
+    #[test]
+    fn unmarking_a_cue_should_leave_the_cursor_where_it_is_and_stage_nothing() {
+        // Arrange: the second cue marked, cursor moved back onto it.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: nothing staged at all, so the track stops looking modified.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+        assert_that!(app.staged_cue_deletions().is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Marking a cue that has already been rewritten keeps the rewrite, so unmarking gives it
+    /// back. The deletion still carries the *file's* words rather than the staged ones, or
+    /// the save would check the file for something it never said.
+    #[test]
+    fn marking_a_rewritten_cue_should_keep_the_rewrite_and_snapshot_the_file() {
+        // Arrange: the first cue rewritten.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: both staged, and the deletion describes the file rather than the page.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+        assert_that!(change.cues.deletes[&0].text.as_str()).is_equal_to("First line");
+        // The row reads as deleted rather than as edited — going is the edit.
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+
+        // Act: unmark.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_delete_selected_cue();
+
+        // Assert: the typing came back.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.deletes.is_empty()).is_true();
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A line the reader has said is leaving is not a line they asked to rewrite or retime,
+    /// so the three cue mutations refuse it and say why — the same refusal the track list
+    /// gives for moving or re-encoding a track marked for deletion.
+    #[test]
+    fn editing_a_cue_marked_for_deletion_should_be_refused() {
+        // Arrange: the first cue marked, cursor back on it, timing mode on.
+        let (mut app, directory) = cue_deleting_app();
+        app.toggle_delete_selected_cue();
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_cue_timing_mode();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act / Assert: the editor does not open.
+        app.notice = None;
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.is_none()).is_true();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Act / Assert: a nudge moves nothing.
+        app.notice = None;
+        app.nudge_selected_cue(2);
+        assert_that!(app.subtitle_changes[&source].cues.edits.is_empty()).is_true();
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .selected_cue()
+                .unwrap()
+                .start
+        )
+        .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Act / Assert: and `r` has nothing to put back.
+        app.notice = None;
+        app.reset_selected_cue_timing();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue the reader added exists nowhere but the page, so `d` un-adds it: there is no
+    /// line in the file to be marked against and nothing to restore it from. The row goes
+    /// with it, and the file's own cues keep the positions their rewrites are keyed by.
+    #[test]
+    fn deleting_an_added_cue_should_un_add_it_and_take_its_row_with_it() {
+        // Arrange: a cue added between the second and the third, and the first rewritten.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.focus_timeline();
+        app.move_timeline_cursor(9, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(4);
+        // The cursor came home to the added cue, which sits last: the timeline cursor starts
+        // on the selected cue's own moment, so nine steps from 0:01 is 0:05.5.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(3);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: the insertion and its row are both gone, and nothing was marked instead.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.inserts.is_empty()).is_true();
+        assert_that!(change.cues.deletes.is_empty()).is_true();
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+        let state = app.subtitle_edit.as_ref().unwrap();
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order([
+            "First line!",
+            "Second line",
+            "Third line",
+        ]);
+        assert_that!(state.position_of(CueOrigin::File(2))).is_equal_to(Some(2));
+        assert_that!(state.selected).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A SubRip file with nothing in it is not a subtitle track, and remuxing one back into a
+    /// container is a save that fails on something the reader did. The last cue is refused,
+    /// with the notice pointing at the thing they are actually after.
+    #[test]
+    fn marking_the_last_cue_a_track_has_left_should_be_refused() {
+        // Arrange: two of the three cues marked already.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.toggle_delete_selected_cue();
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes[&source].cues.deletes.len()).is_equal_to(2);
+
+        // Act
+        app.notice = None;
+        app.toggle_delete_selected_cue();
+
+        // Assert: still two, and the refusal names the way out.
+        assert_that!(app.subtitle_changes[&source].cues.deletes.len()).is_equal_to(2);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str())
+            .contains("delete the track itself");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An ASS cue's timing is the anchor every animation tag in it is measured from, and the
+    /// rewrite path this stages through is SubRip's. Refused for the reason the editor is,
+    /// in the same words.
+    #[test]
+    fn deleting_a_cue_should_refuse_a_track_it_cannot_rewrite() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "A sign"),
+                edit_cue_at(3, 4, "Another sign"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the cursor in the timeline no cue is marked anywhere, so `d` has nothing to be
+    /// about — marking the cue the panel is parked on would take out a line nothing on screen
+    /// points at.
+    #[test]
+    fn deleting_a_cue_should_be_inert_while_the_timeline_holds_the_cursor() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        app.focus_timeline();
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `d` means "delete the track" one layer up and "delete the cue" here, so the guard on
+    /// the page is what keeps the two apart — and a dialog swallows it entirely, the way it
+    /// swallows every other action behind it.
+    #[test]
+    fn deleting_a_cue_should_only_answer_from_the_page_with_nothing_over_it() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act / Assert: nothing from the track list, which has its own meaning for `d`.
+        app.layer = Layer::Streams;
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Act / Assert: and nothing from behind a dialog.
+        app.layer = Layer::SubtitleEdit;
+        app.dialog = Some(Dialog::Keybindings);
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Act / Assert: with the dialog gone it answers.
+        app.dialog = None;
+        app.toggle_delete_selected_cue();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track with no cues on it has no row for `d` to be about, and answering by staging
+    /// something keyed against a cue that is not there would be worse than answering nothing.
+    #[test]
+    fn deleting_a_cue_should_do_nothing_on_a_track_with_no_cues() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new(), CueStyle::SubRip);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A deletion is visible on this page and nowhere else, so leaving without asking would
+    /// throw it away silently — and discarding has to take it with the rewrites.
+    #[test]
+    fn leaving_the_page_should_ask_about_a_deletion_and_then_discard_it() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.toggle_delete_selected_cue();
+
+        // Act
+        app.back();
+
+        // Assert: asked rather than left.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act: discard.
         app.choose_leave_subtitle_edit(1);
         app.activate_leave_subtitle_edit();
 

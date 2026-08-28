@@ -1111,6 +1111,64 @@ impl SubtitleEditState {
         at
     }
 
+    /// Takes a row out of the page's list, for a cue the reader added and has now un-added.
+    ///
+    /// The mirror of [`Self::insert_cue`] and it follows the same rules for the same reasons:
+    /// every file cue keeps the position its staged rewrites are keyed by (that is what
+    /// [`Self::origins`] is for), the encoded frames above the gone row shift down rather than
+    /// being cleared, and the frames of every cue that shared the screen with it are dropped,
+    /// since a frame is burned with everything on screen at that moment. The lanes are
+    /// repacked and the overlap groups rebuilt, because a row leaving the panel is a change to
+    /// the list every drawing of it is derived from.
+    ///
+    /// **Only ever used for an inserted cue.** A cue the file holds is marked to go and stays
+    /// on screen until a save carries it out, so that the mark can be taken back off.
+    pub fn remove_cue(&mut self, position: usize) {
+        let Some(gone) = self.cues.get(position).cloned() else {
+            return;
+        };
+        self.cues.remove(position);
+        self.origins.remove(position);
+        // Kept as the list's own numbering, which every caller that reads `Cue::index`
+        // expects to be the position in this list.
+        for (at, cue) in self.cues.iter_mut().enumerate() {
+            cue.index = at;
+        }
+        // The row itself has no frame to keep, and everything below it has moved up one.
+        self.encoded.retain(|frame| frame.cue_index != position);
+        for frame in &mut self.encoded {
+            if frame.cue_index > position {
+                frame.cue_index -= 1;
+            }
+        }
+        match self.frame_error.as_mut() {
+            Some((cue, _)) if *cue == position => self.frame_error = None,
+            Some((cue, _)) if *cue > position => *cue -= 1,
+            _ => {}
+        }
+        let cues = &self.cues;
+        self.encoded.retain(|frame| {
+            cues.get(frame.cue_index)
+                .is_some_and(|other| !shares_screen(other, gone.start, gone.end))
+        });
+        self.layout = pack_lanes(&self.cues, MAX_LANES);
+        self.groups = group_overlaps(&self.cues);
+        // The keys are positions in `groups`, which has just been rebuilt without a row that
+        // was in it — so every remembered place is about a group that may no longer be the
+        // same group.
+        self.group_memory.clear();
+        // The row that took the gone one's place, which is where the eye already is. Clamped
+        // rather than moved, so removing the last row lands on the new last one.
+        self.selected = position.min(self.cues.len().saturating_sub(1));
+        self.group_page = self
+            .groups
+            .get(self.group_of(self.selected))
+            .map(|group| (self.selected - group.first) / GROUP_COLUMNS)
+            .unwrap_or(0);
+        self.leave_timeline();
+        self.select_cue();
+    }
+
     /// Shifts the selected cue through time, keeping its duration, and reports the new
     /// timing for staging.
     ///
@@ -4796,5 +4854,147 @@ mod tests {
         assert_that!(state.has_frame(1)).is_false();
         assert_that!(state.has_frame(2)).is_false();
         assert_that!(state.has_frame(3)).is_true();
+    }
+
+    /// Un-adding a cue takes its row out of the list, and every file cue keeps the position
+    /// its staged rewrites are addressed by — the same claim the insertion makes, going the
+    /// other way.
+    #[test]
+    fn removing_a_cue_should_take_its_row_out_without_moving_the_files_positions() {
+        // Arrange: an inserted cue sitting third in a list of four.
+        let mut state = ready(3);
+        let at = state.insert_cue(
+            7,
+            Duration::from_millis(3200),
+            Duration::from_millis(3800),
+            "new".to_string(),
+        );
+        assert_that!(at).is_equal_to(2);
+
+        // Act
+        state.remove_cue(at);
+
+        // Assert: the list is what it was, and the file's cues answer for their own
+        // positions again.
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["line 0", "line 1", "line 2"]);
+        assert_that!(state.origin(2)).is_equal_to(Some(CueOrigin::File(2)));
+        assert_that!(state.position_of(CueOrigin::File(2))).is_equal_to(Some(2));
+        assert_that!(state.position_of(CueOrigin::Inserted(7))).is_none();
+        // The list's own numbering follows the list, which is what every reader of
+        // `Cue::index` expects.
+        let indices: Vec<usize> = state.cues.iter().map(|cue| cue.index).collect();
+        assert_that!(indices).contains_exactly_in_given_order([0, 1, 2]);
+        // The panel has one row fewer to draw, and the cursor is on the row that took the
+        // gone one's place.
+        assert_that!(state.groups.len()).is_equal_to(3);
+        assert_that!(state.selected).is_equal_to(2);
+    }
+
+    /// A frame is burned with everything on screen at that moment, so a cue leaving makes its
+    /// neighbours' pictures wrong — and only its neighbours'. The frames below it shift up
+    /// with their rows rather than being thrown away.
+    #[test]
+    fn removing_a_cue_should_drop_the_frames_it_shared_the_screen_with() {
+        // Arrange: a cue overlapping the second one only, with every frame on hand.
+        let mut state = ready(3);
+        state.set_preview_cells(Size::new(40, 20));
+        let at = state.insert_cue(
+            0,
+            Duration::from_millis(2500),
+            Duration::from_millis(2800),
+            "new".to_string(),
+        );
+        assert_that!(at).is_equal_to(2);
+        for index in 0..4 {
+            state.apply_frame(index, protocol(40, 20));
+        }
+
+        // Act
+        state.remove_cue(at);
+
+        // Assert: the first cue never shared the screen with it and keeps its frame; the
+        // second did and loses it; the third's frame follows the row up from 3 to 2.
+        assert_that!(state.has_frame(0)).is_true();
+        assert_that!(state.has_frame(1)).is_false();
+        assert_that!(state.has_frame(2)).is_true();
+        assert_that!(state.has_frame(3)).is_false();
+    }
+
+    /// The selection cannot be left pointing past the end of a list that just got shorter:
+    /// a cursor outside the list is one the panel cannot draw.
+    #[test]
+    fn removing_the_last_cue_should_bring_the_cursor_back_into_the_list() {
+        // Arrange: an inserted cue at the end of the track, selected.
+        let mut state = ready(3);
+        let at = state.insert_cue(
+            0,
+            Duration::from_millis(9000),
+            Duration::from_millis(9500),
+            "new".to_string(),
+        );
+        assert_that!(at).is_equal_to(3);
+
+        // Act
+        state.remove_cue(at);
+
+        // Assert
+        assert_that!(state.cues.len()).is_equal_to(3);
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.group_of(state.selected)).is_equal_to(2);
+    }
+
+    /// The status row's frame error is keyed on a cue's *position*, so a row leaving the list
+    /// moves it: the error of the row that went has nothing left to be about, and one below it
+    /// would otherwise be reported against whichever cue moved up into its slot.
+    #[test]
+    fn removing_a_cue_should_move_the_frame_error_with_the_rows() {
+        // Arrange: four rows, with the last one's frame having failed.
+        let mut state = ready(3);
+        let at = state.insert_cue(
+            0,
+            Duration::from_millis(3200),
+            Duration::from_millis(3800),
+            "new".to_string(),
+        );
+        assert_that!(at).is_equal_to(2);
+        state.fail_frame(3, "no such frame".to_string());
+
+        // Act: take the inserted row out from above it.
+        state.remove_cue(at);
+
+        // Assert: the error followed its cue up a row.
+        state.select_first();
+        assert_that!(state.frame_error()).is_none();
+        state.select(2);
+        assert_that!(state.frame_error()).is_equal_to(Some("no such frame"));
+
+        // Arrange / Act: and an error about the row that goes has nothing left to be about.
+        let at = state.insert_cue(
+            1,
+            Duration::from_millis(3200),
+            Duration::from_millis(3800),
+            "again".to_string(),
+        );
+        state.fail_frame(at, "gone".to_string());
+        state.remove_cue(at);
+
+        // Assert
+        assert_that!(state.frame_error()).is_none();
+    }
+
+    /// A position no row stands at is not a row to remove, and answering one by removing
+    /// something else would be worse than answering nothing.
+    #[test]
+    fn removing_a_cue_that_is_not_there_should_do_nothing() {
+        // Arrange
+        let mut state = ready(3);
+
+        // Act
+        state.remove_cue(9);
+
+        // Assert
+        assert_that!(state.cues.len()).is_equal_to(3);
+        assert_that!(state.selected).is_equal_to(0);
     }
 }

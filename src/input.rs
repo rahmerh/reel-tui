@@ -1057,6 +1057,13 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.open_cue_editor();
         }
+        // The same key that marks a *track* for deletion one layer up, doing the same thing to
+        // a cue: press it to mark, press it again to unmark, and `Ctrl+S` carries it out. A
+        // reader who has learnt `d` on the track list has learnt it here.
+        (KeyCode::Char('d'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.toggle_delete_selected_cue();
+        }
         // The same key that processes staged files everywhere else, from the page where the
         // cue edits were made: they are staged edits like any other, so the key that writes
         // them is the key that writes those.
@@ -1481,7 +1488,7 @@ mod tests {
         // alone leaves the behaviour intact — so this test does not fail on that edit by
         // itself, and is a contract lock rather than a single-guard regression test.
         let keys = [
-            ("d (delete track)", key(KeyCode::Char('d'))),
+            ("d (delete track or cue)", key(KeyCode::Char('d'))),
             ("i (stream details)", key(KeyCode::Char('i'))),
             ("h (subtitle column left)", key(KeyCode::Char('h'))),
             ("ctrl+k (move track up)", ctrl('k')),
@@ -3703,6 +3710,55 @@ mod tests {
         assert_that!(app.dialog).is_equal_to(None);
         assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `d` marks a cue for deletion on the subtitle edit page, exactly as it marks a track
+    /// one layer up — and `Ctrl+D` keeps meaning "half a page down", which the two arms are
+    /// only kept apart by their modifiers.
+    #[test]
+    fn d_should_mark_a_cue_for_deletion_on_the_subtitle_edit_page() {
+        // Arrange: the page, with two cues on it so one can go.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: ["subtitles", "scale"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            (0..2)
+                .map(|index| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(index as u64 * 2 + 1),
+                    end: std::time::Duration::from_secs(index as u64 * 2 + 2),
+                    text: format!("line {index}"),
+                    dialogue: Vec::new(),
+                    events: 1,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+
+        // Act / Assert: `d` marks the selected cue and moves on.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('d')));
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Act / Assert: `Ctrl+D` still scrolls rather than marking a second one.
+        handle_key(&mut app, &mut input, ctrl('d'));
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+
+        // Act / Assert: and `d` back on it takes the mark off.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('d')));
+        assert_that!(app.staged_cue_deletions().is_empty()).is_true();
 
         // Cleanup
         drop(app);
