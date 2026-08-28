@@ -284,17 +284,17 @@ pub struct CueInsert {
 }
 
 /// Everything the subtitle edit page has staged against one track's cues: lines rewritten,
-/// and lines added.
+/// lines added, and lines marked to go.
 ///
-/// **One type rather than two fields, because every gate in the application asks the same
-/// question of both.** Whether a track is modified, whether it changes the media, whether
-/// leaving the page throws work away, whether the save has to rewrite the file at all — each
-/// is `is_empty()` here, and a second collection sitting beside this one would have to be
-/// remembered at every one of those places and at every one added later.
+/// **One type rather than three fields, because every gate in the application asks the same
+/// question of all of them.** Whether a track is modified, whether it changes the media,
+/// whether leaving the page throws work away, whether the save has to rewrite the file at
+/// all — each is `is_empty()` here, and a second collection sitting beside this one would
+/// have to be remembered at every one of those places and at every one added later.
 ///
-/// Rewrites are keyed by the cue's *position* in the parsed list and insertions by an id of
-/// their own, because a cue that does not exist in the file has no position to be keyed by
-/// and two insertions at the same moment are two cues rather than one.
+/// Rewrites and deletions are keyed by the cue's *position* in the parsed list and insertions
+/// by an id of their own, because a cue that does not exist in the file has no position to be
+/// keyed by and two insertions at the same moment are two cues rather than one.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CueChanges {
     /// Cues the file already holds, rewritten — keyed by position in the parsed list.
@@ -303,12 +303,25 @@ pub struct CueChanges {
     /// than positions for the same reason [`CueEdit`] uses positions: an inserted cue has no
     /// place in the file yet, and the page has to be able to keep amending the one it made.
     pub inserts: BTreeMap<usize, CueInsert>,
+    /// Cues the file holds that are to be taken out of it, keyed by position in the parsed
+    /// list and carrying what stood there for exactly the reason [`CueEdit::original`] does:
+    /// a position is only meaningful against the list it was taken from, so the writer
+    /// refuses when the cue standing there is not the one the reader marked.
+    ///
+    /// A cue can be both rewritten and deleted, and that is deliberate: marking a line to go
+    /// must not silently cost the reader typing they can get back by unmarking it. The
+    /// rewrite simply lands on a line the writer then drops.
+    ///
+    /// Deletions only ever name cues the *file* holds. A cue the reader added is removed by
+    /// dropping its [`CueInsert`], since it names no line to be marked against and nothing
+    /// would be left to restore it from.
+    pub deletes: BTreeMap<usize, CueSnapshot>,
 }
 
 impl CueChanges {
     /// Whether anything at all is staged against this track's cues.
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty() && self.inserts.is_empty()
+        self.edits.is_empty() && self.inserts.is_empty() && self.deletes.is_empty()
     }
 
     /// The next free insertion id.
@@ -408,32 +421,34 @@ impl SubtitleChange {
 /// Putting one at its place in time first would move every cue after it and leave the
 /// remaining edits addressing the wrong lines; the sort below is what actually puts it where
 /// it belongs, and `cue::write_srt` renumbers the file from one afterwards.
+///
+/// **Deleted cues are checked first and dropped last, and both halves of that matter.** The
+/// check runs ahead of the rewrites because a cue that is both rewritten and deleted would
+/// otherwise be checked against words a rewrite had already replaced, where what the reader
+/// marked is the line the *file* holds. The drop runs after them because the positions every
+/// edit is keyed by address the file as it was read, and removing a line moves every line
+/// below it.
 pub fn rewrite_srt_cues(source: &str, changes: &CueChanges) -> Result<String, String> {
     let mut cues = crate::cue::parse_srt(source);
+    for (position, original) in &changes.deletes {
+        checked_cue(&mut cues, *position, original)?;
+    }
     for (position, edit) in &changes.edits {
-        let Some(cue) = cues.get_mut(*position) else {
-            return Err(format!(
-                "This track no longer has a cue #{}; it may have been edited elsewhere.",
-                position + 1
-            ));
-        };
-        if cue.text != edit.original.text {
-            return Err(format!(
-                "Cue #{} no longer reads the way it did when it was edited; \
-                 it may have been changed elsewhere.",
-                position + 1
-            ));
-        }
-        if cue.start != edit.original.start || cue.end != edit.original.end {
-            return Err(format!(
-                "Cue #{} is no longer timed the way it was when it was edited; \
-                 it may have been changed elsewhere.",
-                position + 1
-            ));
-        }
+        let cue = checked_cue(&mut cues, *position, &edit.original)?;
         cue.text = edit.text.clone();
         cue.start = edit.start;
         cue.end = edit.end;
+    }
+    if !changes.deletes.is_empty() {
+        // `retain` visits in order, so the counter is the cue's position in the file — the
+        // same numbering the deletions are keyed by, and still meaningful because nothing has
+        // been removed or appended yet.
+        let mut position = 0;
+        cues.retain(|_| {
+            let keep = !changes.deletes.contains_key(&position);
+            position += 1;
+            keep
+        });
     }
     for insert in changes.inserts.values() {
         cues.push(crate::cue::Cue {
@@ -452,6 +467,44 @@ pub fn rewrite_srt_cues(source: &str, changes: &CueChanges) -> Result<String, St
     // the same tie-break `cue::parse_srt` applies when it reads this back.
     cues.sort_by_key(|cue| (cue.start, cue.end));
     Ok(crate::cue::write_srt(&cues))
+}
+
+/// The cue standing at `position`, once it has been confirmed to be the one the reader was
+/// looking at.
+///
+/// The three refusals a staged change can meet are stated here once rather than at each kind
+/// of change, because they are the same three: the file lost that cue, the cue's words moved,
+/// or its timing did. A rewrite and a deletion are equally wrong when the line underneath
+/// them has become somebody else's.
+///
+/// Numbered from one in the message, because that is how a SubRip file numbers its cues and
+/// how the reader will find it again.
+fn checked_cue<'a>(
+    cues: &'a mut [crate::cue::Cue],
+    position: usize,
+    original: &CueSnapshot,
+) -> Result<&'a mut crate::cue::Cue, String> {
+    let Some(cue) = cues.get_mut(position) else {
+        return Err(format!(
+            "This track no longer has a cue #{}; it may have been edited elsewhere.",
+            position + 1
+        ));
+    };
+    if cue.text != original.text {
+        return Err(format!(
+            "Cue #{} no longer reads the way it did when it was edited; \
+             it may have been changed elsewhere.",
+            position + 1
+        ));
+    }
+    if cue.start != original.start || cue.end != original.end {
+        return Err(format!(
+            "Cue #{} is no longer timed the way it was when it was edited; \
+             it may have been changed elsewhere.",
+            position + 1
+        ));
+    }
+    Ok(cue)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2528,6 +2581,7 @@ fra
                     end: Duration::from_millis(900),
                 },
             )]),
+            ..CueChanges::default()
         };
 
         // Act
@@ -2543,6 +2597,159 @@ fra
             "two, rewritten",
             "three",
         ]);
+    }
+
+    /// The staged cue changes that a bare map of deletions amounts to.
+    fn deletions(deletes: BTreeMap<usize, CueSnapshot>) -> CueChanges {
+        CueChanges {
+            deletes,
+            ..Default::default()
+        }
+    }
+
+    /// A cue marked to go leaves the file, the ones around it are untouched, and the counters
+    /// describe the file that was written rather than the one that was read.
+    #[test]
+    fn rewrite_srt_cues_should_drop_a_deleted_cue_and_renumber_the_rest() {
+        // Arrange: the middle cue.
+        let changes = deletions(BTreeMap::from([(1, snapshot("two", 3))]));
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("the deletion should apply");
+
+        // Assert: two cues left, with their own words and timings.
+        let cues = crate::cue::parse_srt(&written);
+        let read: Vec<(&str, u128, u128)> = cues
+            .iter()
+            .map(|cue| {
+                (
+                    cue.text.as_str(),
+                    cue.start.as_millis(),
+                    cue.end.as_millis(),
+                )
+            })
+            .collect();
+        assert_that!(read)
+            .contains_exactly_in_given_order([("one", 1000, 2000), ("three", 5000, 6000)]);
+        // Renumbered from one: the third cue is now the second, and nothing in the file still
+        // claims to be a cue #3.
+        assert_that!(written.as_str()).contains("2\n00:00:05,000 --> 00:00:06,000\nthree");
+        assert_that!(written.contains("\n3\n")).is_false();
+    }
+
+    /// Deletions are keyed by position in the file as it was *read*, so two of them do not
+    /// shift each other — the first one dropped must not make the second address the wrong
+    /// line.
+    #[test]
+    fn rewrite_srt_cues_should_drop_several_cues_by_the_positions_the_file_was_read_at() {
+        // Arrange: the first and the last.
+        let changes = deletions(BTreeMap::from([
+            (0, snapshot("one", 1)),
+            (2, snapshot("three", 5)),
+        ]));
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("both should apply");
+
+        // Assert
+        let cues = crate::cue::parse_srt(&written);
+        let texts: Vec<&str> = cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["two"]);
+    }
+
+    /// A cue can be both rewritten and marked to go, because marking one must not cost the
+    /// reader typing they get back by unmarking it. The rewrite lands and the line still
+    /// leaves — and, crucially, the deletion is checked against what the *file* says rather
+    /// than against the words the rewrite has just put there.
+    #[test]
+    fn rewrite_srt_cues_should_drop_a_cue_that_was_also_rewritten() {
+        // Arrange: the middle cue rewritten and deleted at once.
+        let changes = CueChanges {
+            edits: BTreeMap::from([(1, cue_edit("two", 3, "two, rewritten"))]),
+            deletes: BTreeMap::from([(1, snapshot("two", 3))]),
+            ..Default::default()
+        };
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("both should apply");
+
+        // Assert: gone, and its rewritten words are nowhere in the file either.
+        let cues = crate::cue::parse_srt(&written);
+        let texts: Vec<&str> = cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["one", "three"]);
+        assert_that!(written.contains("rewritten")).is_false();
+    }
+
+    /// A deletion is addressed by position exactly as a rewrite is, so it meets the same
+    /// three refusals: the file lost that cue, its words moved, or its timing did. Without
+    /// them, a sidecar edited elsewhere between marking and saving would have the reader's
+    /// deletion land on whichever line moved into the slot.
+    #[test]
+    fn rewrite_srt_cues_should_refuse_a_deletion_the_file_no_longer_matches() {
+        // Act / Assert: the cue at that position now says something else.
+        let moved = rewrite_srt_cues(
+            THREE_CUES,
+            &deletions(BTreeMap::from([(1, snapshot("SOMETHING ELSE", 3))])),
+        );
+        assert_that!(moved.unwrap_err().as_str()).contains("no longer reads the way it did");
+
+        // Act / Assert: the cue is timed differently now.
+        let retimed = rewrite_srt_cues(
+            THREE_CUES,
+            &deletions(BTreeMap::from([(1, snapshot("two", 30))])),
+        );
+        assert_that!(retimed.unwrap_err().as_str()).contains("no longer timed the way it was");
+
+        // Act / Assert: and the cue is gone from the file entirely.
+        let missing = rewrite_srt_cues(
+            THREE_CUES,
+            &deletions(BTreeMap::from([(9, snapshot("nine", 9))])),
+        );
+        assert_that!(missing.unwrap_err().as_str()).contains("no longer has a cue");
+    }
+
+    /// Insertions survive a deletion of everything the file held: the two are different
+    /// key spaces, and the cue the reader added is the one the file ends up with.
+    #[test]
+    fn rewrite_srt_cues_should_keep_an_insertion_when_every_file_cue_is_deleted() {
+        // Arrange
+        let changes = CueChanges {
+            inserts: BTreeMap::from([(
+                0,
+                CueInsert {
+                    text: "the only one".to_string(),
+                    start: Duration::from_secs(9),
+                    end: Duration::from_secs(10),
+                },
+            )]),
+            deletes: BTreeMap::from([
+                (0, snapshot("one", 1)),
+                (1, snapshot("two", 3)),
+                (2, snapshot("three", 5)),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        let written = rewrite_srt_cues(THREE_CUES, &changes).expect("the changes should apply");
+
+        // Assert
+        let cues = crate::cue::parse_srt(&written);
+        let texts: Vec<&str> = cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order(["the only one"]);
+    }
+
+    /// Every gate in the application asks `is_empty()` of the staged cue changes, so a track
+    /// carrying nothing but a deletion has to answer that it is modified — otherwise the save
+    /// skips the rewrite and the mark is silently dropped.
+    #[test]
+    fn cue_changes_should_not_be_empty_when_only_a_deletion_is_staged() {
+        // Arrange
+        let changes = deletions(BTreeMap::from([(0, snapshot("one", 1))]));
+
+        // Act / Assert
+        assert_that!(changes.is_empty()).is_false();
+        assert_that!(CueChanges::default().is_empty()).is_true();
     }
 
     /// Insertion ids are handed out one past the highest ever used rather than by counting,

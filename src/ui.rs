@@ -162,6 +162,10 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // same reason the badge is, and shown on the cue panel: a staged edit is invisible once
     // the editor closes, and invisible unsaved work is work a reader thinks is saved.
     let edited = app.staged_cue_edits();
+    // And which are marked to be taken out of it, read here for the same reason and shown in
+    // the same corner. Kept apart from the rewrites rather than merged: the rows wear
+    // different colours and the counts answer different questions.
+    let deleted = app.staged_cue_deletions();
     // How far the selected cue has been moved, for the timeline's title. Read here for the
     // same reason `edited` is: it comes from the staged edits rather than from the page.
     let shift = app.selected_cue_shift().map(format_shift);
@@ -243,7 +247,16 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // comes back to and what the timeline's window is fitted around.
     let selected = cursor.is_none().then_some(state.selected);
     render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
-    render_edit_cues(frame, state, columns[1], &edited, selected);
+    render_edit_cues(
+        frame,
+        state,
+        columns[1],
+        CueMarks {
+            edited: &edited,
+            deleted: &deleted,
+        },
+        selected,
+    );
     render_edit_timeline(frame, state, shift, cursor, selected, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
@@ -500,6 +513,34 @@ impl GroupTiming {
     }
 }
 
+/// What the cue panel's border says about the work staged against this track, or `None` when
+/// there is none.
+///
+/// Two counts rather than one total, each in the colour its rows wear, so the reader can tell
+/// three rewrites from three lines about to leave the file without opening the panel to look.
+/// The separator is dim because it is punctuation between two answers rather than a third.
+fn staged_cue_counts(marks: CueMarks) -> Option<Line<'static>> {
+    let mut spans = Vec::new();
+    if !marks.edited.is_empty() {
+        spans.push(Span::styled(
+            format!(" {} edited ", marks.edited.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !marks.deleted.is_empty() {
+        if !spans.is_empty() {
+            // Bare, because both counts carry their own edge space and a separator with more
+            // would open a gap on one side of it.
+            spans.push(Span::styled("·", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!(" {} deleted ", marks.deleted.len()),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
+}
+
 /// The cue list, drawn one *group* to a row rather than one cue.
 ///
 /// A group is a run of cues that are on screen together (`cue::group_overlaps`). The
@@ -516,7 +557,7 @@ fn render_edit_cues(
     frame: &mut Frame,
     state: &mut SubtitleEditState,
     area: Rect,
-    edited: &BTreeSet<usize>,
+    marks: CueMarks,
     selected: Option<usize>,
 ) {
     // The same border the file list and the track list wear when they hold the cursor. Two
@@ -533,10 +574,15 @@ fn render_edit_cues(
     // row: it is a count of *these* rows' frames, and the status row carries one message at
     // a time — where "Preparing playback…" is the one worth reading while a span decodes.
     //
-    // The count of *edited* cues takes the same corner when the pass is over, which is when
+    // The count of *staged* cues takes the same corner when the pass is over, which is when
     // editing happens: a staged edit is invisible the moment the editor closes, and
     // invisible unsaved work is work the reader believes is saved. The pass wins the corner
     // while it runs because it is finite and about to stop; the edits are still there after.
+    //
+    // Rewrites and deletions are counted apart rather than added together, and each in the
+    // colour its rows wear: they are different work with different consequences, and a single
+    // number would make the reader open the panel to find out which they had. Each half is
+    // dropped at zero, so the ordinary case of one kind of edit reads exactly as it did.
     if let WarmState::Working { done, total } = state.warm {
         block = block.title(
             Line::styled(
@@ -545,14 +591,8 @@ fn render_edit_cues(
             )
             .right_aligned(),
         );
-    } else if !edited.is_empty() {
-        block = block.title(
-            Line::styled(
-                format!(" {} edited ", edited.len()),
-                Style::default().fg(Color::Yellow),
-            )
-            .right_aligned(),
-        );
+    } else if let Some(counts) = staged_cue_counts(marks) {
+        block = block.title(counts.right_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -576,7 +616,7 @@ fn render_edit_cues(
             state,
             group,
             timing,
-            edited,
+            marks,
             selected,
             Rect {
                 x: inner.x,
@@ -635,7 +675,7 @@ fn render_edit_group(
     state: &SubtitleEditState,
     group: CueGroup,
     timing: GroupTiming,
-    edited: &BTreeSet<usize>,
+    marks: CueMarks,
     selected: Option<usize>,
     area: Rect,
 ) {
@@ -652,8 +692,7 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            selected == Some(first),
-            edited.contains(&first),
+            marks.at(first, selected),
             &format!(
                 " {} → {} ",
                 format_timestamp(cue.start),
@@ -699,8 +738,7 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            selected == Some(position),
-            edited.contains(&position),
+            marks.at(position, selected),
             &timing.title(cue),
             Rect {
                 x: area.x + if offset == 0 { 0 } else { left_width },
@@ -809,14 +847,8 @@ fn render_edit_fork(
 /// how the row was built, so it is the one that gives way. At the sizes the panel is actually
 /// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
 /// fits, with the two titles' decorative spaces sharing the column where they meet.
-fn render_edit_cue(
-    frame: &mut Frame,
-    cue: &Cue,
-    selected: bool,
-    edited: bool,
-    timing: &str,
-    area: Rect,
-) {
+fn render_edit_cue(frame: &mut Frame, cue: &Cue, row: CueRowState, timing: &str, area: Rect) {
+    let selected = row.selected;
     let folded = (cue.events > 1)
         .then(|| format!(" ×{} ", cue.events))
         // Measured on what the two titles *say*, plus one column between them, rather than on
@@ -840,12 +872,12 @@ fn render_edit_cue(
         }
         (block, fill)
     } else {
+        let timing_style = Style::default().fg(row.timing_colour());
         let mut block = Block::bordered()
             .border_style(Style::default().fg(Color::White))
-            .title(Line::styled(timing, Style::default().fg(Color::DarkGray)));
+            .title(Line::styled(timing, timing_style));
         if let Some(folded) = folded {
-            block = block
-                .title(Line::styled(folded, Style::default().fg(Color::DarkGray)).right_aligned());
+            block = block.title(Line::styled(folded, timing_style).right_aligned());
         }
         (block, Style::default().fg(Color::Gray))
     };
@@ -862,25 +894,82 @@ fn render_edit_cue(
         &cue.text.replace('\n', " / "),
         usize::from(inner.width).saturating_sub(1).max(1),
     );
-    // A rewritten cue is said by its own words rather than by a marker beside them: the
-    // words *are* what changed, and the row is otherwise identical to one that was not
-    // touched. Yellow is the colour every other staged-but-unwritten thing in the
-    // application already wears, and the italic carries it into the selected row, where the
-    // cyan fill owns the colours and yellow on cyan would be unreadable.
-    let text_style = if edited {
-        let italic = text_style.add_modifier(Modifier::ITALIC);
-        if selected {
-            italic
-        } else {
-            italic.fg(Color::Yellow)
-        }
-    } else {
-        text_style
-    };
     frame.render_widget(
-        Paragraph::new(Line::styled(format!(" {text}"), text_style)),
+        Paragraph::new(Line::styled(format!(" {text}"), row.text_style(text_style))),
         inner,
     );
+}
+
+/// What one cue row is saying about itself beyond its words.
+///
+/// **Deletion outranks a rewrite, which is the ranking the track list's rows already follow**
+/// (`TrackRowState`): a row marked to go is not also an edited row, because going *is* the
+/// edit — there is no version of it that will ever be read.
+///
+/// Both marks are a modifier as well as a colour, and that is what makes them survive the
+/// selection: the selected row is filled cyan and owns its colours, so yellow or red on it
+/// would be unreadable and the italic or the strikethrough is all that carries over.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CueRowState {
+    selected: bool,
+    edited: bool,
+    deleted: bool,
+}
+
+impl CueRowState {
+    /// The style of the row's words.
+    ///
+    /// A rewritten cue is said by its own words rather than by a marker beside them — the
+    /// words *are* what changed, and the row is otherwise identical to one nobody touched.
+    /// A deleted one is said by a line through those words, which is the one mark that
+    /// means "this is going" without needing a legend.
+    fn text_style(self, base: Style) -> Style {
+        if self.deleted {
+            let struck = base.add_modifier(Modifier::CROSSED_OUT);
+            if self.selected {
+                struck
+            } else {
+                struck.fg(Color::Red)
+            }
+        } else if self.edited {
+            let italic = base.add_modifier(Modifier::ITALIC);
+            if self.selected {
+                italic
+            } else {
+                italic.fg(Color::Yellow)
+            }
+        } else {
+            base
+        }
+    }
+
+    /// The colour of the timing on an unselected row's border, so a row marked to go reads as
+    /// one red thing rather than as struck-through words under an ordinary timestamp.
+    fn timing_colour(self) -> Color {
+        if self.deleted {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }
+    }
+}
+
+/// Which rows of the cue panel carry work that has not been written out, gathered so the two
+/// answers travel together down to the row that has to rank them.
+#[derive(Clone, Copy, Debug)]
+struct CueMarks<'a> {
+    edited: &'a BTreeSet<usize>,
+    deleted: &'a BTreeSet<usize>,
+}
+
+impl CueMarks<'_> {
+    fn at(self, position: usize, selected: Option<usize>) -> CueRowState {
+        CueRowState {
+            selected: selected == Some(position),
+            edited: self.edited.contains(&position),
+            deleted: self.deleted.contains(&position),
+        }
+    }
 }
 
 fn render_edit_timeline(
@@ -3037,6 +3126,11 @@ fn keybindings_text() -> Text<'static> {
         "i",
         "Edit the selected cue's text, or add a cue at the timeline cursor (SubRip tracks); \
          Esc keeps the edit, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "d",
+        "Mark or unmark the selected cue for deletion (SubRip tracks); Ctrl-s writes it",
     );
     keybinding(
         &mut lines,
@@ -11873,9 +11967,10 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", and the three that
-        // match on "tracks": the SRT timing preview, the cue editor, and the timing mode.
-        assert_eq!(count, 5);
+        // "Move track down / up", "Mark or unmark track for deletion", and the four that
+        // match on "tracks": the SRT timing preview, the cue editor, the timing mode, and
+        // marking a cue for deletion.
+        assert_eq!(count, 6);
     }
 
     #[test]
@@ -13191,6 +13286,19 @@ mod tests {
                 columns[columns.len() - panel..].iter().collect()
             })
             .collect()
+    }
+
+    /// Which terminal column `needle` starts at on a drawn row, or `None` when it is not on
+    /// it.
+    ///
+    /// `str::find` answers in *bytes*, and this page is drawn almost entirely in box-drawing
+    /// glyphs that are three bytes each — so a byte offset taken from one of these rows lands
+    /// tens of columns to the right of the text it found, on padding the style under test was
+    /// never applied to. That reads as the styling being absent rather than as the test
+    /// looking in the wrong place.
+    fn column_of(line: &str, needle: &str) -> Option<u16> {
+        line.find(needle)
+            .map(|byte| line[..byte].chars().count() as u16)
     }
 
     /// The crossbar of the first group's fork, with the cue panel's own border trimmed off
@@ -14887,6 +14995,48 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Rewrites and deletions are counted apart and each dropped at zero, because they are
+    /// different work with different consequences: one number would make the reader open the
+    /// panel to find out which of the two they had staged.
+    #[test]
+    fn the_cue_panel_should_count_deletions_apart_from_rewrites() {
+        // Arrange: three cues, so two can go and one is left.
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-count",
+            vec![
+                edit_cue(1000, 2000, "One"),
+                edit_cue(3000, 4000, "Two"),
+                edit_cue(5000, 6000, "Three"),
+            ],
+        );
+
+        // Act / Assert: a deletion alone reads on its own, with no separator to hang off.
+        app.toggle_delete_selected_cue();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 deleted")).is_true();
+        assert_that!(screen.contains("edited")).is_false();
+        assert_that!(screen.contains("·")).is_false();
+
+        // Act / Assert: a rewrite as well — of the second cue, which marking the first moved
+        // the cursor onto — and both counts stand side by side.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited · 1 deleted")).is_true();
+
+        // Act / Assert: and unmarking the first takes the deletion's half away again.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_delete_selected_cue();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited")).is_true();
+        assert_that!(screen.contains("deleted")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The timeline's title is the readout a reader nudges against: the cue's live times,
     /// and how far it has been moved.
     ///
@@ -15009,8 +15159,8 @@ mod tests {
             let line: String = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect();
-            let text = line.find("Untouched").or_else(|| line.find("Rewritten"));
-            (line.clone(), text.map(|x| buffer[(x as u16, y)].clone()))
+            let text = column_of(&line, "Untouched").or_else(|| column_of(&line, "Rewritten"));
+            (line.clone(), text.map(|x| buffer[(x, y)].clone()))
         };
 
         // The two cue rows, found by the words on them.
@@ -15049,6 +15199,141 @@ mod tests {
         let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
         assert_that!(edited_cell.fg).is_equal_to(Color::Yellow);
         assert!(edited_cell.modifier.contains(Modifier::ITALIC));
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue marked to go says so in red, with a line through the words it will not get to
+    /// say — the same colour a track marked for deletion wears one layer up. The
+    /// strikethrough is what carries the mark onto the selected row, where the cyan fill owns
+    /// the colours, exactly as the italic carries a rewrite onto it.
+    #[test]
+    fn a_cue_marked_for_deletion_should_say_so_in_red_and_struck_through() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-mark",
+            vec![
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Doomed"),
+            ],
+        );
+
+        // The words of the row at `y`, with the style of its first character.
+        let row = |app: &mut App, y: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = column_of(&line, "Untouched").or_else(|| column_of(&line, "Doomed"));
+            (line.clone(), text.map(|x| buffer[(x, y)].clone()))
+        };
+
+        // The two cue rows, found by the words on them.
+        let mut rows = (0..30).filter(|y| {
+            let line = row(&mut app, *y).0;
+            line.contains("Untouched") || line.contains("Doomed")
+        });
+        let untouched = rows.next().expect("the first cue should be drawn");
+        let doomed = rows.next().expect("the second cue should be drawn");
+        drop(rows);
+
+        // Act: mark the second one, which leaves the cursor on it — there is nowhere further
+        // down the list for it to go.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.toggle_delete_selected_cue();
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([1]);
+
+        // Assert: struck through under the cursor, where the fill owns the colours.
+        let (_, marked_cell) = row(&mut app, doomed);
+        let marked_cell = marked_cell.expect("the marked cue should still be drawn");
+        assert!(
+            marked_cell.modifier.contains(Modifier::CROSSED_OUT),
+            "a cue marked for deletion should be struck through"
+        );
+        let (_, plain_cell) = row(&mut app, untouched);
+        let plain_cell = plain_cell.expect("the untouched cue should still be drawn");
+        assert_that!(plain_cell.fg).is_equal_to(Color::Gray);
+        assert!(
+            !plain_cell.modifier.contains(Modifier::CROSSED_OUT),
+            "an untouched cue's words should be left alone"
+        );
+
+        // Act / Assert: and with the cursor off it, red carries the same thing the line does.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        let (_, marked_cell) = row(&mut app, doomed);
+        let marked_cell = marked_cell.expect("the marked cue should still be drawn");
+        assert_that!(marked_cell.fg).is_equal_to(Color::Red);
+        assert!(marked_cell.modifier.contains(Modifier::CROSSED_OUT));
+        // The row reads as one red thing rather than struck-through words under an ordinary
+        // timestamp, so the timing on its border goes red too.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let border: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, doomed - 1)].symbol())
+            .collect();
+        let timing =
+            column_of(&border, "00:00:05.0").expect("the marked cue's timing should be drawn");
+        assert_that!(buffer[(timing, doomed - 1)].fg).is_equal_to(Color::Red);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Going *is* the edit: a row marked to go is not also a rewritten row, which is the
+    /// ranking the track list's rows already follow. Without it a cue rewritten and then
+    /// marked would be drawn yellow and italic — saying it will read differently, about a
+    /// line that will not be read at all.
+    #[test]
+    fn a_cue_both_rewritten_and_marked_should_read_as_deleted() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-over-edited",
+            vec![
+                edit_cue(1000, 3000, "Rewritten"),
+                edit_cue(5000, 7000, "Spare"),
+            ],
+        );
+
+        // Act: rewrite the first cue, then mark it.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.toggle_delete_selected_cue();
+        // The cursor moved on, so the marked row is drawn unselected and shows its colour.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Assert
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let found = (0..buffer.area.height).find_map(|y| {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            column_of(&line, "Rewritten").map(|x| buffer[(x, y)].clone())
+        });
+        let cell = found.expect("the rewritten and marked cue should be drawn");
+        assert_that!(cell.fg).is_equal_to(Color::Red);
+        assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+        assert!(
+            !cell.modifier.contains(Modifier::ITALIC),
+            "a cue marked to go must not also read as one about to say something else"
+        );
 
         // Cleanup
         drop(app);

@@ -5019,6 +5019,157 @@ fn adding_a_cue_from_the_timeline_should_stage_it_and_ctrl_s_should_write_it() {
     );
 }
 
+const THREE_SIDECAR_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst line\n\n\
+                                  2\n00:00:03,000 --> 00:00:04,000\nSecond line\n\n\
+                                  3\n00:00:05,000 --> 00:00:06,000\nThird line\n\n";
+
+/// A subtitle track carries junk as often as it carries a wrong line — a duplicated sign, a
+/// stray credit, a caption for a sound that is not there — and the one thing the page could
+/// not do was take one out. `d` marks the selected cue to go, the same key and the same red
+/// a track marked for deletion wears one layer up, and `Ctrl+S` carries it out.
+///
+/// Driven end to end and **asserted on the file**, because every layer short of the sidecar
+/// agrees while this is broken: the row can be marked while the staged change is keyed
+/// against the wrong position, and a save that drops the wrong line leaves a file that still
+/// parses. So this presses the real keys and then reads the sidecar off disk.
+///
+/// The refusal is here for the same reason. A SubRip file with nothing in it is not a
+/// subtitle track, and a track emptied this way would be a save that fails on something the
+/// reader did rather than on a tool.
+#[test]
+fn deleting_a_cue_should_stage_it_and_ctrl_s_should_remove_it_from_the_file() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "deleting_a_cue_should_stage_it_and_ctrl_s_should_remove_it_from_the_file";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-delete");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(9.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, THREE_SIDECAR_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // staged counts use, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    // Act: mark the first cue.
+    app.press(key(KeyCode::Char('d')));
+
+    // Assert: staged, counted on the panel's border, and the row is still there to be
+    // unmarked — the mark is an intent, not a removal.
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "a marked cue should stage like every other cue edit"
+    );
+    let state = app.app.subtitle_edit.as_ref().expect("the page is open");
+    assert_eq!(
+        state.cues.len(),
+        3,
+        "the marked row should stay in the list"
+    );
+    assert_eq!(
+        state.selected, 1,
+        "marking should move the cursor on, so a run of `d` takes out a run of cues"
+    );
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("First line") && screen.contains("1 deleted"),
+        "the marked cue should still be drawn, and counted as going:\n{screen}"
+    );
+    assert!(
+        !screen.contains("edited"),
+        "a deletion is not a rewrite, and the two counts answer separately:\n{screen}"
+    );
+
+    // Act / Assert: a second `d` takes out the second cue too, and the third is refused —
+    // a track with no cues at all is not a subtitle track.
+    app.press(key(KeyCode::Char('d')));
+    app.press(key(KeyCode::Char('d')));
+    assert_eq!(
+        app.app.staged_cue_deletions().len(),
+        2,
+        "the last cue a track has left should be refused"
+    );
+    assert!(
+        app.app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("delete the track itself")),
+        "the refusal should point at the thing the reader is actually after"
+    );
+
+    // Act / Assert: `k` back onto the second and `d` again takes its mark off.
+    app.press(key(KeyCode::Char('k')));
+    app.press(key(KeyCode::Char('d')));
+    assert_eq!(
+        app.app.staged_cue_deletions().len(),
+        1,
+        "a second press on a marked row should unmark it"
+    );
+
+    // Act: write it.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: the marked line is gone, the two that were not marked are untouched, and the
+    // file is renumbered from one.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert_eq!(
+        written,
+        "1\n00:00:03,000 --> 00:00:04,000\nSecond line\n\n\
+         2\n00:00:05,000 --> 00:00:06,000\nThird line\n\n",
+        "the save should drop the marked cue and renumber the file"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written deletion should stop being unsaved work"
+    );
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().cues.len(),
+        2,
+        "the page should come back on the track as it now is"
+    );
+
+    // Act / Assert: and a cue marked but discarded on the way off the page never reaches the
+    // file, for the reason a discarded rewrite does not.
+    app.press(key(KeyCode::Char('d')));
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "the second deletion should stage like the first"
+    );
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmLeaveCues));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Enter));
+    assert_eq!(app.app.layer, Layer::Streams, "discarding should leave");
+    assert!(
+        !app.app.has_track_edits(),
+        "discarding should take the marked cue with it"
+    );
+    let after = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert_eq!(
+        after, written,
+        "a discarded deletion should never reach the file"
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))
