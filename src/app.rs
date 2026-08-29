@@ -43,7 +43,8 @@ use crate::{
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
     subtitle_edit::{
-        self, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, WarmState,
+        self, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
+        WarmState,
     },
 };
 
@@ -3763,12 +3764,32 @@ impl App {
         }
     }
 
-    /// `t`: turns the timing mode on or off for the open page.
+    /// `t`: turns the timing mode on or off at cue scale, where `h`/`l` move the selection.
+    pub fn toggle_cue_timing_mode(&mut self) {
+        self.toggle_timing_scope(TimingScope::Cue);
+    }
+
+    /// `T`: turns the timing mode on or off at track scale — global retiming, where `h`/`l`
+    /// move every cue in the track by the same amount.
+    ///
+    /// This is the answer to the commonest defect a subtitle file has, which is not a wrong
+    /// line but the whole file being a second or two out. At cue scale that is one press per
+    /// cue, which for a feature film is a thousand presses to fix one mistake.
+    pub fn toggle_global_retiming(&mut self) {
+        self.toggle_timing_scope(TimingScope::Track);
+    }
+
+    /// Turns the timing mode on at the given scale, or off if it is already at that scale.
+    ///
+    /// **The scales replace each other rather than stacking**, which is what
+    /// [`TimingScope`] being one value buys: pressing `T` while `t` is on retimes the track
+    /// rather than leaving two modes on for `h` to choose between, and one `Esc` leaves
+    /// whichever is on.
     ///
     /// **Not gated on a playback**, unlike every dialog this page can raise. A mode is not
     /// drawn into the cell buffer a running span would wipe, and being usable *while* a span
-    /// plays is the reason it is a mode at all — see [`SubtitleEditState::timing_mode`].
-    pub fn toggle_cue_timing_mode(&mut self) {
+    /// plays is the reason it is a mode at all — see [`SubtitleEditState::timing`].
+    fn toggle_timing_scope(&mut self, scope: TimingScope) {
         if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
         }
@@ -3784,7 +3805,11 @@ impl App {
             return;
         }
         if let Some(state) = self.subtitle_edit.as_mut() {
-            state.timing_mode = !state.timing_mode;
+            state.timing = if state.timing == scope {
+                TimingScope::Off
+            } else {
+                scope
+            };
         }
         self.notice = None;
     }
@@ -3812,25 +3837,41 @@ impl App {
         (shift != 0).then_some(shift)
     }
 
-    /// Whether the open page's timing mode is on, which is what gives `h`/`l` their second
-    /// meaning.
-    pub fn cue_timing_mode(&self) -> bool {
+    /// How much of the track the open page's timing mode moves, which is what gives `h`/`l`
+    /// their other meanings.
+    pub fn timing_scope(&self) -> TimingScope {
         self.subtitle_edit
             .as_ref()
-            .is_some_and(|state| state.timing_mode)
+            .map(|state| state.timing)
+            .unwrap_or_default()
     }
 
-    /// Turns the timing mode off, for `Esc` — and reports whether it was on.
+    /// How far global retiming has moved the open track, in milliseconds.
+    ///
+    /// `None` for a track sitting at the timings the file gives it, so the readout says
+    /// nothing rather than saying zero — the same rule [`Self::selected_cue_shift`] follows
+    /// one scale down.
+    pub fn track_shift(&self) -> Option<i64> {
+        self.subtitle_edit
+            .as_ref()
+            .map(|state| state.track_shift)
+            .filter(|shift| *shift != 0)
+    }
+
+    /// Turns the timing mode off at whichever scale it is on, for `Esc` — and reports whether
+    /// it was on.
     ///
     /// `Esc` peels this page one layer at a time, and the answer is what tells
-    /// [`Self::back`] to stop there rather than go on to ask about leaving.
+    /// [`Self::back`] to stop there rather than go on to ask about leaving. One press leaves
+    /// either scale, because the two are one mode.
     pub fn leave_cue_timing_mode(&mut self) -> bool {
         self.subtitle_edit
             .as_mut()
-            .is_some_and(|state| std::mem::take(&mut state.timing_mode))
+            .is_some_and(|state| std::mem::take(&mut state.timing).is_on())
     }
 
-    /// `h`/`l` and `H`/`L` in timing mode: shifts the selected cue and stages the result.
+    /// `h`/`l` and `H`/`L` in timing mode at cue scale: shifts the selected cue and stages
+    /// the result.
     pub fn nudge_selected_cue(&mut self, steps: i64) {
         if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
@@ -3838,7 +3879,7 @@ impl App {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        if !state.timing_mode {
+        if state.timing != TimingScope::Cue {
             return;
         }
         // A cue marked to go has no timing worth arguing about, and nudging one would put a
@@ -3884,7 +3925,7 @@ impl App {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        if !state.timing_mode {
+        if state.timing != TimingScope::Cue {
             return;
         }
         if self.selected_cue_is_deleted() {
@@ -3916,6 +3957,145 @@ impl App {
             *from = start;
             *to = end;
         });
+    }
+
+    /// `h`/`l` and `H`/`L` in timing mode at track scale: shifts **every** cue by the same
+    /// amount and stages the lot.
+    ///
+    /// **Staged in one pass rather than through [`Self::stage_cue_change`] per cue.** That
+    /// function clones the file's whole [`SubtitleChange`] and stores it back on every call,
+    /// which for a thousand-cue track would be a thousand clones of a thousand-entry map for
+    /// one press of a held key. The rules it enforces are kept here rather than skipped: the
+    /// `original` snapshot stays pinned to what the file says, an edit that no longer asks
+    /// for anything is removed rather than stored, and an inserted cue is amended in the
+    /// inserts and never dropped.
+    ///
+    /// **A cue marked for deletion shifts with the rest**, where a per-cue nudge refuses one.
+    /// The mark can be taken back off, and coming back to a line left behind by every shift
+    /// since would be a silent surprise; the writer applies a rewrite before dropping the
+    /// line, so carrying one for a cue that is about to go costs nothing.
+    pub fn shift_whole_track(&mut self, steps: i64) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Track {
+            return;
+        }
+        let source = state.source.clone();
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        // Gathered before the shift, because with nothing staged against a cue yet the page's
+        // own copy is what its snapshot falls back to — and that is what is about to move.
+        // Timings only: a thousand-cue track costs a thousand pairs of `Duration` per press
+        // rather than a thousand `String`s, and the words are not what a shift changes.
+        let before: Vec<(Duration, Duration)> =
+            state.cues.iter().map(|cue| (cue.start, cue.end)).collect();
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        if state.shift_all(steps).is_none() {
+            return;
+        }
+        let mut change = self.subtitle_change(&source, format);
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        for (position, (cue, &(was_start, was_end))) in state.cues.iter().zip(&before).enumerate() {
+            match state.origin(position) {
+                Some(CueOrigin::File(at)) => {
+                    // Built only for a cue nothing is staged against, which after the first
+                    // press of a held key is none of them — the entry already there carries
+                    // the file's snapshot forward, which is what pins it to disk.
+                    let edit = change.cues.edits.entry(at).or_insert_with(|| {
+                        CueEdit::unchanged(CueSnapshot {
+                            text: cue.text.clone(),
+                            start: was_start,
+                            end: was_end,
+                        })
+                    });
+                    edit.start = cue.start;
+                    edit.end = cue.end;
+                }
+                Some(CueOrigin::Inserted(id)) => {
+                    if let Some(insert) = change.cues.inserts.get_mut(&id) {
+                        insert.start = cue.start;
+                        insert.end = cue.end;
+                    }
+                }
+                None => continue,
+            }
+        }
+        // A track shifted back to where the file has it stops being an edit, the same way one
+        // cue does. Only a rewrite can stop asking for anything: an insertion *is* the ask.
+        change.cues.edits.retain(|_, edit| edit.is_effective());
+        self.store_subtitle_change(source, change);
+    }
+
+    /// `r` in timing mode at track scale: puts **every** cue back to the timing the file
+    /// gives it.
+    ///
+    /// The wide version of [`Self::reset_selected_cue_timing`], and it undoes hand nudges
+    /// along with the shift — `r` means "the timings the file has", at either scale, rather
+    /// than meaning something different depending on which one is on.
+    ///
+    /// **Every cue's words are left alone**, exactly as they are one scale down: this is a
+    /// key of the timing mode, and a reader who retimed *and* rewrote has not asked for their
+    /// typing back. An inserted cue has no timing in the file to be put back to, so it stays
+    /// where it was placed.
+    ///
+    /// This is the one key on the page that can discard a lot of work in a single press, and
+    /// there is no undo to recover it with.
+    pub fn reset_track_timing(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Track {
+            return;
+        }
+        let source = state.source.clone();
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        let Some(change) = self.subtitle_changes.get(&source) else {
+            // Nothing staged is nothing to put back, and the cues are already the file's.
+            return;
+        };
+        // Only a staged edit remembers what the file said, so this is every cue there is
+        // anything to restore for; the rest are untouched and need no moving.
+        let restored: Vec<(usize, Duration, Duration)> = (0..state.cues.len())
+            .filter_map(|position| match state.origin(position)? {
+                CueOrigin::File(cue) => {
+                    let edit = change.cues.edits.get(&cue)?;
+                    Some((position, edit.original.start, edit.original.end))
+                }
+                CueOrigin::Inserted(_) => None,
+            })
+            .collect();
+        if restored.is_empty() {
+            // Nothing staged against a line the file holds is nothing to put back. A track
+            // whose cues are all the reader's own reaches here too, and keeps its figure:
+            // an inserted cue has no timing in the file, so none of them moved.
+            return;
+        }
+        let mut change = self.subtitle_change(&source, format);
+        for edit in change.cues.edits.values_mut() {
+            edit.start = edit.original.start;
+            edit.end = edit.original.end;
+        }
+        // A cue whose timing was the only thing changed stops being an edit; one that was
+        // also rewritten keeps its words and so stays.
+        change.cues.edits.retain(|_, edit| edit.is_effective());
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.restore_timings(&restored);
+        }
+        self.store_subtitle_change(source, change);
     }
 
     /// Whether the open file is carrying cue edits that have not been written to disk yet,
@@ -4011,6 +4191,10 @@ impl App {
     /// Closes the page and puts the cursor back on the track list.
     fn leave_subtitle_edit(&mut self) {
         self.close_subtitle_edit();
+        // A refusal raised on this page was about a key pressed on this page. Carried out of
+        // it, the footer on the track list would paint it over a view it says nothing about
+        // — the reader having asked a question here and been answered there.
+        self.notice = None;
         self.layer = Layer::Streams;
     }
 
@@ -21936,7 +22120,7 @@ mod tests {
         // Arrange
         let (mut app, directory) = cue_editing_app();
         app.toggle_cue_timing_mode();
-        assert_that!(app.cue_timing_mode()).is_true();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_true();
 
         // Act: three steps later, in two bursts.
         app.nudge_selected_cue(2);
@@ -22037,6 +22221,297 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A global shift stages an edit for every cue in the track, each carrying the file's own
+    /// words and the timing it has been moved to.
+    ///
+    /// The staging is the half that fails invisibly: the page's list can be moved correctly
+    /// while the edits are keyed against the wrong cues or never created at all, and every
+    /// assertion short of the map still passes.
+    #[test]
+    fn global_retiming_should_stage_every_cue_in_the_track() {
+        // Arrange: two cues, at 1s → 2s and 3s → 4s.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act: three steps on, so the whole track moves 150ms.
+        app.shift_whole_track(3);
+
+        // Assert: the page's cues moved together.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(1150));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(3150));
+        assert_that!(app.track_shift()).is_equal_to(Some(150));
+
+        // Assert: and so did the staged edits, each still pinned to what the file says.
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged")
+            .cues
+            .edits;
+        assert_that!(edits.len()).is_equal_to(2);
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_millis(1150));
+        assert_that!(edits[&0].original.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edits[&0].text.as_str()).is_equal_to("First line");
+        assert_that!(edits[&1].start).is_equal_to(Duration::from_millis(3150));
+        assert_that!(edits[&1].original.start).is_equal_to(Duration::from_secs(3));
+
+        // Assert: every row of the panel says so, which is what the border counts.
+        assert_that!(app.staged_cue_edits().len()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track shifted back to where the file has it stops being an edit, the same way one
+    /// cue does — otherwise a reader who changed their mind leaves the file looking modified
+    /// and is asked about discarding work that amounts to nothing.
+    #[test]
+    fn a_track_shifted_back_to_its_own_timing_should_stage_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act: out and back again.
+        app.shift_whole_track(4);
+        app.shift_whole_track(-4);
+
+        // Assert: nothing staged, and the track is not left looking modified.
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.track_shift()).is_none();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue the reader added this session moves with the track, and moves in the *inserts*
+    /// rather than being given an edit keyed against a line the file does not have.
+    #[test]
+    fn global_retiming_should_carry_an_inserted_cue_with_the_rest() {
+        // Arrange: a cue added from the timeline, between the file's two.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(5, Duration::from_secs(1));
+        app.open_cue_editor();
+        app.cue_editor_insert('N');
+        app.close_cue_editor();
+        let inserted = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .and_then(|change| change.cues.inserts.get(&0))
+            .map(|insert| insert.start)
+            .expect("the cue should be staged as an insertion");
+
+        // Act
+        app.toggle_global_retiming();
+        app.shift_whole_track(2);
+
+        // Assert: the insertion moved by the same 100ms as the file's cues.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged");
+        assert_that!(change.cues.inserts[&0].start)
+            .is_equal_to(inserted + Duration::from_millis(100));
+        assert_that!(change.cues.edits[&0].start).is_equal_to(Duration::from_millis(1100));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue marked to go shifts with the track, where a per-cue nudge refuses one.
+    ///
+    /// The mark can be taken back off, and a line left behind by every shift since would be a
+    /// silent surprise. The row still reads as deleted rather than as edited.
+    #[test]
+    fn global_retiming_should_move_a_cue_marked_for_deletion_too() {
+        // Arrange: the first cue marked to go.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_delete_selected_cue();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+
+        // Act
+        app.toggle_global_retiming();
+        app.shift_whole_track(2);
+
+        // Assert: it moved with the rest, and is still marked to go.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged");
+        assert_that!(change.cues.edits[&0].start).is_equal_to(Duration::from_millis(1100));
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_millis(1100));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `r` at track scale puts every cue back to the file's timing and keeps every word the
+    /// reader typed — the wide version of what `r` already does to one cue.
+    #[test]
+    fn resetting_at_track_scale_should_restore_every_timing_and_keep_the_words() {
+        // Arrange: one cue rewritten, then the whole track shifted, then one cue nudged on
+        // top of that — so the reset has all three kinds of work to answer for.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.toggle_global_retiming();
+        app.shift_whole_track(3);
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+        app.toggle_global_retiming();
+
+        // Act
+        app.reset_track_timing();
+
+        // Assert: every cue is back at the file's timing, hand nudges included.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_secs(3));
+        assert_that!(app.track_shift()).is_none();
+
+        // Assert: the rewritten cue kept its words, and the cue that was only moved is no
+        // longer an edit at all.
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the rewrite should still be staged")
+            .cues
+            .edits;
+        assert_that!(edits.len()).is_equal_to(1);
+        assert_that!(edits[&0].text.as_str()).is_equal_to("First line!");
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track nobody has moved has nothing to put back, and `r` on one changes nothing
+    /// rather than storing an empty change that makes the file look modified.
+    #[test]
+    fn resetting_a_track_nobody_moved_should_do_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act
+        app.reset_track_timing();
+
+        // Assert
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The two scales are one mode, so turning either on turns the other off and one `Esc`
+    /// leaves whichever is on. Two flags could disagree; one value cannot.
+    #[test]
+    fn the_two_timing_scales_should_replace_each_other() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+
+        // Act / Assert: `t` then `T` leaves the wide scale on, not both.
+        app.toggle_cue_timing_mode();
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+
+        // Act / Assert: and the narrow keys are inert while it is.
+        app.nudge_selected_cue(2);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Act / Assert: `T` again turns it off rather than cycling to the other scale.
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+
+        // Act / Assert: and the wide keys are inert once it is off.
+        app.shift_whole_track(2);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Act / Assert: one `Esc` leaves the wide scale, exactly as it leaves the narrow one.
+        app.toggle_global_retiming();
+        app.back();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every wide-scale key is inert off the page and under a dialog, the guard every other
+    /// key on this page carries — a dialog swallows the page's keys, and off the page there
+    /// is no track to retime.
+    #[test]
+    fn global_retiming_should_be_inert_off_the_page_and_under_a_dialog() {
+        // Arrange: retiming on, then a dialog raised over the page.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act / Assert: nothing moves and the scale cannot be changed under it.
+        app.shift_whole_track(2);
+        app.reset_track_timing();
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Arrange: back on the track list, where there is no page.
+        app.dialog = None;
+        app.layer = Layer::Streams;
+
+        // Act / Assert
+        app.shift_whole_track(2);
+        app.reset_track_timing();
+        app.toggle_global_retiming();
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Global retiming is refused on the same tracks the cue editor is, and the refusal names
+    /// the reason rather than leaving the key looking broken.
+    #[test]
+    fn global_retiming_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+
+        // Act
+        app.toggle_global_retiming();
+
+        // Assert: not in the mode, and told why.
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Act / Assert: and the keys the mode would have given meaning to stay inert.
+        app.shift_whole_track(1);
+        app.reset_track_timing();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The timing mode is refused on the same tracks the editor is, and for the same reason:
     /// an ASS cue's timing is the anchor its own animation is measured from.
     #[test]
@@ -22054,7 +22529,7 @@ mod tests {
         app.toggle_cue_timing_mode();
 
         // Assert: not in the mode, and told why.
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
 
         // Act / Assert: and the keys the mode would have given meaning to stay inert.
@@ -22079,7 +22554,7 @@ mod tests {
 
         // Act: `Esc` off the page, and answer "discard".
         app.back();
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         assert_that!(app.dialog).is_equal_to(None);
         app.back();
         assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
@@ -25461,7 +25936,7 @@ mod tests {
         // Act / Assert: the first press leaves the mode and nothing else — the cursor stays
         // where the reader put it.
         assert_that!(app.back()).is_true();
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         assert_that!(app.timeline_focused()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
