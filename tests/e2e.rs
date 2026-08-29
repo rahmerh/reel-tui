@@ -4847,6 +4847,132 @@ fn retiming_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
     );
 }
 
+/// The commonest defect a subtitle file has is not a wrong line but being a second or two out
+/// from end to end, and `T` is the answer to it: the same timing mode one scale up, where
+/// `h`/`l` and `H`/`L` move every cue in the track together and `r` puts all of them back.
+///
+/// Asserted on the sidecar, because every layer short of it agrees while the feature is
+/// broken: the mode turns on either way, the page's cues can be right while the staged edits
+/// are keyed against the wrong positions or snapshotted against the wrong timings, and a save
+/// that writes the wrong `-->` lines leaves a file that still parses.
+///
+/// **The numbers are chosen for the floor, which is what makes this a track shift rather than
+/// a pile of cue shifts.** Eight presses of `H` ask for four seconds that a track starting at
+/// one second does not have. Shortened to what the earliest cue can spare, every cue still
+/// moves by the same amount and the two-second gap between these two survives; clamped per
+/// cue instead, the first stops at zero while the second keeps going and lands half a second
+/// early — which is the whole file quietly retimed by a key that says it moves it.
+#[test]
+fn global_retiming_should_stage_every_cue_and_ctrl_s_should_write_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "global_retiming_should_stage_every_cue_and_ctrl_s_should_write_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-global-retime");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    // 1.0s → 2.0s "First line", 3.0s → 4.0s "Second line".
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // edited-count uses, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    let cue_start =
+        |app: &Harness, cue: usize| app.app.subtitle_edit.as_ref().unwrap().cues[cue].start;
+
+    // Act / Assert: `t` then `T` is one mode at two scales, not two modes — so the press
+    // after them moves the cue the cursor is *not* on as well.
+    app.press(key(KeyCode::Char('t')));
+    app.press(key(KeyCode::Char('T')));
+    app.press(key(KeyCode::Char('l')));
+    assert_eq!(
+        (cue_start(&app, 0), cue_start(&app, 1)),
+        (Duration::from_millis(1050), Duration::from_millis(3050)),
+        "T should replace the cue scale rather than stacking on it"
+    );
+
+    // Act / Assert: `r` at this scale puts the whole track back in one press, which is not
+    // an edit at all.
+    app.press(key(KeyCode::Char('r')));
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "r should put the whole track back to the timings the file gives it"
+    );
+    assert_eq!(cue_start(&app, 1), Duration::from_secs(3));
+
+    // Act: two seconds later.
+    for _ in 0..4 {
+        app.press(key(KeyCode::Char('L')));
+    }
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("global +2.00s"),
+        "the title should name the figure as the track's, not as the cue's:\n{screen}"
+    );
+
+    // Act: then four seconds earlier, against a track that has three to give.
+    for _ in 0..8 {
+        app.press(key(KeyCode::Char('H')));
+    }
+
+    // Assert: staged, and the page says both how far the track went and that every row of
+    // it is unwritten.
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("global -1.00s") && screen.contains("2 edited"),
+        "the page should show the track's shift and count every cue it moved:\n{screen}"
+    );
+
+    // Act / Assert: `Esc` gives `h`/`l` back without leaving the page.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, None, "Esc should not ask anything yet");
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "Esc should take the scale rather than the page"
+    );
+
+    // Act: write it.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: both cues moved by the same second, nobody's words changed, and the gap the
+    // file had between them survived the floor.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        written.contains("00:00:00,000 --> 00:00:01,000\nFirst line"),
+        "the earliest cue should stop against 0:00 with its length intact:\n{written}"
+    );
+    assert!(
+        written.contains("00:00:02,000 --> 00:00:03,000\nSecond line"),
+        "every cue should move by the same amount, so the gap survives the floor:\n{written}"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written shift should stop being unsaved work"
+    );
+}
+
 /// A subtitle track is missing a line as often as it has a wrong one, and the moment that
 /// line belongs at is exactly what the timeline cursor names. `i` from the timeline therefore
 /// adds a cue there rather than rewriting the selection — which is a line nothing on screen

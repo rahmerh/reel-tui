@@ -39,7 +39,8 @@ use crate::{
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
     subtitle_edit::{
-        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, GROUP_COLUMNS, LoadStatus, SubtitleEditState, WarmState,
+        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, GROUP_COLUMNS, LoadStatus, SubtitleEditState,
+        TimingScope, WarmState,
     },
 };
 
@@ -166,9 +167,25 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // the same corner. Kept apart from the rewrites rather than merged: the rows wear
     // different colours and the counts answer different questions.
     let deleted = app.staged_cue_deletions();
-    // How far the selected cue has been moved, for the timeline's title. Read here for the
-    // same reason `edited` is: it comes from the staged edits rather than from the page.
-    let shift = app.selected_cue_shift().map(format_shift);
+    // How far what the keys are moving has been moved, for the timeline's title. Read here
+    // for the same reason `edited` is: it comes from the staged edits rather than the page.
+    //
+    // **The scale decides which figure it is.** While `h`/`l` move the whole track, the
+    // selected cue's own shift answers a question nobody is asking and would be read as what
+    // the keys are doing; while they move one cue, the track's figure would be. The wide one
+    // is labelled because the two are otherwise the same shape, and a bare `+2.35s` under a
+    // reader who has just pressed `T` must not be mistaken for one line's.
+    // Why a key the reader just pressed did nothing, read here for the same reason as the
+    // rest: this page draws its own frame and returns before `render_footer`, the one place
+    // this field is otherwise drawn, so without carrying it onto the page's own status row
+    // every refusal it raises is set and silently dropped.
+    let notice = app.notice.clone();
+    let shift = match app.timing_scope() {
+        TimingScope::Track => app
+            .track_shift()
+            .map(|moved| format!("global {}", format_shift(moved))),
+        TimingScope::Off | TimingScope::Cue => app.selected_cue_shift().map(format_shift),
+    };
     let Some(state) = app.subtitle_edit.as_mut() else {
         return;
     };
@@ -211,7 +228,7 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // The status row is charged to the same budget: it appears only while the background
     // frame pass has something to say, so on the sizes where it and the axis cannot both
     // fit, the axis gives way for as long as the pass runs and comes back when it ends.
-    let status = edit_status_line(state);
+    let status = edit_status_line(state, notice.as_deref());
     let status_height = u16::from(status.is_some());
     let lanes = state.layout.lane_count as u16;
     let cue_panel_floor = CUE_BLOCK_ROWS + 2;
@@ -283,7 +300,23 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// This is a status line, not control help — the keybindings popup (`?`) remains the only
 /// place this application documents its keys.
-fn edit_status_line(state: &SubtitleEditState) -> Option<(String, Color)> {
+fn edit_status_line(state: &SubtitleEditState, notice: Option<&str>) -> Option<(String, Color)> {
+    // **A refusal comes before everything else, because it is the only line here that is
+    // about the key the reader has just pressed.** Everything below describes something the
+    // page is doing; this describes something it declined to do, and a key that appears to
+    // do nothing is indistinguishable from a key that is broken.
+    //
+    // It cannot sit here stale and hide the lines below it: every movement on this page
+    // clears it (`App::select_next`, `move_cue_within_group`, `focus_timeline`,
+    // `move_timeline_cursor`), and `frame_error` — the one it could otherwise mask — is
+    // keyed on the selected cue and so only has anything to say once the cursor has moved.
+    //
+    // Yellow, which is what `render_footer` gives the same string on every other layer: the
+    // page draws its own frame and never reaches that footer, so this is the same message in
+    // the same colour rather than a second channel for it.
+    if let Some(notice) = notice {
+        return Some((format!(" {notice}"), Color::Yellow));
+    }
     // A cue that could not be drawn comes first. It is the only line here that explains
     // something the user is looking *at* — an empty pane under the cursor — where the
     // others describe work going on elsewhere, and it clears itself as soon as the cursor
@@ -1000,7 +1033,11 @@ fn render_edit_timeline(
     // a readout rather than a label: after three presses the times alone cannot say whether
     // the reader is a tenth of a second in or a whole one, which is the only question they
     // are asking. Yellow in the timing mode, matching the cue the keys are pointing at.
-    let retiming = state.timing_mode;
+    // Either scale of the mode takes the yellow and the colour swap: the swap is there
+    // because a yellow playhead inside a yellow span is invisible, and that pair is on screen
+    // exactly when someone retimes against a playing span — which is as true of a whole-track
+    // shift as of one cue's nudge.
+    let retiming = state.timing.is_on();
     // **The title answers for whichever pane holds the cursor, never for both at once.** The
     // two readouts answer different questions — the cue's times say what is being judged, the
     // cursor's moment says where the picture in the pane comes from — and only one of them is
@@ -1016,7 +1053,7 @@ fn render_edit_timeline(
     // The moment stands bare rather than behind a `▼` matching the ruler's mark. Now that the
     // title carries one reading at a time there is nothing for a glyph to tell it apart from,
     // and a triangle inside a parenthesised title reads as debris rather than as a label.
-    let readings = match cursor {
+    let mut readings: Vec<String> = match cursor {
         Some(at) => vec![format_precise(at)],
         None => [
             Some(format!(
@@ -1030,6 +1067,16 @@ fn render_edit_timeline(
         .flatten()
         .collect(),
     };
+    // **The cue's times are what goes when the title will not fit, not the figure beside
+    // them.** The pane is as wide as the page and the page's floor is fifty columns, where
+    // two timestamps and a labelled global figure do not both fit inside a border — and
+    // ratatui clips a title from the right, so left alone the reader would lose the one
+    // number they are pressing a key to change and keep the two they are not. Nothing is
+    // lost by dropping them: the cue's own times are on its row in the panel throughout,
+    // which is the same reason the cursor's reading stands the pair down entirely.
+    while readings.len() > 1 && title_width(&readings) > usize::from(area.width.saturating_sub(2)) {
+        readings.remove(0);
+    }
     let title = format!(" Timeline ({}) ", readings.join(" · "));
     let block = Block::bordered()
         .border_style(focus_border(cursor.is_some()))
@@ -1075,7 +1122,7 @@ fn render_edit_timeline(
         selected,
         state.playback_position(),
         cursor,
-        retiming,
+        state.timing,
     );
     // The selection's two `▲` marks go with the selection: while the cursor is here, the one
     // moment being pointed at is the cursor's, and a second pair of marks under a cue nobody
@@ -1214,6 +1261,20 @@ fn timeline_ruler(
 /// way — and which way is half of what the reader is checking. Hundredths rather than the
 /// tenths the timestamps beside it carry, since the step is fifty milliseconds and a
 /// tenth-second readout would sit still for every other press.
+/// How many columns the timeline's title takes with these readings in it.
+///
+/// Counted in characters rather than bytes: the readings carry `→` and are joined by `·`,
+/// each of which is one column and three bytes, so a byte count would drop a reading that
+/// fits and leave the title short of the pane it was measured against.
+fn title_width(readings: &[String]) -> usize {
+    " Timeline () ".chars().count()
+        + readings
+            .iter()
+            .map(|reading| reading.chars().count())
+            .sum::<usize>()
+        + readings.len().saturating_sub(1) * " · ".chars().count()
+}
+
 fn format_shift(millis: i64) -> String {
     let sign = if millis.is_negative() { '-' } else { '+' };
     let millis = millis.unsigned_abs();
@@ -1249,12 +1310,18 @@ fn playhead_colour(retiming: bool) -> Color {
 /// selection's neighbours are drawn in full loses where every other line begins and ends,
 /// which is most of what the pane is worth reading for.
 ///
-/// **`retiming` swaps two colours rather than adding a third.** The selected cue is normally
-/// cyan and the playhead yellow, chosen that way because they must not be the same; in the
-/// timing mode the selection takes yellow — the colour everything staged-but-unwritten wears
-/// — and hands cyan to the playhead. Painting the selection yellow without moving the
+/// **The timing mode swaps two colours rather than adding a third.** The selected cue is
+/// normally cyan and the playhead yellow, chosen that way because they must not be the same;
+/// in the timing mode the selection takes yellow — the colour everything staged-but-unwritten
+/// wears — and hands cyan to the playhead. Painting the selection yellow without moving the
 /// playhead would hide a yellow `│` inside a yellow span, which is exactly the pair on
 /// screen when a reader nudges a cue with a span still playing.
+///
+/// **At the wider scale every cue takes that yellow, not only the selected one**, because at
+/// that scale every cue is what the keys are moving. A pane that marked one line while `h`
+/// moved all of them would be pointing at the wrong thing — and the selection is not lost,
+/// since it keeps the bold the others do not have. The colour is the answer to "what am I
+/// about to move", which is the question this pane is being read for while the mode is on.
 fn timeline_lines(
     cues: &[Cue],
     layout: &LaneLayout,
@@ -1262,8 +1329,9 @@ fn timeline_lines(
     selected: Option<usize>,
     playhead: Option<Duration>,
     cursor: Option<Duration>,
-    retiming: bool,
+    timing: TimingScope,
 ) -> Vec<Line<'static>> {
+    let retiming = timing.is_on();
     let width = window.width as usize;
     // `pack_lanes` already guarantees at least one lane, including for an empty track, so
     // there is nothing to clamp here.
@@ -1315,6 +1383,13 @@ fn timeline_lines(
             .min(lanes.saturating_sub(1));
         let style = if Some(index) == selected {
             Style::default().fg(selection_colour(retiming)).bold()
+        } else if timing == TimingScope::Track {
+            // Every cue is moving, so every cue wears the colour that says so — the
+            // selection keeps the bold, which is what still tells it from its neighbours.
+            // The overflow marking below gives way for as long as the mode is on: it is a
+            // fact about the lanes rather than about the edit, and while the reader is
+            // moving the whole track what they need the pane to answer is what is moving.
+            Style::default().fg(selection_colour(true))
         } else if layout.overflowed.get(index).copied().unwrap_or(false) {
             Style::default().fg(Color::Magenta)
         } else {
@@ -3095,6 +3170,12 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
+        "T",
+        "Global retiming: move every cue's timing together, for a track that is out of sync \
+         throughout (SubRip tracks); Esc leaves, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
         "Ctrl-j / Ctrl-k",
         "Put the cursor in the timeline / back in the cue list",
     );
@@ -3102,14 +3183,15 @@ fn keybindings_text() -> Text<'static> {
         &mut lines,
         "h / l",
         "Move the timeline cursor 0.5s back or on while it holds the cursor, otherwise move \
-         the cue 0.05s earlier or later while timing, otherwise move between cues that share \
-         a moment or choose Yes or No on a preview settings switch",
+         the cue — or every cue, while retiming globally — 0.05s earlier or later while \
+         timing, otherwise move between cues that share a moment or choose Yes or No on a \
+         preview settings switch",
     );
     keybinding(
         &mut lines,
         "H / L",
-        "Move the timeline cursor five seconds back or on, or the cue half a second earlier \
-         or later while timing",
+        "Move the timeline cursor five seconds back or on, or the cue — or every cue — half \
+         a second earlier or later while timing",
     );
     keybinding(
         &mut lines,
@@ -3119,7 +3201,8 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "r",
-        "Put the cue back to the timing the file gives it, while timing",
+        "Put the cue back to the timing the file gives it — or every cue, while retiming \
+         globally — while timing",
     );
     keybinding(
         &mut lines,
@@ -11967,10 +12050,11 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", and the four that
-        // match on "tracks": the SRT timing preview, the cue editor, the timing mode, and
-        // marking a cue for deletion.
-        assert_eq!(count, 6);
+        // "Move track down / up", "Mark or unmark track for deletion", the four that match
+        // on "tracks" — the SRT timing preview, the cue editor, the timing mode, and marking
+        // a cue for deletion — and global retiming, which names both a track that is out of
+        // sync and the SubRip tracks it works on.
+        assert_eq!(count, 7);
     }
 
     #[test]
@@ -13829,6 +13913,38 @@ mod tests {
     /// the cursor moves, and it clears itself the moment the cursor reaches a cue that
     /// drew — so it can never be left blaming the wrong line.
     #[test]
+    fn a_refusal_should_reach_the_status_row_rather_than_being_dropped_silently() {
+        // Arrange: the page, carrying the refusal a key it declined has left behind. Set
+        // directly rather than provoked, because which keys raise which notice is settled in
+        // `app.rs`; what is under test here is that the page draws one at all.
+        let (mut app, directory) = edit_page_app("edit-refusal-row", vec![edit_cue(0, 1000, "a")]);
+        app.notice = Some(
+            "Only SubRip cues can be edited here; this track is another \
+                           format."
+                .to_string(),
+        );
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the reason is on the page, rather than set and never drawn — this page
+        // returns before `render_footer`, which is the only other place it would appear.
+        assert_that!(&screen).contains("Only SubRip cues can be edited here");
+
+        // Act / Assert: and it does not travel to the track list, where it would be painted
+        // over a view it says nothing about.
+        app.back();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.notice.is_none()).is_true();
+        let streams = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(&streams).does_not_contain("Only SubRip cues can be edited here");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn a_cue_that_could_not_be_drawn_should_report_on_the_status_row() {
         // Arrange
         let (mut app, directory) = edit_page_app(
@@ -14464,7 +14580,15 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, Some(0), None, None, false);
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        );
         let text = timeline_text(&lines);
 
         // Assert
@@ -14507,7 +14631,7 @@ mod tests {
             Some(0),
             None,
             None,
-            false,
+            TimingScope::Off,
         ));
 
         // Assert: the one column it falls on carries the cue, and nothing but the axis's
@@ -14544,7 +14668,7 @@ mod tests {
             Some(0),
             None,
             None,
-            false,
+            TimingScope::Off,
         ));
 
         // Assert: one cue drawn, and nothing wrapped around from the other.
@@ -14571,8 +14695,8 @@ mod tests {
             width: 61,
         };
         let at = Some(std::time::Duration::from_secs(15));
-        let colours = |retiming: bool| {
-            let lines = timeline_lines(&cues, &layout, &window, Some(0), at, None, retiming);
+        let colours = |timing: TimingScope| {
+            let lines = timeline_lines(&cues, &layout, &window, Some(0), at, None, timing);
             let cells: Vec<(char, Option<Color>)> = lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
@@ -14592,8 +14716,8 @@ mod tests {
         };
 
         // Act
-        let (cue_normally, playhead_normally) = colours(false);
-        let (cue_retiming, playhead_retiming) = colours(true);
+        let (cue_normally, playhead_normally) = colours(TimingScope::Off);
+        let (cue_retiming, playhead_retiming) = colours(TimingScope::Cue);
 
         // Assert: cyan cue, yellow playhead — and in the mode, the other way round.
         assert_that!(cue_normally).is_equal_to(Some(Color::Cyan));
@@ -14605,6 +14729,57 @@ mod tests {
         // is the property the swap exists to keep.
         assert_that!(cue_normally != playhead_normally).is_true();
         assert_that!(cue_retiming != playhead_retiming).is_true();
+    }
+
+    /// At the wider scale every cue takes the retiming yellow, because every cue is what the
+    /// keys are about to move.
+    ///
+    /// The selection is not lost in the crowd: it keeps the bold the others do not have. And
+    /// the playhead still holds the colour the swap hands it, so the one mark that has to
+    /// stay readable over a span is readable over all of them.
+    #[test]
+    fn retiming_globally_should_paint_every_cue_yellow_rather_than_only_the_selected_one() {
+        // Arrange: three cues, only one of which the cursor is on.
+        let cues = vec![
+            edit_cue(1000, 3000, "one"),
+            edit_cue(5000, 7000, "two"),
+            edit_cue(9000, 11_000, "three"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, 4);
+        let window = window_over(0, 20, 61);
+
+        // Act: the lanes as they are drawn at each scale.
+        let styles = |timing: TimingScope| {
+            timeline_lines(&cues, &layout, &window, Some(0), None, None, timing)
+                .iter()
+                .flat_map(|line| line.spans.clone())
+                .filter(|span| span.content.contains('|'))
+                .map(|span| (span.style.fg, span.style.add_modifier))
+                .collect::<Vec<_>>()
+        };
+
+        // Assert: at cue scale only the selection is yellow and its neighbours stay dim.
+        let narrow = styles(TimingScope::Cue);
+        assert_that!(
+            narrow
+                .iter()
+                .filter(|(fg, _)| *fg == Some(Color::Yellow))
+                .count()
+        )
+        .is_equal_to(1);
+        assert_that!(narrow.iter().any(|(fg, _)| *fg == Some(Color::DarkGray))).is_true();
+
+        // Assert: at track scale every cue is yellow, and exactly one of them is bold — so
+        // the reader can still see which one the other keys are about.
+        let wide = styles(TimingScope::Track);
+        assert_that!(wide.iter().all(|(fg, _)| *fg == Some(Color::Yellow))).is_true();
+        assert_that!(
+            wide.iter()
+                .filter(|(_, modifier)| modifier.contains(Modifier::BOLD))
+                .count()
+        )
+        .is_equal_to(1);
+        assert_that!(wide.len() > 1).is_true();
     }
 
     /// The ruler's `▲` marks are the selected cue's two ends, so they follow it to yellow —
@@ -14641,11 +14816,19 @@ mod tests {
         let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
         let window = window_over(0, 60, 61);
         let selection_spans = |selected: Option<usize>| {
-            timeline_lines(&cues, &layout, &window, selected, None, None, false)
-                .iter()
-                .flat_map(|line| line.spans.clone())
-                .filter(|span| span.style.fg == Some(Color::Cyan))
-                .count()
+            timeline_lines(
+                &cues,
+                &layout,
+                &window,
+                selected,
+                None,
+                None,
+                TimingScope::Off,
+            )
+            .iter()
+            .flat_map(|line| line.spans.clone())
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .count()
         };
 
         // Act / Assert
@@ -14655,7 +14838,13 @@ mod tests {
         // Act / Assert: and the cues themselves are still all there, so standing the
         // selection down is not standing the track down.
         let text = timeline_text(&timeline_lines(
-            &cues, &layout, &window, None, None, None, false,
+            &cues,
+            &layout,
+            &window,
+            None,
+            None,
+            None,
+            TimingScope::Off,
         ));
         assert_that!(text.join("").matches('|').count()).is_equal_to(4);
     }
@@ -14686,7 +14875,15 @@ mod tests {
         };
 
         // Act
-        let lines = timeline_lines(&cues, &layout, &window, Some(0), None, None, false);
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        );
 
         // Assert: the overflowed cue is the only one painted magenta.
         let magenta = lines
@@ -14765,7 +14962,7 @@ mod tests {
             Some(0),
             None,
             None,
-            false,
+            TimingScope::Off,
         ))
         .remove(0);
 
@@ -14809,7 +15006,7 @@ mod tests {
             Some(0),
             Some(std::time::Duration::from_secs(30)),
             Some(std::time::Duration::from_secs(40)),
-            false,
+            TimingScope::Off,
         ))
         .remove(0);
 
@@ -14837,7 +15034,7 @@ mod tests {
         };
 
         // Act: an empty track, with the cursor still sitting on cue zero.
-        let lines = timeline_lines(&[], &layout, &window, Some(0), None, None, false);
+        let lines = timeline_lines(&[], &layout, &window, Some(0), None, None, TimingScope::Off);
 
         // Assert: one lane carrying nothing but the axis's gridlines, rather than an index
         // panic or a cue drawn for a selection that does not exist.
@@ -15071,6 +15268,75 @@ mod tests {
         let screen = draw(&mut app, 100, 30).join("\n");
         assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
         assert_that!(screen.contains("0.00s")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// While the whole track is being retimed the title says so in words, so the figure
+    /// cannot be read as the selected cue's own shift.
+    ///
+    /// The two are otherwise the same shape, and they answer different questions: one says
+    /// how far this line has moved, the other how far the file has. A reader who has just
+    /// pressed `T` must not have to work out which they are looking at.
+    #[test]
+    fn the_timeline_title_should_label_the_figure_while_the_whole_track_is_retimed() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-global-title",
+            vec![edit_cue(5000, 7000, "Hello"), edit_cue(9000, 11000, "Bye")],
+        );
+
+        // Act: into the wide scale and three steps on.
+        app.toggle_global_retiming();
+        for _ in 0..3 {
+            app.shift_whole_track(1);
+        }
+
+        // Assert: the cue's live times, and the track's figure named as the track's.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.1 → 00:00:07.1 · global +0.15s)"))
+            .is_true();
+
+        // Act / Assert: back at the file's timings the figure goes rather than reading zero.
+        app.reset_track_timing();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("global")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// On a pane too narrow for both, the cue's times go and the figure stays.
+    ///
+    /// Ratatui clips a title from the right, so left alone the reader would lose the one
+    /// number they are pressing a key to change and keep the two they are not. Nothing is
+    /// lost by dropping the times — they are on the cue's own row in the panel throughout.
+    #[test]
+    fn a_narrow_timeline_title_should_drop_the_cues_times_before_the_track_figure() {
+        // Arrange: the page at its narrowest, with the whole track moved.
+        let (mut app, directory) =
+            edit_page_app("edit-global-narrow", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_global_retiming();
+        for _ in 0..3 {
+            app.shift_whole_track(1);
+        }
+
+        // Act / Assert: with room for both, both are there.
+        let wide = draw(&mut app, 100, 30).join("\n");
+        assert_that!(wide.contains("00:00:05.1 → 00:00:07.1 · global +0.15s")).is_true();
+
+        // Act: the narrowest page `render` allows, where the two do not fit together.
+        let narrow = draw(&mut app, 50, 30).join("\n");
+
+        // Assert: the figure survives whole, and the times are what gave way. Asserted on
+        // the title rather than the screen — the cue's times are still on its own row in the
+        // panel, which is exactly why the title can afford to drop them.
+        assert_that!(narrow.contains("Timeline (global +0.15s)")).is_true();
+        assert_that!(narrow.contains("Timeline (00:00:05.1")).is_false();
 
         // Cleanup
         drop(app);
@@ -15711,7 +15977,7 @@ mod tests {
             Some(0),
             Some(std::time::Duration::from_secs(18)),
             None,
-            false,
+            TimingScope::Off,
         );
 
         // Assert: on both lanes, at the column that moment maps to — over the cue rather
@@ -15730,7 +15996,7 @@ mod tests {
             Some(0),
             None,
             None,
-            false,
+            TimingScope::Off,
         ));
         for lane in &text {
             assert_that!(lane.contains('│')).is_false();
@@ -15763,7 +16029,7 @@ mod tests {
                 Some(0),
                 Some(at),
                 None,
-                false,
+                TimingScope::Off,
             ));
             for lane in &text {
                 assert_that!(lane.contains('│')).is_false();
@@ -15874,7 +16140,15 @@ mod tests {
         let at = Duration::from_secs(20);
 
         // Act: the playhead and the cursor on the same column.
-        let lines = timeline_lines(&cues, &layout, &window, Some(0), Some(at), Some(at), false);
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            Some(at),
+            Some(at),
+            TimingScope::Off,
+        );
 
         // Assert: the cursor wins the column, and it is green.
         let text = timeline_text(&lines);
@@ -15894,7 +16168,7 @@ mod tests {
             Some(0),
             None,
             None,
-            false,
+            TimingScope::Off,
         ));
         assert_that!(text[0].contains('│')).is_false();
     }

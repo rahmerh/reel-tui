@@ -93,6 +93,39 @@ pub enum EditFocus {
     Timeline,
 }
 
+/// How much of the track the timing mode moves.
+///
+/// **One mode at two scales rather than two modes.** `t` turns it on at [`Self::Cue`] and `T`
+/// at [`Self::Track`]; a value can hold only one of them, so `h`/`l` never have two meanings
+/// to arbitrate between and there is one mode to describe rather than two that have to be
+/// kept consistent with each other. Everything else about the mode is the same at both
+/// scales: the same keys, the same colour swap, the same `Esc` to leave it.
+///
+/// The wide scale exists because the commonest defect in a subtitle file is not a wrong line
+/// but a whole file a second or two out. At [`Self::Cue`] that costs one press of `h` per
+/// cue, which for a feature film is a thousand presses to fix one mistake.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimingScope {
+    /// Not retiming: `h`/`l` move between cues that share a moment.
+    #[default]
+    Off,
+    /// `h`/`l` move the selected cue.
+    Cue,
+    /// `h`/`l` move every cue in the track by the same amount.
+    Track,
+}
+
+impl TimingScope {
+    /// Whether the timing mode is on at either scale.
+    ///
+    /// The page asks this far more often than it asks which scale — the colour swap, the
+    /// yellow title and `Esc`'s peel are all about the mode rather than about how much of it
+    /// moves.
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+}
+
 /// Where one row of the page's cue list came from.
 ///
 /// The page's list and the *file's* stop being the same list the moment a cue is inserted:
@@ -530,15 +563,23 @@ pub struct SubtitleEditState {
     /// Where each entry of [`Self::cues`] came from, parallel to it and always the same
     /// length. See [`CueOrigin`].
     origins: Vec<CueOrigin>,
-    /// Whether `h`/`l` move the selected cue through time rather than through its group.
+    /// Whether `h`/`l` move cues through time rather than through a group, and how many.
     ///
     /// A mode rather than a dialog because it has to coexist with a playback: no dialog may
     /// be raised over one ([`crate::app::App::playback_in_progress`]), and the work this is
-    /// for is alternating a nudge with a `p` until the line lands.
+    /// for is alternating a shift with a `p` until the line lands.
     ///
     /// Sticky, and follows the cursor: `j`/`k` still walk the track, so a whole file can be
     /// retimed without turning the mode on again at every cue.
-    pub timing_mode: bool,
+    pub timing: TimingScope,
+    /// How far global retiming has moved the track, in milliseconds, signed.
+    ///
+    /// Kept rather than derived because it cannot be derived once hand nudges are mixed in:
+    /// [`crate::app::App::selected_cue_shift`] answers for one cue, and with some cues moved
+    /// individually there is no cue whose shift is the track's. Reset when a new track
+    /// arrives and when the track's timings are put back, and deliberately **untouched by a
+    /// per-cue nudge** — it answers for the track, not for whatever the cursor is on.
+    pub track_shift: i64,
     pub layout: LaneLayout,
     /// The cue list split into runs that share the screen, parallel to nothing — each cue
     /// is in exactly one group and the ordinary cue is a group of one.
@@ -706,7 +747,8 @@ impl SubtitleEditState {
             warm: WarmState::Off,
             cues: Vec::new(),
             origins: Vec::new(),
-            timing_mode: false,
+            timing: TimingScope::Off,
+            track_shift: 0,
             layout: LaneLayout::default(),
             groups: Vec::new(),
             selected: 0,
@@ -808,6 +850,10 @@ impl SubtitleEditState {
             .unwrap_or(0);
         self.group_memory.clear();
         self.list_scroll = 0;
+        // These cues are the file's own timings, whatever the last list had been shifted by:
+        // a reading of the file that a save has just rewritten is where a shift is measured
+        // from, so carrying the old figure over would report this track as already moved.
+        self.track_shift = 0;
         // A new cue list is a new track under the cursor, so the timeline cursor has nothing
         // left to be standing on: it is seeded from a cue, and every cue it was measured
         // against has just been replaced.
@@ -1196,6 +1242,86 @@ impl SubtitleEditState {
         let selected = self.selected;
         self.set_cue_timing(selected, start, end);
         Some((selected, start, end))
+    }
+
+    /// Shifts **every** cue through time by the same amount, and reports how far in
+    /// milliseconds, signed.
+    ///
+    /// **The floor clamp is the whole track's, not each cue's.** A backward shift is
+    /// shortened to what the *earliest* cue allows, so every cue still moves by the same
+    /// amount. Clamping each cue against zero on its own would let the ones near the start
+    /// bunch up while the rest kept moving — the track silently stretched by a key that says
+    /// it moves the track, which is the wide-scale version of the mistake
+    /// [`Self::nudge_selected`] avoids by shortening the whole shift rather than one end.
+    ///
+    /// **Every frame goes stale, so they are all dropped.** Each cue now begins at a
+    /// different instant, so every cached still is a picture of somewhere else; there is
+    /// nothing left to filter with [`shares_screen`] the way [`Self::set_cue_timing`] does.
+    ///
+    /// **The overlap groups are left alone, and here that is provable rather than a
+    /// judgement.** A uniform shift moves every cue equally, so no cue can come to overlap
+    /// another that it did not overlap before. The lanes are repacked all the same: it costs
+    /// one pass and means nothing downstream depends on that proof continuing to hold.
+    ///
+    /// `None` when there is nothing to move or the track is already against the floor, so a
+    /// held `h` at 0:00 stages nothing and re-renders nothing.
+    pub fn shift_all(&mut self, steps: i64) -> Option<i64> {
+        if self.cues.is_empty() {
+            return None;
+        }
+        let shift = TIMING_STEP.saturating_mul(steps.unsigned_abs().try_into().ok()?);
+        let shift = if steps.is_negative() {
+            shift.min(self.cues.iter().map(|cue| cue.start).min()?)
+        } else {
+            shift
+        };
+        if shift.is_zero() {
+            return None;
+        }
+        for cue in &mut self.cues {
+            if steps.is_negative() {
+                cue.start -= shift;
+                cue.end -= shift;
+            } else {
+                cue.start += shift;
+                cue.end += shift;
+            }
+        }
+        let moved = i64::try_from(shift.as_millis()).ok()? * steps.signum();
+        self.track_shift += moved;
+        self.retimed();
+        Some(moved)
+    }
+
+    /// Puts every cue back to a timing supplied by the caller, for the wide `r`.
+    ///
+    /// The caller owns which timings those are, because the file's copy of them lives in the
+    /// staged edits rather than on the page — this only moves the cues and stands the page's
+    /// derived state down, exactly as a shift does. Positions the caller says nothing about
+    /// are left where they are: an inserted cue has no timing in the file to be put back to.
+    pub fn restore_timings(&mut self, timings: &[(usize, Duration, Duration)]) {
+        for &(position, start, end) in timings {
+            if let Some(cue) = self.cues.get_mut(position) {
+                cue.start = start;
+                cue.end = end;
+            }
+        }
+        self.track_shift = 0;
+        self.retimed();
+    }
+
+    /// What every whole-track retiming leaves the page to do: drop the stale pictures, repack
+    /// the lanes, stop a playback that is now about timings the track no longer has, and ask
+    /// for the selected cue's picture again.
+    ///
+    /// Shared by [`Self::shift_all`] and [`Self::restore_timings`] so the two cannot come to
+    /// disagree about what a wide move costs.
+    fn retimed(&mut self) {
+        self.encoded.clear();
+        self.frame_error = None;
+        self.layout = pack_lanes(&self.cues, MAX_LANES);
+        self.stop_playback();
+        self.request_frame();
     }
 
     /// Retimes one cue and asks for its picture again.
@@ -3173,6 +3299,155 @@ mod tests {
     fn a_nudge_on_a_track_with_no_cues_should_do_nothing() {
         let mut state = state();
         assert_that!(state.nudge_selected(1)).is_none();
+    }
+
+    /// A global shift moves every cue by the same amount, including the ones the cursor is
+    /// nowhere near — which is the whole difference between it and a nudge.
+    #[test]
+    fn a_global_shift_should_move_every_cue_by_the_same_amount() {
+        // Arrange: `ready` puts cues at 0.0s, 2.0s and 4.0s, each a second long.
+        let mut state = ready(3);
+        let before: Vec<(Duration, Duration)> =
+            state.cues.iter().map(|cue| (cue.start, cue.end)).collect();
+
+        // Act: three steps on, then one back.
+        let moved = state.shift_all(3);
+        state.shift_all(-1);
+
+        // Assert: reported in milliseconds, signed, and accumulated on the track.
+        assert_that!(moved).is_equal_to(Some(150));
+        assert_that!(state.track_shift).is_equal_to(100);
+
+        // Assert: every cue moved by exactly that, and none of them changed length.
+        for (cue, (was_start, was_end)) in state.cues.iter().zip(before) {
+            assert_that!(cue.start).is_equal_to(was_start + Duration::from_millis(100));
+            assert_that!(cue.end).is_equal_to(was_end + Duration::from_millis(100));
+        }
+    }
+
+    /// A backward shift is shortened to what the *earliest* cue allows, so the track keeps
+    /// its shape.
+    ///
+    /// Clamping each cue against zero on its own would hold the early ones still while the
+    /// rest kept moving — the track silently stretched by a key that says it moves the track.
+    #[test]
+    fn a_global_shift_at_the_start_of_the_media_should_clamp_the_whole_track_together() {
+        // Arrange: cue 0 is 30ms from the floor, the others are seconds away from it.
+        let mut state = ready(3);
+        state.cues[0].start = Duration::from_millis(30);
+        state.cues[0].end = Duration::from_millis(1030);
+
+        // Act: a step back, which is more than the earliest cue has room for.
+        let moved = state.shift_all(-1);
+
+        // Assert: every cue moved by the 30ms the earliest one allowed, not by 50ms, and not
+        // by different amounts from each other.
+        assert_that!(moved).is_equal_to(Some(-30));
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(1970));
+        assert_that!(state.cues[2].start).is_equal_to(Duration::from_millis(3970));
+        assert_that!(state.cues[0].end - state.cues[0].start).is_equal_to(Duration::from_secs(1));
+
+        // Act / Assert: pressed again it reports nothing, so a held key at the floor stages
+        // nothing and re-renders nothing.
+        assert_that!(state.shift_all(-1)).is_none();
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(1970));
+        assert_that!(state.track_shift).is_equal_to(-30);
+    }
+
+    /// Nothing to move, nothing reported.
+    #[test]
+    fn a_global_shift_on_a_track_with_no_cues_should_do_nothing() {
+        let mut state = state();
+        assert_that!(state.shift_all(1)).is_none();
+        assert_that!(state.track_shift).is_equal_to(0);
+    }
+
+    /// Every cached still is a picture of a moment its cue no longer starts at, so the whole
+    /// window goes — where a single nudge keeps the frames it cannot have affected.
+    ///
+    /// The overlap groups are left alone: a uniform shift moves every cue equally, so no cue
+    /// can come to share the screen with one it did not share it with before.
+    #[test]
+    fn a_global_shift_should_drop_every_frame_and_leave_the_groups_alone() {
+        // Arrange: three cues, each with a frame ready, and a note of how they group.
+        let mut state = ready(3);
+        for cue in 0..3 {
+            state.apply_frame(cue, protocol(10, 5));
+        }
+        let groups = state.groups.clone();
+
+        // Act
+        state.shift_all(4);
+
+        // Assert: no frame survived, including the two the cursor is nowhere near.
+        assert_that!(state.encoded.is_empty()).is_true();
+        // Assert: and the rows the panel draws did not reflow under the reader.
+        assert_that!(state.groups).is_equal_to(groups);
+    }
+
+    /// `r` at track scale puts back only the cues the caller names, and leaves the shift
+    /// readout at zero.
+    #[test]
+    fn restoring_timings_should_move_the_named_cues_and_clear_the_shift() {
+        // Arrange: a track shifted on, with a frame drawn against the new timings.
+        let mut state = ready(3);
+        state.shift_all(2);
+        state.apply_frame(0, protocol(10, 5));
+
+        // Act: put two of the three back where the file has them.
+        state.restore_timings(&[
+            (0, Duration::ZERO, Duration::from_secs(1)),
+            (2, Duration::from_secs(4), Duration::from_secs(5)),
+        ]);
+
+        // Assert: the named cues moved and the unnamed one stayed where the shift left it.
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+        assert_that!(state.cues[2].start).is_equal_to(Duration::from_secs(4));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(2100));
+
+        // Assert: the track reads as unmoved again, and the stale picture is gone.
+        assert_that!(state.track_shift).is_equal_to(0);
+        assert_that!(state.encoded.is_empty()).is_true();
+    }
+
+    /// A position past the end of the list is ignored rather than panicking: the caller reads
+    /// the staged edits, which address a file the page's list can have drifted from.
+    #[test]
+    fn restoring_a_timing_for_a_cue_that_is_not_there_should_do_nothing() {
+        // Arrange
+        let mut state = ready(2);
+
+        // Act
+        state.restore_timings(&[(9, Duration::ZERO, Duration::from_secs(1))]);
+
+        // Assert
+        assert_that!(state.cues.len()).is_equal_to(2);
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+    }
+
+    /// A new cue list is the file's own timings, so the shift it is measured by starts again.
+    #[test]
+    fn a_new_track_should_reset_the_shift_readout() {
+        // Arrange: a page whose track has been shifted.
+        let mut state = ready(2);
+        state.shift_all(3);
+        assert_that!(state.track_shift).is_equal_to(150);
+
+        // Act: the file is re-read, as it is after a save rewrites it.
+        state.apply_prepared(vec![cue(0, 1000, "line 0")], CueStyle::SubRip);
+
+        // Assert
+        assert_that!(state.track_shift).is_equal_to(0);
+    }
+
+    /// The two scales are one value, so turning one on cannot leave the other on.
+    #[test]
+    fn the_timing_scope_should_report_whether_the_mode_is_on_at_either_scale() {
+        assert_that!(TimingScope::Off.is_on()).is_false();
+        assert_that!(TimingScope::Cue.is_on()).is_true();
+        assert_that!(TimingScope::Track.is_on()).is_true();
+        assert_that!(TimingScope::default()).is_equal_to(TimingScope::Off);
     }
 
     /// Retiming a cue invalidates the pictures of the lines it *shares the screen with*, not

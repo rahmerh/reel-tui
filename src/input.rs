@@ -11,7 +11,7 @@ use crate::app::{
     App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
     VideoSettingsMode,
 };
-use crate::subtitle_edit;
+use crate::subtitle_edit::{self, TimingScope};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -1109,22 +1109,28 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         // move between rows and these move between the cues sharing one. Ahead of the
         // generic `h`/`l` arms below, which are about horizontal choices on other layers.
         //
-        // **Three meanings now share this pair, and the focus decides before the mode
+        // **Four meanings now share this pair, and the focus decides before the mode
         // does.** With the cursor in the timeline they walk it through the media; that is
         // what left and right mean in a pane whose only axis is time, and a pane holding the
         // cursor owning its own movement keys is the whole point of the focus. Otherwise the
-        // timing mode moves the selected cue, and otherwise again the cursor steps between
-        // the cues sharing a moment. Each of the two inner meanings comes back with `Esc`.
+        // timing mode moves the selected cue or the whole track, depending on the scale it
+        // was turned on at, and otherwise again the cursor steps between the cues sharing a
+        // moment. Each of the inner meanings comes back with `Esc`.
+        //
+        // The scale is read off one value rather than two flags, so there is no state in
+        // which two of these arms could both be right — see `subtitle_edit::TimingScope`.
         (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE)
             if app.layer == Layer::SubtitleEdit =>
         {
             input.reset_sequence();
             if app.timeline_focused() {
                 app.move_timeline_cursor(-1, subtitle_edit::TIMELINE_STEP);
-            } else if app.cue_timing_mode() {
-                app.nudge_selected_cue(-1);
             } else {
-                app.move_cue_within_group(-1);
+                match app.timing_scope() {
+                    TimingScope::Cue => app.nudge_selected_cue(-1),
+                    TimingScope::Track => app.shift_whole_track(-1),
+                    TimingScope::Off => app.move_cue_within_group(-1),
+                }
             }
         }
         (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE)
@@ -1133,10 +1139,12 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             if app.timeline_focused() {
                 app.move_timeline_cursor(1, subtitle_edit::TIMELINE_STEP);
-            } else if app.cue_timing_mode() {
-                app.nudge_selected_cue(1);
             } else {
-                app.move_cue_within_group(1);
+                match app.timing_scope() {
+                    TimingScope::Cue => app.nudge_selected_cue(1),
+                    TimingScope::Track => app.shift_whole_track(1),
+                    TimingScope::Off => app.move_cue_within_group(1),
+                }
             }
         }
         // Modifiers are `NONE | SHIFT` rather than `SHIFT` alone, the same allowance the
@@ -1152,7 +1160,15 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
                     subtitle_edit::TIMELINE_STEP,
                 );
             } else {
-                app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP);
+                // The leap is ten of whatever `h` moves, at either scale — a shift and a
+                // nudge are the same gesture over different amounts of the track, so the
+                // key that means "ten of those" cannot mean one of them only.
+                match app.timing_scope() {
+                    TimingScope::Track => app.shift_whole_track(-subtitle_edit::TIMING_LEAP),
+                    TimingScope::Off | TimingScope::Cue => {
+                        app.nudge_selected_cue(-subtitle_edit::TIMING_LEAP)
+                    }
+                }
             }
         }
         (KeyCode::Char('L'), KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -1165,15 +1181,36 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
                     subtitle_edit::TIMELINE_STEP,
                 );
             } else {
-                app.nudge_selected_cue(subtitle_edit::TIMING_LEAP);
+                match app.timing_scope() {
+                    TimingScope::Track => app.shift_whole_track(subtitle_edit::TIMING_LEAP),
+                    TimingScope::Off | TimingScope::Cue => {
+                        app.nudge_selected_cue(subtitle_edit::TIMING_LEAP)
+                    }
+                }
             }
+        }
+        // `T` for the same mode one scale up: global retiming, where `h`/`l` move every cue
+        // in the track together. The capital is the bigger version of the lowercase, which
+        // is what `H`/`L` already mean beside `h`/`l` on this page.
+        (KeyCode::Char('T'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if app.layer == Layer::SubtitleEdit =>
+        {
+            input.reset_sequence();
+            app.toggle_global_retiming();
         }
         // `r` for the timing this cue started at, which is what `r` already means one layer
         // up: on the track list it puts the focused field back to what the file says. Inert
         // outside the timing mode, where this page has nothing to reset.
+        //
+        // It reaches as far as the keys beside it do: at track scale it puts every cue back,
+        // so `r` means "the timings the file has" at both scales rather than meaning
+        // something different depending on which one is on.
         (KeyCode::Char('r'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
-            app.reset_selected_cue_timing();
+            match app.timing_scope() {
+                TimingScope::Track => app.reset_track_timing(),
+                TimingScope::Off | TimingScope::Cue => app.reset_selected_cue_timing(),
+            }
         }
         (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.layer == Layer::Streams => {
             input.reset_sequence();
@@ -3870,7 +3907,7 @@ mod tests {
         // Act / Assert: nothing on the streams layer, where there is no page to be in a
         // mode on.
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         assert_that!(app.layer).is_equal_to(Layer::Streams);
 
         // Arrange: the subtitle edit page, on a cue.
@@ -3879,9 +3916,141 @@ mod tests {
 
         // Act / Assert: on, then off again with the same key.
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
-        assert_that!(app.cue_timing_mode()).is_true();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_true();
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `T` turns the timing mode on at the wider scale, and only on the page that has one.
+    ///
+    /// The modifier pair matters: a shifted letter arrives carrying `SHIFT` from terminals
+    /// that report it and bare from those that do not, so both have to reach the same key.
+    #[test]
+    fn shift_t_should_toggle_global_retiming_only_on_the_subtitle_edit_page() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: nothing on the streams layer, where there is no page to retime.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Arrange: the subtitle edit page, on a cue.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+
+        // Act / Assert: on, and off again with the same key.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+
+        // Act / Assert: and the terminals that do report the modifier reach the same key.
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('T')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The two scales are one mode, so `T` from the cue scale replaces it rather than
+    /// stacking on it — and one `Esc` leaves whichever is on.
+    #[test]
+    fn the_two_timing_scales_should_replace_each_other_at_the_keys() {
+        // Arrange: the page, in the narrow scale.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+
+        // Act / Assert: `T` takes over rather than leaving both on.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+
+        // Act / Assert: and `t` takes it back the other way.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue);
+
+        // Act / Assert: one `Esc` leaves the mode without leaving the page.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// At the wider scale `h`/`l` and `H`/`L` move the whole track, and `r` puts all of it
+    /// back — the same four keys, reaching further.
+    #[test]
+    fn h_and_l_should_move_the_whole_track_while_retiming_globally() {
+        // Arrange: the page, with cues at 1s and 3600s.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+
+        // Act: one step on.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+
+        // Assert: the far cue moved too, which is the whole difference from a nudge.
+        let far = |app: &App| app.subtitle_edit.as_ref().unwrap().cues[1].start;
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+        assert_that!(far(&app)).is_equal_to(std::time::Duration::from_millis(3600050));
+
+        // Act / Assert: `L` is ten of those, at this scale as at the other.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('L')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1550));
+        assert_that!(far(&app)).is_equal_to(std::time::Duration::from_millis(3600550));
+
+        // Act / Assert: `H` comes back the other way.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('H')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+
+        // Act / Assert: and `r` puts the whole track back where the file has it.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(far(&app)).is_equal_to(std::time::Duration::from_secs(3600));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pane holding the cursor owns the keys that mean movement in it, whichever scale the
+    /// timing mode is on at: `Ctrl+J` and the timeline still take `h`/`l` first.
+    #[test]
+    fn the_timeline_cursor_should_still_own_h_and_l_while_retiming_globally() {
+        // Arrange: the page, retiming globally, with the cursor handed to the timeline.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('T')));
+        handle_key(&mut app, &mut input, ctrl('j'));
+
+        // Act: the keys that would otherwise move the track.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('L')));
+
+        // Assert: the cues stood still and the cursor did the moving.
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor().is_some()).is_true();
+
+        // Assert: and the mode was left alone by the detour, so `Ctrl+K` comes back to it.
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
 
         // Cleanup
         drop(app);
@@ -3955,7 +4124,7 @@ mod tests {
         // reader has already walked away from.
         handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
 
@@ -3980,7 +4149,7 @@ mod tests {
 
         // Act / Assert: the first `Esc` takes the mode and nothing else.
         handle_key(&mut app, &mut input, key(KeyCode::Esc));
-        assert_that!(app.cue_timing_mode()).is_false();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
         assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
         assert_that!(app.dialog).is_none();
 
@@ -4305,7 +4474,7 @@ mod tests {
         // the precedence exists for.
         let (mut app, directory, mut input) = timeline_app();
         handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
-        assert_that!(app.cue_timing_mode()).is_true();
+        assert_that!(app.timing_scope() == TimingScope::Cue).is_true();
         handle_key(
             &mut app,
             &mut input,
