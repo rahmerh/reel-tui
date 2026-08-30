@@ -1193,6 +1193,27 @@ impl Harness {
         }
     }
 
+    /// Everything drawn reversed, as one string.
+    ///
+    /// The cue panel marks a search hit by reversing the matched run rather than by
+    /// colouring it — the page already spends five colours, and reversing is legible
+    /// against each of them — so "which words matched" is a question about a modifier
+    /// that only the buffer can answer. Nothing else in this UI reverses a cell.
+    pub fn reversed_text(&self) -> String {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| {
+                cell.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     /// Everything drawn on the selection's fill, as one string.
     ///
     /// The subtitle edit page marks the selected cue by filling its block rather than by putting

@@ -5473,6 +5473,167 @@ fn deleting_a_cue_should_stage_it_and_ctrl_s_should_remove_it_from_the_file() {
     );
 }
 
+/// The subtitle edit page can play a cue, retime it, resize it, add one and take one out —
+/// but until now it had no way to *find* one, and on a feature-length track the only way to
+/// reach a remembered line was to hold `j` past a thousand rows. `/` opens the same search
+/// bar the file list and the keybindings popup already use, the cue list narrows to the rows
+/// whose words match, and the matched run is highlighted.
+///
+/// Driven end to end and **asserted on the screen**, because the interesting half of this is
+/// what is drawn: the list can narrow correctly while the highlight lands on the wrong run,
+/// and — the one thing this page must never do — the *timeline* can narrow with it. The
+/// timeline is a picture of the whole track, so hiding cues from it would misdescribe where
+/// the lines actually are; that is asserted here by counting the cue brackets it draws
+/// before and after the filter bites.
+#[test]
+fn searching_the_cue_list_should_show_only_matching_cues_and_highlight_them() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "searching_the_cue_list_should_show_only_matching_cues_and_highlight_them";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-search");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(9.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, THREE_SIDECAR_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first, so nothing is still repainting the panel underneath the
+    // assertions about what it is drawing.
+    wait_for_frames(&mut app);
+
+    // Arrange: the cursor parked on the third cue, which is where an abandoned search has to
+    // put the reader back — and which no query below matches, so a restored cursor cannot be
+    // confused with one that simply never moved.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('j')));
+    assert_eq!(app.app.subtitle_edit.as_ref().unwrap().selected, 2);
+    app.pump();
+    let brackets_before = app.screen().matches('|').count();
+    assert!(
+        brackets_before > 0,
+        "the timeline should be drawing the track's cues to begin with:\n{}",
+        app.screen()
+    );
+
+    // Act: search for a word only the second cue holds, typed in the wrong case.
+    app.press(key(KeyCode::Char('/')));
+    assert!(
+        app.app.cue_search_active(),
+        "`/` should open the cue panel's search bar"
+    );
+    for letter in "second".chars() {
+        app.press(key(KeyCode::Char(letter)));
+    }
+    app.pump();
+
+    // Assert: one row drawn, the match highlighted, the cursor on it — and the timeline
+    // untouched, because it describes the track rather than the search.
+    let screen = app.screen();
+    assert!(
+        screen.contains("Second line"),
+        "the matching cue should be drawn:\n{screen}"
+    );
+    assert!(
+        !screen.contains("First line") && !screen.contains("Third line"),
+        "the cues that do not match should be filtered out of the list:\n{screen}"
+    );
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().selected,
+        1,
+        "the cursor should land on the match"
+    );
+    assert!(
+        app.reversed_text().contains("Second"),
+        "the matched words should be highlighted, and only them: {:?}\n{screen}",
+        app.reversed_text()
+    );
+    assert_eq!(
+        screen.matches('|').count(),
+        brackets_before,
+        "the timeline should keep drawing every cue in the track:\n{screen}"
+    );
+
+    // Act / Assert: `Esc` while the bar is up abandons the search — the whole list is back
+    // and the reader is where they started, not where the search took them.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert!(!app.app.cue_search_active(), "`Esc` should close the bar");
+    assert_eq!(app.app.layer, Layer::SubtitleEdit, "and not leave the page");
+    let screen = app.screen();
+    assert!(
+        screen.contains("First line") && screen.contains("Third line"),
+        "abandoning the search should bring the whole list back:\n{screen}"
+    );
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().selected,
+        2,
+        "abandoning should put the reader back on the cue they searched from"
+    );
+    assert!(
+        app.reversed_text().is_empty(),
+        "and take the highlighting with it"
+    );
+
+    // Act: search again and confirm it with `Enter`, which leaves the filter in force and
+    // hands the keys back to the list.
+    app.press(key(KeyCode::Char('/')));
+    for letter in "second".chars() {
+        app.press(key(KeyCode::Char(letter)));
+    }
+    app.press(key(KeyCode::Enter));
+    assert!(
+        !app.app.cue_search_active(),
+        "`Enter` should leave the bar rather than the filter"
+    );
+
+    // Assert: movement stays inside the matches — `j` and `k` cannot reach a cue the reader
+    // has filtered away, which is the whole point of narrowing the list.
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('k')));
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().selected,
+        1,
+        "movement should not walk out of the filtered list"
+    );
+    app.pump();
+    assert!(
+        !app.screen().contains("Third line"),
+        "a confirmed search should keep the list narrowed:\n{}",
+        app.screen()
+    );
+
+    // Act / Assert: with the bar closed, a back key drops the filter before it leaves the
+    // page — the reader gets their list back, and stays where they are.
+    app.press(key(KeyCode::Esc));
+    app.pump();
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "the first back key should spend itself on the filter"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("First line") && screen.contains("Third line"),
+        "dropping the filter should bring the whole list back:\n{screen}"
+    );
+    app.press(key(KeyCode::Esc));
+    assert_eq!(
+        app.app.layer,
+        Layer::Streams,
+        "and the next one should leave the page, since no cue edit was staged"
+    );
+}
+
 /// The cache root, under the `XDG_CACHE_HOME` the harness redirects.
 fn frames_root() -> PathBuf {
     PathBuf::from(std::env::var("XDG_CACHE_HOME").expect("the harness redirects the cache"))

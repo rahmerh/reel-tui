@@ -16,8 +16,11 @@ use ratatui::layout::Size;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
+use crate::app::SearchState;
 use crate::audio::{AudioOutput, AudioSource, frame_index_at};
-use crate::cue::{Cue, CueGroup, LaneLayout, MAX_LANES, group_overlaps, pack_lanes, shares_screen};
+use crate::cue::{
+    Cue, CueGroup, LaneLayout, MAX_LANES, fold_case, group_overlaps, pack_lanes, shares_screen,
+};
 use crate::preview::{
     CueStyle, FRAME_WINDOW_BUDGET, FrameSource, FrameTarget, PlaybackAnchor, PlaybackFrames,
     ScrubTarget, seek_ceiling, seek_for,
@@ -613,6 +616,29 @@ pub struct SubtitleEditState {
     /// The cue panel draws a group as its unit rather than a cue, so this is what its
     /// scrolling and its `j`/`k` movement are measured in.
     pub groups: Vec<CueGroup>,
+    /// Which groups the cue panel is drawing, as positions in [`Self::groups`], ascending.
+    ///
+    /// The panel's filter is a *view* rather than an edit: `cues` and `groups` keep every
+    /// entry the track has, and this says which of them the reader asked to see. That is
+    /// what lets the timeline, the frame window, the staged edits and the cache keys go on
+    /// addressing the whole track while the panel shows part of it — a filter that removed
+    /// cues instead would move every one of those out from under itself.
+    ///
+    /// `(0..groups.len())` while no query is in force, so every path that reads it is the
+    /// same code filtered or not, rather than a `None` arm shadowing the ordinary one.
+    visible: Vec<usize>,
+    /// The cue panel's filter bar.
+    ///
+    /// The page's own rather than [`crate::app::App`]'s, unlike the file list's and the
+    /// keybindings popup's: the renderer holds this page mutably while it draws the panel,
+    /// so a bar owned by `App` could not be measured there — and a filter dropped with the
+    /// page is one that cannot greet the reader on their next visit.
+    cue_search: SearchState,
+    /// The cue the search was opened on, for the `Esc` that abandons it.
+    ///
+    /// A [`CueOrigin`] rather than a position, so it survives the list shifting under it —
+    /// the same reason every other claim on this page about "which cue" is one.
+    search_origin: Option<CueOrigin>,
     pub selected: usize,
     /// Which page of the selected group's members the panel is showing, counted in pages of
     /// [`GROUP_COLUMNS`] from the group's first member.
@@ -777,6 +803,9 @@ impl SubtitleEditState {
             track_shift: 0,
             layout: LaneLayout::default(),
             groups: Vec::new(),
+            visible: Vec::new(),
+            cue_search: SearchState::default(),
+            search_origin: None,
             selected: 0,
             group_page: 0,
             group_memory: HashMap::new(),
@@ -880,6 +909,11 @@ impl SubtitleEditState {
         // a reading of the file that a save has just rewritten is where a shift is measured
         // from, so carrying the old figure over would report this track as already moved.
         self.track_shift = 0;
+        // And the filter goes with them, for the same reason: a query is about the list it
+        // was typed against, and this is a fresh reading of a file a save has just
+        // rewritten. Carried over, it could hide the very cue `restore` was put back on.
+        // This is also what fills `visible` for a page that has never been searched.
+        self.clear_cue_search();
         // A new cue list is a new track under the cursor, so the timeline cursor has nothing
         // left to be standing on: it is seeded from a cue, and every cue it was measured
         // against has just been replaced.
@@ -906,6 +940,7 @@ impl SubtitleEditState {
         self.origins.clear();
         self.layout = LaneLayout::default();
         self.groups.clear();
+        self.clear_cue_search();
         self.encoded.clear();
         self.frame_pending_since = None;
         self.refill_nearby = false;
@@ -1068,6 +1103,10 @@ impl SubtitleEditState {
         if self.frame_error.as_ref().is_some_and(|(at, _)| *at == cue) {
             self.frame_error = None;
         }
+        // The words are what the filter matches on, so a rewrite can put this row into the
+        // drawn list or take it out of it. The groups and the positions are untouched, so
+        // unlike an insertion this is only the projection being rebuilt.
+        self.refilter();
         self.request_frame();
     }
 
@@ -1175,6 +1214,11 @@ impl SubtitleEditState {
             .get(self.group_of(at))
             .map(|group| (at - group.first) / GROUP_COLUMNS)
             .unwrap_or(0);
+        // A new row and a rebuilt `groups` between them move every position the filter
+        // holds, so the projection is rebuilt against the list as it now is. The cursor is
+        // already on the new cue, so `refilter` moves it only if the reader's query does
+        // not match what they just typed — which is honest, and visible in the panel.
+        self.refilter();
         // The reader made a cue; the page has to be showing it. That means the cue panel,
         // which is the only pane that marks a selection — the timeline draws no bracket while
         // it holds the cursor, so a new cue made from there would land unmarked and invisible.
@@ -1237,6 +1281,8 @@ impl SubtitleEditState {
             .get(self.group_of(self.selected))
             .map(|group| (self.selected - group.first) / GROUP_COLUMNS)
             .unwrap_or(0);
+        // For the reason `insert_cue` does it: a row leaving moves every position after it.
+        self.refilter();
         self.leave_timeline();
         self.select_cue();
     }
@@ -2005,6 +2051,165 @@ impl SubtitleEditState {
         self.status == LoadStatus::Preparing
     }
 
+    /// The cue panel's filter bar, for the renderer that measures it and the keys that
+    /// type into it.
+    pub fn cue_search(&self) -> &SearchState {
+        &self.cue_search
+    }
+
+    /// The bar's buffer, for [`crate::app::App::text_input_mut`].
+    pub fn cue_search_mut(&mut self) -> &mut SearchState {
+        &mut self.cue_search
+    }
+
+    /// The query the panel is filtered by, trimmed, or empty when it is not filtered.
+    ///
+    /// The single answer to "is a filter in force", read by the renderer to decide whether
+    /// to draw the bar and highlight the words, and by the paging rules below.
+    pub fn cue_query(&self) -> &str {
+        self.cue_search.value.trim()
+    }
+
+    /// Whether this cue's words match the query. An empty query matches everything, so the
+    /// unfiltered list is the same code path as a filtered one.
+    ///
+    /// Matched against [`Cue::text`] — the words the panel actually draws, which already
+    /// carry a staged rewrite — rather than against `Cue::dialogue`, which is the string
+    /// libass reads and can hold override tags the reader never sees. Timings are not
+    /// searched: a reader hunting for a moment has the timeline for it.
+    ///
+    /// Case-insensitive substring, the rule every other search in the application follows.
+    fn cue_matches(cue: &Cue, query: &str) -> bool {
+        query.is_empty() || fold_case(&cue.text).contains(&fold_case(query))
+    }
+
+    /// The first cue of this group whose words match, if any.
+    fn first_match_in(&self, group: CueGroup, query: &str) -> Option<usize> {
+        (group.first..group.end()).find(|cue| {
+            self.cues
+                .get(*cue)
+                .is_some_and(|cue| Self::cue_matches(cue, query))
+        })
+    }
+
+    /// Rebuilds which groups the panel is drawing, and puts the cursor somewhere it can
+    /// still be seen.
+    ///
+    /// **A group is shown whole when any of its cues matches.** The group is the panel's
+    /// unit — one row, one stop for `j`, one fork whose crossbar says how far the run
+    /// reaches — so dropping members out of one would draw a fork with nothing to fork
+    /// into and make the row lie about what shares the screen. The highlight is what says
+    /// which member hit; `h`/`l` still walk all of them.
+    ///
+    /// **The cursor holds still while its own group still matches.** Typing another letter
+    /// must not move a reader off the line they are reading, which is what a reset to the
+    /// first match on every keystroke would do. Only a group filtered out from under the
+    /// cursor moves it, and then to the first one still on screen.
+    ///
+    /// **No matches at all leaves the selection exactly where it is.** There is nowhere
+    /// honest to put it, the preview pane goes on showing a real cue, and the panel says
+    /// there are none rather than pointing at one it is not drawing.
+    pub fn refilter(&mut self) {
+        let query = self.cue_search.value.trim().to_string();
+        self.visible = (0..self.groups.len())
+            .filter(|index| {
+                query.is_empty()
+                    || self
+                        .groups
+                        .get(*index)
+                        .is_some_and(|group| self.first_match_in(*group, &query).is_some())
+            })
+            .collect();
+        // Cues rather than groups: the reader is counting the lines they were looking for,
+        // and a group is a drawing decision they never asked about.
+        self.cue_search.match_count = if query.is_empty() {
+            0
+        } else {
+            self.cues
+                .iter()
+                .filter(|cue| Self::cue_matches(cue, &query))
+                .count()
+        };
+        if self.visible.is_empty() || self.visible_position().is_some() {
+            return;
+        }
+        self.remember_place();
+        let first = self.visible[0];
+        self.enter_group(first);
+        self.select_cue();
+    }
+
+    /// Where the cursor's group sits in [`Self::visible`], or `None` when the filter has
+    /// hidden it — which is the one case [`Self::refilter`] has to move the cursor for.
+    ///
+    /// A binary search rather than a scan: `visible` is ascending by construction, and this
+    /// is read by every movement key and by every draw of the panel.
+    fn visible_position(&self) -> Option<usize> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        self.visible.binary_search(&self.selected_group()).ok()
+    }
+
+    /// The groups the panel is drawing, as positions in [`Self::groups`].
+    pub fn visible_groups(&self) -> &[usize] {
+        &self.visible
+    }
+
+    /// Opens the filter bar, remembering the cue to come back to if it is abandoned.
+    ///
+    /// The origin is taken only when there is not one already, so the several ways a bar
+    /// can be re-opened mid-search — `/` pressed again, the bar re-activated after a
+    /// keystroke was refused — all still return to where the search began rather than to
+    /// wherever the filter had since moved the cursor.
+    ///
+    /// Pressing `Enter` clears it (see [`Self::finish_cue_search`]), so a search the reader
+    /// *confirmed* and then re-opened comes back to where they confirmed it. That is the
+    /// point of confirming: they accepted the row the filter put them on, and an `Esc`
+    /// three searches later must not teleport them back to a cue they left long ago.
+    pub fn start_cue_search(&mut self) {
+        if self.search_origin.is_none() {
+            self.search_origin = self.selected_origin();
+        }
+        self.cue_search.activate();
+    }
+
+    /// Leaves the bar with the filter still in force, handing the keys back to the list.
+    pub fn finish_cue_search(&mut self) {
+        self.cue_search.deactivate();
+        self.search_origin = None;
+    }
+
+    /// Drops the filter and puts the cursor back where the search was opened.
+    ///
+    /// The origin is a [`CueOrigin`], so a cue the reader added or removed while the filter
+    /// was up is still found — or honestly not found, in which case the cursor stays where
+    /// the search left it rather than jumping somewhere arbitrary.
+    pub fn cancel_cue_search(&mut self) {
+        let origin = self.search_origin.take();
+        self.clear_cue_search();
+        if let Some(cue) = origin.and_then(|origin| self.position_of(origin)) {
+            self.remember_place();
+            self.selected = cue;
+            self.group_page = self
+                .groups
+                .get(self.group_of(cue))
+                .map(|group| (cue - group.first) / GROUP_COLUMNS)
+                .unwrap_or(0);
+            self.select_cue();
+        }
+    }
+
+    /// Empties the query and leaves the bar, without moving the cursor.
+    ///
+    /// What `Esc` does to a filter left in force with the bar already closed, and what a
+    /// new cue list does to one that was never closed at all.
+    pub fn clear_cue_search(&mut self) {
+        self.cue_search.clear();
+        self.search_origin = None;
+        self.refilter();
+    }
+
     /// Which group holds the cue at this position in the list.
     ///
     /// Zero for a list with no groups at all, which is the empty track — every caller here
@@ -2038,10 +2243,23 @@ impl SubtitleEditState {
     /// in redrawing itself the moment they step off it is the same lost place as re-entering
     /// on the wrong cue — they can see it happen, one row up, as they press `j`. A group
     /// never visited has nothing to anchor a window on and shows its first members.
+    ///
+    /// **While a filter is in force, a group the cursor is not in is paged to its first
+    /// match instead.** The row is on the list *because* something in it matched, so a
+    /// page that did not hold that cue would be the panel showing two lines neither of
+    /// which is the reason the reader can see them — worst on a group of four whose only
+    /// match is its last member, which would otherwise never be drawn at all. The match
+    /// outranks the remembered page for exactly that reason; the cursor's own group is
+    /// still the exception, because there the reader is steering.
     pub fn group_window(&self, group: CueGroup) -> (usize, usize) {
         let shown = group.len.min(GROUP_COLUMNS);
+        let query = self.cue_query();
         let page = if group.holds(self.selected) {
             self.group_page
+        } else if !query.is_empty() {
+            self.first_match_in(group, query)
+                .map(|cue| (cue - group.first) / GROUP_COLUMNS)
+                .unwrap_or(0)
         } else {
             self.group_memory
                 .get(&self.group_of(group.first))
@@ -2071,12 +2289,16 @@ impl SubtitleEditState {
     /// grouping creates, where the cursor is on a later member of the last group and there
     /// is no group left to move to. Landing on that group's first member would be a jump
     /// backwards in answer to `j`, so it is refused instead.
+    ///
+    /// **Steps over the groups the panel is drawing, not over every group the track has**
+    /// ([`Self::visible`]). A filter that left `j` walking through rows nobody can see
+    /// would be a cursor disappearing for several presses at a time; unfiltered the two
+    /// lists are the same, so this is the movement it always was.
     pub fn select(&mut self, delta: isize) -> bool {
-        if self.groups.is_empty() {
+        let Some(current) = self.visible_position() else {
             return false;
-        }
-        let last = self.groups.len() - 1;
-        let current = self.selected_group();
+        };
+        let last = self.visible.len() - 1;
         let next = if delta < 0 {
             current.saturating_sub(delta.unsigned_abs())
         } else {
@@ -2086,7 +2308,8 @@ impl SubtitleEditState {
             return false;
         }
         self.remember_place();
-        self.enter_group(next);
+        let group = self.visible[next];
+        self.enter_group(group);
         self.select_cue();
         true
     }
@@ -2102,14 +2325,26 @@ impl SubtitleEditState {
     /// The remembered cue is checked against the group rather than trusted: `cues` and
     /// `groups` are public, so a caller can leave a shorter list under a memory taken from
     /// a longer one, and a selection outside its group is a cursor the panel cannot draw.
+    ///
+    /// **While a filter is in force the cursor lands on the group's first match instead**,
+    /// with the page set to show it — the same rule [`Self::group_window`] draws an
+    /// unselected group by, applied to the one the reader has just arrived in. Searching
+    /// for a word and landing on the line beside it would make `/` point at the wrong cue,
+    /// and on a group of four whose match is its last member the reader would have to
+    /// press `l` three times to reach what they searched for.
     fn enter_group(&mut self, index: usize) {
         let group = self.groups[index];
-        let (cue, page) = self
-            .group_memory
-            .get(&index)
-            .copied()
-            .filter(|(cue, _)| group.holds(*cue))
-            .unwrap_or((group.first, 0));
+        let query = self.cue_query();
+        let (cue, page) = if !query.is_empty() {
+            let cue = self.first_match_in(group, query).unwrap_or(group.first);
+            (cue, (cue - group.first) / GROUP_COLUMNS)
+        } else {
+            self.group_memory
+                .get(&index)
+                .copied()
+                .filter(|(cue, _)| group.holds(*cue))
+                .unwrap_or((group.first, 0))
+        };
         self.selected = cue;
         self.group_page = page;
     }
@@ -2157,31 +2392,47 @@ impl SubtitleEditState {
     /// make it land somewhere the reader did not ask for. The memory is overwritten rather
     /// than left stale, so a later `k` back into the group agrees with where `gg` put the
     /// cursor.
+    ///
+    /// The top of the *drawn* list while a filter is in force — the first row the reader
+    /// can see, entered on its match, since `gg` means "the top of this list" and the list
+    /// is what the panel is showing.
     pub fn select_first(&mut self) -> bool {
-        if self.cues.is_empty() || self.selected == 0 {
+        let Some(group) = self.visible.first().copied() else {
             return false;
-        }
-        self.remember_place();
-        self.selected = 0;
-        self.group_page = 0;
-        self.remember_place();
-        self.select_cue();
-        true
+        };
+        self.jump_to_group(group)
     }
 
     /// The bottom of the list, which is the last *group's* first member rather than the
     /// last cue — the same place `j` would land on arriving there, so `G` and a held `j`
-    /// agree about where the end is.
+    /// agree about where the end is. The last drawn row while a filter is in force, for the
+    /// reason `gg` takes the first one.
     pub fn select_last(&mut self) -> bool {
-        let Some(group) = self.groups.last().copied() else {
+        let Some(group) = self.visible.last().copied() else {
             return false;
         };
-        if self.selected == group.first {
+        self.jump_to_group(group)
+    }
+
+    /// The absolute move `gg` and `G` share: into a group at its first member — or its
+    /// first match, while a filter is in force — rather than at the place it was last left.
+    ///
+    /// The memory is overwritten rather than left stale, so a later `k` back into the group
+    /// agrees with where the jump put the cursor.
+    fn jump_to_group(&mut self, index: usize) -> bool {
+        let group = self.groups[index];
+        let query = self.cue_query();
+        let target = if query.is_empty() {
+            group.first
+        } else {
+            self.first_match_in(group, query).unwrap_or(group.first)
+        };
+        if self.selected == target {
             return false;
         }
         self.remember_place();
-        self.selected = group.first;
-        self.group_page = 0;
+        self.selected = target;
+        self.group_page = (target - group.first) / GROUP_COLUMNS;
         self.remember_place();
         self.select_cue();
         true
@@ -2214,10 +2465,17 @@ impl SubtitleEditState {
     /// At least one, so the shortest panel the layout can produce still shows the group
     /// under the cursor rather than nothing at all — a group that does not fit whole is
     /// clipped from the bottom, exactly as an over-tall cue block always was.
+    ///
+    /// `from` and the answer are positions in [`Self::visible`], not in `groups`: rows the
+    /// filter is not drawing cost the panel nothing, so counting them would scroll the list
+    /// past its own end.
     fn groups_fitting(&self, from: usize, height: usize) -> usize {
-        let mut used = self.group_height(from);
+        let Some(first) = self.visible.get(from).copied() else {
+            return 0;
+        };
+        let mut used = self.group_height(first);
         let mut count = 1;
-        for group in from + 1..self.groups.len() {
+        for group in self.visible.iter().skip(from + 1).copied() {
             let next = used + CUE_CONNECTOR_ROWS + self.group_height(group);
             if next > height {
                 break;
@@ -2231,20 +2489,26 @@ impl SubtitleEditState {
     /// The furthest the list can scroll before it starts showing blank rows under the last
     /// group. Walked backwards from the end, because that is the direction the constraint
     /// comes from.
+    /// A position in [`Self::visible`], counting only the rows the filter is drawing — for
+    /// the reason [`Self::groups_fitting`] does.
     fn max_scroll(&self, height: usize) -> usize {
-        // Saturating rather than guarded: an empty track never reaches here — `cue_scroll`
+        // Saturating rather than guarded: an empty list never reaches here — `cue_scroll`
         // has already returned — and if it did, the loop below is empty and the answer is
         // the zero it should be.
-        let last = self.groups.len().saturating_sub(1);
-        let mut used = self.group_height(last);
+        let last = self.visible.len().saturating_sub(1);
+        let mut used = self
+            .visible
+            .get(last)
+            .map(|group| self.group_height(*group))
+            .unwrap_or(0);
         let mut scroll = last;
-        for group in (0..last).rev() {
-            let next = used + CUE_CONNECTOR_ROWS + self.group_height(group);
+        for position in (0..last).rev() {
+            let next = used + CUE_CONNECTOR_ROWS + self.group_height(self.visible[position]);
             if next > height {
                 break;
             }
             used = next;
-            scroll = group;
+            scroll = position;
         }
         scroll
     }
@@ -2258,13 +2522,23 @@ impl SubtitleEditState {
     /// count the renderer had divided out. It cannot be a division any more: a lone cue and
     /// a pair are different heights, so how many rows a screenful costs depends on which
     /// groups are in it.
+    ///
+    /// `list_scroll` and `list_rows` are positions and counts in [`Self::visible`], so a
+    /// filtered list scrolls through what it is drawing rather than through the whole
+    /// track. Unfiltered the two are the same list.
+    ///
+    /// A filter matching nothing leaves the scroll where an empty track leaves it: there
+    /// are no rows, so there is nothing to keep on screen and nothing to draw.
     pub fn cue_scroll(&mut self, height: usize) {
-        if height == 0 || self.groups.is_empty() {
+        if height == 0 || self.visible.is_empty() {
             self.list_rows = 0;
             self.list_scroll = 0;
             return;
         }
-        let selected = self.selected_group();
+        // The cursor's group is off the drawn list only while the filter hides it, which
+        // `refilter` allows exactly when nothing matches at all — and that has returned
+        // above. Zero rather than a guard, so the scroll is still clamped below.
+        let selected = self.visible_position().unwrap_or(0);
         if selected < self.list_scroll {
             self.list_scroll = selected;
         }
@@ -5555,5 +5829,483 @@ mod tests {
         // Assert
         assert_that!(state.cues.len()).is_equal_to(3);
         assert_that!(state.selected).is_equal_to(0);
+    }
+
+    /// Types `query` into the page's filter bar, as the keys would.
+    fn search_for(state: &mut SubtitleEditState, query: &str) {
+        state.start_cue_search();
+        state.cue_search_mut().input.value = query.to_string();
+        state.refilter();
+    }
+
+    /// A page whose cues overlap into one group of four, preceded and followed by ordinary
+    /// lone cues — the shape every rule about groups under a filter is about.
+    fn grouped_page() -> SubtitleEditState {
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "opening line"),
+                // Four cues sharing one stretch of screen, so they are one group.
+                cue(2000, 9000, "alpha"),
+                cue(2500, 9000, "bravo"),
+                cue(3000, 9000, "charlie"),
+                cue(3500, 9000, "delta"),
+                cue(12000, 13000, "closing line"),
+            ],
+            CueStyle::SubRip,
+        );
+        state
+    }
+
+    #[test]
+    fn an_empty_query_should_leave_every_group_on_the_list() {
+        // Arrange
+        let state = ready(4);
+
+        // Assert: the projection is the whole list, so every path that reads it is the
+        // code it always was rather than a filtered special case.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![0, 1, 2, 3]);
+        assert_that!(state.cue_query()).is_equal_to("");
+        assert_that!(state.cue_search().match_count).is_equal_to(0);
+    }
+
+    #[test]
+    fn a_query_should_keep_only_the_matching_rows_and_count_the_cues() {
+        // Arrange
+        let mut state = ready(4);
+
+        // Act
+        search_for(&mut state, "LINE 2");
+
+        // Assert: case-insensitive, and the count is of cues rather than of groups —
+        // the reader is counting the lines they were looking for.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![2]);
+        assert_that!(state.cue_search().match_count).is_equal_to(1);
+    }
+
+    #[test]
+    fn a_row_whose_neighbours_share_its_screen_should_stay_whole() {
+        // Arrange: only one member of the group of four matches.
+        let mut state = grouped_page();
+
+        // Act
+        search_for(&mut state, "charlie");
+
+        // Assert: the group is drawn, and it is still the group of four it was. Filtering
+        // members out of it would draw a fork with nothing to fork into and make the row
+        // lie about what shares the screen.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![1]);
+        assert_that!(state.groups[1].len).is_equal_to(4);
+        assert_that!(state.cue_search().match_count).is_equal_to(1);
+    }
+
+    /// The requirement that makes a filtered group worth showing at all: the reader can see
+    /// the cue they searched for, not merely the row it happens to live on.
+    #[test]
+    fn a_group_should_be_entered_and_drawn_at_the_page_holding_its_match() {
+        // Arrange: `delta` is the group's *last* member, on page one of two.
+        let mut state = grouped_page();
+
+        // Act
+        search_for(&mut state, "delta");
+
+        // Assert: the cursor is on the match rather than on the group's first member, and
+        // the pair of blocks drawn is the one holding it.
+        assert_that!(state.selected).is_equal_to(4);
+        let (first, shown) = state.group_window(state.groups[1]);
+        assert_that!(first).is_equal_to(3);
+        assert_that!(shown).is_equal_to(2);
+    }
+
+    #[test]
+    fn a_matching_group_the_cursor_is_not_in_should_still_draw_its_match() {
+        // Arrange: a query the closing line matches too, so there is a second drawn row
+        // for the cursor to move to and leave the group behind.
+        let mut state = grouped_page();
+        search_for(&mut state, "delta");
+        state.edit_cue_text(5, "closing delta".to_string());
+        // Group 1 is the run of four; group 2 is the closing line, cue 5.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![1, 2]);
+
+        // Act: down onto the closing line, off the group entirely.
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(5);
+
+        // Assert: the group the cursor left is still drawn at the page holding the only
+        // reason it is on the list — a row showing two lines neither of which matched
+        // would leave the reader unable to see why it is there.
+        let (first, _) = state.group_window(state.groups[1]);
+        assert_that!(first).is_equal_to(3);
+    }
+
+    #[test]
+    fn moving_down_should_step_over_the_rows_the_filter_hides() {
+        // Arrange: "line 0" and "line 3" match; the two between them do not.
+        let mut state = ready(4);
+        search_for(&mut state, "line 0");
+        state.cue_search_mut().input.value = "line".to_string();
+        state.refilter();
+        state.cue_search_mut().input.value = "line 0".to_string();
+        state.refilter();
+
+        // Act / Assert: with one row left there is nowhere to go, and a refused move is
+        // what stops a held `j` re-requesting the same frame on every repeat.
+        assert_that!(state.select(1)).is_false();
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    #[test]
+    fn j_and_k_should_walk_only_the_matching_rows() {
+        // Arrange: cues 0 and 3 match, 1 and 2 do not.
+        let mut state = state();
+        state.apply_prepared(
+            vec![
+                cue(0, 1000, "keep me"),
+                cue(2000, 3000, "skip"),
+                cue(4000, 5000, "skip"),
+                cue(6000, 7000, "keep me too"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        search_for(&mut state, "keep");
+
+        // Assert: `j` lands on the next *drawn* row rather than walking through rows
+        // nobody can see, which would be a cursor disappearing for several presses.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![0, 3]);
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.select(1)).is_false();
+        assert_that!(state.select(-1)).is_true();
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    #[test]
+    fn gg_and_capital_g_should_land_on_the_ends_of_the_drawn_list() {
+        // Arrange
+        let mut state = ready(5);
+        search_for(&mut state, "line");
+        state.cue_search_mut().input.value = "line 3".to_string();
+        state.refilter();
+
+        // Act / Assert: one row left, so both ends are it and neither key moves.
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.select_first()).is_false();
+        assert_that!(state.select_last()).is_false();
+
+        // Act: widen the filter to three rows.
+        state.cue_search_mut().input.value = "line".to_string();
+        state.refilter();
+        state.selected = 2;
+
+        // Assert: the ends of the whole list, since everything matches "line".
+        assert_that!(state.select_last()).is_true();
+        assert_that!(state.selected).is_equal_to(4);
+        assert_that!(state.select_first()).is_true();
+        assert_that!(state.selected).is_equal_to(0);
+    }
+
+    #[test]
+    fn gg_should_land_on_a_matching_member_of_the_first_drawn_group() {
+        // Arrange: the first drawn row is the group of four, whose only match is its last
+        // member; a second row below it gives the cursor somewhere to be first.
+        let mut state = grouped_page();
+        search_for(&mut state, "delta");
+        state.edit_cue_text(5, "closing delta".to_string());
+        assert_that!(state.select(1)).is_true();
+        assert_that!(state.selected).is_equal_to(5);
+
+        // Act
+        assert_that!(state.select_first()).is_true();
+
+        // Assert: `gg` is an absolute move, and the place it lands is still the match
+        // rather than the group's first member — the same rule arriving by `k` follows.
+        assert_that!(state.selected).is_equal_to(4);
+    }
+
+    #[test]
+    fn the_cursor_should_hold_still_while_its_own_row_still_matches() {
+        // Arrange
+        let mut state = ready(4);
+        state.select(2);
+        assert_that!(state.selected).is_equal_to(2);
+
+        // Act: a query the selected cue matches.
+        search_for(&mut state, "line 2");
+
+        // Assert: typing another letter must not move a reader off the line they are
+        // reading, which is what resetting to the first match on every keystroke would do.
+        assert_that!(state.selected).is_equal_to(2);
+    }
+
+    #[test]
+    fn a_filter_that_hides_the_cursor_should_move_it_to_the_first_row_left() {
+        // Arrange
+        let mut state = ready(4);
+        state.select(3);
+
+        // Act: a query the selected cue does not match.
+        search_for(&mut state, "line 1");
+
+        // Assert
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![1]);
+        assert_that!(state.selected).is_equal_to(1);
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_should_leave_the_selection_alone_and_refuse_movement() {
+        // Arrange
+        let mut state = ready(4);
+        state.select(2);
+
+        // Act
+        search_for(&mut state, "nothing here");
+
+        // Assert: there is nowhere honest to put the cursor, so it stays — and the preview
+        // pane goes on showing a real cue rather than blanking.
+        assert_that!(state.visible_groups()).is_empty();
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.cue_search().match_count).is_equal_to(0);
+        assert_that!(state.select(1)).is_false();
+        assert_that!(state.select(-1)).is_false();
+        assert_that!(state.select_first()).is_false();
+        assert_that!(state.select_last()).is_false();
+        assert_that!(state.selected).is_equal_to(2);
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_should_leave_no_rows_to_scroll_through() {
+        // Arrange
+        let mut state = ready(8);
+        search_for(&mut state, "nothing here");
+
+        // Act
+        state.cue_scroll(20);
+
+        // Assert: the same answer an empty track gives, since there is nothing to draw.
+        assert_that!(state.list_rows).is_equal_to(0);
+        assert_that!(state.list_scroll).is_equal_to(0);
+    }
+
+    #[test]
+    fn scrolling_should_count_only_the_rows_the_filter_is_drawing() {
+        // Arrange: twelve cues of which three match, in a panel with room for two rows.
+        let mut state = state();
+        let cues = (0..12)
+            .map(|index| {
+                let start = index as u64 * 2000;
+                let text = if index % 4 == 0 {
+                    format!("wanted {index}")
+                } else {
+                    format!("other {index}")
+                };
+                cue(start, start + 1000, &text)
+            })
+            .collect();
+        state.apply_prepared(cues, CueStyle::SubRip);
+        search_for(&mut state, "wanted");
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![0, 4, 8]);
+
+        // Act: onto the last match, in a panel holding two lone cues (three rows each plus
+        // a connector between them).
+        state.select(2);
+        state.cue_scroll(7);
+
+        // Assert: positions in the *drawn* list, so the panel scrolls by one row rather
+        // than by the eight groups the filter is hiding.
+        assert_that!(state.selected).is_equal_to(8);
+        assert_that!(state.list_scroll).is_equal_to(1);
+        assert_that!(state.list_rows).is_equal_to(2);
+    }
+
+    #[test]
+    fn h_and_l_should_still_reach_a_shown_groups_unmatched_members() {
+        // Arrange: the group is on the list because `delta` matched, and the cursor is on
+        // it — but the reader asked for the whole row, not the match alone.
+        let mut state = grouped_page();
+        search_for(&mut state, "delta");
+        assert_that!(state.selected).is_equal_to(4);
+
+        // Act / Assert: `h` walks back through the members that did not match, stopping at
+        // the group's own end the way it always did.
+        assert_that!(state.select_within_group(-1)).is_true();
+        assert_that!(state.selected).is_equal_to(3);
+        assert_that!(state.select_within_group(-2)).is_true();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.select_within_group(-1)).is_false();
+    }
+
+    #[test]
+    fn rewriting_a_cue_should_move_it_into_or_out_of_the_filter() {
+        // Arrange
+        let mut state = ready(4);
+        search_for(&mut state, "wanted");
+        assert_that!(state.visible_groups()).is_empty();
+
+        // Act: the words are what the filter matches on.
+        state.edit_cue_text(2, "wanted line".to_string());
+
+        // Assert
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![2]);
+        assert_that!(state.selected).is_equal_to(2);
+
+        // Act: and back out of it again.
+        state.edit_cue_text(2, "line 2".to_string());
+
+        // Assert
+        assert_that!(state.visible_groups()).is_empty();
+    }
+
+    #[test]
+    fn adding_and_removing_a_cue_should_rebuild_the_filter_against_the_new_list() {
+        // Arrange
+        let mut state = ready(3);
+        search_for(&mut state, "line 2");
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![2]);
+
+        // Act: a cue added before the match moves every position after it. Placed in the
+        // gap between two existing cues so it forms a row of its own — this is about the
+        // projection following a shift, not about grouping.
+        let at = state.insert_cue(
+            0,
+            Duration::from_millis(1200),
+            Duration::from_millis(1800),
+            "line 2 as well".to_string(),
+        );
+
+        // Assert: both rows match now, and the projection describes the list as it is.
+        assert_that!(at).is_equal_to(1);
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![1, 3]);
+
+        // Act: and taking it out again puts the projection back.
+        state.remove_cue(1);
+
+        // Assert
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![2]);
+    }
+
+    #[test]
+    fn abandoning_a_search_should_drop_the_filter_and_come_back_to_the_starting_cue() {
+        // Arrange
+        let mut state = ready(4);
+        state.select(3);
+
+        // Act: search away from it, then abandon.
+        search_for(&mut state, "line 1");
+        assert_that!(state.selected).is_equal_to(1);
+        state.cancel_cue_search();
+
+        // Assert: the whole list is back, the bar is closed, and the cursor is where the
+        // reader left it rather than where the filter had put it.
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![0, 1, 2, 3]);
+        assert_that!(state.cue_search().is_active).is_false();
+        assert_that!(state.cue_query()).is_equal_to("");
+        assert_that!(state.selected).is_equal_to(3);
+    }
+
+    #[test]
+    fn abandoning_a_search_should_find_the_starting_cue_even_after_the_list_shifted() {
+        // Arrange: the origin is a `CueOrigin`, not a position, so a row added above it
+        // while the filter was up does not send the cursor to the wrong line.
+        let mut state = ready(4);
+        state.select(2);
+
+        // Act
+        search_for(&mut state, "line 3");
+        state.insert_cue(
+            0,
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            "line 3 inserted".to_string(),
+        );
+        state.cancel_cue_search();
+
+        // Assert: cue 2 has become cue 3, and that is where the cursor comes back to.
+        assert_that!(state.cues[state.selected].text.as_str()).is_equal_to("line 2");
+    }
+
+    #[test]
+    fn confirming_a_search_should_keep_the_filter_and_close_the_bar() {
+        // Arrange
+        let mut state = ready(4);
+        search_for(&mut state, "line 1");
+
+        // Act
+        state.finish_cue_search();
+
+        // Assert: the keys go back to the list, and the list is still the filtered one —
+        // which is what makes the bar stay drawn with the query in it.
+        assert_that!(state.cue_search().is_active).is_false();
+        assert_that!(state.cue_query()).is_equal_to("line 1");
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![1]);
+    }
+
+    #[test]
+    fn re_opening_a_search_should_come_back_to_where_the_last_one_was_confirmed() {
+        // Arrange: search away from cue 3 and press Enter, accepting cue 0.
+        let mut state = ready(4);
+        state.select(3);
+        search_for(&mut state, "line 0");
+        state.finish_cue_search();
+        assert_that!(state.selected).is_equal_to(0);
+
+        // Act: `/` again on the filter still in force, then abandon it.
+        state.start_cue_search();
+        state.cancel_cue_search();
+
+        // Assert: back to cue 0, not to cue 3. Confirming is the reader accepting where the
+        // filter put them, so an `Esc` in a *later* search must not undo it — that would be
+        // a key teleporting them to a cue they left several searches ago.
+        assert_that!(state.selected).is_equal_to(0);
+        assert_that!(state.cue_query()).is_equal_to("");
+    }
+
+    #[test]
+    fn re_opening_a_search_mid_flight_should_still_return_to_where_it_began() {
+        // Arrange: the bar can be re-opened without ever being confirmed, and then the
+        // origin is still the cue the reader pressed `/` on.
+        let mut state = ready(4);
+        state.select(3);
+        search_for(&mut state, "line 0");
+        assert_that!(state.selected).is_equal_to(0);
+
+        // Act: re-open without confirming, then abandon.
+        state.start_cue_search();
+        state.cancel_cue_search();
+
+        // Assert
+        assert_that!(state.selected).is_equal_to(3);
+    }
+
+    #[test]
+    fn a_new_cue_list_should_arrive_unfiltered() {
+        // Arrange
+        let mut state = ready(4);
+        search_for(&mut state, "line 1");
+
+        // Act: what a save does — the page is closed and the rewritten file read back.
+        state.apply_prepared(
+            vec![cue(0, 1000, "fresh one"), cue(2000, 3000, "fresh two")],
+            CueStyle::SubRip,
+        );
+
+        // Assert: a query is about the list it was typed against, and this is another one.
+        assert_that!(state.cue_query()).is_equal_to("");
+        assert_that!(state.visible_groups().to_vec()).is_equal_to(vec![0, 1]);
+    }
+
+    #[test]
+    fn a_failed_page_should_leave_no_filter_behind_it() {
+        // Arrange
+        let mut state = ready(4);
+        search_for(&mut state, "line 1");
+
+        // Act
+        state.fail("could not read the track".to_string());
+
+        // Assert: no cues, so no rows, and nothing left claiming to filter them.
+        assert_that!(state.cue_query()).is_equal_to("");
+        assert_that!(state.visible_groups()).is_empty();
     }
 }
