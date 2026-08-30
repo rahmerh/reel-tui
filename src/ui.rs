@@ -186,6 +186,12 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|moved| format!("global {}", format_shift(moved))),
         TimingScope::Off | TimingScope::Cue => app.selected_cue_shift().map(format_shift),
     };
+    // And how long it now is, when that is not the length the file gives it. Read beside the
+    // shift because it comes from the same place and answers the other half of the same
+    // question: the shift says the line moved, this says it was stretched. There is no
+    // track-scale version, because a whole-track shift moves both ends of every cue and so
+    // cannot change any of their lengths.
+    let length = app.selected_cue_length_change().map(format_length_reading);
     let Some(state) = app.subtitle_edit.as_mut() else {
         return;
     };
@@ -274,7 +280,7 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         selected,
     );
-    render_edit_timeline(frame, state, shift, cursor, selected, rows[1]);
+    render_edit_timeline(frame, state, shift, length, cursor, selected, rows[1]);
     if let Some((message, color)) = status {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -1009,6 +1015,7 @@ fn render_edit_timeline(
     frame: &mut Frame,
     state: &mut SubtitleEditState,
     shift: Option<String>,
+    length: Option<String>,
     cursor: Option<Duration>,
     selected: Option<usize>,
     area: Rect,
@@ -1053,6 +1060,11 @@ fn render_edit_timeline(
     // The moment stands bare rather than behind a `▼` matching the ruler's mark. Now that the
     // title carries one reading at a time there is nothing for a glyph to tell it apart from,
     // and a triangle inside a parenthesised title reads as debris rather than as a label.
+    //
+    // The length joins the shift once the cue has been resized, and for the same reason: the
+    // two timestamps say where the line is and how long it is only by subtraction, which is
+    // arithmetic nobody does while holding a key down. Dropped for a cue at the length the
+    // file gives it, so it is a readout rather than a figure that is always there.
     let mut readings: Vec<String> = match cursor {
         Some(at) => vec![format_precise(at)],
         None => [
@@ -1062,6 +1074,7 @@ fn render_edit_timeline(
                 format_timestamp(cue.end)
             )),
             shift,
+            length,
         ]
         .into_iter()
         .flatten()
@@ -1273,6 +1286,17 @@ fn title_width(readings: &[String]) -> usize {
             .map(|reading| reading.chars().count())
             .sum::<usize>()
         + readings.len().saturating_sub(1) * " · ".chars().count()
+}
+
+/// How long the selected cue is on screen, for the timeline's title.
+///
+/// The word is what tells it apart from the shift beside it: the two are otherwise the same
+/// shape, and a bare `2.50s` next to a bare `+0.15s` would leave the reader working out which
+/// of them is the number their last press changed. Hundredths, matching the shift, since both
+/// move in fifty-millisecond steps.
+fn format_length_reading(length: Duration) -> String {
+    let millis = length.as_millis();
+    format!("{}.{:02}s long", millis / 1000, (millis % 1000) / 10)
 }
 
 fn format_shift(millis: i64) -> String {
@@ -2597,6 +2621,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_cue_editor(frame, app);
         return;
     }
+    if dialog == Dialog::CueLength {
+        render_cue_length_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::ConfirmLeaveCues {
         render_confirm_leave_cues_dialog(frame, app);
         return;
@@ -2617,6 +2645,7 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::ConfirmReset
         | Dialog::ResolveConflicts
         | Dialog::EditCue
+        | Dialog::CueLength
         | Dialog::ConfirmLeaveCues => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
@@ -2948,6 +2977,60 @@ fn render_cue_editor(frame: &mut Frame, app: &App) {
     frame.set_cursor_position((column, row));
 }
 
+/// How long the selected cue is on screen, typed rather than nudged — the subtitle edit
+/// page's `D`.
+///
+/// The smallest popup in the application, because it asks one question and holds one answer.
+/// Titled with the cue and the span it currently has, so the number being typed can be
+/// judged against where the line actually sits without leaving the dialog to look.
+fn render_cue_length_dialog(frame: &mut Frame, app: &App) {
+    let Some(draft) = app.cue_length.as_ref() else {
+        return;
+    };
+    let title = app
+        .subtitle_edit
+        .as_ref()
+        .and_then(|state| {
+            let position = state.position_of(draft.origin)?;
+            let cue = state.cues.get(position)?;
+            Some(format!(
+                " Cue {} · {} → {} ",
+                position + 1,
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            ))
+        })
+        .unwrap_or_else(|| " Cue length ".to_string());
+
+    let area = centered_fixed(frame.area(), CUE_LENGTH_WIDTH, CUE_LENGTH_HEIGHT);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::styled(title, Style::default().fg(Color::Cyan)));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let line = text_field_line(
+        TextField::new(
+            "On screen for",
+            FieldValue::Editing(&draft.input),
+            TextInputConfig::CUE_LENGTH.width,
+        )
+        .selected(true)
+        .reject(app.text_input_reject(TextInputSite::CueLength)),
+    );
+    frame.render_widget(Paragraph::new(vec![Line::from(""), line]), inner);
+}
+
+/// Columns the cue length popup takes.
+///
+/// Wider than the field needs, because the field's own refusal message is drawn on the end of
+/// its row: sized to the value alone, a typed letter would be answered by a reason clipped
+/// halfway through, which is no answer at all.
+const CUE_LENGTH_WIDTH: u16 = 64;
+/// Rows it takes: a blank line and the field, inside a border.
+const CUE_LENGTH_HEIGHT: u16 = 4;
+
 /// "Leaving discards them" — the question `Esc` asks on the way off the subtitle edit page.
 fn render_confirm_leave_cues_dialog(frame: &mut Frame, app: &App) {
     let lines = vec![
@@ -3196,7 +3279,19 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "Ctrl-h / Ctrl-l",
-        "Move the timeline cursor 0.05s back or on, the same step a cue is nudged by",
+        "Move the timeline cursor 0.05s back or on while it holds the cursor, the same step \
+         a cue is nudged by, otherwise grow the selected cue 0.05s from its start or its \
+         end while timing, changing how long it is on screen",
+    );
+    keybinding(
+        &mut lines,
+        "Alt-h / Alt-l",
+        "Shrink the selected cue 0.05s from its start or its end while timing",
+    );
+    keybinding(
+        &mut lines,
+        "D",
+        "Type exactly how long the selected cue is on screen, as mm:ss.mmm, while timing",
     );
     keybinding(
         &mut lines,
@@ -5000,6 +5095,7 @@ fn reject_message(reject: InputReject) -> String {
         InputReject::Character(CharClass::Digits) => "digits only".to_string(),
         InputReject::Character(CharClass::Word) => "no spaces".to_string(),
         InputReject::Character(CharClass::Text) => "unsupported character".to_string(),
+        InputReject::Character(CharClass::Timecode) => "digits, : and . only".to_string(),
         InputReject::Full(max_len) => format!("{max_len} character limit"),
     }
 }
@@ -7208,6 +7304,15 @@ mod tests {
                     column: 0,
                 });
             }
+            Dialog::CueLength => {
+                let mut input = TextInputState::new("00:02.000".to_string());
+                input.activate();
+                app.cue_length = Some(crate::app::CueLengthDraft {
+                    source: SubtitleSource::Embedded(2),
+                    origin: crate::subtitle_edit::CueOrigin::File(0),
+                    input,
+                });
+            }
             Dialog::ConfirmLeaveCues => {}
             Dialog::PreviewSettings => {
                 app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup::default());
@@ -7368,7 +7473,7 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 14] = [
+        const DIALOGS: [(Dialog, &str); 15] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::PreviewSettings, "Preview settings"),
@@ -7385,6 +7490,7 @@ mod tests {
             (Dialog::ConfirmReset, "Reset this file's edits?"),
             (Dialog::ResolveConflicts, "Changed:   video tracks"),
             (Dialog::EditCue, "Hello there"),
+            (Dialog::CueLength, "On screen for"),
             (Dialog::ConfirmLeaveCues, "Cue edits are staged"),
         ];
 
@@ -12028,6 +12134,11 @@ mod tests {
             "Home/End",
             "Backspace/Delete",
             "languages",
+            // The cue resize keys. This popup is the only place a key is documented, so a
+            // binding missing from here is a binding nobody can find.
+            "Ctrl-h / Ctrl-l",
+            "Alt-h / Alt-l",
+            "mm:ss.mmm",
         ];
 
         // Act
@@ -15274,6 +15385,49 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A resized cue puts a second figure on the title, and the word is what tells the two
+    /// apart: one says the line moved, the other says how long it is now on screen.
+    ///
+    /// Both can be true at once — a cue can be shifted *and* stretched — which is exactly why
+    /// neither may be a bare number standing next to the other.
+    #[test]
+    fn the_timeline_title_should_read_out_a_changed_cue_length() {
+        // Arrange: a cue the file has running 5.0s → 7.0s.
+        let (mut app, directory) =
+            edit_page_app("edit-length-title", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_cue_timing_mode();
+
+        // Act: the end out by ten presses, so the line is on screen half a second longer.
+        for _ in 0..10 {
+            app.move_selected_cue_edge(crate::subtitle_edit::CueEdge::End, true);
+        }
+
+        // Assert: the times moved with the end, and the length says what it now is.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.5 · 2.50s long)")).is_true();
+
+        // Act / Assert: shifted as well, both figures stand, each saying which it is.
+        for _ in 0..3 {
+            app.nudge_selected_cue(1);
+        }
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("· +0.15s · 2.50s long)")).is_true();
+
+        // Act / Assert: back at the file's length the figure goes rather than reading the
+        // same number on every cue the reader walks past — even though the cue is still
+        // shifted, so the two are dropped independently.
+        for _ in 0..10 {
+            app.move_selected_cue_edge(crate::subtitle_edit::CueEdge::End, false);
+        }
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("· +0.15s)")).is_true();
+        assert_that!(screen.contains("long")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// While the whole track is being retimed the title says so in words, so the figure
     /// cannot be read as the selected cue's own shift.
     ///
@@ -15304,6 +15458,35 @@ mod tests {
         let screen = draw(&mut app, 100, 30).join("\n");
         assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
         assert_that!(screen.contains("global")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The length dialog names the cue it is about and shows the value being typed, so the
+    /// number can be judged against where the line actually sits without closing it.
+    #[test]
+    fn the_cue_length_dialog_should_name_the_cue_and_show_the_value() {
+        // Arrange: the page on a cue running 5.0s → 7.0s, in the mode.
+        let (mut app, directory) =
+            edit_page_app("edit-length-dialog", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_cue_timing_mode();
+
+        // Act
+        app.open_cue_length_dialog();
+        let screen = draw(&mut app, 100, 30).join("\n");
+
+        // Assert: the cue's number and span in the title, the field and its value inside.
+        assert_that!(screen.contains("Cue 1 · 00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(screen.contains("On screen for")).is_true();
+        assert_that!(screen.contains("00:02.000")).is_true();
+
+        // Act / Assert: a character the field refuses says why, rather than looking like a
+        // dead key.
+        app.input_text_char('x');
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("digits, : and . only")).is_true();
 
         // Cleanup
         drop(app);

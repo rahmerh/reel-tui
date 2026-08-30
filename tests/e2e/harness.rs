@@ -1298,6 +1298,12 @@ pub fn ctrl(code: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)
 }
 
+/// A terminal sends `Alt+x` as an `Esc` prefix rather than as a bit on the byte, which is why
+/// the cue resize's inverse direction is bound here rather than on `Ctrl+Shift`.
+pub fn alt(code: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(code), KeyModifiers::ALT)
+}
+
 /// Mirrors `require_tools` in `src/edit.rs`'s test module, which integration tests
 /// cannot reach because it lives inside a `#[cfg(test)]` block. Accepts either a bare
 /// program name or `program:encoder`.

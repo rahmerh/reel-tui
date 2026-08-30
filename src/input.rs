@@ -11,7 +11,7 @@ use crate::app::{
     App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
     VideoSettingsMode,
 };
-use crate::subtitle_edit::{self, TimingScope};
+use crate::subtitle_edit::{self, CueEdge, TimingScope};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOutcome {
@@ -116,6 +116,22 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                     app.cue_editor_insert(character)
                 }
                 _ => {}
+            }
+        }
+        // One field and nothing else, so it hands everything except its two answers to the
+        // generic text keys — the value is digits and separators, and the field itself
+        // refuses anything that is not.
+        Some(Dialog::CueLength) => {
+            input.reset_sequence();
+            match (key.code, key.modifiers) {
+                (KeyCode::Enter, _) => app.commit_cue_length(),
+                // Leaving drops the typing, where the cue editor keeps it: this is one
+                // number, quicker to retype than to find again, and a half-typed length kept
+                // across a visit would make the field lie about the cue's length next time.
+                (KeyCode::Esc, _) => app.cancel_cue_length(),
+                _ => {
+                    handle_text_input_key(app, key);
+                }
             }
         }
         Some(Dialog::ConfirmLeaveCues) => match (key.code, key.modifiers) {
@@ -1089,21 +1105,68 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.focus_cues();
         }
-        // `Ctrl+H`/`Ctrl+L` are the same movement as `h`/`l` below at the finest of the
-        // pane's three scales: the coarse step finds a shot and this one finds the frame
-        // inside it. Deliberately the *cue nudge's* step, so a moment the cursor can stand
-        // on is always a timing a cue can be nudged onto — which is the pair of movements
-        // this pane exists to be used with.
+        // **`h` and `l` keep meaning left and right under a modifier too, and the pane
+        // holding the cursor decides what they move — the rule the bare pair already
+        // follows.** In the timeline they are the finest of that pane's three scales: the
+        // coarse step finds a shot and this one finds the frame inside it, deliberately the
+        // *cue nudge's* step, so a moment the cursor can stand on is always a timing a cue
+        // can be nudged onto. In the cue panel they are the timing mode's other axis, where
+        // `h`/`l` move the whole cue and these move one end of it.
         //
-        // Inert while the cue panel holds the cursor rather than guarded here: the pair has
-        // no second meaning to reach on this layer, and `move_cursor` already refuses.
+        // **`Ctrl` grows the cue and `Alt` shrinks it, from whichever end the key names.**
+        // `Ctrl+H` takes the start earlier and `Ctrl+L` the end later — both outwards, which
+        // is the left-is-earlier sense the bare pair carries — and `Alt+H`/`Alt+L` pull the
+        // same edge back in. So the letter picks the edge, the modifier picks the direction,
+        // and no key on this page means two things at once.
+        //
+        // **`Alt` rather than `Ctrl+Shift`, because `Ctrl+Shift+H` does not exist as far as a
+        // terminal is concerned.** A control character carries no shift bit, so a terminal
+        // sends the same byte for `Ctrl+H` and `Ctrl+Shift+H` unless the application has
+        // turned the kitty keyboard protocol on — which this one has not, and which several
+        // of the terminals that can draw the preview do not implement. Binding the shifted
+        // pair would leave the inverse silently doing the *forward* move on most machines,
+        // which is worse than a key that does nothing. `Alt` is distinguishable everywhere,
+        // because it arrives as an `Esc` prefix rather than as a bit on the byte.
+        //
+        // The resize is guarded on the focus rather than left to `move_selected_cue_edge`
+        // because it is about the *selected* cue, and while the timeline holds the cursor
+        // nothing on screen marks one — the reason `h`/`l` branch on it too.
         (KeyCode::Char('h'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
-            app.move_timeline_cursor(-1, subtitle_edit::TIMELINE_FINE_STEP);
+            if app.timeline_focused() {
+                app.move_timeline_cursor(-1, subtitle_edit::TIMELINE_FINE_STEP);
+            } else {
+                app.move_selected_cue_edge(CueEdge::Start, false);
+            }
         }
         (KeyCode::Char('l'), KeyModifiers::CONTROL) if app.layer == Layer::SubtitleEdit => {
             input.reset_sequence();
-            app.move_timeline_cursor(1, subtitle_edit::TIMELINE_FINE_STEP);
+            if app.timeline_focused() {
+                app.move_timeline_cursor(1, subtitle_edit::TIMELINE_FINE_STEP);
+            } else {
+                app.move_selected_cue_edge(CueEdge::End, true);
+            }
+        }
+        (KeyCode::Char('h'), KeyModifiers::ALT)
+            if app.layer == Layer::SubtitleEdit && !app.timeline_focused() =>
+        {
+            input.reset_sequence();
+            app.move_selected_cue_edge(CueEdge::Start, true);
+        }
+        (KeyCode::Char('l'), KeyModifiers::ALT)
+            if app.layer == Layer::SubtitleEdit && !app.timeline_focused() =>
+        {
+            input.reset_sequence();
+            app.move_selected_cue_edge(CueEdge::End, false);
+        }
+        // Fifty milliseconds a press is the right size for landing a line against a mouth
+        // and the wrong size for "this sign should be up for eight seconds", which is what
+        // this types in one go.
+        (KeyCode::Char('D'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if app.layer == Layer::SubtitleEdit && !app.timeline_focused() =>
+        {
+            input.reset_sequence();
+            app.open_cue_length_dialog();
         }
         // The second axis the cue list grew when overlapping cues became one row: `j`/`k`
         // move between rows and these move between the cues sharing one. Ahead of the
@@ -1449,6 +1512,12 @@ mod tests {
 
     fn ctrl(code: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)
+    }
+
+    /// A terminal sends `Alt+x` as an `Esc` prefix rather than as a bit on the byte, which is
+    /// why the cue resize's inverse direction is bound here and not on `Ctrl+Shift`.
+    fn alt(code: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(code), KeyModifiers::ALT)
     }
 
     fn exit_result(
@@ -3599,6 +3668,14 @@ mod tests {
             .start
     }
 
+    fn selected_cue_end(app: &App) -> std::time::Duration {
+        app.subtitle_edit
+            .as_ref()
+            .and_then(|state| state.selected_cue())
+            .expect("the page should be on a cue")
+            .end
+    }
+
     fn subtitle_track_app() -> (App, PathBuf) {
         let (mut app, directory) = test_app();
         fs::write(directory.join("movie.mkv"), b"media").unwrap();
@@ -4090,6 +4167,168 @@ mod tests {
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1550));
         handle_key(&mut app, &mut input, key(KeyCode::Char('H')));
         assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(1050));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The modified `h`/`l` are the timing mode's second axis: they move the cue's left and
+    /// right end rather than the whole of it, so what they change is how long the line is on
+    /// screen. `Ctrl` pushes that end outwards and `Alt` pulls it back in.
+    #[test]
+    fn the_edge_keys_should_move_one_end_of_the_cue_in_timing_mode() {
+        // Arrange: the page, and a cue at 1.0s → 2.0s.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+
+        // Act / Assert: out of the mode they do nothing, so a stray press on a page nobody
+        // is retiming cannot edit the file.
+        handle_key(&mut app, &mut input, ctrl('h'));
+        handle_key(&mut app, &mut input, ctrl('l'));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: in the mode, `Ctrl+H` grows the cue from the left and `Alt+H` shrinks
+        // it again, both leaving the end where it was.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, ctrl('h'));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_millis(950));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_secs(2));
+        handle_key(&mut app, &mut input, alt('h'));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+
+        // Act / Assert: `Ctrl+L` grows it from the right and `Alt+L` shrinks it, leaving the
+        // start alone — and the pair of round trips stages nothing at all.
+        handle_key(&mut app, &mut input, ctrl('l'));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_millis(2050));
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        handle_key(&mut app, &mut input, alt('l'));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_secs(2));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// **`Ctrl+H`/`Ctrl+L` mean two things on this page and the focus is what decides**, the
+    /// rule the bare pair already follows: the cursor's finest step in the timeline, and the
+    /// selected cue's edges in the cue panel. The failure this pins is a reader scrubbing the
+    /// timeline and silently retiming a cue nothing on screen marks — or the reverse.
+    #[test]
+    fn the_pane_holding_the_cursor_should_decide_what_ctrl_h_moves() {
+        // Arrange: the page, in the timing mode, on a cue at 1.0s → 2.0s.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+
+        // Act: hand the cursor to the timeline and press both of them there.
+        handle_key(&mut app, &mut input, ctrl('j'));
+        assert_that!(app.timeline_focused()).is_true();
+        let seeded = app.subtitle_edit.as_ref().unwrap().cursor().unwrap();
+        handle_key(&mut app, &mut input, ctrl('l'));
+        handle_key(&mut app, &mut input, ctrl('l'));
+        handle_key(&mut app, &mut input, ctrl('h'));
+
+        // Assert: the cursor moved by the fine step and the cue is untouched.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor().unwrap())
+            .is_equal_to(seeded + subtitle_edit::TIMELINE_FINE_STEP);
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_secs(2));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: back in the cue panel the same key moves the cue's end instead.
+        handle_key(&mut app, &mut input, ctrl('k'));
+        handle_key(&mut app, &mut input, ctrl('l'));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_millis(2050));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `D` opens the length dialog, which then takes every key: a digit lands, `Ctrl-u`
+    /// clears, a letter is refused rather than closing it, `Esc` cancels and `Enter` commits.
+    #[test]
+    fn the_length_dialog_should_take_the_keys_and_leave_on_esc_or_enter() {
+        // Arrange: the page, in the mode, on a cue at 1.0s → 2.0s.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+
+        // Act / Assert: `D` opens it holding the cue's length.
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('D')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:01.000");
+
+        // Act / Assert: a letter is refused by the field rather than closing the dialog, and
+        // `q` — which is a back key everywhere else — is just another refused character.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:01.000");
+
+        // Act / Assert: `Ctrl-u` clears what is behind the caret and digits land.
+        handle_key(&mut app, &mut input, ctrl('u'));
+        for character in "00:02.500".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:02.500");
+
+        // Act / Assert: `Esc` closes it and leaves the cue exactly as it was.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_secs(2));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: and `Enter` commits, keeping the start and moving the end.
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('D')));
+        handle_key(&mut app, &mut input, ctrl('u'));
+        for character in "00:02.500".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.dialog).is_none();
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
+        assert_that!(selected_cue_end(&app)).is_equal_to(std::time::Duration::from_millis(3500));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timeline pane has no selected cue to resize, so the keys that resize one are inert
+    /// while it holds the cursor — the rule `d` and the vertical movement keys already follow.
+    #[test]
+    fn the_resize_keys_should_do_nothing_while_the_timeline_holds_the_cursor() {
+        // Arrange: the page, in the mode, with the cursor handed to the timeline.
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        timed_cues(&mut app);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, ctrl('j'));
+        assert_that!(app.timeline_focused()).is_true();
+
+        // Act: the shrinking pair — the growing one is the cursor's own fine step here, which
+        // `the_pane_holding_the_cursor_should_decide_what_ctrl_h_moves` covers.
+        handle_key(&mut app, &mut input, alt('h'));
+        handle_key(&mut app, &mut input, alt('l'));
+        handle_key(&mut app, &mut input, shifted(KeyCode::Char('D')));
+
+        // Assert: no dialog, no edit, and the cue exactly where the file has it.
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(selected_cue_start(&app)).is_equal_to(std::time::Duration::from_secs(1));
 
         // Cleanup
         drop(app);

@@ -56,6 +56,32 @@ pub const TIMING_STEP: Duration = Duration::from_millis(50);
 /// How many steps `H`/`L` move in one press.
 pub const TIMING_LEAP: i64 = 10;
 
+/// The shortest a cue may be made.
+///
+/// One [`TIMING_STEP`], which is the finest length this page can express at all: a cue held
+/// at the floor can still be lengthened by exactly one press, and no run of presses can
+/// collapse a line to nothing. The floor exists because the two resize keys move one end
+/// each — without it, holding `}` down walks the end past the start and writes a cue whose
+/// `-->` line runs backwards, which is a file no player will read and which nothing later in
+/// the save would notice.
+pub const MIN_CUE_LENGTH: Duration = TIMING_STEP;
+
+/// Which end of a cue the resize keys move.
+///
+/// `Ctrl+H`/`Alt+H` move the start and `Ctrl+L`/`Alt+L` the end: the letter picks the edge,
+/// keeping the left-and-right sense the bare `h`/`l` carry on this page, and the modifier
+/// picks the direction — `Ctrl` pushes that edge outwards and `Alt` pulls it back in.
+///
+/// A separate axis from [`SubtitleEditState::nudge_selected`] rather than a mode inside it,
+/// because moving a cue and resizing it are two different questions about the same line —
+/// *when* it is on screen and *how long* — and a reader correcting one is usually about to
+/// check the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CueEdge {
+    Start,
+    End,
+}
+
 /// How far one press of `h`/`l` moves the timeline cursor.
 ///
 /// **Ten times [`TIMING_STEP`], and deliberately not the same figure.** Nudging a cue is
@@ -1242,6 +1268,98 @@ impl SubtitleEditState {
         let selected = self.selected;
         self.set_cue_timing(selected, start, end);
         Some((selected, start, end))
+    }
+
+    /// Moves one end of the selected cue and leaves the other where it is, reporting the new
+    /// timing for staging.
+    ///
+    /// The other half of [`Self::nudge_selected`], which moves both ends together: that one
+    /// answers *when* a line is on screen and this one answers *how long*. A track is as
+    /// often a little out in the second as in the first — a line that arrives with the shot
+    /// and goes away while the mouth is still moving — and until this there was no key on the
+    /// page that could change it.
+    ///
+    /// **Neither end may cross the other**, and the floor is [`MIN_CUE_LENGTH`] rather than
+    /// zero: a cue of no length is not a subtitle, and one whose end precedes its start is a
+    /// `-->` line no player reads and nothing in the save path would refuse. The clamp is
+    /// written so that a cue *already* at or under the floor — which a malformed file can
+    /// hold — is never pushed the wrong way by a press asking to shorten it; it simply
+    /// reports `None`.
+    ///
+    /// `None` when there is no cue, when the press is against a floor, or when it would
+    /// otherwise change nothing, so a held key stages nothing and re-renders no frame — the
+    /// contract [`Self::nudge_selected`] follows for the same reason.
+    ///
+    /// **One step per press rather than a signed count**, unlike the nudge: there is no leap
+    /// key for an edge — `H`/`L` are the whole cue's and the other modifier is the other
+    /// direction — so a step count would be a parameter the application can only ever pass
+    /// one of two values for, with arithmetic under it that nothing could reach.
+    pub fn move_selected_edge(
+        &mut self,
+        edge: CueEdge,
+        later: bool,
+    ) -> Option<(usize, Duration, Duration)> {
+        let cue = self.cues.get(self.selected)?;
+        let (start, end) = match (edge, later) {
+            (CueEdge::Start, true) => {
+                // The `max` is what keeps a degenerate cue still: with the ceiling below
+                // where the start already is, a bare `min` would answer a press meaning
+                // "later" by moving the start *earlier*.
+                let ceiling = cue.end.saturating_sub(MIN_CUE_LENGTH).max(cue.start);
+                ((cue.start + TIMING_STEP).min(ceiling), cue.end)
+            }
+            (CueEdge::Start, false) => (cue.start.saturating_sub(TIMING_STEP), cue.end),
+            (CueEdge::End, true) => (cue.start, cue.end + TIMING_STEP),
+            (CueEdge::End, false) => {
+                let floor = (cue.start + MIN_CUE_LENGTH).min(cue.end);
+                (cue.start, cue.end.saturating_sub(TIMING_STEP).max(floor))
+            }
+        };
+        self.resize_selected(start, end)
+    }
+
+    /// Sets how long the selected cue is on screen, keeping its start, for the length dialog.
+    ///
+    /// **The start is what is kept.** The reader is answering "how long should this line be
+    /// up for", and the start is the half they have already judged against the picture —
+    /// moving it to honour a typed length would undo the work the dialog was opened on top
+    /// of.
+    ///
+    /// `None` for a length under [`MIN_CUE_LENGTH`] and for the length the cue already has,
+    /// so the caller can tell a refusal from a no-op and stage nothing for either.
+    pub fn set_selected_length(&mut self, length: Duration) -> Option<(usize, Duration, Duration)> {
+        if length < MIN_CUE_LENGTH {
+            return None;
+        }
+        let cue = self.cues.get(self.selected)?;
+        let (start, end) = (cue.start, cue.start + length);
+        self.resize_selected(start, end)
+    }
+
+    /// Applies a span to the selected cue, or reports `None` when it is the span it has.
+    ///
+    /// The one place both resizes end, so an edge nudge and a typed length cannot come to
+    /// disagree about what a resize costs the page — which is everything
+    /// [`Self::set_cue_timing`] does: the stale frames, the repacked lanes, the stopped
+    /// playback and the fresh grab.
+    fn resize_selected(
+        &mut self,
+        start: Duration,
+        end: Duration,
+    ) -> Option<(usize, Duration, Duration)> {
+        let cue = self.cues.get(self.selected)?;
+        if (start, end) == (cue.start, cue.end) {
+            return None;
+        }
+        let selected = self.selected;
+        self.set_cue_timing(selected, start, end);
+        Some((selected, start, end))
+    }
+
+    /// How long the selected cue is on screen, for the length dialog to open holding.
+    pub fn selected_length(&self) -> Option<Duration> {
+        let cue = self.cues.get(self.selected)?;
+        Some(cue.end.saturating_sub(cue.start))
     }
 
     /// Shifts **every** cue through time by the same amount, and reports how far in
@@ -3299,6 +3417,172 @@ mod tests {
     fn a_nudge_on_a_track_with_no_cues_should_do_nothing() {
         let mut state = state();
         assert_that!(state.nudge_selected(1)).is_none();
+    }
+
+    /// The nudge's other axis: an edge press moves one end and leaves the other exactly
+    /// where it was, so what changes is how long the line is on screen.
+    #[test]
+    fn an_edge_press_should_move_one_end_and_leave_the_other_alone() {
+        // Arrange: `ready` puts cue 1 at 2.0s → 3.0s.
+        let mut state = ready(3);
+        state.select(1);
+
+        // Act / Assert: the end out, then back, then the start out and back — each press
+        // reports the pair it produced, and only ever moves the end it names.
+        assert_that!(state.move_selected_edge(CueEdge::End, true)).is_equal_to(Some((
+            1,
+            Duration::from_secs(2),
+            Duration::from_millis(3050),
+        )));
+        assert_that!(state.move_selected_edge(CueEdge::End, false)).is_equal_to(Some((
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        )));
+        assert_that!(state.move_selected_edge(CueEdge::Start, false)).is_equal_to(Some((
+            1,
+            Duration::from_millis(1950),
+            Duration::from_secs(3),
+        )));
+        assert_that!(state.move_selected_edge(CueEdge::Start, true)).is_equal_to(Some((
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        )));
+
+        // Assert: and the cues either side are untouched throughout.
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+        assert_that!(state.cues[2].start).is_equal_to(Duration::from_secs(4));
+    }
+
+    /// A cue's start stops at the start of the media, and stopping there is not the same as
+    /// refusing: the press that reaches zero still moves, it just moves less far.
+    #[test]
+    fn an_edge_press_should_stop_a_cues_start_at_zero() {
+        // Arrange: cue 0 runs 0.030s → 1.030s, so a step back is more room than it has.
+        let mut state = ready(2);
+        state.cues[0].start = Duration::from_millis(30);
+        state.cues[0].end = Duration::from_millis(1030);
+
+        // Act / Assert: it lands on zero and grows by the thirty milliseconds it had —
+        // which is right here, where growing is what was asked for, and would be wrong for a
+        // nudge, which must never edit a cue's length by accident.
+        assert_that!(state.move_selected_edge(CueEdge::Start, false)).is_equal_to(Some((
+            0,
+            Duration::ZERO,
+            Duration::from_millis(1030),
+        )));
+
+        // Act / Assert: pressed again it reports nothing at all.
+        assert_that!(state.move_selected_edge(CueEdge::Start, false)).is_none();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+    }
+
+    /// Neither end may be pushed through the other. The press is refused outright rather
+    /// than landing on the floor, so a held key stages nothing and re-renders nothing.
+    #[test]
+    fn neither_edge_should_be_pushed_past_the_other() {
+        // Arrange: a cue exactly at the floor.
+        let mut state = ready(2);
+        state.cues[0].start = Duration::from_secs(1);
+        state.cues[0].end = Duration::from_secs(1) + MIN_CUE_LENGTH;
+
+        // Act / Assert: from either end, nothing moves.
+        assert_that!(state.move_selected_edge(CueEdge::End, false)).is_none();
+        assert_that!(state.move_selected_edge(CueEdge::Start, true)).is_none();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(state.cues[0].end).is_equal_to(Duration::from_secs(1) + MIN_CUE_LENGTH);
+
+        // Arrange / Act / Assert: a malformed file can hold a cue already shorter than the
+        // floor — or one running backwards — and a press must not answer that by moving the
+        // edge the wrong way.
+        state.cues[0].end = Duration::from_millis(1010);
+        assert_that!(state.move_selected_edge(CueEdge::Start, true)).is_none();
+        assert_that!(state.move_selected_edge(CueEdge::End, false)).is_none();
+        state.cues[0].end = Duration::from_millis(900);
+        assert_that!(state.move_selected_edge(CueEdge::Start, true)).is_none();
+        assert_that!(state.move_selected_edge(CueEdge::End, false)).is_none();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_secs(1));
+    }
+
+    /// The end is deliberately not capped against the media's own length, exactly as a
+    /// nudge's is not: one rule about where a cue may go is worth more than two.
+    #[test]
+    fn an_edge_press_should_not_cap_a_cue_against_the_media() {
+        // Arrange: a cue that already ends where the media does.
+        let mut state = ready(1);
+        state.cues[0].end = state.duration;
+
+        // Act / Assert
+        let past = state.duration + Duration::from_millis(50);
+        assert_that!(state.move_selected_edge(CueEdge::End, true)).is_equal_to(Some((
+            0,
+            Duration::ZERO,
+            past,
+        )));
+    }
+
+    /// Nothing to resize, nothing reported — from either key and from the dialog.
+    #[test]
+    fn resizing_a_track_with_no_cues_should_do_nothing() {
+        let mut state = state();
+        assert_that!(state.move_selected_edge(CueEdge::End, true)).is_none();
+        assert_that!(state.set_selected_length(Duration::from_secs(2))).is_none();
+        assert_that!(state.selected_length()).is_none();
+    }
+
+    /// A typed length keeps the cue's start and moves its end, which is the half the reader
+    /// has already judged against the picture.
+    #[test]
+    fn a_typed_length_should_keep_the_start_and_move_the_end() {
+        // Arrange: `ready` puts cue 1 at 2.0s → 3.0s.
+        let mut state = ready(3);
+        state.select(1);
+        assert_that!(state.selected_length()).is_equal_to(Some(Duration::from_secs(1)));
+
+        // Act / Assert
+        assert_that!(state.set_selected_length(Duration::from_millis(2500))).is_equal_to(Some((
+            1,
+            Duration::from_secs(2),
+            Duration::from_millis(4500),
+        )));
+        assert_that!(state.selected_length()).is_equal_to(Some(Duration::from_millis(2500)));
+
+        // Act / Assert: a length under the floor is refused, and so is the length the cue
+        // already has — the caller stages nothing for either.
+        assert_that!(state.set_selected_length(Duration::from_millis(10))).is_none();
+        assert_that!(state.set_selected_length(Duration::from_millis(2500))).is_none();
+        assert_that!(state.cues[1].end).is_equal_to(Duration::from_millis(4500));
+    }
+
+    /// A resize stales the same frames a nudge does and by the same rule: a frame is burned
+    /// with everything on screen at its moment, so a cue grown into a neighbour's span
+    /// changes what the neighbour's picture should show. The overlap groups are deliberately
+    /// left alone, for the reason `set_cue_timing` gives.
+    #[test]
+    fn a_resize_should_drop_the_frames_it_stales_and_leave_the_groups_alone() {
+        // Arrange: cues at 0.0s, 2.0s and 4.0s, each a second long, each with a frame.
+        let mut state = ready(3);
+        for cue in 0..3 {
+            state.apply_frame(cue, protocol(10, 5));
+        }
+        let groups = state.groups.len();
+
+        // Act: grow cue 0 until it covers cue 1's moment.
+        for _ in 0..30 {
+            state.move_selected_edge(CueEdge::End, true);
+        }
+
+        // Assert: the resized cue's own frame and its new neighbour's are both gone, and the
+        // cue nothing reached still has its picture.
+        assert_that!(state.encoded.iter().any(|frame| frame.cue_index == 0)).is_false();
+        assert_that!(state.encoded.iter().any(|frame| frame.cue_index == 1)).is_false();
+        assert_that!(state.encoded.iter().any(|frame| frame.cue_index == 2)).is_true();
+
+        // Assert: the lanes were repacked, so the collision the resize created is drawn —
+        // while the groups, which the panel's cursor is measured in, held still.
+        assert_that!(state.layout.lanes[1]).is_not_equal_to(state.layout.lanes[0]);
+        assert_that!(state.groups.len()).is_equal_to(groups);
     }
 
     /// A global shift moves every cue by the same amount, including the ones the cursor is

@@ -31,7 +31,7 @@ use fixtures::{
     write_media_with_chapter_and_attachment, write_solid_frame, write_vobsub_media,
 };
 use harness::{
-    Harness, Scratch, codec_names, ctrl, key, languages, probe, require_tools,
+    Harness, Scratch, alt, codec_names, ctrl, key, languages, probe, require_tools,
     stream_indices_of_type,
 };
 use reel_tui::app::{
@@ -4970,6 +4970,183 @@ fn global_retiming_should_stage_every_cue_and_ctrl_s_should_write_it() {
     assert!(
         !app.app.has_unsaved_cue_edits(),
         "a written shift should stop being unsaved work"
+    );
+}
+
+/// The second commonest thing wrong with a subtitle track is not a line in the wrong place
+/// but a line up for the wrong length — one that goes away while the mouth is still moving,
+/// or hangs over the shot after it. `Ctrl+H`/`Alt+H` and `Ctrl+L`/`Alt+L` move one end of the
+/// selected cue and `D` types a length outright, all inside the same timing mode `h`/`l`
+/// shift a cue in.
+///
+/// Asserted on the sidecar, because every layer short of it agrees while the feature is
+/// broken: the keys move the page's own copy of the cue either way, the dialog opens
+/// either way, the staged edit can be keyed against the wrong position or snapshotted against
+/// the wrong timing, and a save that writes the wrong `-->` line leaves a file that still
+/// parses.
+///
+/// **The numbers are chosen so the written cue starts earlier *and* ends earlier than the
+/// file's**, which is the pair no shift of any size can produce — that is what makes this a
+/// resize rather than a nudge in disguise. The floor is exercised for the same reason the
+/// global scenario exercises its own: a cue pressed down to the minimum and then pressed
+/// again must hold still, or a held key walks one end through the other and writes a cue that
+/// runs backwards.
+#[test]
+fn resizing_a_cue_should_stage_its_new_length_and_ctrl_s_should_write_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "resizing_a_cue_should_stage_its_new_length_and_ctrl_s_should_write_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-cue-resize");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(7.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    // 1.0s → 2.0s "First line", 3.0s → 4.0s "Second line".
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first: while it runs it owns the corner of the cue panel the
+    // edited-count uses, so waiting it out is what makes the count assertable at all.
+    wait_for_frames(&mut app);
+
+    let span = |app: &Harness| {
+        let cue = &app.app.subtitle_edit.as_ref().unwrap().cues[0];
+        (cue.start, cue.end)
+    };
+
+    // Act / Assert: with the mode off the edge keys do nothing, so a stray press on a page
+    // nobody is retiming cannot edit the file.
+    app.press(ctrl('l'));
+    app.press(ctrl('h'));
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "the resize keys should be inert outside the timing mode"
+    );
+
+    // Act: into the mode, the end out by two presses and the start out by one.
+    app.press(key(KeyCode::Char('t')));
+    app.press(ctrl('l'));
+    app.press(ctrl('l'));
+    app.press(ctrl('h'));
+
+    // Assert: one end moved per press, and the page says the line is now on screen longer.
+    assert_eq!(
+        span(&app),
+        (Duration::from_millis(950), Duration::from_millis(2100)),
+        "each edge key should move one end and leave the other"
+    );
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("1.15s long") && screen.contains("1 edited"),
+        "the page should say how long the cue now is and that it is unwritten:\n{screen}"
+    );
+
+    // Act / Assert: `D` opens the length dialog holding the length the cue really has.
+    app.press(key(KeyCode::Char('D')));
+    assert_eq!(app.app.dialog, Some(Dialog::CueLength));
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("On screen for") && screen.contains("00:01.150"),
+        "the dialog should open on the cue's own length:\n{screen}"
+    );
+
+    // Act: retype it as half a second, which no number of edge presses is quicker at.
+    app.press(ctrl('u'));
+    for character in "00:00.500".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+
+    // Assert: closed, with the start kept and the end moved to honour the length.
+    assert_eq!(app.app.dialog, None, "Enter should close the dialog");
+    assert_eq!(
+        span(&app),
+        (Duration::from_millis(950), Duration::from_millis(1450)),
+        "a typed length should keep the start and move the end"
+    );
+
+    // Act / Assert: a length no cue can have is refused and the dialog stays up, so the
+    // typing is not thrown away and the cue is not silently left as it was.
+    app.press(key(KeyCode::Char('D')));
+    app.press(ctrl('u'));
+    for character in "00:00.010".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::CueLength),
+        "a length under the floor should not close the dialog"
+    );
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, None, "Esc should close it");
+    assert_eq!(
+        span(&app),
+        (Duration::from_millis(950), Duration::from_millis(1450)),
+        "a cancelled dialog should leave the cue exactly as it was"
+    );
+
+    // Act: down to the floor exactly, then two more presses that would take it under.
+    app.press(key(KeyCode::Char('D')));
+    app.press(ctrl('u'));
+    for character in "00:00.050".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    app.press(alt('l'));
+    app.press(alt('h'));
+
+    // Assert: it sat on the floor and neither press moved anything — from either end.
+    assert_eq!(
+        span(&app),
+        (Duration::from_millis(950), Duration::from_millis(1000)),
+        "neither end should be pushed through the other"
+    );
+
+    // Act / Assert: `Esc` gives the keys back without leaving the page.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, None, "Esc should not ask anything yet");
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "Esc should take the mode rather than the page"
+    );
+
+    // Act: write it.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: the file carries the resized cue — earlier at both ends, which no shift can
+    // produce — its words are untouched, and the cue nobody touched is exactly as it was.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    assert!(
+        written.contains("00:00:00,950 --> 00:00:01,000\nFirst line"),
+        "the save should write the resized cue:\n{written}"
+    );
+    assert!(
+        written.contains("00:00:03,000 --> 00:00:04,000\nSecond line"),
+        "a resize is one cue's, so the other should be untouched:\n{written}"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written resize should stop being unsaved work"
     );
 }
 
