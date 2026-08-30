@@ -712,6 +712,42 @@ pub fn format_srt_timestamp(at: Duration) -> String {
     )
 }
 
+/// Renders how long a cue is on screen, in the shape the length dialog reads back:
+/// `mm:ss.mmm`.
+///
+/// Milliseconds rather than the tenths every *display* format here keeps, because this one
+/// is not read, it is edited — it is what the field opens holding, and a value that rounded
+/// on the way in would retime the cue by up to fifty milliseconds the moment the reader
+/// pressed `Enter` without changing anything.
+///
+/// No hours field: a cue that is on screen for an hour is not a thing a subtitle file has,
+/// and [`parse_length`] reads a minutes field past fifty-nine back correctly anyway.
+pub fn format_length(at: Duration) -> String {
+    let seconds = at.as_secs();
+    format!(
+        "{:02}:{:02}.{:03}",
+        seconds / 60,
+        seconds % 60,
+        at.subsec_millis()
+    )
+}
+
+/// Reads a length typed into the cue length dialog.
+///
+/// [`parse_timestamp`] with one concession: a value carrying no `:` at all is read as
+/// seconds, so `2.5` is two and a half seconds rather than a refusal. The field opens on
+/// `mm:ss.mmm` and that is the shape it teaches, but a reader who clears it and types the
+/// number they are actually thinking of has said something unambiguous, and answering it
+/// with "unreadable" would be pedantry.
+pub fn parse_length(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    if text.contains(':') {
+        parse_timestamp(text)
+    } else {
+        parse_timestamp(&format!("00:{text}"))
+    }
+}
+
 /// How many rows the timeline track will stack overlapping cues onto before it starts
 /// crowding them together.
 pub const MAX_LANES: usize = 4;
@@ -1849,6 +1885,39 @@ mod tests {
         assert_that!(parse_timestamp("00:00:01,abc")).is_none();
         assert_that!(parse_timestamp("00:00:01,")).is_none();
         assert_that!(parse_timestamp("00::01,000")).is_none();
+    }
+
+    /// The length dialog opens holding what this renders and commits what the other reads,
+    /// so a value that did not survive the round trip would retime a cue the reader only
+    /// looked at.
+    #[test]
+    fn a_length_should_survive_the_round_trip_through_the_field() {
+        // Act / Assert: milliseconds are kept, not rounded to the tenths the cue list shows.
+        for millis in [50, 1_000, 2_500, 61_050, 3_600_000] {
+            let length = Duration::from_millis(millis);
+            assert_that!(parse_length(&format_length(length))).is_equal_to(Some(length));
+        }
+
+        // Assert: and the shape it teaches is the one the dialog asks for.
+        assert_that!(format_length(Duration::from_millis(2500)).as_str()).is_equal_to("00:02.500");
+        // Past the hour the minutes simply carry on, which reads back correctly because
+        // `parse_timestamp` accepts an out-of-range component.
+        assert_that!(format_length(Duration::from_secs(3600)).as_str()).is_equal_to("60:00.000");
+    }
+
+    /// A value with no `:` in it is read as seconds, so a reader who clears the field and
+    /// types the number they are actually thinking of is answered rather than refused.
+    #[test]
+    fn a_length_typed_as_bare_seconds_should_be_read_as_seconds() {
+        // Act / Assert
+        assert_that!(parse_length("2.5")).is_equal_to(Some(Duration::from_millis(2500)));
+        assert_that!(parse_length("2")).is_equal_to(Some(Duration::from_secs(2)));
+        assert_that!(parse_length(" 90 ")).is_equal_to(Some(Duration::from_secs(90)));
+
+        // Assert: and what is not a time is still not a time.
+        assert_that!(parse_length("")).is_none();
+        assert_that!(parse_length("1:2:3:4")).is_none();
+        assert_that!(parse_length(".")).is_none();
     }
 
     /// Debug builds panic on integer overflow, so an absurd hours field in a corrupt

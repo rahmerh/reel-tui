@@ -43,7 +43,7 @@ use crate::{
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
     subtitle_edit::{
-        self, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
+        self, CueEdge, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
         WarmState,
     },
 };
@@ -130,6 +130,26 @@ const CUE_MARKED_FOR_DELETION: &str = "Unmark this cue for deletion before editi
 const CUE_TRACK_NEEDS_A_CUE: &str =
     "A subtitle track needs at least one cue; delete the track itself instead.";
 
+/// Why the length dialog will not take what was typed into it.
+///
+/// Stated as the shape that *is* read rather than as "invalid", because the field accepts
+/// only digits and separators — so a value that reaches here is one arranged wrongly, and
+/// showing the arrangement is the whole answer.
+const CUE_LENGTH_UNREADABLE: &str = "Type a length as mm:ss.mmm, for example 00:02.500.";
+
+/// Why the length dialog will not take a length of nothing.
+///
+/// The floor is one nudge, so the refusal can name a real value rather than a rule.
+const CUE_LENGTH_TOO_SHORT: &str = "A cue has to be on screen for at least 0.05s.";
+
+/// Why the length dialog will not take a length the media does not contain.
+///
+/// Not pedantry about a value that would merely look odd: a cue's span is what `p` decodes,
+/// so a mistyped `99:99.999` is a request to hold a hundred minutes of raw frames in memory.
+/// The edge keys cannot reach such a length — fifty milliseconds at a time — which is why
+/// this is the one place the check is needed.
+const CUE_LENGTH_LONGER_THAN_MEDIA: &str = "A cue cannot be on screen for longer than the media.";
+
 /// The subtitle edit page's cue editor: one cue's text, being rewritten.
 ///
 /// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
@@ -181,6 +201,25 @@ pub struct CueEditor {
     pub lines: Vec<String>,
     pub row: usize,
     pub column: usize,
+}
+
+/// The open cue length dialog: which cue it is about, and the value being typed.
+///
+/// Its own draft beside [`CueEditor`] rather than a field on the page, so a dialog that is
+/// not open is a state that does not exist — and so the cue it was opened on is remembered
+/// by *origin* rather than by position, which is the only address that survives a list the
+/// page can renumber underneath it.
+///
+/// A [`TextInputState`] rather than the cue editor's bespoke buffer: a length is one short
+/// single-line value, which is exactly what every other field in the application is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueLengthDraft {
+    /// Which subtitle track's cue this is, so a length typed here cannot be applied to a
+    /// track the page has since moved on from.
+    pub source: SubtitleSource,
+    /// Which cue is being resized — see [`CueOrigin`].
+    pub origin: CueOrigin,
+    pub input: TextInputState,
 }
 
 impl CueEditor {
@@ -368,6 +407,11 @@ pub enum CharClass {
     Word,
     /// ASCII digits only.
     Digits,
+    /// A time value: digits and the two separators one is written with.
+    ///
+    /// The comma is accepted beside the period because SubRip writes its timestamps with
+    /// one, so it is what a reader who has been looking at the file will reach for.
+    Timecode,
 }
 
 impl CharClass {
@@ -376,6 +420,7 @@ impl CharClass {
             Self::Text => !character.is_control(),
             Self::Word => !character.is_control() && !character.is_whitespace(),
             Self::Digits => character.is_ascii_digit(),
+            Self::Timecode => character.is_ascii_digit() || matches!(character, ':' | '.' | ','),
         }
     }
 }
@@ -422,6 +467,18 @@ impl TextInputConfig {
         width: 16,
         max_len: 20,
         accepts: CharClass::Digits,
+        exit_on_empty_backspace: false,
+    };
+    /// How long a cue is on screen, typed as `mm:ss.mmm`.
+    ///
+    /// Narrow because the value is nine characters and the popup holding it is the smallest
+    /// in the application; the cap is loose enough to retype the value from scratch without
+    /// clearing it first, which is what a field that refuses a keystroke at the cap feels
+    /// broken for.
+    pub const CUE_LENGTH: Self = Self {
+        width: 14,
+        max_len: 16,
+        accepts: CharClass::Timecode,
         exit_on_empty_backspace: false,
     };
 
@@ -475,6 +532,7 @@ pub enum TextInputSite {
     SubtitleTitle,
     LanguageSearch,
     CustomResolution,
+    CueLength,
     FileSearch,
     KeybindingsSearch,
 }
@@ -753,6 +811,9 @@ pub enum Dialog {
     PreviewSettings,
     /// The subtitle edit page's cue editor, opened with `i` — see `App::open_cue_editor`.
     EditCue,
+    /// How long the selected cue is on screen, typed rather than nudged. Opened with `D`
+    /// from the subtitle edit page's timing mode — see `App::open_cue_length_dialog`.
+    CueLength,
     /// "Leaving discards them" before walking off the subtitle edit page with staged cue text
     /// that has not been written yet — see `App::request_leave_subtitle_edit`.
     ConfirmLeaveCues,
@@ -1453,6 +1514,8 @@ pub struct App {
     pub preview_settings_popup: Option<PreviewSettingsPopup>,
     /// The subtitle edit page's open cue editor, if `i` has raised one.
     pub cue_editor: Option<CueEditor>,
+    /// The subtitle edit page's open cue length dialog, if `D` has raised one.
+    pub cue_length: Option<CueLengthDraft>,
     /// Which answer the "discard the unwritten cue edits?" prompt is pointing at.
     pub leave_cues_choice: LeaveCuesChoice,
     pub container_target: Option<ContainerFormat>,
@@ -1603,6 +1666,7 @@ impl App {
             preview_defaults: PreviewSettings::default(),
             preview_settings_popup: None,
             cue_editor: None,
+            cue_length: None,
             leave_cues_choice: LeaveCuesChoice::default(),
             preview: None,
             container_target: None,
@@ -3910,6 +3974,206 @@ impl App {
         });
     }
 
+    /// `Ctrl+H`/`Alt+H` and `Ctrl+L`/`Alt+L` in timing mode at cue scale: moves one end of
+    /// the selected cue and stages the result.
+    ///
+    /// The guards are [`Self::nudge_selected_cue`]'s, in the same order and for the same
+    /// reasons — this is that key's other axis, not a new kind of edit. What it changes is
+    /// how long the line is on screen rather than when, which is the second commonest thing
+    /// wrong with a subtitle track and the one the page had no key for.
+    pub fn move_selected_cue_edge(&mut self, edge: CueEdge, later: bool) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Cue {
+            return;
+        }
+        // A cue marked to go has no length worth arguing about, exactly as it has no timing
+        // worth nudging.
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let (source, selected) = (state.source.clone(), state.selected);
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        // Taken before the resize, for the reason the nudge takes it before the move: with
+        // nothing staged yet the page's own copy of the cue is the snapshot, and the resize
+        // is about to move it.
+        let file = self.file_cue_snapshot(&source, selected);
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        let Some((_, start, end)) = state.move_selected_edge(edge, later) else {
+            return;
+        };
+        self.stage_cue_change(&source, origin, file, move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
+    }
+
+    /// `D` in timing mode at cue scale: opens the dialog for typing how long the selected cue
+    /// is on screen.
+    ///
+    /// The edge keys move fifty milliseconds a press, which is the right size for landing a
+    /// line against a mouth and the wrong size for saying "this sign should be up for eight
+    /// seconds". This is that answer, typed once.
+    ///
+    /// **Gated on a running playback where the edge keys are not**, because it is a dialog:
+    /// a span's pixels reach the terminal outside the cell buffer a popup is drawn into, so
+    /// one opened over a playback is invisible and swallows every key. The edge keys are a
+    /// mode's keys and have no such problem — which is exactly why the timing mode is a mode.
+    pub fn open_cue_length_dialog(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Cue {
+            return;
+        }
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        let Some(length) = state.selected_length() else {
+            return;
+        };
+        let mut input = TextInputState::new(crate::cue::format_length(length));
+        // Opened active, because the dialog has nothing in it but this field: a value the
+        // reader has to press something to start typing into would be a step that answers no
+        // question.
+        input.activate();
+        self.cue_length = Some(CueLengthDraft {
+            source: state.source.clone(),
+            origin,
+            input,
+        });
+        self.clear_text_input_reject();
+        self.notice = None;
+        self.dialog = Some(Dialog::CueLength);
+    }
+
+    /// `Enter` in the length dialog: reads what was typed, stages it, and closes.
+    ///
+    /// **A value that cannot be used leaves the dialog open**, with the refusal on the page's
+    /// status row behind it. Closing on a bad value would throw the typing away and leave the
+    /// cue silently unchanged, which is the one outcome a reader cannot tell from success.
+    ///
+    /// A length the cue already has closes without staging anything: pressing `Enter` on an
+    /// untouched field is how a reader backs out of a dialog they opened to look at, and it
+    /// must not make the file look modified.
+    pub fn commit_cue_length(&mut self) {
+        let Some(draft) = self.cue_length.as_ref() else {
+            return;
+        };
+        let Some(length) = crate::cue::parse_length(&draft.input.value) else {
+            self.notice = Some(CUE_LENGTH_UNREADABLE.into());
+            return;
+        };
+        if length < subtitle_edit::MIN_CUE_LENGTH {
+            self.notice = Some(CUE_LENGTH_TOO_SHORT.into());
+            return;
+        }
+        // **A typo here is the one keypress on this page that can ask for an unbounded
+        // decode.** A cue's span is what `p` plays, and a playback decodes the whole of it to
+        // raw frames — so a mistyped `99:99.999` is a hundred-minute span in memory, from a
+        // page whose every other span is a line of dialogue. Nothing else the reader can
+        // press produces a length the media does not contain, and this refuses to be the
+        // first. Skipped for media whose duration is unknown rather than guessed at.
+        let media = self
+            .subtitle_edit
+            .as_ref()
+            .map(|state| state.duration)
+            .unwrap_or_default();
+        if !media.is_zero() && length > media {
+            self.notice = Some(CUE_LENGTH_LONGER_THAN_MEDIA.into());
+            return;
+        }
+        let (source, origin) = (draft.source.clone(), draft.origin);
+        self.close_cue_length_dialog();
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        // The dialog remembers the cue by origin, so a page that has moved on — another
+        // track, or the cue gone with a save — is a length with nothing to apply it to
+        // rather than one applied to whatever now stands in that slot.
+        if state.source != source {
+            return;
+        }
+        let Some(position) = state.position_of(origin) else {
+            return;
+        };
+        let file = self.file_cue_snapshot(&source, position);
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        let Some((_, start, end)) = state.set_selected_length(length) else {
+            return;
+        };
+        self.stage_cue_change(&source, origin, file, move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
+    }
+
+    /// `Esc` in the length dialog: drops what was typed and leaves the cue as it was.
+    ///
+    /// Unlike the cue editor, which keeps its buffer on the way out: that one holds words
+    /// that took typing and can be come back to, where this holds one number that is quicker
+    /// to retype than to find again — and a half-typed length kept across a visit would open
+    /// the dialog on something that is not the cue's length, which is the one thing the field
+    /// is supposed to be able to tell you.
+    pub fn cancel_cue_length(&mut self) {
+        self.close_cue_length_dialog();
+    }
+
+    fn close_cue_length_dialog(&mut self) {
+        self.cue_length = None;
+        self.clear_text_input_reject();
+        if self.dialog == Some(Dialog::CueLength) {
+            self.dialog = None;
+        }
+    }
+
+    /// How long the selected cue is on screen, when that is not the length the file gives it.
+    ///
+    /// `None` for a cue nothing is staged against, for one whose words or start moved but
+    /// whose length did not, and for an inserted cue — the rules
+    /// [`Self::selected_cue_shift`] follows one axis over, and for the same reason: a figure
+    /// that is on screen whatever the reader does is a label rather than a readout.
+    pub fn selected_cue_length_change(&self) -> Option<Duration> {
+        let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.selected_origin()? else {
+            return None;
+        };
+        let edit = self
+            .subtitle_changes
+            .get(&state.source)?
+            .cues
+            .edits
+            .get(&cue)?;
+        let length = edit.end.saturating_sub(edit.start);
+        let was = edit.original.end.saturating_sub(edit.original.start);
+        (length != was).then_some(length)
+    }
+
     /// `0` in timing mode: puts the selected cue back to the timing the file gives it.
     ///
     /// The file's timing rather than the last nudge's, which is what makes this an undo of
@@ -4159,7 +4423,8 @@ impl App {
             .collect()
     }
 
-    /// Whether the selected cue is marked to go, which is what `i`, `t` and `r` refuse on.
+    /// Whether the selected cue is marked to go, which is what `i`, the timing mode's keys —
+    /// `h`/`l`, the modified `h`/`l` edge keys, `D` — and `r` all refuse on.
     fn selected_cue_is_deleted(&self) -> bool {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return false;
@@ -5984,6 +6249,11 @@ impl App {
         if self.custom_resolution_input_active() {
             return Some(TextInputSite::CustomResolution);
         }
+        // The field is the whole dialog, so it is active for as long as the dialog is: there
+        // is nothing else here for a keystroke to be meant for.
+        if self.dialog == Some(Dialog::CueLength) && self.cue_length.is_some() {
+            return Some(TextInputSite::CueLength);
+        }
         if self.dialog == Some(Dialog::Keybindings) && self.keybindings_search.is_active {
             return Some(TextInputSite::KeybindingsSearch);
         }
@@ -6042,6 +6312,10 @@ impl App {
                 };
                 Some((input, TextInputConfig::RESOLUTION))
             }
+            TextInputSite::CueLength => Some((
+                &mut self.cue_length.as_mut()?.input,
+                TextInputConfig::CUE_LENGTH,
+            )),
             TextInputSite::FileSearch => {
                 let config = self.file_search.config();
                 Some((&mut self.file_search.input, config))
@@ -6116,7 +6390,8 @@ impl App {
             | TextInputSite::AudioTitle
             | TextInputSite::VideoTitle
             | TextInputSite::SubtitleTitle
-            | TextInputSite::CustomResolution => {}
+            | TextInputSite::CustomResolution
+            | TextInputSite::CueLength => {}
         }
     }
 
@@ -19643,6 +19918,14 @@ mod tests {
                     }),
                 });
             }
+            TextInputSite::CueLength => {
+                app.cue_length = Some(CueLengthDraft {
+                    source: SubtitleSource::Embedded(2),
+                    origin: CueOrigin::File(0),
+                    input: active,
+                });
+                app.dialog = Some(Dialog::CueLength);
+            }
             TextInputSite::FileSearch => {
                 app.layer = Layer::Files;
                 app.dialog = None;
@@ -19655,7 +19938,7 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 10] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 11] = [
         TextInputSite::ContainerMetadata,
         TextInputSite::AudioTitle,
         TextInputSite::AudioLanguageSearch,
@@ -19664,6 +19947,7 @@ mod tests {
         TextInputSite::SubtitleTitle,
         TextInputSite::LanguageSearch,
         TextInputSite::CustomResolution,
+        TextInputSite::CueLength,
         TextInputSite::FileSearch,
         TextInputSite::KeybindingsSearch,
     ];
@@ -19689,6 +19973,7 @@ mod tests {
                 TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
+                TextInputSite::CueLength => TextInputConfig::CUE_LENGTH,
                 TextInputSite::FileSearch => app.file_search.config(),
                 TextInputSite::KeybindingsSearch => app.keybindings_search.config(),
             };
@@ -19864,6 +20149,7 @@ mod tests {
                 | TextInputSite::AudioLanguageSearch
                 | TextInputSite::VideoLanguageSearch => ("onetwo", ""),
                 TextInputSite::CustomResolution => ("1234", ""),
+                TextInputSite::CueLength => ("00:02.500", ""),
                 _ => ("one two", "one "),
             };
             for character in typed.chars() {
@@ -22151,6 +22437,211 @@ mod tests {
             .is_equal_to(Duration::from_millis(1150));
         assert_that!(app.selected_cue_shift()).is_equal_to(Some(150));
         assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The other axis of the same mode: the modified `h`/`l` move one end and leave the other,
+    /// so what changes is how long the line is on screen rather than when it is.
+    #[test]
+    fn resizing_a_cue_should_stage_it_against_the_length_the_file_gives_it() {
+        // Arrange: a cue the file has running 1s → 2s.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+
+        // Act: the end out by two presses, then the start back by one.
+        app.move_selected_cue_edge(CueEdge::End, true);
+        app.move_selected_cue_edge(CueEdge::End, true);
+        app.move_selected_cue_edge(CueEdge::Start, false);
+
+        // Assert: one entry, holding the file's timing and the new one.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the resize should be staged against the track");
+        assert_that!(change.cues.edits.len()).is_equal_to(1);
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
+        assert_that!(edit.original.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
+        assert_that!(edit.start).is_equal_to(Duration::from_millis(950));
+        assert_that!(edit.end).is_equal_to(Duration::from_millis(2100));
+
+        // Assert: the words came along untouched, so a save cannot rewrite them.
+        assert_that!(edit.text.as_str()).is_equal_to("First line");
+
+        // Assert: the page agrees, and both readouts say what happened — the start moved,
+        // and the line is now on screen for longer than the file says.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_millis(2100));
+        assert_that!(app.selected_cue_shift()).is_equal_to(Some(-50));
+        assert_that!(app.selected_cue_length_change())
+            .is_equal_to(Some(Duration::from_millis(1150)));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: back to the length the file gives it and the readout stands down,
+        // even though the cue is still shifted.
+        app.move_selected_cue_edge(CueEdge::End, false);
+        app.move_selected_cue_edge(CueEdge::End, false);
+        app.move_selected_cue_edge(CueEdge::Start, true);
+        assert_that!(app.selected_cue_length_change()).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The resize keys are the timing mode's, so they are inert with the mode off and at the
+    /// scale where `h`/`l` move the whole file — and refused outright on a cue the reader has
+    /// said is leaving, exactly as a nudge is.
+    #[test]
+    fn resizing_should_be_refused_outside_the_cue_scale_and_on_a_deleted_cue() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+
+        // Act / Assert: with the mode off, nothing.
+        app.move_selected_cue_edge(CueEdge::End, true);
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+
+        // Act / Assert: at track scale, nothing either — `T` is aimed at the file, and one
+        // cue's length is not something a whole-file key changes.
+        app.toggle_global_retiming();
+        app.move_selected_cue_edge(CueEdge::End, true);
+        app.open_cue_length_dialog();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: at cue scale on a cue marked to go, refused in the same words the
+        // editor and the nudge use.
+        app.toggle_cue_timing_mode();
+        app.toggle_delete_selected_cue();
+        // Marking advances the cursor, so the cursor has to come back to the marked row for
+        // the refusal to be the one under test.
+        app.select_previous();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+        app.notice = None;
+        app.move_selected_cue_edge(CueEdge::End, true);
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_MARKED_FOR_DELETION));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+        app.notice = None;
+        app.open_cue_length_dialog();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_MARKED_FOR_DELETION));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The dialog opens holding the cue's real length, takes a typed one, and stages it the
+    /// same way a nudge does.
+    #[test]
+    fn the_length_dialog_should_open_on_the_cues_length_and_stage_what_is_typed() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+
+        // Act
+        app.open_cue_length_dialog();
+
+        // Assert: the field opens active, holding the second the file gives this cue.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        let draft = app.cue_length.as_ref().expect("the draft should be there");
+        assert_that!(draft.input.value.as_str()).is_equal_to("00:01.000");
+        assert_that!(draft.input.is_active).is_true();
+        assert_that!(app.active_text_input()).is_equal_to(Some(TextInputSite::CueLength));
+
+        // Act: retype it as three and a half seconds.
+        for _ in 0..9 {
+            app.backspace_text();
+        }
+        for character in "00:03.500".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+
+        // Assert: closed, and staged with the start kept and the end moved.
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.cue_length.is_none()).is_true();
+        let cue = &app.subtitle_edit.as_ref().unwrap().cues[0];
+        assert_that!(cue.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(cue.end).is_equal_to(Duration::from_millis(4500));
+        let edit = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .and_then(|change| change.cues.edits.get(&0))
+            .expect("the typed length should be staged");
+        assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
+        assert_that!(edit.end).is_equal_to(Duration::from_millis(4500));
+        assert_that!(app.selected_cue_length_change())
+            .is_equal_to(Some(Duration::from_millis(3500)));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A value the dialog cannot use keeps it open and says why. Closing on one would throw
+    /// the typing away and leave the cue unchanged, which is the one outcome a reader cannot
+    /// tell apart from success.
+    #[test]
+    fn a_length_that_cannot_be_used_should_keep_the_dialog_open() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        app.open_cue_length_dialog();
+        for _ in 0..9 {
+            app.backspace_text();
+        }
+
+        // Act / Assert: an arrangement of digits that is not a time.
+        for character in "1:2:3:4".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_LENGTH_UNREADABLE));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: and a length no cue can have.
+        for _ in 0..7 {
+            app.backspace_text();
+        }
+        for character in "00:00.010".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_LENGTH_TOO_SHORT));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: the field refuses a letter outright, so nothing else can reach here.
+        app.input_text_char('x');
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:00.010");
+
+        // Act / Assert: `Esc` drops the typing and leaves the cue exactly as it was.
+        app.cancel_cue_length();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.cue_length.is_none()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: reopening shows the cue's length again rather than what was typed.
+        app.open_cue_length_dialog();
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:01.000");
+
+        // Act / Assert: committing the length it already has stages nothing at all.
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
