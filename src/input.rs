@@ -1455,8 +1455,40 @@ mod tests {
         (app, directory)
     }
 
+    /// `test_app` plus a real file on the list, selected.
+    ///
+    /// A staged change is filed under a path, so without one every `Ctrl+S` in these tests
+    /// would report that nothing is staged instead of reaching the save. Built here rather
+    /// than by writing into `test_app`'s directory afterwards, because the scan that finds
+    /// the file happens inside `App::new`.
+    fn media_app() -> (App, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-input-media-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("movie.mkv"), b"media").unwrap();
+        let (probe_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (conflict_tx, _) = mpsc::channel::<ProbeRequest>();
+        let (edit_tx, _) = mpsc::channel::<EditRequest>();
+        let mut app = App::new(
+            directory.clone(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
+        app.select_first();
+        (app, directory)
+    }
+
     fn subtitle_settings_app() -> (App, PathBuf) {
-        let (mut app, directory) = test_app();
+        let (mut app, directory) = media_app();
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "streams": [
@@ -1484,7 +1516,7 @@ mod tests {
     }
 
     fn audio_settings_app() -> (App, PathBuf) {
-        let (mut app, directory) = test_app();
+        let (mut app, directory) = media_app();
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "format": {"format_name": "matroska,webm"},
@@ -1522,7 +1554,7 @@ mod tests {
     }
 
     fn container_settings_app() -> (App, PathBuf) {
-        let (mut app, directory) = test_app();
+        let (mut app, directory) = media_app();
         app.outcome = Some(ProbeOutcome::Video(
             MediaInfo::from_json(serde_json::json!({
                 "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
@@ -1538,6 +1570,51 @@ mod tests {
             .unwrap();
         app.open_container_settings();
         (app, directory)
+    }
+
+    /// A probed file with one re-encodable video track, sitting in the video settings popup.
+    ///
+    /// The encoders and the muxer are declared because `open_video_settings` builds its codec
+    /// list from them: without them the popup opens on a codec row with nothing to choose,
+    /// and every key that moves the cursor has half a dialog to move around.
+    fn video_settings_app() -> (App, PathBuf) {
+        let (mut app, directory) = media_app();
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080,
+                     "tags": {"language": "eng"}, "disposition": {"default": 1}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.subtitle_capabilities.ffmpeg = true;
+        app.subtitle_capabilities.ffmpeg_encoders = BTreeSet::from([
+            "libx264".to_string(),
+            "libx265".to_string(),
+            "libsvtav1".to_string(),
+            "libvpx-vp9".to_string(),
+        ]);
+        app.subtitle_capabilities.ffmpeg_muxers = BTreeSet::from(["matroska".to_string()]);
+        app.stream_order = vec![0];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|track| *track == crate::app::TrackRef::Embedded(0))
+            .unwrap();
+        app.open_video_settings();
+        (app, directory)
+    }
+
+    /// Puts the video popup's cursor on one field, whatever order the rows come in.
+    fn focus_video_field(app: &mut App, field: VideoSettingsField) {
+        app.video_settings_popup
+            .as_mut()
+            .expect("the video settings popup is open")
+            .field = field;
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3562,6 +3639,368 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The save question has two axes: `h`/`l` between its buttons and `j`/`k` down the list
+    /// of what is about to be written. They are easy to confuse for one another, and a
+    /// version where `j` moved the button would put the reader one keypress from starting a
+    /// batch they meant to scroll past.
+    #[test]
+    fn the_save_question_should_keep_its_buttons_and_its_list_on_separate_keys() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        app.dialog = Some(Dialog::ConfirmProcessAll);
+        app.set_confirm_process_all_max_scroll(20);
+
+        // Act / Assert: `l` and `h` move between the buttons and come back.
+        let choice = app.confirm_process_all_choice;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.confirm_process_all_choice).is_not_equal_to(choice);
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.confirm_process_all_choice).is_equal_to(choice);
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        assert_that!(app.confirm_process_all_choice).is_not_equal_to(choice);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.confirm_process_all_choice).is_equal_to(choice);
+
+        // Act / Assert: `j` and `k` move the list a row at a time and leave the buttons
+        // exactly where they were.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(2);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.confirm_process_all_scroll).is_equal_to(0);
+        assert_that!(app.confirm_process_all_choice).is_equal_to(choice);
+
+        // Act / Assert: `Enter` answers with the button under the cursor. Nothing is staged
+        // here, so the dialog simply closes rather than dispatching a batch.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The batch view's cursor is what picks the row a failure is read off, so it has to
+    /// move by a row as well as by a page — and every back key still has to reach the
+    /// cancel question rather than being eaten by the movement arm.
+    #[test]
+    fn the_batch_view_should_move_its_cursor_a_row_and_a_page_at_a_time() {
+        // Arrange: a batch of enough items that a cursor has somewhere to go.
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: (0..4)
+                .map(|index| crate::staging::BatchItem {
+                    path: directory.join(format!("clip{index}.mkv")),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Pending,
+                    output_path: None,
+                })
+                .collect(),
+            started: std::time::Instant::now(),
+        });
+
+        // Act / Assert: down a row, and back up.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.batch_cursor).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(app.batch_cursor).is_equal_to(2);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        assert_that!(app.batch_cursor).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.batch_cursor).is_equal_to(0);
+
+        // Act / Assert: a page clamps at each end rather than running off it.
+        handle_key(&mut app, &mut input, ctrl('d'));
+        let bottom = app.batch_cursor;
+        assert_that!(bottom > 0).is_true();
+        handle_key(&mut app, &mut input, ctrl('u'));
+        assert_that!(app.batch_cursor).is_equal_to(0);
+
+        // Act / Assert: and the dialog still answers a back key with the cancel question,
+        // which is the only way to stop a running batch.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmCancel));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cancel question and the reset question are both two buttons and an `Enter`, and
+    /// both default to the harmless half. `h` is the half that is easy to leave unbound,
+    /// since the cursor already starts on the left.
+    #[test]
+    fn the_two_button_questions_should_move_left_as_well_as_right() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+
+        // Act / Assert: the cancel question.
+        app.dialog = Some(Dialog::ConfirmCancel);
+        let cancel = app.cancel_edit_choice;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.cancel_edit_choice).is_not_equal_to(cancel);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.cancel_edit_choice).is_equal_to(cancel);
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.cancel_edit_choice).is_equal_to(cancel);
+
+        // Act / Assert: `Enter` answers it, and with no batch running the answer is simply
+        // to put the question away.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.dialog).is_not_equal_to(Some(Dialog::ConfirmCancel));
+
+        // Act / Assert: the reset question, whose left button is its safe one.
+        app.dialog = Some(Dialog::ConfirmReset);
+        app.reset_choice = crate::app::ResetChoice::default();
+        let reset = app.reset_choice;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.reset_choice).is_not_equal_to(reset);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        assert_that!(app.reset_choice).is_equal_to(reset);
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.reset_choice).is_equal_to(reset);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The source-changed notice is a list that can outgrow its panel, so it scrolls — and
+    /// deliberately answers no back key, because deferring it would leave a staged edit
+    /// pointing at tracks the file no longer has.
+    #[test]
+    fn the_conflict_notice_should_scroll_and_still_refuse_a_back_key() {
+        // Arrange
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        app.dialog = Some(Dialog::ResolveConflicts);
+        app.set_conflict_max_scroll(20);
+
+        // Act / Assert: a row at a time, both ways, clamped at the top.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.conflict_scroll).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(app.conflict_scroll).is_equal_to(2);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.conflict_scroll).is_equal_to(0);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.conflict_scroll).is_equal_to(0);
+
+        // Act / Assert: neither back key answers it; only acknowledging does.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('q')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ResolveConflicts));
+        handle_key(&mut app, &mut input, key(KeyCode::Char(' ')));
+        assert_that!(app.dialog).is_not_equal_to(Some(Dialog::ResolveConflicts));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The six single-line fields share one set of editing keys, so a key that works in the
+    /// container's title works in the cue length and in every search bar. This walks the
+    /// half of that set no caller binds to anything else.
+    #[test]
+    fn every_single_line_field_should_answer_the_same_cursor_and_delete_keys() {
+        // Arrange: the container settings popup's text field, which is an ordinary one.
+        let (mut app, directory) = container_settings_app();
+        let mut input = InputState::default();
+        // Down onto the title, since the popup opens on the format row, which is a dropdown
+        // rather than a field.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for character in "abc".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        let value = |app: &App| {
+            app.container_settings_popup
+                .as_ref()
+                .unwrap()
+                .text_input
+                .value
+                .clone()
+        };
+        assert_that!(value(&app).as_str()).is_equal_to("abc");
+
+        // Act / Assert: `Home` and `Left`/`Right` put the caret where the next letter lands.
+        handle_key(&mut app, &mut input, key(KeyCode::Home));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('>')));
+        assert_that!(value(&app).as_str()).is_equal_to(">abc");
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('-')));
+        assert_that!(value(&app).as_str()).is_equal_to(">a-bc");
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        handle_key(&mut app, &mut input, key(KeyCode::Delete));
+        assert_that!(value(&app).as_str()).is_equal_to(">abc");
+
+        // Act / Assert: `End` reaches the far end, and `Delete` there has nothing to take.
+        handle_key(&mut app, &mut input, key(KeyCode::End));
+        handle_key(&mut app, &mut input, key(KeyCode::Delete));
+        assert_that!(value(&app).as_str()).is_equal_to(">abc");
+        handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        assert_that!(value(&app).as_str()).is_equal_to(">ab");
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The file list's search bar walks its results without leaving the field, the way the
+    /// cue list's does. `j` and `k` are letters while a bar is open, so the arrows and their
+    /// control twins are the only way through — and losing one would leave a reader who has
+    /// typed a query unable to reach the second match.
+    #[test]
+    fn the_file_search_should_walk_its_results_on_the_arrows_and_their_control_twins() {
+        // Arrange: two files and a query both match.
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ".mkv".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        let selected = |app: &App| app.list_state.selected();
+        let first = selected(&app);
+
+        // Act / Assert: down and back up, on both spellings.
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        let second = selected(&app);
+        assert_that!(second).is_not_equal_to(first);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(selected(&app)).is_equal_to(first);
+        handle_key(&mut app, &mut input, ctrl('n'));
+        assert_that!(selected(&app)).is_equal_to(second);
+        handle_key(&mut app, &mut input, ctrl('p'));
+        assert_that!(selected(&app)).is_equal_to(first);
+
+        // Assert: and none of it typed into the query.
+        assert_that!(app.file_search.value.as_str()).is_equal_to(".mkv");
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+S` on the subtitle edit page writes the cue work from the page itself: cue edits
+    /// are staged edits like any other, so the key that writes those is the key that writes
+    /// them, and a reader should not have to leave the page to save what they did on it.
+    #[test]
+    fn ctrl_s_should_save_from_the_subtitle_edit_page_itself() {
+        // Arrange: a page with a staged cue edit and no dialog over it.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('!')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act
+        handle_key(&mut app, &mut input, ctrl('s'));
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `h` and `H` mean three different things on the subtitle edit page, and the pane holding
+    /// the cursor is what decides which. With the timeline holding it they walk the cursor
+    /// through the track — and must not nudge the cue the other pane is parked on, which is a
+    /// line nothing on screen marks while the cursor is here.
+    #[test]
+    fn h_and_shift_h_should_walk_the_timeline_cursor_rather_than_retime_a_cue() {
+        // Arrange: the timeline holding the cursor, parked away from zero so a backward step
+        // has room, and the timing mode on so a leaked nudge would be visible.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, ctrl('j'));
+        assert_that!(app.timeline_focused()).is_true();
+        let cursor = |app: &App| {
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .cursor()
+                .expect("the timeline holds the cursor")
+        };
+        let start = cursor(&app);
+
+        // Act / Assert: `h` is one step back and `l` puts it back.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('h')));
+        let stepped = cursor(&app);
+        assert_that!(stepped < start).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(cursor(&app)).is_equal_to(start);
+
+        // Act / Assert: `H` is ten of them, so it moves further than `h` did.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('H')));
+        let leapt = cursor(&app);
+        assert_that!(leapt < stepped).is_true();
+
+        // Assert: and nothing was retimed on the way — the cue the other pane is parked on
+        // is a line nothing on screen marks while the cursor is here.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Enter` on the track list opens the settings for whatever kind of track the cursor is
+    /// on, which is the one key that dispatches on the row rather than on the layer.
+    #[test]
+    fn enter_on_the_track_list_should_open_the_settings_for_the_row_under_the_cursor() {
+        // Arrange
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::SubtitleSettings));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `k` and `Up` are the catch-all's answer to "back up a row", reached from whichever
+    /// list has the cursor when nothing more specific claims the key.
+    #[test]
+    fn k_should_move_back_up_the_file_list() {
+        // Arrange: two files, cursor on the second.
+        let (mut app, directory) = browsing_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        let second = app.list_state.selected();
+
+        // Act / Assert
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        let first = app.list_state.selected();
+        assert_that!(first).is_not_equal_to(second);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(app.list_state.selected()).is_equal_to(second);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.list_state.selected()).is_equal_to(first);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The error notice has exactly one job: go away. Both the confirm key and the back
     /// keys have to do it, or a failure message strands the user in a modal.
     #[test]
@@ -3727,7 +4166,7 @@ mod tests {
                 "format": {"format_name": "matroska,webm"},
                 "streams": [
                     {"index": 0, "codec_type": "video", "codec_name": "h264"},
-                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "eng"}}
                 ]
             }))
             .unwrap(),
@@ -4923,6 +5362,136 @@ mod tests {
         (app, directory, input)
     }
 
+    /// The cue editor is the application's only multi-line buffer, so it is the only place
+    /// the arrows mean two axes and `Home`/`End` mean anything at all. A SubRip cue is
+    /// routinely two lines and where it breaks is part of what the reader is judging, so
+    /// every one of these keys is load-bearing rather than a convenience.
+    #[test]
+    fn the_cue_editor_should_move_its_cursor_in_two_axes_and_edit_at_it() {
+        // Arrange: two lines in the buffer, cursor left at the end of the second.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::EditCue));
+        for _ in 0.."alpha line".len() {
+            handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        }
+        for character in "one".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        for character in "two".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        let text = |app: &App| app.cue_editor.as_ref().unwrap().text();
+        assert_that!(text(&app).as_str()).is_equal_to("one\ntwo");
+
+        // Act / Assert: `Up` crosses the line break, and typing lands on the line above.
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('!')));
+        assert_that!(text(&app).as_str()).is_equal_to("one!\ntwo");
+
+        // Act / Assert: `Home` and `End` reach the ends of the line the cursor is on rather
+        // than the ends of the buffer, and `Ctrl+A`/`Ctrl+E` are the same two keys.
+        handle_key(&mut app, &mut input, key(KeyCode::Home));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('>')));
+        assert_that!(text(&app).as_str()).is_equal_to(">one!\ntwo");
+        handle_key(&mut app, &mut input, key(KeyCode::End));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('<')));
+        assert_that!(text(&app).as_str()).is_equal_to(">one!<\ntwo");
+        handle_key(&mut app, &mut input, ctrl('a'));
+        handle_key(&mut app, &mut input, key(KeyCode::Delete));
+        assert_that!(text(&app).as_str()).is_equal_to("one!<\ntwo");
+        handle_key(&mut app, &mut input, ctrl('e'));
+        handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        assert_that!(text(&app).as_str()).is_equal_to("one!\ntwo");
+
+        // Act / Assert: `Down` and the horizontal arrows move within the buffer too, and
+        // `Delete` at the end of a line pulls the next one up onto it.
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        handle_key(&mut app, &mut input, ctrl('a'));
+        handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        assert_that!(text(&app).as_str()).is_equal_to("one!two");
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+S` from inside the cue editor means what it means everywhere else: stage the
+    /// typing and start writing it. It has to close the editor first, or the save would be
+    /// dispatched with the words still sitting in a buffer nothing has read.
+    #[test]
+    fn ctrl_s_in_the_cue_editor_should_stage_the_typing_and_start_the_save() {
+        // Arrange
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for character in " edited".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Act
+        handle_key(&mut app, &mut input, ctrl('s'));
+
+        // Assert: the editor is gone, the words are staged, and the save is asking.
+        assert_that!(app.cue_editor.is_none()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the subtitle edit page with cue work on it asks first, because the answer is
+    /// destructive and this page is the only place staged cue text is visible. The question's
+    /// own keys are `h`/`l` between the two buttons and `Enter` on the one under the cursor —
+    /// and a back key is not an answer to it at all.
+    #[test]
+    fn the_leave_cues_question_should_answer_to_its_buttons_and_not_to_a_back_key() {
+        // Arrange: a page with a staged cue edit, and the question raised.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('x')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+
+        // Act / Assert: a back key puts the reader back on the page with their edits, which
+        // is the safe half of the choice rather than an answer to the question.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: `l` and `h` move between the two buttons, so the cursor comes back
+        // to where it started rather than drifting.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        let choice = app.leave_cues_choice;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_that!(app.leave_cues_choice).is_not_equal_to(choice);
+        handle_key(&mut app, &mut input, key(KeyCode::Left));
+        assert_that!(app.leave_cues_choice).is_equal_to(choice);
+
+        // Act / Assert: a bare `Enter` takes the safe half — the reader stays, edits intact.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: and the other button discards them and leaves.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        handle_key(&mut app, &mut input, key(KeyCode::Right));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn slash_should_open_the_cue_search_and_ordinary_keys_should_type_into_it() {
         // Arrange
@@ -5089,6 +5658,511 @@ mod tests {
         // a match found from the timeline would be a line nothing on screen points at.
         assert_that!(app.timeline_focused()).is_false();
         assert_that!(app.cue_search_active()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Whichever settings popup is open, is its field help showing?
+    fn settings_help_visible(app: &App) -> bool {
+        app.container_settings_popup
+            .as_ref()
+            .map(|popup| popup.help_visible)
+            .or_else(|| {
+                app.audio_settings_popup
+                    .as_ref()
+                    .map(|popup| popup.help_visible)
+            })
+            .or_else(|| {
+                app.video_settings_popup
+                    .as_ref()
+                    .map(|popup| popup.help_visible)
+            })
+            .or_else(|| {
+                app.subtitle_settings_popup
+                    .as_ref()
+                    .map(|popup| popup.help_visible)
+            })
+            .expect("a settings popup should be open")
+    }
+
+    /// Whichever settings popup is open, which row is its cursor on?
+    ///
+    /// The four fields are four different enums, so they are compared as their debug names —
+    /// what is being asserted is only that the cursor moved, and to where relative to itself.
+    fn settings_cursor_row(app: &App) -> String {
+        app.container_settings_popup
+            .as_ref()
+            .map(|popup| format!("{:?}", popup.field))
+            .or_else(|| {
+                app.audio_settings_popup
+                    .as_ref()
+                    .map(|popup| format!("{:?}", popup.field))
+            })
+            .or_else(|| {
+                app.video_settings_popup
+                    .as_ref()
+                    .map(|popup| format!("{:?}", popup.field))
+            })
+            .or_else(|| {
+                app.subtitle_settings_popup
+                    .as_ref()
+                    .map(|popup| format!("{:?}", popup.field))
+            })
+            .expect("a settings popup should be open")
+    }
+
+    /// The four settings popups are four separate key blocks that all have to answer the
+    /// same set: `K` for the field help, `k`/`Up` back up the list, `G` to the last row and
+    /// `gg` back to the first, `r` to put the focused field back, and `Ctrl+S` to save from
+    /// wherever the cursor is. Each block spells them out itself, so one added or reshuffled
+    /// can lose any of them silently — which is why they are checked together rather than
+    /// one popup at a time.
+    #[test]
+    fn every_settings_popup_should_answer_the_same_shared_keys() {
+        for (name, open) in [
+            (
+                "container",
+                container_settings_app as fn() -> (App, PathBuf),
+            ),
+            ("audio", audio_settings_app as fn() -> (App, PathBuf)),
+            ("video", video_settings_app as fn() -> (App, PathBuf)),
+            ("subtitle", subtitle_settings_app as fn() -> (App, PathBuf)),
+        ] {
+            // Arrange
+            let (mut app, directory) = open();
+            let mut input = InputState::default();
+            let dialog = app.dialog.expect("the popup should be open");
+
+            // Act / Assert: `K` raises the field help and puts it away.
+            handle_key(
+                &mut app,
+                &mut input,
+                KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            );
+            assert!(
+                settings_help_visible(&app),
+                "{name}: `K` should raise the field help"
+            );
+            handle_key(
+                &mut app,
+                &mut input,
+                KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            );
+            assert!(
+                !settings_help_visible(&app),
+                "{name}: `K` should put it away again"
+            );
+
+            // Act / Assert: `G` to the last row, `k` up one, `gg` back to the first — so the
+            // list has a top and a bottom the reader can actually reach.
+            handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+            let last = settings_cursor_row(&app);
+            handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+            assert_ne!(settings_cursor_row(&app), last, "{name}: `k` should go up");
+            handle_key(&mut app, &mut input, key(KeyCode::Down));
+            assert_eq!(
+                settings_cursor_row(&app),
+                last,
+                "{name}: `Down` should come back"
+            );
+            handle_key(&mut app, &mut input, key(KeyCode::Up));
+            assert_ne!(settings_cursor_row(&app), last, "{name}: `Up` should go up");
+            handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+            handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+            let first = settings_cursor_row(&app);
+            assert_ne!(first, last, "{name}: `gg` should reach the first row");
+
+            // Act / Assert: `r` on the first row is inert on an unstaged file rather than an
+            // error — it is the key that undoes, and there is nothing to undo.
+            handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+            assert_eq!(app.dialog, Some(dialog), "{name}: `r` should not navigate");
+            assert_eq!(
+                settings_cursor_row(&app),
+                first,
+                "{name}: `r` should not move the cursor"
+            );
+
+            // Act / Assert: `Ctrl+S` closes the popup from every one of them.
+            handle_key(&mut app, &mut input, ctrl('s'));
+            assert_that!(app.dialog).is_not_equal_to(Some(dialog));
+
+            // Cleanup
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// The video settings popup is the one settings dialog with five modes, and every one of
+    /// them routes its keys differently. This walks the summary's own set: the cursor keys,
+    /// the endpoints, the help panel, and `Enter` opening the dropdown a field belongs to.
+    #[test]
+    fn video_summary_keys_should_move_the_cursor_and_open_the_field_under_it() {
+        // Arrange
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        let field = |app: &App| app.video_settings_popup.as_ref().unwrap().field;
+        let mode = |app: &App| app.video_settings_popup.as_ref().unwrap().mode;
+        assert_that!(mode(&app)).is_equal_to(VideoSettingsMode::Summary);
+        let first = field(&app);
+
+        // Act / Assert: `j` and `k` are one row each and come back to where they started.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(field(&app)).is_not_equal_to(first);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        assert_that!(field(&app)).is_equal_to(first);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(field(&app)).is_not_equal_to(first);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(field(&app)).is_equal_to(first);
+
+        // Act / Assert: `G` goes to the last row and `gg` back to the first, which is the
+        // pair every other list in the application answers to.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        let last = field(&app);
+        assert_that!(last).is_not_equal_to(first);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(field(&app)).is_equal_to(first);
+
+        // Act / Assert: `K` raises the field help and puts it away again.
+        handle_key(
+            &mut app,
+            &mut input,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+        );
+        assert_that!(app.video_settings_popup.as_ref().unwrap().help_visible).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('K')));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().help_visible).is_false();
+
+        // Act / Assert: `Enter` on the codec row opens its dropdown, and a back key closes
+        // the dropdown before it closes the popup — one level at a time.
+        focus_video_field(&mut app, VideoSettingsField::Codec);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(mode(&app)).is_equal_to(VideoSettingsMode::Dropdown);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(mode(&app)).is_equal_to(VideoSettingsMode::Summary);
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::VideoSettings));
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `i` on the title row hands the keys to a text field, and the field keeps them: a
+    /// `j` typed there is a letter rather than a movement, which is the whole reason the
+    /// mode exists.
+    #[test]
+    fn the_video_title_field_should_swallow_the_movement_keys_while_it_is_open() {
+        // Arrange
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Title);
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::TitleEdit);
+        for letter in "jkG".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(letter)));
+        }
+
+        // Assert: the letters landed in the buffer and the cursor never moved.
+        let popup = app.video_settings_popup.as_ref().unwrap();
+        assert_that!(popup.title_input.value.as_str()).is_equal_to("jkG");
+        assert_that!(popup.field).is_equal_to(VideoSettingsField::Title);
+
+        // Act / Assert: `Enter` commits the typing and comes back to the summary.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let popup = app.video_settings_popup.as_ref().unwrap();
+        assert_that!(popup.mode).is_equal_to(VideoSettingsMode::Summary);
+        assert_that!(
+            app.effective_video_settings(0)
+                .and_then(|settings| settings.metadata.title)
+        )
+        .is_equal_to(Some("jkG".to_string()));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The language dropdown is the one video row with a search of its own, so its keys are
+    /// a third set again: `/` opens the field, the arrows move the list under it rather than
+    /// typing into it, and `Esc` drops the query without closing the dropdown.
+    #[test]
+    fn the_video_language_search_should_move_the_list_and_esc_should_only_drop_the_query() {
+        // Arrange
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Language);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::LanguageDropdown);
+
+        // Act: `/` then a query.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .is_active
+        )
+        .is_true();
+        for letter in "dut".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(letter)));
+        }
+
+        // Assert: the letters reached the query rather than the list — `d` is a delete key
+        // one layer up and must not be one here.
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_search
+                .value
+                .as_str()
+        )
+        .is_equal_to("dut");
+
+        // Act / Assert: the arrows and their control twins move the list while the field is
+        // open, which is what makes a search usable without leaving it.
+        let start = app.video_settings_popup.as_ref().unwrap().language_cursor;
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        let moved = app.video_settings_popup.as_ref().unwrap().language_cursor;
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(start);
+        handle_key(&mut app, &mut input, ctrl('n'));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(moved);
+        handle_key(&mut app, &mut input, ctrl('p'));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(start);
+
+        // Act / Assert: `Esc` clears the query and leaves the dropdown standing.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        let popup = app.video_settings_popup.as_ref().unwrap();
+        assert_that!(popup.language_search.value.as_str()).is_equal_to("");
+        assert_that!(popup.mode).is_equal_to(VideoSettingsMode::LanguageDropdown);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+S` is the one key that means the same thing everywhere, and the video popup is
+    /// where that is hardest to get right: it is spelled out separately in each of the five
+    /// modes, so a mode added or reshuffled can silently lose it.
+    #[test]
+    fn ctrl_s_should_reach_the_save_from_every_video_settings_mode() {
+        for mode in [
+            VideoSettingsMode::Summary,
+            VideoSettingsMode::Dropdown,
+            VideoSettingsMode::LanguageDropdown,
+            VideoSettingsMode::TitleEdit,
+        ] {
+            // Arrange: a staged change, so the save has something to ask about rather than
+            // reporting that nothing is edited.
+            let (mut app, directory) = video_settings_app();
+            let mut input = InputState::default();
+            focus_video_field(&mut app, VideoSettingsField::Commentary);
+            app.activate_video_settings();
+            app.video_settings_popup.as_mut().unwrap().mode = mode;
+
+            // Act
+            handle_key(&mut app, &mut input, ctrl('s'));
+
+            // Assert: the popup is gone and the save dialog stands in its place.
+            assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+
+            // Cleanup
+            drop(app);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// The custom resolution draft is a dialog inside a dropdown inside a popup, and the only
+    /// one whose text entry is detected by asking the draft rather than by reading a mode —
+    /// so `i` opening it, the letters reaching it, and `Esc` closing only the field are three
+    /// separate things that can each break on their own.
+    #[test]
+    fn the_custom_resolution_field_should_take_the_keys_and_esc_should_close_only_it() {
+        // Arrange: the resolution dropdown, on its custom entry.
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Resolution);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let custom = app
+            .resolution_choices(0)
+            .iter()
+            .position(|choice| choice.value == crate::app::ResolutionChoiceValue::Custom)
+            .expect("the resolution list should offer a custom entry");
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = custom;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::CustomResolution);
+
+        // Act: `i` opens the width field, which comes pre-filled with the source's own
+        // width — so the reader's first keys are the backspaces that clear it.
+        let draft = |app: &App| {
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .clone()
+                .expect("the draft is open")
+        };
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_that!(app.custom_resolution_input_active()).is_true();
+        assert_that!(draft(&app).width.value.as_str()).is_equal_to("1920");
+        for _ in 0..4 {
+            handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        }
+        for digit in "1280".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(digit)));
+        }
+
+        // Assert
+        assert_that!(draft(&app).width.value.as_str()).is_equal_to("1280");
+
+        // Act / Assert: `Esc` closes the field and leaves the draft standing, so the reader
+        // can move to the height rather than losing the width they just typed.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.custom_resolution_input_active()).is_false();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().mode)
+            .is_equal_to(VideoSettingsMode::CustomResolution);
+        assert_that!(draft(&app).width.value.as_str()).is_equal_to("1280");
+
+        // Act / Assert: and the draft's own movement keys work with no field open.
+        let field_before = draft(&app).field;
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(draft(&app).field).is_not_equal_to(field_before);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('k')));
+        assert_that!(draft(&app).field).is_equal_to(field_before);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Enter` out of the width field is not `Esc` out of it: it closes the field *and*
+    /// takes the draft's own `Enter`, which is what makes typing a size and pressing Enter
+    /// twice unnecessary.
+    #[test]
+    fn enter_in_the_custom_resolution_field_should_also_activate_the_draft() {
+        // Arrange
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Resolution);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let custom = app
+            .resolution_choices(0)
+            .iter()
+            .position(|choice| choice.value == crate::app::ResolutionChoiceValue::Custom)
+            .expect("the resolution list should offer a custom entry");
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = custom;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for _ in 0..4 {
+            handle_key(&mut app, &mut input, key(KeyCode::Backspace));
+        }
+        for digit in "640".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(digit)));
+        }
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert: the field is closed and the draft moved on rather than sitting there
+        // waiting for a second press.
+        assert_that!(app.custom_resolution_input_active()).is_false();
+        let draft = app
+            .video_settings_popup
+            .as_ref()
+            .unwrap()
+            .custom_resolution
+            .as_ref()
+            .expect("the draft is still open");
+        assert_that!(draft.width.value.as_str()).is_equal_to("640");
+        assert_that!(draft.width.is_active).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+S` from inside the custom resolution's *text field* still saves. It is the one
+    /// place the key has to be spelled out ahead of `handle_text_input_key`, or it would be
+    /// typed into the width instead.
+    #[test]
+    fn ctrl_s_should_save_from_inside_the_custom_resolution_field() {
+        // Arrange: a staged change plus the width field open.
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Commentary);
+        app.activate_video_settings();
+        focus_video_field(&mut app, VideoSettingsField::Resolution);
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        let custom = app
+            .resolution_choices(0)
+            .iter()
+            .position(|choice| choice.value == crate::app::ResolutionChoiceValue::Custom)
+            .expect("the resolution list should offer a custom entry");
+        app.video_settings_popup.as_mut().unwrap().resolution_cursor = custom;
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        assert_that!(app.custom_resolution_input_active()).is_true();
+
+        // Act
+        handle_key(&mut app, &mut input, ctrl('s'));
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmProcessAll));
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `r` puts the field under the cursor back to what the file says, and only that field.
+    /// It is bound in the video popup's summary and nowhere near the text modes, so this
+    /// pins the key rather than the reset — which `app.rs` covers on its own.
+    #[test]
+    fn r_should_reset_the_focused_video_field_and_leave_the_others_staged() {
+        // Arrange: two staged changes on one track.
+        let (mut app, directory) = video_settings_app();
+        let mut input = InputState::default();
+        focus_video_field(&mut app, VideoSettingsField::Commentary);
+        app.activate_video_settings();
+        focus_video_field(&mut app, VideoSettingsField::Title);
+        handle_key(&mut app, &mut input, key(KeyCode::Char('i')));
+        for letter in "Feature".chars() {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(letter)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(
+            app.effective_video_settings(0)
+                .and_then(|settings| settings.metadata.title)
+        )
+        .is_equal_to(Some("Feature".to_string()));
+
+        // Act: reset the title row only.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('r')));
+
+        // Assert: the title is back to the file's and the commentary flag survived it.
+        assert_that!(
+            app.effective_video_settings(0)
+                .and_then(|settings| settings.metadata.title)
+        )
+        .is_none();
+        assert_that!(
+            app.effective_video_settings(0)
+                .is_some_and(|settings| settings.metadata.commentary)
+        )
+        .is_true();
 
         // Cleanup
         drop(app);
