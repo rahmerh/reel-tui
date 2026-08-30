@@ -534,6 +534,7 @@ pub enum TextInputSite {
     CustomResolution,
     CueLength,
     FileSearch,
+    CueSearch,
     KeybindingsSearch,
 }
 
@@ -5090,6 +5091,16 @@ impl App {
                 if self.stop_playback() {
                     return true;
                 }
+                // A filter is the next layer down, for the reason a playback is the first:
+                // it is something on screen the reader may want gone without also losing
+                // the page. Ahead of the timing mode because it changes what is *drawn*,
+                // where the mode changes what the keys mean — and the mode is meant to
+                // survive everything else, since nudging a cue and looking at the result
+                // are the same piece of work.
+                if self.cue_search_has_query() {
+                    self.clear_cue_search();
+                    return true;
+                }
                 // The timeline cursor is deliberately *not* peeled here. The two panes are
                 // one page rather than a page and a page inside it, so a reader who moved
                 // the cursor down into the timeline is no deeper in than one who never did —
@@ -6260,6 +6271,15 @@ impl App {
         if self.dialog.is_none() && self.layer == Layer::Files && self.file_search.is_active {
             return Some(TextInputSite::FileSearch);
         }
+        if self.dialog.is_none()
+            && self.layer == Layer::SubtitleEdit
+            && self
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| state.cue_search().is_active)
+        {
+            return Some(TextInputSite::CueSearch);
+        }
         None
     }
 
@@ -6319,6 +6339,11 @@ impl App {
             TextInputSite::FileSearch => {
                 let config = self.file_search.config();
                 Some((&mut self.file_search.input, config))
+            }
+            TextInputSite::CueSearch => {
+                let search = self.subtitle_edit.as_mut()?.cue_search_mut();
+                let config = search.config();
+                Some((&mut search.input, config))
             }
             TextInputSite::KeybindingsSearch => {
                 let config = self.keybindings_search.config();
@@ -6380,6 +6405,18 @@ impl App {
                 }
             }
             TextInputSite::KeybindingsSearch => self.keybindings_scroll = 0,
+            // Rebuilding the projection is what makes the list narrow as the reader types,
+            // and it is what puts the cursor back on a row that is still drawn.
+            TextInputSite::CueSearch => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    if outcome == InputEdit::Exited {
+                        // Backspace off an empty query left the bar rather than abandoning
+                        // the search, so there is nothing to come back to any more.
+                        state.finish_cue_search();
+                    }
+                    state.refilter();
+                }
+            }
             TextInputSite::FileSearch => {
                 if outcome == InputEdit::Exited {
                     self.file_search_origin = None;
@@ -9437,6 +9474,67 @@ impl App {
         self.file_search_origin = None;
     }
 
+    /// Opens the cue panel's filter bar.
+    ///
+    /// Re-checks the layer for the reason [`Self::start_file_search`] does: a search that
+    /// opened somewhere with no cue list would leave the reader typing into a bar whose
+    /// results they cannot see.
+    ///
+    /// **From the timeline it brings the cursor home first.** A search picks a cue, and the
+    /// cue panel is the only pane that marks one — while the timeline holds the cursor no
+    /// cue is marked anywhere, so a match found from there would be a line nothing on
+    /// screen points at.
+    pub fn start_cue_search(&mut self) {
+        self.clear_text_input_reject();
+        if self.layer != Layer::SubtitleEdit {
+            return;
+        }
+        self.focus_cues();
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.start_cue_search();
+        }
+    }
+
+    /// Leaves the bar with the filter still in force, handing the keys back to the list.
+    pub fn finish_cue_search(&mut self) {
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.finish_cue_search();
+        }
+    }
+
+    /// Drops the filter and puts the cursor back where the search was opened.
+    pub fn cancel_cue_search(&mut self) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.cancel_cue_search();
+        }
+    }
+
+    /// Drops a filter left in force with the bar already closed, leaving the cursor alone.
+    pub fn clear_cue_search(&mut self) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.clear_cue_search();
+        }
+    }
+
+    /// Whether the cue panel's filter bar is taking keys, which is what routes typing into
+    /// it rather than into the page's movement keys.
+    pub fn cue_search_active(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.cue_search().is_active)
+    }
+
+    /// Whether the cue panel is filtered — which is what makes a back key clear the filter
+    /// rather than leave the page.
+    pub fn cue_search_has_query(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.cue_query().is_empty())
+    }
+
     pub fn cancel_file_search(&mut self) {
         let selected_path = self.selected_file().map(|file| file.path.clone());
         let original_path = self.file_search_origin.take();
@@ -11257,6 +11355,7 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+    use crate::cue::Cue;
 
     fn media(streams: serde_json::Value) -> MediaInfo {
         MediaInfo::from_json(serde_json::json!({"streams": streams})).unwrap()
@@ -19931,6 +20030,12 @@ mod tests {
                 app.dialog = None;
                 app.start_file_search();
             }
+            TextInputSite::CueSearch => {
+                app.subtitle_edit = Some(ready_edit_page(vec![test_cue(0, 1000, "first line")]));
+                app.layer = Layer::SubtitleEdit;
+                app.dialog = None;
+                app.start_cue_search();
+            }
             TextInputSite::KeybindingsSearch => {
                 app.dialog = Some(Dialog::Keybindings);
                 app.start_keybindings_search();
@@ -19938,7 +20043,7 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 11] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 12] = [
         TextInputSite::ContainerMetadata,
         TextInputSite::AudioTitle,
         TextInputSite::AudioLanguageSearch,
@@ -19949,8 +20054,45 @@ mod tests {
         TextInputSite::CustomResolution,
         TextInputSite::CueLength,
         TextInputSite::FileSearch,
+        TextInputSite::CueSearch,
         TextInputSite::KeybindingsSearch,
     ];
+
+    /// One cue, for the fixtures below.
+    fn test_cue(start: u64, end: u64, text: &str) -> Cue {
+        Cue {
+            index: 0,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            text: text.to_string(),
+            dialogue: Vec::new(),
+            events: 1,
+        }
+    }
+
+    /// A subtitle edit page with its cues already read, as a worker would have delivered
+    /// them — the state every test about the cue panel needs and the only one `App` cannot
+    /// reach without a real probe.
+    fn ready_edit_page(cues: Vec<Cue>) -> SubtitleEditState {
+        let mut state = SubtitleEditState::new(
+            1,
+            crate::preview::FrameSource {
+                media: PathBuf::from("/media/show.mkv"),
+                media_length: 4096,
+                media_modified: None,
+                pixels: (960, 540),
+                style: std::sync::Arc::new(crate::preview::CueStyle::SubRip),
+                workspace: PathBuf::from("/tmp/reel-tui-preview/cue-search"),
+            },
+            SubtitleSource::Embedded(2),
+            Duration::from_secs(600),
+            crate::subtitle_edit::PreviewSupport::Available,
+            12,
+            crate::subtitle_edit::PreviewWorkspace::new().unwrap(),
+        );
+        state.apply_prepared(cues, crate::preview::CueStyle::SubRip);
+        state
+    }
 
     #[test]
     fn every_text_input_site_should_resolve_to_its_own_config() {
@@ -19975,6 +20117,12 @@ mod tests {
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
                 TextInputSite::CueLength => TextInputConfig::CUE_LENGTH,
                 TextInputSite::FileSearch => app.file_search.config(),
+                TextInputSite::CueSearch => app
+                    .subtitle_edit
+                    .as_ref()
+                    .expect("the page is open")
+                    .cue_search()
+                    .config(),
                 TextInputSite::KeybindingsSearch => app.keybindings_search.config(),
             };
             let (_, config) = app.text_input_mut(site).expect("site should resolve");

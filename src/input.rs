@@ -977,6 +977,36 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         }
         return InputOutcome::Continue;
     }
+    // The cue panel's filter bar, the same shape the file list's takes above: while it is
+    // taking keys, everything that is not movement through the results is typing. `j` and
+    // `k` in particular are letters here, which is why the results are walked with the
+    // arrows and `Ctrl-n`/`Ctrl-p` — exactly as they are in the language dropdowns.
+    if app.layer == Layer::SubtitleEdit && app.cue_search_active() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                input.reset_sequence();
+                app.cancel_cue_search();
+            }
+            (KeyCode::Enter, _) => {
+                input.reset_sequence();
+                app.finish_cue_search();
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                input.reset_sequence();
+                app.select_next();
+            }
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                input.reset_sequence();
+                app.select_previous();
+            }
+            _ => {
+                if handle_text_input_key(app, key) {
+                    input.reset_sequence();
+                }
+            }
+        }
+        return InputOutcome::Continue;
+    }
     if is_back_key(key) {
         input.reset_sequence();
         if app.layer == Layer::Files && app.file_search_has_query() {
@@ -993,6 +1023,10 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char('/'), KeyModifiers::NONE) if app.layer == Layer::Files => {
             input.reset_sequence();
             app.start_file_search();
+        }
+        (KeyCode::Char('/'), KeyModifiers::NONE) if app.layer == Layer::SubtitleEdit => {
+            input.reset_sequence();
+            app.start_cue_search();
         }
         (KeyCode::Char('?'), _) => {
             input.reset_sequence();
@@ -4859,6 +4893,221 @@ mod tests {
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
         assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page, on a three-cue track, with the cue panel holding the cursor.
+    fn searchable_cue_page() -> (App, std::path::PathBuf, InputState) {
+        let (mut app, directory) = subtitle_track_app();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('c')));
+        let state = app.subtitle_edit.as_mut().expect("the page should be open");
+        state.apply_prepared(
+            ["alpha line", "bravo line", "charlie line"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| crate::cue::Cue {
+                    index,
+                    start: std::time::Duration::from_secs(index as u64 * 2),
+                    end: std::time::Duration::from_secs(index as u64 * 2 + 1),
+                    text: text.to_string(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                })
+                .collect(),
+            crate::preview::CueStyle::SubRip,
+        );
+        (app, directory, input)
+    }
+
+    #[test]
+    fn slash_should_open_the_cue_search_and_ordinary_keys_should_type_into_it() {
+        // Arrange
+        let (mut app, directory, mut input) = searchable_cue_page();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+
+        // Assert
+        assert_that!(app.cue_search_active()).is_true();
+
+        // Act: `j`, `d` and `t` are movement and editing keys on this page, and letters in
+        // the bar — which is why the results are walked with Ctrl-n and Ctrl-p instead.
+        for character in ['b', 'r', 'a', 'j', 'd', 't'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Assert: the whole word landed in the buffer, and none of it edited the track.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cue_search().value.as_str()).is_equal_to("brajdt");
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_should_walk_the_matches_while_the_bar_is_open() {
+        // Arrange: a query two of the three cues match.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ['l', 'i', 'n', 'e'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Act / Assert
+        handle_key(&mut app, &mut input, ctrl('n'));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Down));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
+        handle_key(&mut app, &mut input, ctrl('p'));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+        handle_key(&mut app, &mut input, key(KeyCode::Up));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+
+        // And the query was never touched by any of it.
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .cue_search()
+                .value
+                .as_str()
+        )
+        .is_equal_to("line");
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn enter_should_confirm_the_filter_and_hand_the_keys_back_to_the_list() {
+        // Arrange
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ['l', 'i', 'n', 'e'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Assert: the bar is closed but the filter stands, so `j` walks the results.
+        assert_that!(app.cue_search_active()).is_false();
+        assert_that!(app.cue_search_has_query()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn esc_should_abandon_the_search_then_the_filter_then_the_page() {
+        // Arrange: start from the last cue so abandoning has somewhere to come back to.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
+
+        // Act / Assert: the first Esc abandons the search outright.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ['a', 'l', 'p'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.cue_search_active()).is_false();
+        assert_that!(app.cue_search_has_query()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: a filter confirmed with Enter is peeled by the next Esc, and only
+        // the one after that leaves the page.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ['a', 'l', 'p'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert_that!(app.cue_search_has_query()).is_true();
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.cue_search_has_query()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_filter_should_be_peeled_before_the_timing_mode_and_after_a_playback() {
+        // Arrange: both the timing mode and a filter are on at once.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('t')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+        for character in ['a', 'l', 'p'] {
+            handle_key(&mut app, &mut input, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+
+        // Assert: the filter went and the mode stayed — nudging a cue and looking at the
+        // result are the same piece of work, so the mode outlives everything above it.
+        assert_that!(app.cue_search_has_query()).is_false();
+        assert_that!(app.timing_scope()).is_equal_to(subtitle_edit::TimingScope::Cue);
+
+        // Act / Assert: the next one takes the mode, and the one after leaves.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.timing_scope()).is_equal_to(subtitle_edit::TimingScope::Off);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn slash_from_the_timeline_should_bring_the_cursor_home_first() {
+        // Arrange: the cursor in the timeline, where no cue is marked anywhere.
+        let (mut app, directory, mut input) = searchable_cue_page();
+        handle_key(&mut app, &mut input, ctrl('j'));
+        assert_that!(app.timeline_focused()).is_true();
+
+        // Act
+        handle_key(&mut app, &mut input, key(KeyCode::Char('/')));
+
+        // Assert: a search picks a cue, and the cue panel is the only pane that marks one —
+        // a match found from the timeline would be a line nothing on screen points at.
+        assert_that!(app.timeline_focused()).is_false();
+        assert_that!(app.cue_search_active()).is_true();
+
+        // Cleanup
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cue_search_should_only_open_from_the_subtitle_edit_page() {
+        // Arrange: `/` on the track list is not a cue search, and `App::start_cue_search`
+        // re-checks the layer so both halves of the contract are covered rather than one
+        // guard in isolation.
+        let (mut app, directory, _) = searchable_cue_page();
+        app.layer = Layer::Streams;
+
+        // Act
+        app.start_cue_search();
+
+        // Assert
+        assert_that!(app.cue_search_active()).is_false();
 
         // Cleanup
         drop(app);

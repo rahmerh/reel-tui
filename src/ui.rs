@@ -28,7 +28,7 @@ use crate::{
     },
     cue::{
         Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_precise,
-        format_timestamp,
+        format_timestamp, match_ranges,
     },
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -180,6 +180,10 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // this field is otherwise drawn, so without carrying it onto the page's own status row
     // every refusal it raises is set and silently dropped.
     let notice = app.notice.clone();
+    // Why the last keystroke aimed at the cue panel's filter bar did not land, if it did
+    // not. Read here for the reason everything above it is: `App`'s accessors take the
+    // whole of it, and the page is borrowed mutably below.
+    let search_reject = app.text_input_reject(TextInputSite::CueSearch);
     let shift = match app.timing_scope() {
         TimingScope::Track => app
             .track_shift()
@@ -269,6 +273,9 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // selection at all. The page still has a `selected` underneath, which is what `Ctrl+K`
     // comes back to and what the timeline's window is fitted around.
     let selected = cursor.is_none().then_some(state.selected);
+    // Cloned out of the page before it is borrowed mutably below, for the reason the badge
+    // and the counts are: the panel needs the query at every level of its drawing.
+    let query = state.cue_query().to_string();
     render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
     render_edit_cues(
         frame,
@@ -277,8 +284,10 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
         CueMarks {
             edited: &edited,
             deleted: &deleted,
+            selected,
+            query: &query,
         },
-        selected,
+        search_reject,
     );
     render_edit_timeline(frame, state, shift, length, cursor, selected, rows[1]);
     if let Some((message, color)) = status {
@@ -597,7 +606,7 @@ fn render_edit_cues(
     state: &mut SubtitleEditState,
     area: Rect,
     marks: CueMarks,
-    selected: Option<usize>,
+    search_reject: Option<InputReject>,
 ) {
     // The same border the file list and the track list wear when they hold the cursor. Two
     // panes on this page now take keys, and without this there is nothing on screen saying
@@ -607,7 +616,7 @@ fn render_edit_cues(
     // two, which is why they arrive as one value: a filled block in an unfocused panel would
     // be a cursor in a pane that has none.
     let mut block = Block::bordered()
-        .border_style(focus_border(selected.is_some()))
+        .border_style(focus_border(marks.selected.is_some()))
         .title(" Cues ");
     // The background pass's count sits on this panel's border rather than on the status
     // row: it is a count of *these* rows' frames, and the status row carries one message at
@@ -636,14 +645,42 @@ fn render_edit_cues(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // **The bar is charged to this panel and to nothing else.** The page's status row at
+    // `rows[2]` comes out of the whole frame, so a bar put there would shrink the *preview*
+    // pane — and a preview resize drops the timeline cursor's frame and disturbs a span
+    // that is playing. Taken out of `inner`, no pane outside this border changes size, so
+    // opening a search cannot interrupt anything the reader is watching.
+    //
+    // Drawn while the bar is active *or* holds a query, the rule the file panel follows: a
+    // filter left in force with the bar closed still has to say what it is filtering by.
+    let (inner, bar) = if state.cue_search().is_active || !state.cue_query().is_empty() {
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
     state.cue_scroll(usize::from(inner.height));
 
-    let last = state.groups.len().saturating_sub(1);
+    let visible = state.visible_groups().to_vec();
+    let last = visible.len().saturating_sub(1);
     let timing = group_timing(&state.cues, inner.width / GROUP_COLUMNS as u16);
     let mut top = inner.y;
 
-    for (index, group) in state
-        .groups
+    // A filter matching nothing says so, rather than leaving the reader looking at an empty
+    // panel that reads the same as a track still loading. The same answer the subtitle
+    // settings popup gives a language search with no hits.
+    if visible.is_empty() && !marks.query.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching cues")
+                .centered()
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+    }
+
+    for (position, group) in visible
         .iter()
         .copied()
         .enumerate()
@@ -653,10 +690,9 @@ fn render_edit_cues(
         render_edit_group(
             frame,
             state,
-            group,
+            state.groups[group],
             timing,
             marks,
-            selected,
             Rect {
                 x: inner.x,
                 y: top,
@@ -665,14 +701,15 @@ fn render_edit_cues(
                 // loop to the groups that start inside the panel, so a height of zero here
                 // is unreachable — and a zero-height group draws nothing, where the
                 // subtraction underflowing would panic.
-                height: (state.group_height(index) as u16).min(inner.bottom().saturating_sub(top)),
+                height: (state.group_height(group) as u16).min(inner.bottom().saturating_sub(top)),
             },
         );
-        top += state.group_height(index) as u16;
+        top += state.group_height(group) as u16;
 
         // Between the rows rather than after each one: the arrow says "and then this", so
-        // the last group has nothing to point at.
-        if top < inner.bottom() && index < last {
+        // the last group has nothing to point at. Counted in *drawn* rows, so a filtered
+        // list does not hang an arrow off its own end.
+        if top < inner.bottom() && position < last {
             frame.render_widget(
                 Paragraph::new("↓")
                     .centered()
@@ -686,6 +723,11 @@ fn render_edit_cues(
             );
         }
         top += CUE_CONNECTOR_ROWS as u16;
+    }
+
+    if let Some(bar) = bar {
+        let line = search_line(state.cue_search_mut(), bar, search_reject);
+        frame.render_widget(Paragraph::new(line), bar);
     }
 }
 
@@ -715,7 +757,6 @@ fn render_edit_group(
     group: CueGroup,
     timing: GroupTiming,
     marks: CueMarks,
-    selected: Option<usize>,
     area: Rect,
 ) {
     // Fetched as one slice and matched on rather than indexed twice: `cues` is public and
@@ -731,12 +772,13 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            marks.at(first, selected),
+            marks.at(first),
             &format!(
                 " {} → {} ",
                 format_timestamp(cue.start),
                 format_timestamp(cue.end)
             ),
+            marks.query,
             area,
         );
         return;
@@ -777,8 +819,9 @@ fn render_edit_group(
         render_edit_cue(
             frame,
             cue,
-            marks.at(position, selected),
+            marks.at(position),
             &timing.title(cue),
+            marks.query,
             Rect {
                 x: area.x + if offset == 0 { 0 } else { left_width },
                 y,
@@ -886,7 +929,14 @@ fn render_edit_fork(
 /// how the row was built, so it is the one that gives way. At the sizes the panel is actually
 /// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
 /// fits, with the two titles' decorative spaces sharing the column where they meet.
-fn render_edit_cue(frame: &mut Frame, cue: &Cue, row: CueRowState, timing: &str, area: Rect) {
+fn render_edit_cue(
+    frame: &mut Frame,
+    cue: &Cue,
+    row: CueRowState,
+    timing: &str,
+    query: &str,
+    area: Rect,
+) {
     let selected = row.selected;
     let folded = (cue.events > 1)
         .then(|| format!(" ×{} ", cue.events))
@@ -933,10 +983,63 @@ fn render_edit_cue(frame: &mut Frame, cue: &Cue, row: CueRowState, timing: &str,
         &cue.text.replace('\n', " / "),
         usize::from(inner.width).saturating_sub(1).max(1),
     );
+    // Highlighted on the string that is about to be drawn rather than on `cue.text`, so
+    // what lights up is what the reader can actually see: the newline folding and the
+    // truncation both move where a match falls, and a match past the end of the row is one
+    // there is nothing to paint.
     frame.render_widget(
-        Paragraph::new(Line::styled(format!(" {text}"), row.text_style(text_style))),
+        Paragraph::new(Line::from(highlight_matches(
+            &format!(" {text}"),
+            query,
+            row.text_style(text_style),
+        ))),
         inner,
     );
+}
+
+/// Splits a row's words into spans so the part the search matched can be told apart.
+///
+/// **The match reverses the row's own style rather than taking a colour of its own.** This
+/// page already spends cyan on the selected cue, yellow on staged and retiming work, red on
+/// a cue marked to go, green on the timeline cursor and magenta on lane overflow; a sixth
+/// colour would have to stay legible against every one of them, and against the selected
+/// row's cyan fill in particular. Reversing is legible against each by construction, and it
+/// is the same move `CueRowState::text_style` already makes when the fill takes its colours
+/// away — a modifier is what survives there.
+///
+/// Returns the whole string as one span when nothing matches, which is every row of an
+/// unfiltered list, so the ordinary case allocates one span exactly as it did before.
+fn highlight_matches(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
+    let ranges = match_ranges(text, query);
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let lit = base.add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for range in ranges {
+        if range.start > at {
+            spans.push(Span::styled(
+                characters[at..range.start].iter().collect::<String>(),
+                base,
+            ));
+        }
+        spans.push(Span::styled(
+            characters[range.start..range.end]
+                .iter()
+                .collect::<String>(),
+            lit,
+        ));
+        at = range.end;
+    }
+    if at < characters.len() {
+        spans.push(Span::styled(
+            characters[at..].iter().collect::<String>(),
+            base,
+        ));
+    }
+    spans
 }
 
 /// What one cue row is saying about itself beyond its words.
@@ -993,18 +1096,29 @@ impl CueRowState {
     }
 }
 
-/// Which rows of the cue panel carry work that has not been written out, gathered so the two
-/// answers travel together down to the row that has to rank them.
+/// Everything the cue panel knows about its rows beyond the cues themselves: which have
+/// been rewritten, which are marked to go, which one is selected, and what the filter is
+/// matching.
+///
+/// Gathered into one value because all four are read at every level of the panel — the
+/// border counts the first two, the group needs the query to page onto a match, and the row
+/// has to rank all of them — and passing them one by one made every function between the
+/// panel and the row take an argument it only forwards.
 #[derive(Clone, Copy, Debug)]
 struct CueMarks<'a> {
     edited: &'a BTreeSet<usize>,
     deleted: &'a BTreeSet<usize>,
+    /// The cue the panel is marking, or `None` while the timeline holds the cursor — the
+    /// one value that decides both the focus border and whether any row is filled at all.
+    selected: Option<usize>,
+    /// What the panel is filtered by, trimmed, or empty when it is not filtered.
+    query: &'a str,
 }
 
 impl CueMarks<'_> {
-    fn at(self, position: usize, selected: Option<usize>) -> CueRowState {
+    fn at(self, position: usize) -> CueRowState {
         CueRowState {
-            selected: selected == Some(position),
+            selected: self.selected == Some(position),
             edited: self.edited.contains(&position),
             deleted: self.deleted.contains(&position),
         }
@@ -3187,7 +3301,11 @@ fn keybindings_text() -> Text<'static> {
     let mut lines = Vec::new();
     keybindings_section(&mut lines, "General");
     keybinding(&mut lines, "?", "Open or close keybindings");
-    keybinding(&mut lines, "/", "Search files, keybindings, or languages");
+    keybinding(
+        &mut lines,
+        "/",
+        "Search files, cues, keybindings, or languages",
+    );
     keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
     keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
     keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
@@ -3236,6 +3354,12 @@ fn keybindings_text() -> Text<'static> {
     // key it adds. It lives here because this popup is the only place the application
     // documents a key — see the no-inline-control-help rule in `AGENTS.md`.
     keybindings_section(&mut lines, "Subtitle editing");
+    keybinding(
+        &mut lines,
+        "/",
+        "Filter the cue list to the lines whose words match, with the match highlighted; \
+         Esc drops the filter",
+    );
     keybinding(
         &mut lines,
         "p",
@@ -3325,7 +3449,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "/",
-        "Search the file list, keybindings, or languages",
+        "Search the file list, the cue list, keybindings, or languages",
     );
     keybinding(&mut lines, "Left/Right", "Move the text cursor");
     keybinding(
@@ -14413,6 +14537,249 @@ mod tests {
         // Title-scoped: the first cue's times are still in the cue list beside it, which
         // is the whole reason the title names only the selection.
         assert_that!(screen.contains("Timeline (00:00:01.5")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn highlight_matches_should_return_one_span_when_nothing_matches() {
+        // Arrange
+        let base = Style::default().fg(Color::Gray);
+
+        // Act / Assert: the unfiltered list is every row, so the ordinary case has to cost
+        // exactly the one span it did before highlighting existed.
+        for query in ["", "   ", "absent"] {
+            let spans = highlight_matches(" hello there", query, base);
+            assert_that!(spans.len()).is_equal_to(1);
+            assert_that!(spans[0].content.as_ref()).is_equal_to(" hello there");
+            assert_that!(spans[0].style).is_equal_to(base);
+        }
+    }
+
+    #[test]
+    fn highlight_matches_should_reverse_only_the_matched_run() {
+        // Arrange
+        let base = Style::default().fg(Color::Gray);
+
+        // Act
+        let spans = highlight_matches(" say hello now", "hello", base);
+
+        // Assert: three spans, and only the middle one is lit — reversing the row's own
+        // style rather than taking a colour, so it stays legible on a selected, edited or
+        // deleted row alike.
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec![" say ", "hello", " now"]);
+        assert_that!(spans[0].style.add_modifier.contains(Modifier::REVERSED)).is_false();
+        assert_that!(spans[1].style.add_modifier.contains(Modifier::REVERSED)).is_true();
+        assert_that!(spans[1].style.fg).is_equal_to(Some(Color::Gray));
+        assert_that!(spans[2].style.add_modifier.contains(Modifier::REVERSED)).is_false();
+    }
+
+    #[test]
+    fn highlight_matches_should_light_every_occurrence_case_insensitively() {
+        // Arrange / Act
+        let spans = highlight_matches("cat CAT cat", "cAt", Style::default());
+
+        // Assert: five spans — three lit, two of separator — and the words keep the case
+        // the file gave them rather than the case that was typed.
+        let lit: Vec<&str> = spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_that!(lit).is_equal_to(vec!["cat", "CAT", "cat"]);
+        assert_that!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .as_str()
+        )
+        .is_equal_to("cat CAT cat");
+    }
+
+    #[test]
+    fn highlight_matches_should_keep_a_hit_that_runs_to_the_end_whole() {
+        // Arrange / Act: the trailing-remainder branch has nothing to add here, which is
+        // the case an off-by-one in it would silently drop.
+        let spans = highlight_matches("say hello", "hello", Style::default());
+
+        // Assert
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec!["say ", "hello"]);
+    }
+
+    #[test]
+    fn highlight_matches_should_survive_multi_byte_text() {
+        // Arrange / Act: every char before the hit is multi-byte, so a byte-sliced version
+        // would panic or cut a character in half.
+        let spans = highlight_matches("écoute — attends", "attends", Style::default());
+
+        // Assert
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec!["écoute — ", "attends"]);
+    }
+
+    #[test]
+    fn the_cue_panel_should_show_its_search_bar_only_while_it_is_filtering() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-bar",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+
+        // Act / Assert: nothing on screen before the key is pressed.
+        assert_that!(cue_panel(&mut app, 100, 24).join("\n")).does_not_contain("Search");
+
+        // Act: open it.
+        app.start_cue_search();
+
+        // Assert: the bar is drawn, and the count reads for an empty query.
+        assert_that!(cue_panel(&mut app, 100, 24).join("\n")).contains("Search");
+
+        // Act: type a query and close the bar with Enter.
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "bravo".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+        app.finish_cue_search();
+
+        // Assert: a filter left in force with the bar closed still says what it is
+        // filtering by, the rule the file panel follows.
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+        assert_that!(&panel).contains("Search");
+        assert_that!(&panel).contains("bravo");
+        assert_that!(&panel).does_not_contain("alpha");
+
+        // Act: drop the filter.
+        app.clear_cue_search();
+
+        // Assert
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+        assert_that!(&panel).does_not_contain("Search");
+        assert_that!(&panel).contains("alpha");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The bar is charged to the cue panel and to nothing else. Put on the page's status
+    /// row instead it would shrink the *preview* pane, and a preview resize drops the
+    /// timeline cursor's frame and disturbs a span that is playing — so opening a search
+    /// would interrupt whatever the reader was watching.
+    #[test]
+    fn the_search_bar_should_cost_the_cue_panel_a_row_and_the_preview_pane_none() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-height",
+            vec![
+                edit_cue(0, 1000, "alpha"),
+                edit_cue(2000, 3000, "bravo"),
+                edit_cue(4000, 5000, "charlie"),
+                edit_cue(6000, 7000, "delta"),
+            ],
+        );
+
+        // Act: measure the panel's capacity with the bar down and with it up, at a height
+        // where the four rows only just fit — so one row given up is one row lost.
+        let mut closed = 0;
+        let mut open = 0;
+        let mut pane_before = ratatui::layout::Size::new(0, 0);
+        let mut pane_after = ratatui::layout::Size::new(0, 0);
+        for height in 12..40 {
+            app.clear_cue_search();
+            draw(&mut app, 100, height);
+            let shut = app.subtitle_edit.as_ref().unwrap().list_rows;
+            let panes = app.subtitle_edit.as_ref().unwrap().preview_cells;
+            app.start_cue_search();
+            draw(&mut app, 100, height);
+            let up = app.subtitle_edit.as_ref().unwrap().list_rows;
+            if up < shut {
+                closed = shut;
+                open = up;
+                pane_before = panes;
+                pane_after = app.subtitle_edit.as_ref().unwrap().preview_cells;
+                break;
+            }
+        }
+
+        // Assert: the list gave up room and the preview pane did not.
+        assert_that!(closed).is_greater_than(0);
+        assert_that!(open).is_less_than(closed);
+        assert_that!(pane_after).is_equal_to(pane_before);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_matched_row_should_have_the_matching_words_reversed() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-highlight",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+        app.start_cue_search();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "rav".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+
+        // Act: read the cells rather than the text, since the highlight is a modifier.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lit: String = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .map(|cell| cell.symbol())
+            .collect();
+
+        // Assert: exactly the matched substring is reversed — not the whole row, and not
+        // the `b` and `o` around it.
+        assert_that!(lit.as_str()).is_equal_to("rav");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_should_say_so_rather_than_draw_an_empty_panel() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-empty",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+        app.start_cue_search();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "nothing here".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+
+        // Act
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+
+        // Assert: an empty panel reads the same as a track still loading, so the filter
+        // says which it is — and the bar's own count agrees with it.
+        assert_that!(&panel).contains("No matching cues");
+        assert_that!(&panel).contains("no matches");
+        assert_that!(&panel).does_not_contain("alpha");
 
         // Cleanup
         drop(app);

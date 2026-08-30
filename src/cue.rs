@@ -9,8 +9,58 @@
 //! what keeps the parser's many malformed-input branches testable as plain functions
 //! over string literals rather than through an application fixture.
 
+use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
+
+/// One lowercase `char` for every `char` of the input, so a position in the folded string
+/// is the same position in the original.
+///
+/// `str::to_lowercase` is the usual answer and is the wrong one here: it is allowed to
+/// change a string's length — German `ß`, Turkish `İ` — and a match found in a string of a
+/// different shape cannot be mapped back onto the words being drawn. Taking the first char
+/// of each mapping keeps the two aligned, at the cost of not folding the handful of
+/// expanding cases, which simply do not match rather than matching in the wrong place.
+///
+/// Shared by the cue panel's filter and its highlighter so the two cannot disagree about
+/// what a match is: a row shown as matching with nothing highlighted on it reads as a bug
+/// in the search.
+pub fn fold_case(text: &str) -> String {
+    text.chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect()
+}
+
+/// Where `query` matches `text`, case-insensitively, as ranges of **chars**.
+///
+/// Chars rather than bytes because the caller is slicing the string up to style parts of
+/// it differently, and subtitle text is routinely non-ASCII.
+///
+/// Non-overlapping and in order, scanning on past each hit so a repeated word is
+/// highlighted everywhere it appears. An empty query matches nothing at all, which is what
+/// makes "no filter" and "a filter matching everything" different things.
+pub fn match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+    let query = fold_case(query.trim());
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let haystack: Vec<char> = fold_case(text).chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    if needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at + needle.len() <= haystack.len() {
+        if haystack[at..at + needle.len()] == needle[..] {
+            ranges.push(at..at + needle.len());
+            at += needle.len();
+        } else {
+            at += 1;
+        }
+    }
+    ranges
+}
 
 /// One subtitle cue: a span of time and the text shown during it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1078,6 +1128,69 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn folding_case_should_keep_one_char_per_char_so_offsets_survive_it() {
+        // Arrange / Act / Assert: the whole point of this over `to_lowercase` is that a
+        // position in the answer is a position in the input, which is what lets a match
+        // found here be painted onto the words being drawn.
+        for text in ["Hello", "ÉCOUTE", "ÅNGSTRÖM", "ß", "İstanbul", ""] {
+            assert_eq!(
+                fold_case(text).chars().count(),
+                text.chars().count(),
+                "folding {text:?} changed how many chars it has"
+            );
+        }
+        assert_that!(fold_case("Hello").as_str()).is_equal_to("hello");
+        assert_that!(fold_case("ÉCOUTE").as_str()).is_equal_to("écoute");
+    }
+
+    #[test]
+    fn match_ranges_should_find_every_occurrence_case_insensitively() {
+        // Arrange / Act
+        let ranges = match_ranges("The cat sat on the CAT mat", "cat");
+
+        // Assert: both, in order, and as char ranges into the original.
+        assert_that!(ranges.clone()).is_equal_to(vec![4..7, 19..22]);
+        let text: Vec<char> = "The cat sat on the CAT mat".chars().collect();
+        assert_that!(text[19..22].iter().collect::<String>().as_str()).is_equal_to("CAT");
+    }
+
+    #[test]
+    fn match_ranges_should_not_overlap_a_hit_with_itself() {
+        // Arrange / Act: "aa" in "aaaa" is two matches, not three — a highlighter fed
+        // overlapping ranges would paint the same columns twice and slice past its own
+        // cursor.
+        let ranges = match_ranges("aaaa", "aa");
+
+        // Assert
+        assert_that!(ranges).is_equal_to(vec![0..2, 2..4]);
+    }
+
+    #[test]
+    fn match_ranges_should_answer_nothing_for_the_cases_that_cannot_match() {
+        // Arrange / Act / Assert: an empty query is "no filter" rather than "matches
+        // everything", a query longer than the text cannot fit, and a miss is a miss.
+        assert_that!(match_ranges("hello", "")).is_empty();
+        assert_that!(match_ranges("hello", "   ")).is_empty();
+        assert_that!(match_ranges("hi", "hello")).is_empty();
+        assert_that!(match_ranges("hello", "world")).is_empty();
+        assert_that!(match_ranges("", "x")).is_empty();
+    }
+
+    #[test]
+    fn match_ranges_should_count_in_chars_rather_than_bytes() {
+        // Arrange: every char before the hit is multi-byte, so a byte-counting version
+        // would report an offset the caller cannot slice a `char` vector by.
+        let ranges = match_ranges("écoute — attends", "attends");
+
+        // Assert
+        assert_that!(ranges.len()).is_equal_to(1);
+        assert_that!(ranges[0].start).is_equal_to(9);
+        assert_that!(ranges[0].end).is_equal_to(16);
+        let text: Vec<char> = "écoute — attends".chars().collect();
+        assert_that!(text[9..16].iter().collect::<String>().as_str()).is_equal_to("attends");
+    }
 
     fn milliseconds(value: u64) -> Duration {
         Duration::from_millis(value)
