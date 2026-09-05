@@ -172,7 +172,10 @@ fn parse_version_word(banner: &str, index: usize) -> Option<Version> {
 mod tests {
     use kernal::prelude::*;
 
-    use super::{MINIMUM_FFMPEG, RequirementError, Version, check_program, parse_version};
+    use super::{
+        MINIMUM_FFMPEG, RequirementError, Version, banner, check_ffmpeg_suite, check_program,
+        parse_version,
+    };
 
     #[test]
     fn parse_version_should_read_every_shape_distributions_ship() {
@@ -255,6 +258,31 @@ mod tests {
             program: "ffprobe",
             found: Version { major: 8, minor: 0 },
         }));
+    }
+
+    /// `check_program` is exercised above against banners written by hand; this is the
+    /// half that reads a real one. It is what runs at startup, so a machine that can build
+    /// this crate but not launch it would otherwise only find out by launching it — and
+    /// FFmpeg above the floor is a stated prerequisite of every suite here.
+    #[test]
+    fn the_startup_check_should_pass_against_the_ffmpeg_this_machine_actually_has() {
+        // Act / Assert
+        assert_that!(check_ffmpeg_suite()).is_ok();
+    }
+
+    /// The banner is read by running the program, so the two answers that matter are a
+    /// program that is there and one that is not: a missing binary has to come back as
+    /// `None` — which `check_program` turns into `Missing` — rather than as an empty
+    /// string that would then be reported as an unreadable version.
+    #[test]
+    fn the_banner_reader_should_answer_nothing_for_a_program_that_is_not_installed() {
+        // Act
+        let present = banner("ffprobe");
+        let absent = banner("reel-tui-no-such-program");
+
+        // Assert
+        assert_that!(present.as_deref().unwrap_or_default()).contains("ffprobe version");
+        assert_that!(absent).is_none();
     }
 
     #[test]

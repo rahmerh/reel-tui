@@ -19117,6 +19117,300 @@ mod tests {
         assert_that!(language.as_deref()).contains("nld");
     }
 
+    /// The tag on a track and the name Tesseract knows a language by are not the same
+    /// string: a container routinely says `en-GB` or `de` where Tesseract wants `eng` or
+    /// `deu`. Picking the wrong one is not a failure the user sees — the OCR simply reads
+    /// the subtitle against another language's model and produces plausible nonsense —
+    /// so every step of the walk down to a usable name is asserted here.
+    #[test]
+    fn the_ocr_language_should_translate_a_two_letter_tag_and_fall_back_in_order() {
+        // Arrange: a track tagged with a regional two-letter code, and a Tesseract that
+        // has only the three-letter names installed.
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+             "tags": {"language": "de-AT"}}
+        ])));
+        app.subtitle_capabilities.tesseract_languages = vec!["eng".to_string(), "deu".to_string()];
+
+        // Act / Assert: the region is dropped and the two-letter code translated.
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("deu");
+
+        // Act / Assert: a language nothing is installed for falls back to English, which
+        // is the one most subtitles this tool meets are actually in.
+        app.subtitle_capabilities.tesseract_languages = vec!["eng".to_string(), "jpn".to_string()];
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("eng");
+
+        // Act / Assert: and with no English either, the first installed language is used
+        // rather than nothing — an OCR run in the wrong language is still recoverable,
+        // where a refusal leaves the user with no way to start one at all.
+        app.subtitle_capabilities.tesseract_languages = vec!["kor".to_string()];
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("kor");
+
+        // Act / Assert: with nothing installed there is nothing to choose.
+        app.subtitle_capabilities.tesseract_languages.clear();
+        assert_that!(app.automatic_ocr_language(&SubtitleSource::Embedded(1))).is_none();
+    }
+
+    /// `gg` and `G` mean "the ends of whatever list I am in", and the video popup is five
+    /// lists wearing one dialog: the summary's rows, three dropdowns and the custom
+    /// resolution draft. Each keeps its own cursor, so an end key that moved the wrong one
+    /// would jump a list the reader cannot see and leave the one in front of them still.
+    /// `r` on a settings popup puts *one* row back to what the file says, and the whole
+    /// point of it being one row is that the rest of the reader's work survives. A reset
+    /// that dropped the neighbouring fields would be indistinguishable from `r` on the
+    /// track list, which is a different key with a confirm in front of it.
+    #[test]
+    fn resetting_one_subtitle_row_should_leave_the_others_staged() {
+        // Arrange: a track with a language, a title and two flags all staged away from
+        // what the file says.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng", "title": "Stored title"}}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+        let source = SubtitleSource::Embedded(1);
+        let mut staged = app.subtitle_metadata_for(&source).unwrap();
+        staged.language = "nld".to_string();
+        staged.title = Some("Typed title".to_string());
+        staged.forced = true;
+        staged.commentary = true;
+        app.store_subtitle_metadata(source.clone(), SubtitleFormat::SubRip, staged);
+
+        // Act: put the language row back, one row at a time.
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Language;
+        app.reset_focused_field();
+
+        // Assert: that row is the file's again and the other three are still the reader's.
+        let metadata = app.subtitle_metadata_for(&source).unwrap();
+        assert_that!(metadata.language.as_str()).is_equal_to("eng");
+        assert_that!(metadata.title.as_deref()).contains("Typed title");
+        assert_that!(metadata.forced).is_true();
+        assert_that!(metadata.commentary).is_true();
+
+        // Act / Assert: and each of the remaining rows answers for itself.
+        for (field, check) in [
+            (SubtitleSettingsField::Title, "title"),
+            (SubtitleSettingsField::Forced, "forced"),
+            (SubtitleSettingsField::Commentary, "commentary"),
+        ] {
+            app.subtitle_settings_popup.as_mut().unwrap().field = field;
+            app.reset_focused_field();
+            let metadata = app.subtitle_metadata_for(&source).unwrap();
+            match check {
+                "title" => {
+                    assert_that!(metadata.title.as_deref()).contains("Stored title");
+                }
+                "forced" => {
+                    assert_that!(metadata.forced).is_false();
+                }
+                _ => {
+                    assert_that!(metadata.commentary).is_false();
+                }
+            }
+        }
+
+        // Assert: with every row back to the file's answer, nothing is staged at all.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg` and `G` mean "the ends of whatever list I am in", and the video popup is five
+    /// lists wearing one dialog: the summary's rows, three dropdowns and the custom
+    /// resolution draft. Each keeps its own cursor, so an end key that moved the wrong one
+    /// would jump a list the reader cannot see and leave the one in front of them still.
+    #[test]
+    fn the_end_keys_should_move_whichever_of_the_video_popups_lists_is_open() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.selected_stream = 1;
+        app.open_video_settings();
+
+        // Act / Assert: the summary walks its own rows.
+        app.move_video_settings_to_endpoint(true);
+        let last = *app.visible_video_fields().last().unwrap();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field).is_equal_to(last);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(VideoSettingsField::Codec);
+
+        // Act / Assert: the rotation list is a fixed set, so its ends are its ends.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.field = VideoSettingsField::Rotation;
+        popup.mode = VideoSettingsMode::Dropdown;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().rotation_cursor)
+            .is_equal_to(VideoRotation::ALL.len() - 1);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().rotation_cursor).is_equal_to(0);
+
+        // Act / Assert: the resolution list skips the presets bigger than the source, so
+        // its far end is the last *enabled* row rather than the last row.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.field = VideoSettingsField::Resolution;
+        app.move_video_settings_to_endpoint(true);
+        let cursor = app.video_settings_popup.as_ref().unwrap().resolution_cursor;
+        assert!(
+            app.resolution_choices(0)[cursor].enabled,
+            "G should land on a choice that can be chosen"
+        );
+
+        // Act / Assert: the language list is long and filtered, so its end is counted from
+        // what is on screen rather than from every language there is.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.mode = VideoSettingsMode::LanguageDropdown;
+        app.move_video_settings_to_endpoint(true);
+        let languages = app.filtered_video_languages().len();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor)
+            .is_equal_to(languages - 1);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(0);
+
+        // Act / Assert: the custom resolution draft moves between its three rows, and its
+        // scaling list when that is open.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.mode = VideoSettingsMode::CustomResolution;
+        popup.custom_resolution = Some(CustomResolutionDraft {
+            width: TextInputState::new("1920".to_string()),
+            height: TextInputState::new("1080".to_string()),
+            scaling: crate::edit::CustomScaling::FitPad,
+            field: CustomResolutionField::Width,
+            scaling_cursor: 0,
+            scaling_dropdown_open: false,
+        });
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .field
+        )
+        .is_equal_to(CustomResolutionField::Scaling);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .field
+        )
+        .is_equal_to(CustomResolutionField::Width);
+
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.scaling_dropdown_open = true;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .scaling_cursor
+        )
+        .is_equal_to(CustomScaling::OPTIONS.len() - 1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The subtitle popup's two dropdowns are the same question one level down, and the
+    /// codec list is the one with disabled rows in it — a format this build has no tool
+    /// for cannot be landed on, or `G` would leave the cursor on a choice `Enter` refuses.
+    #[test]
+    fn the_end_keys_should_move_the_subtitle_popups_dropdowns_to_a_usable_row() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+        let source = app.subtitle_settings_popup.as_ref().unwrap().source.clone();
+        let source_format = app.subtitle_settings_popup.as_ref().unwrap().source_format;
+
+        // Act / Assert: the codec list lands on an enabled row at either end.
+        app.subtitle_settings_popup.as_mut().unwrap().mode = SubtitleSettingsMode::CodecDropdown;
+        for end in [true, false] {
+            app.move_subtitle_settings_to_endpoint(end);
+            let cursor = app.subtitle_settings_popup.as_ref().unwrap().codec_cursor;
+            assert!(
+                app.subtitle_choices(&source, source_format)[cursor].enabled,
+                "the {} of the codec list should be a choice that can be chosen",
+                if end { "far end" } else { "start" },
+            );
+        }
+
+        // Act / Assert: the language list has no disabled rows, so its ends are its ends.
+        app.subtitle_settings_popup.as_mut().unwrap().mode = SubtitleSettingsMode::LanguageDropdown;
+        app.move_subtitle_settings_to_endpoint(true);
+        let languages = app.filtered_subtitle_languages().len();
+        assert_that!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_cursor
+        )
+        .is_equal_to(languages - 1);
+        app.move_subtitle_settings_to_endpoint(false);
+        assert_that!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_cursor
+        )
+        .is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn video_resolution_cursor_should_skip_disabled_higher_presets() {
         // Arrange
