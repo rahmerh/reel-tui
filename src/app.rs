@@ -19168,6 +19168,97 @@ mod tests {
     /// lists wearing one dialog: the summary's rows, three dropdowns and the custom
     /// resolution draft. Each keeps its own cursor, so an end key that moved the wrong one
     /// would jump a list the reader cannot see and leave the one in front of them still.
+    /// `Ctrl+L` moves a subtitle out of the container and into a sidecar. A VobSub track
+    /// on a build with no seconv has nowhere to go — it cannot be written out as itself,
+    /// read into text, or turned into the other picture format — so every choice is
+    /// refused. The refusal has to say so: without it the key simply does nothing, which
+    /// reads as the export being broken rather than as this machine being unable to do it.
+    #[test]
+    fn exporting_a_vobsub_track_with_no_seconv_should_say_why_it_cannot() {
+        // Arrange: a VobSub track, and a build with neither seconv nor tesseract.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "dvd_subtitle",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities::default();
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+
+        // Act
+        let moved = app.transfer_subtitle(1);
+
+        // Assert: nothing is staged, and the notice names the obstacle.
+        assert_that!(moved).is_false();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(1))
+        )
+        .is_false();
+        let notice = app.notice.clone().expect("the refusal should say why");
+        assert_that!(notice.as_str()).contains("Cannot export");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The reset confirm is the one dialog in the application whose answer cannot be
+    /// undone, and `r` and `R` reach it at three different scales. Its title is the only
+    /// thing on screen saying which of the three the reader is about to take, so the file
+    /// scale names the file rather than saying "this file" like the other two.
+    #[test]
+    fn the_reset_confirm_should_name_the_scale_it_is_about_to_discard() {
+        // Act / Assert
+        assert_that!(ResetScope::File(PathBuf::from("/media/movie.mkv")).label())
+            .is_equal_to("Reset movie.mkv?".to_string());
+        assert_that!(ResetScope::CurrentFile.label())
+            .is_equal_to("Reset this file's edits?".to_string());
+        assert_that!(ResetScope::AllFiles.label())
+            .is_equal_to("Reset every staged file?".to_string());
+
+        // Assert: a path with no file name at all still asks a question, rather than
+        // asking the reader to confirm an empty one.
+        assert_that!(ResetScope::File(PathBuf::from("/")).label())
+            .is_equal_to("Reset this file?".to_string());
+    }
+
+    /// A conflict warning names the codec that will not fit the chosen container, and the
+    /// name FFmpeg uses for it is not the name it is known by — `hdmv_pgs_subtitle` and
+    /// `dvd_subtitle` in particular tell the reader nothing. Anything unrecognised is
+    /// upper-cased rather than dropped, so a codec this table has not met still names
+    /// itself in the warning.
+    #[test]
+    fn a_conflict_warning_should_use_the_codecs_common_name() {
+        // Act / Assert
+        for (codec, expected) in [
+            ("subrip", "SubRip/SRT"),
+            ("ass", "ASS"),
+            ("webvtt", "WebVTT"),
+            ("mov_text", "MOV Text"),
+            ("hdmv_pgs_subtitle", "PGS"),
+            ("dvd_subtitle", "VobSub"),
+            ("h264", "H.264"),
+            ("hevc", "HEVC/H.265"),
+            ("av1", "AV1"),
+            ("vp8", "VP8"),
+            ("vp9", "VP9"),
+            ("theora", "THEORA"),
+        ] {
+            assert_that!(warning_codec_label(codec)).is_equal_to(expected.to_string());
+        }
+
+        // Assert: ffprobe's casing is not guaranteed, so the lookup folds it first.
+        assert_that!(warning_codec_label("HDMV_PGS_SUBTITLE")).is_equal_to("PGS".to_string());
+    }
+
     /// `r` on a settings popup puts *one* row back to what the file says, and the whole
     /// point of it being one row is that the rest of the reader's work survives. A reset
     /// that dropped the neighbouring fields would be indistinguishable from `r` on the
