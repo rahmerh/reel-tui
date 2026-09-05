@@ -4240,7 +4240,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                 app.default_streams.contains(&popup.stream_index),
                 selected(field),
                 changed(field),
-                None,
             )),
             field => {
                 let checked = field
@@ -4251,7 +4250,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     checked,
                     selected(field),
                     changed(field),
-                    None,
                 ));
             }
         }
@@ -4505,14 +4503,12 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                 app.default_streams.contains(&popup.stream_index),
                 selected(field),
                 changed(field),
-                None,
             )),
             VideoSettingsField::Commentary => lines.push(subtitle_checkbox_line(
                 field.label(),
                 settings.metadata.commentary,
                 selected(field),
                 changed(field),
-                None,
             )),
         }
     }
@@ -4777,10 +4773,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             )
             .selected(selected(SubtitleSettingsField::Title))
             .changed(changed(SubtitleSettingsField::Title))
-            .reason(
-                app.subtitle_field_reason(SubtitleSettingsField::Title)
-                    .as_deref(),
-            )
             .reject(app.text_input_reject(TextInputSite::SubtitleTitle)),
         ));
     }
@@ -4832,7 +4824,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                     checked,
                     selected(field),
                     changed(field),
-                    app.subtitle_field_reason(field).as_deref(),
                 ));
             }
         }
@@ -5014,13 +5005,6 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
     if let Some(context) = context {
         paragraphs.push((context, Style::default().fg(Color::Gray)));
     }
-    if let Some(reason) = app.subtitle_field_reason(popup.field) {
-        paragraphs.push((
-            format!("Unavailable: {reason}"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
     help_paragraphs(paragraphs)
 }
 
@@ -5160,8 +5144,6 @@ struct TextField<'a> {
     chrome: FieldChrome,
     /// Trailing dim text, such as a match count.
     suffix: Option<String>,
-    /// Why the field is unavailable; also renders it disabled.
-    reason: Option<&'a str>,
     /// Why the last keystroke did not land, if it did not.
     reject: Option<InputReject>,
 }
@@ -5176,7 +5158,6 @@ impl<'a> TextField<'a> {
             changed: false,
             chrome: FieldChrome::Row,
             suffix: None,
-            reason: None,
             reject: None,
         }
     }
@@ -5198,11 +5179,6 @@ impl<'a> TextField<'a> {
 
     fn suffix(mut self, suffix: String) -> Self {
         self.suffix = Some(suffix);
-        self
-    }
-
-    fn reason(mut self, reason: Option<&'a str>) -> Self {
-        self.reason = reason;
         self
     }
 
@@ -5275,16 +5251,12 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         changed,
         chrome,
         suffix,
-        reason,
         reject,
     } = field;
-    let enabled = reason.is_none();
     let editing = matches!(&value, FieldValue::Editing(input) if input.is_active);
     let reject = reject.filter(|_| editing);
 
-    let mut value_style = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else if changed {
+    let mut value_style = if changed {
         changed_style()
     } else {
         Style::default().fg(Color::White)
@@ -5333,7 +5305,7 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
     let label_style = Style::default().fg(if selected { Color::Cyan } else { Color::Gray });
     let mut frame_style = if reject.is_some() {
         Style::default().fg(Color::Red).bold()
-    } else if selected && enabled {
+    } else if selected {
         Style::default().fg(Color::Cyan).bold()
     } else {
         Style::default().fg(Color::DarkGray)
@@ -5386,12 +5358,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
     if let Some(suffix) = suffix {
         spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
     }
-    if let Some(reason) = reason {
-        spans.push(Span::styled(
-            format!("  {reason}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
     if let Some(reject) = reject {
         spans.push(Span::styled(
             format!("  {}", reject_message(reject)),
@@ -5421,33 +5387,22 @@ fn subtitle_checkbox_line(
     checked: bool,
     selected: bool,
     changed: bool,
-    reason: Option<&str>,
 ) -> Line<'static> {
-    let enabled = reason.is_none() || checked;
-    let box_style = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else if selected {
+    let box_style = if selected {
         focused_style(changed)
     } else if changed {
         changed_style()
     } else {
         Style::default().fg(Color::White)
     };
-    let mut spans = vec![
+    Line::from(vec![
         field_label_span(
             "",
             label,
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(if checked { "[x]" } else { "[ ]" }, box_style),
-    ];
-    if let Some(reason) = reason {
-        spans.push(Span::styled(
-            format!("  {reason}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    ])
 }
 
 fn setting_line(
@@ -6999,6 +6954,80 @@ mod tests {
         assert_that!(&text).contains("running.mkv");
         assert_that!(&text).contains("done.mkv");
         assert_that!(&text).contains("stopped.mkv");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file that failed is the one row in the batch worth reading, so it says what went
+    /// wrong rather than showing a gauge — a bar at any percentage would be describing
+    /// progress on something that has stopped.
+    #[test]
+    fn a_failed_file_should_say_why_instead_of_drawing_a_gauge() {
+        // Arrange: one failure, and one running file with no label of its own so the
+        // fallback that names it after the file is drawn too.
+        let (mut app, directory) = test_app("batch-failure", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![
+                crate::staging::BatchItem {
+                    path: app.directory.join("broken.mkv"),
+                    label: Some("Saving".to_string()),
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Failed("muxer refused".to_string()),
+                    output_path: None,
+                },
+                crate::staging::BatchItem {
+                    path: app.directory.join("working.mkv"),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Running,
+                    output_path: None,
+                },
+            ],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert: the failure names itself and its reason, and draws no gauge under it —
+        // a bar for work that has stopped would report progress that cannot happen.
+        assert_that!(&text).contains("broken.mkv Failed: muxer refused");
+
+        // Assert: and a running file with no label of its own falls back to a word, so the
+        // row is never a bare filename with nothing said about it.
+        assert_that!(&text).contains("working.mkv Processing");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The single-file box has one label line, and a phase that has not reported yet
+    /// leaves it empty. A blank line in the middle of a modal box reads as the save having
+    /// stalled, so the file being worked on names itself until a real phase arrives.
+    #[test]
+    fn a_save_with_no_phase_yet_should_name_the_file_it_is_working_on() {
+        // Arrange: one item, no label — the state a save is in between dispatch and the
+        // first progress report.
+        let (mut app, directory) = test_app("progress-label", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: app.directory.join("movie.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&text).contains("Processing movie.mkv");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -8651,6 +8680,57 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The side-by-side layout draws each column from whichever kind of row landed in it, so
+    /// a transfer puts an embedded stream in the *external* column and a sidecar in the
+    /// *embedded* one. Those two arms are the crossed-over pair, and they are exactly the
+    /// ones an untransferred file never reaches — so a layout that drew them wrongly, or not
+    /// at all, would look perfect on every file nobody has staged a transfer on.
+    #[test]
+    fn the_side_by_side_columns_should_draw_a_track_that_has_crossed_over() {
+        // Arrange: an embedded subtitle marked for export and a sidecar marked for import.
+        let (mut app, directory) = probed_app("overview-transfer-columns");
+        select_track(&mut app, TrackRef::Embedded(2));
+        assert!(app.transfer_subtitle(1), "export should be accepted");
+        select_track(&mut app, TrackRef::Sidecar(0));
+        assert!(app.transfer_subtitle(-1), "import should be accepted");
+
+        // Act: the side-by-side layout, with the cursor on the sidecar that crossed over so
+        // the selected-row arm is taken on that side too.
+        let (lines, selected) = overview(&app, true);
+        let joined = lines.join("\n");
+
+        // Assert: both counts held, since one track went each way.
+        assert_that!(joined.as_str()).contains("Embedded subtitles (2)");
+        assert_that!(joined.as_str()).contains("External subtitles (2)");
+
+        // Assert: the exported track is still drawn — it carries a `#index`, which a sidecar
+        // never does, so finding it at all is finding it in the external column.
+        assert!(
+            joined.contains("#2"),
+            "the exported track should still be drawn in the column it moved to:\n{joined}",
+        );
+
+        // Assert: and the cursor's own row reports a line, or the details pane would have
+        // nothing to scroll to for a track that has crossed over.
+        assert!(
+            selected.is_some(),
+            "a transferred track under the cursor should report its line:\n{joined}",
+        );
+
+        // Act / Assert: the same with the cursor on the exported embedded track, which is the
+        // other crossed-over arm's selected case.
+        let mut app = app;
+        select_track(&mut app, TrackRef::Embedded(2));
+        let (lines, selected) = overview(&app, true);
+        assert!(
+            selected.is_some(),
+            "the exported track should report its line too:\n{}",
+            lines.join("\n"),
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn overview_should_reach_the_same_tracks_stacked_as_side_by_side() {
         // Arrange
@@ -9496,6 +9576,86 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The popup's title is how the reader knows which subtitle they are editing, and the
+    /// two sources are named differently because only one of them has a number: an
+    /// embedded track is a stream in the file, while a sidecar is a file of its own and is
+    /// called by its name on disk.
+    #[test]
+    fn the_subtitle_popup_should_name_a_sidecar_by_its_file_and_a_track_by_its_number() {
+        // Arrange
+        let (mut app, directory) = test_app("subtitle-popup-title", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.container_target = Some(ContainerFormat::Matroska);
+        let sidecar_path = directory.join("movie.eng.srt");
+        app.sidecars.push(SidecarEntry {
+            path: sidecar_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        });
+        let popup = |source, field, help_visible| SubtitleSettingsPopup {
+            source,
+            source_format: SubtitleFormat::SubRip,
+            field,
+            mode: SubtitleSettingsMode::Summary,
+            help_visible,
+            codec_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
+        };
+
+        // Act: a sidecar-sourced popup.
+        app.subtitle_settings_popup = Some(popup(
+            SubtitleSource::Sidecar(sidecar_path),
+            SubtitleSettingsField::Language,
+            false,
+        ));
+        let sidecar = drawn(100, 30, |frame| {
+            render_subtitle_settings_dialog(frame, &app)
+        });
+
+        // Assert: the file names the dialog, rather than a stream number it does not have.
+        assert_that!(&sidecar).contains("movie.eng.srt");
+        assert!(
+            !sidecar.contains("Subtitle track #"),
+            "a sidecar is not a track in the file: {sidecar}"
+        );
+
+        // Act: the same popup over the embedded track.
+        app.subtitle_settings_popup = Some(popup(
+            SubtitleSource::Embedded(1),
+            SubtitleSettingsField::Language,
+            false,
+        ));
+        let embedded = drawn(100, 30, |frame| {
+            render_subtitle_settings_dialog(frame, &app)
+        });
+
+        // Assert: the stream number names this one.
+        assert_that!(&embedded).contains("Subtitle track #1");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn subtitle_field_help_should_change_with_the_field_and_explain_sidecar_effects() {
         let (mut app, directory) = test_app("subtitle-field-help", &[]);
@@ -9612,6 +9772,51 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(!content_local.contains("[Network Mode]"));
+    }
+
+    /// A notice takes the whole footer row, which is the point: it is what the application
+    /// has to say about the key just pressed, and the status furniture it displaces is
+    /// unchanging and will still be there a moment later.
+    #[test]
+    fn a_notice_should_take_the_footer_rather_than_share_it() {
+        // Arrange
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
+        app.is_network_mount = true;
+        app.notice = Some("Unmark this track for deletion first.".to_string());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_footer(frame, &app, frame.area()))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        // Assert
+        assert!(
+            content.contains("Unmark this track for deletion first."),
+            "the notice should be on the row: {content}",
+        );
+        assert!(
+            !content.contains("[Network Mode]"),
+            "and it should have the row to itself: {content}",
+        );
     }
 
     #[test]
@@ -11663,6 +11868,59 @@ mod tests {
             .is_equal_to("1920×1080 · 16:9 · 1080p");
     }
 
+    /// The `i` panel is where a user decides whether a file is worth keeping, and a codec
+    /// is most of that decision. A name FFmpeg happens to use (`hevc`, `mpeg2video`) is
+    /// not the name the format is known by, so each is translated; anything unrecognised
+    /// is upper-cased rather than dropped, so a codec added to FFmpeg later still names
+    /// itself here.
+    #[test]
+    fn video_codec_descriptions_should_name_the_format_rather_than_ffmpegs_word_for_it() {
+        // Arrange
+        let stream = |codec: &str| BTreeMap::from([("codec_name".to_string(), Value::from(codec))]);
+
+        // Act / Assert
+        for (codec, expected) in [
+            ("h264", "H.264 (AVC)"),
+            ("hevc", "HEVC (H.265)"),
+            ("av1", "AV1"),
+            ("vp9", "VP9"),
+            ("vp8", "VP8"),
+            ("mpeg4", "MPEG-4 Visual"),
+            ("mpeg2video", "MPEG-2 Video"),
+            ("prores", "Apple ProRes"),
+            ("mjpeg", "Motion JPEG"),
+            ("unknown", "Unknown"),
+            ("theora", "THEORA"),
+        ] {
+            assert_that!(video_format_description(&stream(codec)))
+                .is_equal_to(expected.to_string());
+        }
+        // A stream with no codec at all still describes itself.
+        assert_that!(video_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
+    }
+
+    /// Whether a file is HDR decides whether it is worth re-encoding, and the answer is
+    /// carried by the transfer characteristic rather than by anything named "HDR". A
+    /// transfer this code does not recognise says nothing at all, which is better than
+    /// guessing SDR for a file that is not.
+    #[test]
+    fn dynamic_range_should_be_read_off_the_transfer_characteristic() {
+        // Arrange
+        let stream = |transfer: &str| {
+            BTreeMap::from([("color_transfer".to_string(), Value::from(transfer))])
+        };
+
+        // Act / Assert
+        assert_that!(video_dynamic_range(&stream("smpte2084"))).is_equal_to(Some("HDR10".into()));
+        assert_that!(video_dynamic_range(&stream("arib-std-b67")))
+            .is_equal_to(Some("HLG HDR".into()));
+        for transfer in ["bt709", "gamma22", "gamma28", "smpte170m", "bt470bg"] {
+            assert_that!(video_dynamic_range(&stream(transfer))).is_equal_to(Some("SDR".into()));
+        }
+        assert_that!(video_dynamic_range(&stream("log316"))).is_equal_to(None);
+        assert_that!(video_dynamic_range(&BTreeMap::new())).is_equal_to(None);
+    }
+
     #[test]
     fn audio_codec_descriptions_should_cover_the_pcm_family_and_fall_back_in_caps() {
         // Arrange / Act / Assert: PCM arrives under many codec names (`pcm_s16le`,
@@ -11677,8 +11935,16 @@ mod tests {
         // An unrecognised codec is upper-cased rather than dropped.
         assert_that!(audio_format_description(&stream("nellymoser")))
             .is_equal_to("NELLYMOSER".to_string());
-        assert_that!(audio_format_description(&stream("flac")))
-            .is_equal_to("FLAC · Lossless".to_string());
+        for (codec, expected) in [
+            ("flac", "FLAC · Lossless"),
+            ("alac", "ALAC · Lossless"),
+            ("opus", "Opus"),
+            ("vorbis", "Vorbis"),
+            ("mp3", "MP3"),
+        ] {
+            assert_that!(audio_format_description(&stream(codec)))
+                .is_equal_to(expected.to_string());
+        }
         // A stream with no codec at all still describes itself.
         assert_that!(audio_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
     }
@@ -12434,7 +12700,7 @@ mod tests {
             "Original",
             "Commentary",
         ] {
-            let line = subtitle_checkbox_line(label, false, false, false, None);
+            let line = subtitle_checkbox_line(label, false, false, false);
 
             assert_eq!(
                 line.to_string().chars().position(|glyph| glyph == '['),
@@ -12452,7 +12718,7 @@ mod tests {
         let rows = [
             setting_line("Codec", "SubRip / SRT", false, false, false),
             setting_line("Hearing impaired", "value", false, false, true),
-            subtitle_checkbox_line("Hearing impaired", true, false, false, None),
+            subtitle_checkbox_line("Hearing impaired", true, false, false),
             text_field_line(TextField::new(
                 "Title",
                 FieldValue::Editing(&input),
@@ -12705,7 +12971,7 @@ mod tests {
                 )
                 .suffix(match_suffix(999)),
             ),
-            subtitle_checkbox_line("Hearing impaired", false, false, false, None),
+            subtitle_checkbox_line("Hearing impaired", false, false, false),
         ];
 
         // Assert: nothing wraps, which would desynchronise the popup's line-based
@@ -12926,6 +13192,72 @@ mod tests {
                 render_preview_settings_dialog(frame, &app)
             });
         }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The video popup has three lists and they are not the same shape: Resolution and
+    /// Rotation are plain dropdowns, while Language carries a search field of its own and
+    /// draws a ten-row window around its cursor rather than every language there is. A
+    /// list that drew nothing under its own row would leave the reader pressing `j`
+    /// against a summary that never changes.
+    #[test]
+    fn each_of_the_video_popups_lists_should_draw_under_the_row_it_belongs_to() {
+        // Arrange
+        let (mut app, directory) = test_app("video-lists", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{
+                    "index": 0, "codec_type": "video", "codec_name": "h264",
+                    "width": 1920, "height": 1080
+                }]
+            }))
+            .unwrap(),
+        ));
+        let popup = |field, mode| crate::app::VideoSettingsPopup {
+            stream_index: 0,
+            field,
+            mode,
+            codec_cursor: 0,
+            resolution_cursor: 1,
+            rotation_cursor: 0,
+            custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
+        };
+
+        // Act: the resolution list, expanded.
+        app.video_settings_popup = Some(popup(
+            VideoSettingsField::Resolution,
+            VideoSettingsMode::Dropdown,
+        ));
+        let resolutions = drawn(80, 24, |frame| render_video_settings_dialog(frame, &app));
+
+        // Assert: the choices are drawn, including the one the cursor is on.
+        assert_that!(&resolutions).contains("Resolution");
+        assert_that!(&resolutions).contains("1280×720 / 16:9");
+        assert_that!(&resolutions).contains("Custom");
+
+        // Act: the language list, which is a search field plus a ten-row window around the
+        // cursor. The cursor is put well down the list so the window really is a window.
+        let mut language_popup = popup(
+            VideoSettingsField::Language,
+            VideoSettingsMode::LanguageDropdown,
+        );
+        language_popup.language_cursor = 20;
+        app.video_settings_popup = Some(language_popup);
+        let languages = drawn(80, 24, |frame| render_video_settings_dialog(frame, &app));
+
+        // Assert: the field the query is typed into is on screen with its count, and the
+        // list is the stretch around the cursor rather than the head of the alphabet.
+        assert_that!(&languages).contains("Search");
+        assert_that!(&languages).contains("(185 matches)");
+        assert!(
+            !languages.contains("Abkhazian"),
+            "the window should have scrolled past the first language: {languages}"
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -17020,5 +17352,139 @@ mod tests {
         // Cleanup
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pixel format is the fallback answer to "how many bits per sample", used whenever the
+    /// stream does not state `bits_per_raw_sample`. The high-depth formats are found by
+    /// substring and the ordinary ones by an exact list, and it is that list — the common
+    /// case, every 8-bit video ever probed — that had only one of its entries exercised.
+    #[test]
+    fn video_bit_depth_should_read_every_ordinary_pixel_format_as_eight_bits() {
+        for format in [
+            "yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "nv12", "nv21",
+            "rgb24", "bgr24", "rgba", "bgra", "gray",
+        ] {
+            let stream = stream_of(serde_json::json!({"pix_fmt": format}));
+            assert_eq!(
+                video_bit_depth(&stream),
+                Some(8),
+                "{format} should read as 8-bit"
+            );
+        }
+
+        // And the two answers that are not eight: a stated depth wins outright, a marker in
+        // the name is read when nothing is stated, and an unrecognised format answers with
+        // nothing rather than guessing.
+        assert_eq!(
+            video_bit_depth(&stream_of(
+                serde_json::json!({"pix_fmt": "yuv420p", "bits_per_raw_sample": "10"})
+            )),
+            Some(10),
+        );
+        assert_eq!(
+            video_bit_depth(&stream_of(serde_json::json!({"pix_fmt": "yuv420p12le"}))),
+            Some(12),
+        );
+        assert_eq!(
+            video_bit_depth(&stream_of(serde_json::json!({"pix_fmt": "xyz"}))),
+            None,
+        );
+        assert_eq!(video_bit_depth(&stream_of(serde_json::json!({}))), None);
+    }
+
+    /// Every rejected keystroke has to say why in the field's own words, since the character
+    /// the reader typed is already gone from the screen and silence there is indistinguishable
+    /// from a field that is broken.
+    #[test]
+    fn reject_message_should_name_the_rule_the_keystroke_broke() {
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Digits)),
+            "digits only"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Word)),
+            "no spaces"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Text)),
+            "unsupported character"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Timecode)),
+            "digits, : and . only"
+        );
+        assert_eq!(reject_message(InputReject::Full(32)), "32 character limit");
+    }
+
+    /// A subtitle track whose codec no `SubtitleFormat` covers still has to be named on the
+    /// details pane. Closed captions get their standard's own name, an unnamed codec says so,
+    /// and anything else is shown as the codec — upper-cased, since a bare `dvb_teletext` in
+    /// a column of proper names reads as a bug.
+    #[test]
+    fn subtitle_information_format_should_name_a_codec_no_format_covers() {
+        assert_eq!(
+            subtitle_information_format(Some(SubtitleFormat::SubRip), "subrip"),
+            "SubRip (SRT)"
+        );
+        assert_eq!(
+            subtitle_information_format(None, "eia_608"),
+            "CEA-608 Closed Captions"
+        );
+        assert_eq!(
+            subtitle_information_format(None, "eia_708"),
+            "CEA-708 Closed Captions"
+        );
+        assert_eq!(subtitle_information_format(None, "unknown"), "Unknown");
+        assert_eq!(
+            subtitle_information_format(None, "dvb_teletext"),
+            "DVB_TELETEXT"
+        );
+    }
+
+    /// The container is named from the file's extension where that is recognised and from
+    /// what ffprobe called it otherwise — and the two are combined only when they disagree,
+    /// so an ordinary MKV is not labelled `Matroska (matroska)`.
+    #[test]
+    fn container_format_description_should_fall_back_to_what_ffprobe_called_it() {
+        let info = |format: serde_json::Value| {
+            crate::probe::MediaInfo::from_json(serde_json::json!({
+                "format": format,
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap()
+        };
+
+        // A recognised extension and a probe name that says something else: both.
+        let described = container_format_description(
+            &info(serde_json::json!({"format_long_name": "Matroska / WebM"})),
+            Path::new("/tmp/clip.mkv"),
+        );
+        assert!(
+            described.contains("Matroska / WebM"),
+            "an extension and a probe name that disagree should give both: {described}",
+        );
+
+        // A recognised extension and no probe name at all: the extension's own label.
+        assert_eq!(
+            container_format_description(&info(serde_json::json!({})), Path::new("/tmp/clip.mkv")),
+            crate::edit::ContainerFormat::Matroska.label(),
+        );
+
+        // An extension nothing recognises: whatever ffprobe called it, and "Unknown" when it
+        // called it nothing — a blank in this column would read as a missing field.
+        assert_eq!(
+            container_format_description(
+                &info(serde_json::json!({"format_name": "ogg"})),
+                Path::new("/tmp/clip.weird"),
+            ),
+            "ogg",
+        );
+        assert_eq!(
+            container_format_description(
+                &info(serde_json::json!({})),
+                Path::new("/tmp/clip.weird")
+            ),
+            "Unknown",
+        );
     }
 }

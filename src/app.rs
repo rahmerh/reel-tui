@@ -7235,28 +7235,6 @@ impl App {
             .collect()
     }
 
-    pub fn subtitle_field_reason(&self, field: SubtitleSettingsField) -> Option<String> {
-        let popup = self.subtitle_settings_popup.as_ref()?;
-        if !self.subtitle_field_visible(field) {
-            return None;
-        }
-        let external = self.subtitle_source_external(&popup.source);
-        let flag = field.subtitle_flag()?;
-        if external
-            && matches!(
-                flag,
-                SubtitleFlag::Forced | SubtitleFlag::Cc | SubtitleFlag::HearingImpaired
-            )
-        {
-            return None;
-        }
-        let Some(container) = self.effective_container() else {
-            return Some("Choose a known container to set this flag.".to_string());
-        };
-        (!container.supports_subtitle_flag(flag))
-            .then(|| format!("{} does not support this subtitle flag.", container.label()))
-    }
-
     pub fn subtitle_popup_default(&self) -> bool {
         let Some(popup) = self.subtitle_settings_popup.as_ref() else {
             return false;
@@ -7295,10 +7273,6 @@ impl App {
         let source_format = popup.source_format;
         let external = self.subtitle_source_external(&source);
         if field == SubtitleSettingsField::Default {
-            if let Some(reason) = self.subtitle_field_reason(field) {
-                self.notice = Some(reason);
-                return;
-            }
             self.toggle_subtitle_default(&source);
             return;
         }
@@ -7316,10 +7290,6 @@ impl App {
             SubtitleSettingsField::Commentary => metadata.commentary,
             _ => return,
         };
-        if !current && let Some(reason) = self.subtitle_field_reason(field) {
-            self.notice = Some(reason);
-            return;
-        }
         match field {
             SubtitleSettingsField::Forced => metadata.forced = !metadata.forced,
             SubtitleSettingsField::Cc => metadata.cc = !metadata.cc,
@@ -7368,10 +7338,6 @@ impl App {
         if popup.mode != SubtitleSettingsMode::Summary
             || popup.field != SubtitleSettingsField::Title
         {
-            return;
-        }
-        if let Some(reason) = self.subtitle_field_reason(SubtitleSettingsField::Title) {
-            self.notice = Some(reason);
             return;
         }
         let popup = self.subtitle_settings_popup.as_mut().unwrap();
@@ -7585,11 +7551,9 @@ impl App {
                     popup.language_search.clear();
                     popup.language_cursor = cursor;
                 }
-                SubtitleSettingsField::Title => {
-                    if let Some(reason) = self.subtitle_field_reason(SubtitleSettingsField::Title) {
-                        self.notice = Some(reason);
-                    }
-                }
+                // Typing into the Title row is `start_subtitle_title_input`'s, which the
+                // key handler reaches for that row instead of coming here.
+                SubtitleSettingsField::Title => {}
                 field => self.toggle_subtitle_checkbox(field),
             },
             SubtitleSettingsMode::CodecDropdown => {
@@ -17532,9 +17496,12 @@ mod tests {
             .unwrap();
         assert_that!(change.export_target).contains(SubtitleFormat::VobSub);
         assert_that!(change.embedded_target).is_none();
+        // An exported subtitle carries its flags in its own file name, so the container
+        // has no say in them: Forced stays on the popup with no container chosen at all,
+        // while CC is off it either way — a sidecar spells that one SDH instead.
         app.container_target = None;
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Forced)).is_none();
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Cc)).is_none();
+        assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Forced)).is_true();
+        assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Cc)).is_false();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -21353,7 +21320,6 @@ mod tests {
 
         assert_that!(app.subtitle_popup_metadata().unwrap().forced).is_false();
         assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Forced)).is_false();
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Forced)).is_none();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
