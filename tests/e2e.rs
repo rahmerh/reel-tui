@@ -4973,6 +4973,181 @@ fn global_retiming_should_stage_every_cue_and_ctrl_s_should_write_it() {
     );
 }
 
+/// A clip whose audio is silent except for a tone from `tone_start` to `tone_end`, so
+/// automatic sync's energy-based detector has something unambiguous to find. Built here
+/// rather than through `MediaSpec`, whose audio source is always `anullsrc` for the whole
+/// clip — the same reason `write_shot_change_media` builds its own video.
+fn write_gated_tone_media(path: &std::path::Path, duration: f64, tone_start: f64, tone_end: f64) {
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("color=c=black:s=320x240:r=10:d={duration}"))
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!(
+            "aevalsrc='0.5*sin(2*PI*440*t)*between(t,{tone_start},{tone_end})':d={duration}:s=48000"
+        ))
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .arg(path)
+        .status()
+        .expect("ffmpeg should run");
+    assert!(status.success(), "building {} failed", path.display());
+}
+
+/// Automatic sync (`A`) measures the track's offset from its own audio and stages it
+/// through the same machinery a hand-nudged `T` uses.
+///
+/// The fixture's audio is silent except for a 3-second tone from 10s to 13s, standing in
+/// for dialogue; the sidecar's one cue covers 8s to 11s — two seconds early. `A` should
+/// find the same +2s a reader would have pressed `L` forty times to reach by hand, stage
+/// it the same way, and `Ctrl+S` should write the corrected timing to the file.
+///
+/// Asserted on the sidecar, for the reason every cue-editing scenario is: the page's own
+/// copy of the cues can be right while the staged change is keyed against the wrong thing,
+/// and a save that writes the wrong `-->` line leaves a file that still parses. The offset
+/// is checked to the nearest hundred milliseconds rather than exactly, since it comes out
+/// of a real `ffmpeg` decode and a real energy threshold rather than out of arithmetic.
+#[test]
+fn auto_sync_should_measure_the_tracks_offset_from_its_audio_and_ctrl_s_should_write_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test =
+        "auto_sync_should_measure_the_tracks_offset_from_its_audio_and_ctrl_s_should_write_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-auto-sync");
+    write_gated_tone_media(&scratch.join("clip.mkv"), 20.0, 10.0, 13.0);
+    let sidecar = scratch.join("clip.eng.srt");
+    // 8.0s → 11.0s, two seconds earlier than the tone actually starts.
+    fs::write(&sidecar, "1\n00:00:08,000 --> 00:00:11,000\nFirst line\n\n").unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    // The background pass first, the same reason the global-retiming scenario waits it
+    // out: while it runs it owns the corner of the cue panel the auto-sync notice would
+    // otherwise have to compete with for the reader's attention.
+    wait_for_frames(&mut app);
+
+    // Act: ask for it.
+    app.press(key(KeyCode::Char('A')));
+
+    // Assert: the page says it is working before the (real, background) decode has had a
+    // chance to answer — checked before any further pump, so the assertion cannot race the
+    // worker.
+    assert_eq!(
+        app.app.notice.as_deref(),
+        Some("Syncing subtitles to audio…"),
+        "the page should say it is working while the worker decodes the audio"
+    );
+
+    // Act: wait for the worker's real answer.
+    app.wait_until("auto sync to finish", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.syncing)
+    });
+
+    // Assert: the cue moved close enough to 10s that a viewer would call it aligned, and
+    // the page said so.
+    let moved_start = app.app.subtitle_edit.as_ref().unwrap().cues[0].start;
+    let expected = Duration::from_secs(10);
+    let error = moved_start.abs_diff(expected);
+    assert!(
+        error <= Duration::from_millis(150),
+        "the cue should land within 150ms of the tone's own start (10s), landed at \
+         {moved_start:?}"
+    );
+    let notice = app.app.notice.clone().unwrap_or_default();
+    assert!(
+        notice.starts_with("Synced: shifted by +"),
+        "the page should report a positive shift toward the tone:\n{notice}"
+    );
+
+    // Act: write it.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+
+    // Assert: the file itself carries the corrected timing.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should still be there");
+    let written_start = written
+        .lines()
+        .find_map(|line| line.split_once(" --> ").map(|(start, _)| start))
+        .and_then(|start| {
+            let (h, rest) = start.split_once(':')?;
+            let (m, rest) = rest.split_once(':')?;
+            let (s, ms) = rest.split_once(',')?;
+            Some(Duration::from_millis(
+                h.parse::<u64>().ok()? * 3_600_000
+                    + m.parse::<u64>().ok()? * 60_000
+                    + s.parse::<u64>().ok()? * 1_000
+                    + ms.parse::<u64>().ok()?,
+            ))
+        })
+        .expect("the written cue should have a timing line");
+    assert!(
+        written_start.abs_diff(expected) <= Duration::from_millis(150),
+        "the written cue should carry the corrected timing:\n{written}"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written shift should stop being unsaved work"
+    );
+}
+
+/// Automatic sync refuses a track with no audio to measure against, naming the reason
+/// rather than leaving the key looking broken — the same shape every other refusal on this
+/// page takes.
+#[test]
+fn auto_sync_should_refuse_a_track_with_no_audio_to_measure_against() {
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "auto_sync_should_refuse_a_track_with_no_audio_to_measure_against";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("subtitle-auto-sync-no-audio");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().size(320, 240).duration(5.0).audio(&[]),
+    );
+    let sidecar = scratch.join("clip.eng.srt");
+    fs::write(&sidecar, CACHED_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    open_sidecar_edit_page(&mut app);
+    wait_for_frames(&mut app);
+
+    let before = app.app.subtitle_edit.as_ref().unwrap().cues[0].start;
+
+    app.press(key(KeyCode::Char('A')));
+    app.wait_until("auto sync to give up", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.syncing)
+    });
+
+    // Assert: nothing moved, nothing staged, and the page said why rather than nothing.
+    assert_eq!(
+        app.app.subtitle_edit.as_ref().unwrap().cues[0].start,
+        before,
+        "a track with nothing to measure against should not be retimed"
+    );
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a refused sync should stage nothing"
+    );
+    let notice = app.app.notice.clone().unwrap_or_default();
+    assert!(
+        !notice.is_empty() && notice != "Syncing subtitles to audio…",
+        "the page should explain the refusal rather than leave the key looking broken:\n{notice}"
+    );
+}
+
 /// The second commonest thing wrong with a subtitle track is not a line in the wrong place
 /// but a line up for the wrong length — one that goes away while the mouth is still moving,
 /// or hangs over the shot after it. `Ctrl+H`/`Alt+H` and `Ctrl+L`/`Alt+L` move one end of the

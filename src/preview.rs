@@ -507,6 +507,36 @@ pub struct WarmRequest {
     pub cache_tracks: usize,
 }
 
+/// One track to measure against its own audio, for automatic sync (`A`).
+///
+/// Carries the cues by value rather than a `FrameSource` the way [`WarmRequest`] does,
+/// because this worker draws nothing and so needs none of a frame's rendering shape —
+/// only the media to decode audio from, the cues to compare it against, and the track's
+/// length to bin both signals over.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncRequest {
+    pub generation: u64,
+    pub media: PathBuf,
+    pub cues: Vec<Cue>,
+    pub duration: Duration,
+}
+
+/// What automatic sync found, or why it found nothing worth applying.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncOutcome {
+    /// The offset to apply, in milliseconds — positive moves the cues later. See
+    /// [`crate::sync::find_offset`].
+    Applied(i64),
+    /// The alignment found did not clear [`crate::sync`]'s confidence floor, so nothing
+    /// is worth applying — a wrong-language track, a mostly silent one, or a track that
+    /// is in fact already in sync are all indistinguishable from here, so the page reports
+    /// this the same way for all of them.
+    NotConfident,
+    /// The audio could not be decoded at all — commonly, the file has no audio track for
+    /// `-map 0:a:0` to find. Carries `ffmpeg`'s own complaint, which already says so.
+    Failed(String),
+}
+
 /// What a span being played is *about*, which is also how the page recognises it coming back.
 ///
 /// The subtitle edit page has two cursors and either of them can ask for a playback, so a
@@ -794,6 +824,11 @@ pub enum PreviewEvent {
         anchor: PlaybackAnchor,
         outcome: PlaybackOutcome,
     },
+    /// Automatic sync's answer for a track, or why it has none.
+    Sync {
+        generation: u64,
+        outcome: SyncOutcome,
+    },
 }
 
 /// The UI thread's half of the preview workers.
@@ -805,6 +840,9 @@ pub enum PreviewEvent {
 #[derive(Debug)]
 pub struct PreviewHandles {
     prepare_tx: Sender<PrepareRequest>,
+    /// Unconditional, unlike [`Self::frame_tx`] and its neighbours: automatic sync draws
+    /// no picture at all, so a terminal with no image protocol still gets it.
+    sync_tx: Sender<SyncRequest>,
     /// `None` when the terminal offered no image protocol, which is also what tests get.
     /// The page then stays on its text preview, the same fallback a build without libass
     /// takes — and nothing is rendered in the background either, since there would be
@@ -844,6 +882,18 @@ impl PreviewHandles {
         // A dead worker leaves the page on its loader, which is the same thing that
         // happens if the extraction never finishes; there is nothing better to do here.
         let _ = self.prepare_tx.send(request);
+    }
+
+    /// Asks for a track's offset from its own audio, dead reckoned in the background.
+    ///
+    /// A dead worker leaves [`SubtitleEditState::syncing`] stuck on, for the same reason
+    /// [`Self::request`] leaves the page on its loader — there is nothing better to do
+    /// than let the reader see the page has stopped answering rather than pretend the
+    /// request never happened.
+    ///
+    /// [`SubtitleEditState::syncing`]: crate::subtitle_edit::SubtitleEditState::syncing
+    pub fn request_sync(&self, request: SyncRequest) {
+        let _ = self.sync_tx.send(request);
     }
 
     /// Asks for the frame at one cue. Silently does nothing without a frame worker.
@@ -976,6 +1026,25 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
         }
     });
 
+    // Unconditional, like the prepare worker above and unlike every worker in the
+    // `Some(picker)` arm below: automatic sync draws nothing, so a terminal offering no
+    // image protocol still gets it.
+    let (sync_tx, sync_rx) = mpsc::channel::<SyncRequest>();
+    let sync_generation = Arc::clone(&live_generation);
+    let sync_events = event_tx.clone();
+    std::thread::spawn(move || {
+        // FIFO, for the same reason `prepare` is: one request per press of `A`, not one
+        // per cursor movement, so there is no burst worth collapsing.
+        while let Ok(request) = sync_rx.recv() {
+            let Some(event) = sync_track(&request, &sync_generation) else {
+                continue;
+            };
+            if sync_events.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
     // The image workers exist only when there is something that could draw their output.
     let (frame_tx, warm_tx, playback_tx) = match picker {
         Some(picker) => {
@@ -1037,6 +1106,7 @@ pub fn spawn_preview_workers(picker: Option<Picker>) -> (PreviewHandles, Receive
     (
         PreviewHandles {
             prepare_tx,
+            sync_tx,
             frame_tx,
             warm_tx,
             playback_tx,
@@ -1471,6 +1541,7 @@ pub fn seek_ceiling(duration: Duration) -> Option<Duration> {
 pub(crate) struct TestHandles {
     pub handles: PreviewHandles,
     pub prepare_rx: Receiver<PrepareRequest>,
+    pub sync_rx: Receiver<SyncRequest>,
     pub frame_rx: Receiver<FrameRequest>,
     pub warm_rx: Receiver<WarmRequest>,
     pub playback_rx: Receiver<PlaybackRequest>,
@@ -1481,6 +1552,7 @@ pub(crate) struct TestHandles {
 #[cfg(test)]
 pub(crate) fn test_handles() -> TestHandles {
     let (prepare_tx, prepare_rx) = mpsc::channel();
+    let (sync_tx, sync_rx) = mpsc::channel();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (warm_tx, warm_rx) = mpsc::channel();
     let (playback_tx, playback_rx) = mpsc::channel();
@@ -1489,6 +1561,7 @@ pub(crate) fn test_handles() -> TestHandles {
     TestHandles {
         handles: PreviewHandles {
             prepare_tx,
+            sync_tx,
             frame_tx: Some(frame_tx),
             warm_tx: Some(warm_tx),
             playback_tx: Some(playback_tx),
@@ -1500,6 +1573,7 @@ pub(crate) fn test_handles() -> TestHandles {
             picker: Some(Picker::halfblocks()),
         },
         prepare_rx,
+        sync_rx,
         frame_rx,
         warm_rx,
         playback_rx,
@@ -2260,11 +2334,71 @@ fn read_samples(path: &Path) -> Vec<f32> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
+    decode_f32le(&bytes)
+}
+
+/// Interleaved little-endian floats, the format both the scrub playback's sound and
+/// automatic sync's audio extraction are decoded to.
+fn decode_f32le(bytes: &[u8]) -> Vec<f32> {
     let (samples, _) = bytes.as_chunks::<4>();
     samples
         .iter()
         .map(|&chunk| f32::from_le_bytes(chunk))
         .collect()
+}
+
+/// The rate automatic sync decodes a track's audio at. Far below anything speech needs
+/// to be told apart from silence by energy alone, which is what keeps a feature-length
+/// file's extraction a few seconds of work rather than a few dozen.
+const SYNC_SAMPLE_RATE: u32 = 16_000;
+
+/// The whole track's audio, decoded once to mono `f32le` — no video, and nothing written
+/// to a file: unlike the scrub playback, this is the only stream this decode produces, so
+/// there is no second output to deadlock a pipe against.
+fn sync_extract_command(media: &Path) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(media)
+        .args(["-map", "0:a:0", "-vn", "-ac", "1", "-ar"])
+        .arg(SYNC_SAMPLE_RATE.to_string())
+        .args(["-f", "f32le", "-"]);
+    command
+}
+
+/// Automatic sync's worker: decodes the track's audio, measures its offset from the
+/// cues, and reports one answer. `None` only when the page has already moved on, the
+/// same test [`prepare`] makes before doing anything at all.
+fn sync_track(request: &SyncRequest, live_generation: &AtomicU64) -> Option<PreviewEvent> {
+    let abandoned = || live_generation.load(Ordering::Relaxed) != request.generation;
+    if abandoned() {
+        return None;
+    }
+    let mut command = sync_extract_command(&request.media);
+    let outcome = match run_cancellable(&mut command, &abandoned) {
+        RunOutcome::Abandoned => return None,
+        RunOutcome::Failed(message) => SyncOutcome::Failed(message),
+        RunOutcome::Finished(output) if !output.status.success() => SyncOutcome::Failed(
+            command_failure("Could not read this file's audio", &output.stderr),
+        ),
+        RunOutcome::Finished(output) => {
+            let samples = decode_f32le(&output.stdout);
+            let speech = crate::sync::detect_speech_regions(&samples, SYNC_SAMPLE_RATE);
+            let cues: Vec<(Duration, Duration)> = request
+                .cues
+                .iter()
+                .map(|cue| (cue.start, cue.end))
+                .collect();
+            match crate::sync::find_offset(&speech, &cues, request.duration) {
+                Some(offset_ms) => SyncOutcome::Applied(offset_ms),
+                None => SyncOutcome::NotConfident,
+            }
+        }
+    };
+    Some(PreviewEvent::Sync {
+        generation: request.generation,
+        outcome,
+    })
 }
 
 /// Renders every cue in a track into the cache, reporting progress as it goes.

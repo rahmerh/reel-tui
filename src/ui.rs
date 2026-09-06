@@ -3668,6 +3668,12 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(
         &mut lines,
+        "A",
+        "Auto sync: measure how far this track is out of sync with its own audio and stage \
+         the correction (SubRip tracks); Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
         "Ctrl-j / Ctrl-k",
         "Put the cursor in the timeline / back in the cue list",
     );
@@ -13109,9 +13115,10 @@ mod tests {
         assert_that!(&content).does_not_contain("Open or close keybindings");
         // "Move track down / up", "Mark or unmark track for deletion", "Add a new subtitle
         // track", the four that match on "tracks" — the SRT timing preview, the cue editor,
-        // the timing mode, and marking a cue for deletion — and global retiming, which names
-        // both a track that is out of sync and the SubRip tracks it works on.
-        assert_eq!(count, 8);
+        // the timing mode, and marking a cue for deletion — global retiming, which names
+        // both a track that is out of sync and the SubRip tracks it works on, and automatic
+        // sync, which names both this track and the SubRip tracks it works on too.
+        assert_eq!(count, 9);
     }
 
     #[test]

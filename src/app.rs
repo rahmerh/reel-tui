@@ -31,7 +31,7 @@ use crate::{
     preview::{
         CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackAnchor, PlaybackOutcome,
         PlaybackRequest, PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent,
-        PreviewHandles, WarmRequest,
+        PreviewHandles, SyncOutcome, SyncRequest, WarmRequest,
     },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
@@ -113,6 +113,17 @@ impl Default for PreviewSettings {
 /// the cue without shifting them animates the line against itself.
 const CUE_EDITS_SUBRIP_ONLY: &str =
     "Only SubRip cues can be edited here; this track is another format.";
+
+/// Signed seconds to a hundredth, for automatic sync's completion notice
+/// (`Synced: shifted by +1.35s`). Not shared with the timeline title's own shift readout
+/// (`ui::format_shift`), which `App` must not depend on — this page's state owns nothing
+/// about rendering, and a two-line duplicate of a sign and a decimal point is cheaper than
+/// a dependency the other way round.
+fn format_offset(millis: i64) -> String {
+    let sign = if millis.is_negative() { '-' } else { '+' };
+    let millis = millis.unsigned_abs();
+    format!("{sign}{}.{:02}s", millis / 1000, (millis % 1000) / 10)
+}
 
 /// Why the cue editor and the timing mode refuse a cue that is marked to go.
 ///
@@ -3707,6 +3718,7 @@ impl App {
         let mut received = false;
         let mut prepared = false;
         let mut stopped_playback = false;
+        let mut sync_outcome = None;
         while let Ok(event) = receiver.try_recv() {
             received = true;
             let Some(state) = self.subtitle_edit.as_mut() else {
@@ -3781,11 +3793,22 @@ impl App {
                         }
                     }
                 }
+                PreviewEvent::Sync {
+                    generation,
+                    outcome,
+                } if generation == state.generation => {
+                    state.syncing = false;
+                    sync_outcome = Some(outcome);
+                }
                 _ => {}
             }
         }
-        // After the drain, not inside it: dispatching needs the workers and the settings,
-        // which are `self` fields the loop's borrow of `subtitle_edit` rules out.
+        // After the drain, not inside it: applying an outcome needs `self` fully — staging
+        // the shift and setting the notice — which the loop's borrow of `subtitle_edit`
+        // rules out, exactly the reason `prepared` and `stopped_playback` are deferred too.
+        if let Some(outcome) = sync_outcome {
+            self.apply_auto_sync_outcome(outcome);
+        }
         if prepared {
             self.start_warming();
         }
@@ -4986,23 +5009,50 @@ impl App {
         let Some(format) = self.subtitle_source_format(&source) else {
             return;
         };
-        // Gathered before the shift, because with nothing staged against a cue yet the page's
-        // own copy is what its snapshot falls back to — and that is what is about to move.
-        // Timings only: a thousand-cue track costs a thousand pairs of `Duration` per press
-        // rather than a thousand `String`s, and the words are not what a shift changes.
-        let before: Vec<(Duration, Duration)> =
-            state.cues.iter().map(|cue| (cue.start, cue.end)).collect();
+        let before = self.cue_timings_before_shift();
         let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
         if state.shift_all(steps).is_none() {
             return;
         }
-        let mut change = self.subtitle_change(&source, format);
+        self.stage_whole_track_shift(&source, format, &before);
+    }
+
+    /// Every cue's current timing, gathered right before a whole-track move — shared by
+    /// [`Self::shift_whole_track`] and [`Self::auto_sync_track`], since both need the "was"
+    /// half of [`Self::stage_whole_track_shift`]'s comparison taken before the move happens.
+    ///
+    /// With nothing staged against a cue yet the page's own copy is what its snapshot falls
+    /// back to — and that is exactly what is about to move. Timings only: a thousand-cue
+    /// track costs a thousand pairs of `Duration` per call rather than a thousand `String`s,
+    /// and the words are not what a shift changes.
+    fn cue_timings_before_shift(&self) -> Vec<(Duration, Duration)> {
+        self.subtitle_edit
+            .as_ref()
+            .map(|state| state.cues.iter().map(|cue| (cue.start, cue.end)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Stages every cue's *new* timing against its `before` snapshot, once the page's own
+    /// cues have already been moved.
+    ///
+    /// Shared by [`Self::shift_whole_track`] (a run of hand nudges, staged in one pass rather
+    /// than through [`Self::stage_cue_change`] per cue — see that function's own doc comment
+    /// for why) and [`Self::auto_sync_track`] (one computed offset, applied the same way): a
+    /// whole-track move is staged identically whether the amount came from a keypress or from
+    /// a background worker, so the two cannot come to disagree about what it costs to record.
+    fn stage_whole_track_shift(
+        &mut self,
+        source: &SubtitleSource,
+        format: SubtitleFormat,
+        before: &[(Duration, Duration)],
+    ) {
+        let mut change = self.subtitle_change(source, format);
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        for (position, (cue, &(was_start, was_end))) in state.cues.iter().zip(&before).enumerate() {
+        for (position, (cue, &(was_start, was_end))) in state.cues.iter().zip(before).enumerate() {
             match state.origin(position) {
                 Some(CueOrigin::File(at)) => {
                     // Built only for a cue nothing is staged against, which after the first
@@ -5030,7 +5080,96 @@ impl App {
         // A track shifted back to where the file has it stops being an edit, the same way one
         // cue does. Only a rewrite can stop asking for anything: an insertion *is* the ask.
         change.cues.edits.retain(|_, edit| edit.is_effective());
-        self.store_subtitle_change(source, change);
+        self.store_subtitle_change(source.clone(), change);
+    }
+
+    /// `A`: measures how far this track is out of sync with its own audio and dispatches
+    /// the work to the background — see [`crate::sync`] for the algorithm. Applying the
+    /// answer, once it comes back, is [`Self::apply_auto_sync_outcome`].
+    ///
+    /// Refused in the same words `t`/`T` are (`CUE_EDITS_SUBRIP_ONLY`) for the reason they
+    /// are: an ASS cue's timing anchors its override tags, so shifting it without shifting
+    /// them animates the line against itself. A second press while the first is still
+    /// decoding does nothing, guarded by [`SubtitleEditState::syncing`] — the decode is a
+    /// few seconds even on a feature-length file, long enough that a double press is a real
+    /// possibility rather than a formality, and there is no worker generation to coalesce a
+    /// second request into the way a frame request would.
+    ///
+    /// **Not gated on a playback**, unlike every dialog this page can raise: this only sets
+    /// a notice and dispatches a background request, and draws nothing of its own that a
+    /// running span's image would wipe.
+    pub fn auto_sync_track(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.syncing {
+            return;
+        }
+        let source = state.source.clone();
+        let generation = state.generation;
+        let media = state.media().to_path_buf();
+        let cues = state.cues.clone();
+        let duration = state.duration;
+        if self.subtitle_source_format(&source) != Some(SubtitleFormat::SubRip) {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        preview.request_sync(SyncRequest {
+            generation,
+            media,
+            cues,
+            duration,
+        });
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.syncing = true;
+        }
+        self.notice = Some("Syncing subtitles to audio…".into());
+    }
+
+    /// Applies automatic sync's answer once the worker reports it, from
+    /// [`Self::receive_preview_events`]. Reports the outcome on the page's one status slot
+    /// exactly as every other one-shot action on this page does.
+    ///
+    /// **Applying a found offset reuses [`Self::stage_whole_track_shift`] wholesale** — the
+    /// same staging a hand-nudged `T` produces, so a reader who does not like the computed
+    /// answer corrects it with the same keys they would use on their own retiming, and a
+    /// save writes either the same way.
+    fn apply_auto_sync_outcome(&mut self, outcome: SyncOutcome) {
+        match outcome {
+            SyncOutcome::Applied(offset_ms) => {
+                let Some(state) = self.subtitle_edit.as_ref() else {
+                    return;
+                };
+                let source = state.source.clone();
+                let Some(format) = self.subtitle_source_format(&source) else {
+                    return;
+                };
+                let before = self.cue_timings_before_shift();
+                let negative = offset_ms.is_negative();
+                let shift = Duration::from_millis(offset_ms.unsigned_abs());
+                let Some(state) = self.subtitle_edit.as_mut() else {
+                    return;
+                };
+                let Some(moved) = state.shift_track_by(shift, negative) else {
+                    self.notice = Some("Already in sync.".into());
+                    return;
+                };
+                self.stage_whole_track_shift(&source, format, &before);
+                self.notice = Some(format!("Synced: shifted by {}", format_offset(moved)));
+            }
+            SyncOutcome::NotConfident => {
+                self.notice = Some("Couldn't confidently align this track to the audio.".into());
+            }
+            SyncOutcome::Failed(message) => {
+                self.notice = Some(message);
+            }
+        }
     }
 
     /// `r` in timing mode at track scale: puts **every** cue back to the timing the file
@@ -25438,6 +25577,240 @@ mod tests {
         assert_that!(app.has_unsaved_cue_edits()).is_false();
 
         // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `A` dispatches one request carrying this page's media and cues, and marks the page
+    /// syncing so a second press does nothing while the first is still running.
+    #[test]
+    fn auto_sync_track_should_dispatch_a_request_for_the_pages_media_and_cues() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        let (generation, media) = {
+            let state = app.subtitle_edit.as_ref().unwrap();
+            (state.generation, state.media().to_path_buf())
+        };
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.auto_sync_track();
+
+        // Assert: one request, for this page's generation, media and cues.
+        let request = preview
+            .sync_rx
+            .try_recv()
+            .expect("a sync request should be sent");
+        assert_that!(request.generation).is_equal_to(generation);
+        assert_that!(request.media).is_equal_to(media);
+        assert_that!(request.cues.len()).is_equal_to(2);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().syncing).is_true();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Syncing subtitles to audio…"));
+
+        // Act / Assert: a second press while the first is still running sends nothing more.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Automatic sync is refused on the same tracks the cue editor is, and for the same
+    /// reason: an ASS cue's timing is the anchor its own animation is measured from.
+    #[test]
+    fn auto_sync_track_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.auto_sync_track();
+
+        // Assert: nothing dispatched, and told why.
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `A` is inert off the page and under a dialog, the guard every other key on this page
+    /// carries.
+    #[test]
+    fn auto_sync_track_should_be_inert_off_the_page_and_under_a_dialog() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act / Assert: swallowed under a dialog.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Arrange: back on the track list, where there is no page.
+        app.dialog = None;
+        app.layer = Layer::Streams;
+
+        // Act / Assert: swallowed off the page too.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A found offset is staged exactly as a hand-nudged `T` would stage it, and reported.
+    #[test]
+    fn apply_auto_sync_outcome_should_stage_a_found_offset_and_report_it() {
+        // Arrange: cues at 1s and 3s.
+        let (mut app, directory) = cue_editing_app();
+
+        // Act: the worker found the track should move 1.35s later.
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(1_350));
+
+        // Assert: staged the same way `shift_whole_track` stages a hand nudge.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(2_350));
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged")
+            .cues
+            .edits;
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_millis(2_350));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by +1.35s"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A negative offset moves the track earlier and is reported with its sign.
+    #[test]
+    fn apply_auto_sync_outcome_should_stage_a_negative_offset() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(-500));
+
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(500));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by -0.50s"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An offset of exactly zero moves nothing, and says so rather than claiming a shift
+    /// that did not happen.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_an_already_synced_track_rather_than_stage_nothing() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(0));
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Already in sync."));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A low-confidence alignment stages nothing and says why, rather than moving the track
+    /// on a guess nobody asked for.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_low_confidence_without_staging_anything() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::NotConfident);
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref())
+            .is_equal_to(Some("Couldn't confidently align this track to the audio."));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A failed extraction (commonly, no audio track) reports `ffmpeg`'s own complaint
+    /// rather than a generic failure.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_a_failed_extraction() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Failed("no audio stream".into()));
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("no audio stream"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker's answer is applied only once it comes back for this page's own
+    /// generation, and it clears [`SubtitleEditState::syncing`] whether or not the answer
+    /// was one it could use — a stuck flag would refuse every future press silently.
+    #[test]
+    fn receive_preview_events_should_apply_a_sync_result_and_clear_the_syncing_flag() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        app.set_preview_handles(Some(preview.handles));
+        app.auto_sync_track();
+        preview
+            .sync_rx
+            .try_recv()
+            .expect("the dispatch should have sent a request");
+
+        // Act
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx
+            .send(PreviewEvent::Sync {
+                generation,
+                outcome: SyncOutcome::Applied(150),
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&event_rx);
+
+        // Assert
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().syncing).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_millis(1_150));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by +0.15s"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A result for a page the reader has since left is dropped, the same rule every other
+    /// preview event follows.
+    #[test]
+    fn receive_preview_events_should_drop_a_sync_result_for_a_superseded_generation() {
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app.auto_sync_track();
+        let stale_generation = app.subtitle_edit.as_ref().unwrap().generation;
+        // The page moved on, which bumps its generation.
+        app.subtitle_edit.as_mut().unwrap().generation += 1;
+
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx
+            .send(PreviewEvent::Sync {
+                generation: stale_generation,
+                outcome: SyncOutcome::Applied(150),
+            })
+            .unwrap();
+        app.receive_preview_events(&event_rx);
+
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 

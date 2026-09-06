@@ -20,4 +20,5 @@ pub mod requirements;
 pub mod staging;
 pub mod subtitle;
 pub mod subtitle_edit;
+pub mod sync;
 pub mod ui;

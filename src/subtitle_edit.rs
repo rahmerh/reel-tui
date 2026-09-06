@@ -615,6 +615,14 @@ pub struct SubtitleEditState {
     /// arrives and when the track's timings are put back, and deliberately **untouched by a
     /// per-cue nudge** — it answers for the track, not for whatever the cursor is on.
     pub track_shift: i64,
+    /// Whether an automatic sync (`A`) is currently decoding the file's audio in the
+    /// background.
+    ///
+    /// Guards a second press from dispatching a second worker run while the first is
+    /// still going — the decode is a few seconds even on a feature-length file, long
+    /// enough that a double press is a real possibility rather than a formality. Cleared
+    /// when the worker's answer comes back, whatever it was.
+    pub syncing: bool,
     pub layout: LaneLayout,
     /// The cue list split into runs that share the screen, parallel to nothing — each cue
     /// is in exactly one group and the ordinary cue is a group of one.
@@ -807,6 +815,7 @@ impl SubtitleEditState {
             origins: Vec::new(),
             timing: TimingScope::Off,
             track_shift: 0,
+            syncing: false,
             layout: LaneLayout::default(),
             groups: Vec::new(),
             visible: Vec::new(),
@@ -1448,11 +1457,24 @@ impl SubtitleEditState {
     /// `None` when there is nothing to move or the track is already against the floor, so a
     /// held `h` at 0:00 stages nothing and re-renders nothing.
     pub fn shift_all(&mut self, steps: i64) -> Option<i64> {
+        let shift = TIMING_STEP.saturating_mul(steps.unsigned_abs().try_into().ok()?);
+        self.shift_track_by(shift, steps.is_negative())
+    }
+
+    /// Moves every cue by a raw duration rather than a step count, for automatic sync
+    /// (`A`, [`crate::app::App::auto_sync_track`]): the offset it computes rarely lands on
+    /// a [`TIMING_STEP`] boundary, and it is one figure to apply rather than a count of
+    /// steps to convert into one.
+    ///
+    /// Shares every rule [`Self::shift_all`] already states with it — the floor clamp so a
+    /// backward move never pushes the earliest cue before 0:00, the accumulated
+    /// [`Self::track_shift`], and [`Self::retimed`]'s cleanup — so a hand nudge and a
+    /// computed one cannot come to disagree about what moving the whole track costs.
+    pub fn shift_track_by(&mut self, shift: Duration, negative: bool) -> Option<i64> {
         if self.cues.is_empty() {
             return None;
         }
-        let shift = TIMING_STEP.saturating_mul(steps.unsigned_abs().try_into().ok()?);
-        let shift = if steps.is_negative() {
+        let shift = if negative {
             shift.min(self.cues.iter().map(|cue| cue.start).min()?)
         } else {
             shift
@@ -1461,7 +1483,7 @@ impl SubtitleEditState {
             return None;
         }
         for cue in &mut self.cues {
-            if steps.is_negative() {
+            if negative {
                 cue.start -= shift;
                 cue.end -= shift;
             } else {
@@ -1469,7 +1491,7 @@ impl SubtitleEditState {
                 cue.end += shift;
             }
         }
-        let moved = i64::try_from(shift.as_millis()).ok()? * steps.signum();
+        let moved = i64::try_from(shift.as_millis()).ok()? * if negative { -1 } else { 1 };
         self.track_shift += moved;
         self.retimed();
         Some(moved)
@@ -4018,6 +4040,73 @@ mod tests {
         let mut state = state();
         assert_that!(state.shift_all(1)).is_none();
         assert_that!(state.track_shift).is_equal_to(0);
+    }
+
+    /// `shift_track_by` is what `shift_all` is built on, for automatic sync's computed
+    /// offset rather than a step count. It has to move the same way `shift_all` does for a
+    /// hand-nudged track and a computed one to agree.
+    #[test]
+    fn a_raw_track_shift_should_move_every_cue_forward_by_that_duration() {
+        let mut state = ready(3);
+        let before: Vec<(Duration, Duration)> =
+            state.cues.iter().map(|cue| (cue.start, cue.end)).collect();
+
+        let moved = state.shift_track_by(Duration::from_millis(1_350), false);
+
+        assert_that!(moved).is_equal_to(Some(1_350));
+        assert_that!(state.track_shift).is_equal_to(1_350);
+        for (cue, (was_start, was_end)) in state.cues.iter().zip(before) {
+            assert_that!(cue.start).is_equal_to(was_start + Duration::from_millis(1_350));
+            assert_that!(cue.end).is_equal_to(was_end + Duration::from_millis(1_350));
+        }
+    }
+
+    #[test]
+    fn a_raw_track_shift_backward_should_clamp_to_the_earliest_cues_room() {
+        let mut state = ready(3);
+        state.cues[0].start = Duration::from_millis(30);
+        state.cues[0].end = Duration::from_millis(1_030);
+
+        let moved = state.shift_track_by(Duration::from_millis(2_000), true);
+
+        assert_that!(moved).is_equal_to(Some(-30));
+        assert_that!(state.cues[0].start).is_equal_to(Duration::ZERO);
+        assert_that!(state.track_shift).is_equal_to(-30);
+    }
+
+    #[test]
+    fn a_raw_track_shift_of_zero_should_report_nothing_and_move_nothing() {
+        let mut state = ready(3);
+        let before: Vec<(Duration, Duration)> =
+            state.cues.iter().map(|cue| (cue.start, cue.end)).collect();
+
+        assert_that!(state.shift_track_by(Duration::ZERO, false)).is_none();
+        assert_that!(state.track_shift).is_equal_to(0);
+        for (cue, (was_start, was_end)) in state.cues.iter().zip(before) {
+            assert_that!(cue.start).is_equal_to(was_start);
+            assert_that!(cue.end).is_equal_to(was_end);
+        }
+    }
+
+    #[test]
+    fn a_raw_track_shift_on_a_track_with_no_cues_should_do_nothing() {
+        let mut state = state();
+        assert_that!(state.shift_track_by(Duration::from_secs(1), false)).is_none();
+        assert_that!(state.track_shift).is_equal_to(0);
+    }
+
+    /// [`SubtitleEditState::retimed`]'s cleanup runs for a raw shift exactly as it does for
+    /// a stepped one: stale frames dropped, the lanes repacked, any playback stopped.
+    #[test]
+    fn a_raw_track_shift_should_run_the_same_cleanup_a_stepped_shift_does() {
+        let mut state = ready(3);
+        state.apply_frame(0, protocol(4, 2));
+        state.frame_error = Some((0, "stale".into()));
+
+        state.shift_track_by(Duration::from_millis(500), false);
+
+        assert_that!(state.encoded).is_empty();
+        assert_that!(state.frame_error).is_none();
     }
 
     /// Every cached still is a picture of a moment its cue no longer starts at, so the whole

@@ -1381,6 +1381,16 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
             input.reset_sequence();
             app.toggle_global_retiming();
         }
+        // `A` for automatic sync: measures the track's offset from its own audio in the
+        // background and stages the correction through the same machinery `T` does by
+        // hand. Not a mode like `t`/`T` — one press dispatches the measurement and the
+        // answer lands as a notice once the worker reports it.
+        (KeyCode::Char('A'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if app.layer == Layer::SubtitleEdit =>
+        {
+            input.reset_sequence();
+            app.auto_sync_track();
+        }
         // `r` for the timing this cue started at, which is what `r` already means one layer
         // up: on the track list it puts the focused field back to what the file says. Inert
         // outside the timing mode, where this page has nothing to reset.
