@@ -1036,19 +1036,30 @@ struct ParsedSidecar {
     number: Option<usize>,
 }
 
+/// Whether a sidecar written beside this file would ever be matched back to it.
+///
+/// The single answer to "can this file own a subtitle sidecar", read by
+/// [`media_paths_by_stem`] when matching the files on disk and by `App::open_create_track`
+/// when refusing to make one. Both halves have to agree: a bare audio file reaches the
+/// track list perfectly well, and a sidecar written next to one would be an orphan the
+/// application never shows — so the refusal and the matcher cannot be allowed to drift
+/// apart into two lists of extensions.
+pub fn is_sidecar_host(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "mkv" | "mks" | "mp4" | "mov" | "m4v" | "webm" | "avi" | "ts" | "m2ts" | "mts"
+    )
+}
+
 fn media_paths_by_stem(files: &[FileEntry]) -> HashMap<String, Vec<PathBuf>> {
     let mut result: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for file in files {
-        let extension = file
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(
-            extension.as_str(),
-            "mkv" | "mks" | "mp4" | "mov" | "m4v" | "webm" | "avi" | "ts" | "m2ts" | "mts"
-        ) {
+        if !is_sidecar_host(&file.path) {
             continue;
         }
         if let Some(stem) = file.path.file_stem().and_then(|stem| stem.to_str()) {
@@ -1637,6 +1648,32 @@ mod tests {
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The refusal `a` raises and the matcher that finds sidecars read one answer, so a
+    /// container that can own a sidecar and one the application will offer to make a sidecar
+    /// for cannot come apart. Case-insensitive, since the matcher lowercases too.
+    #[test]
+    fn is_sidecar_host_should_accept_the_containers_the_matcher_scans() {
+        for extension in [
+            "mkv", "mks", "mp4", "mov", "m4v", "webm", "avi", "ts", "m2ts", "mts",
+        ] {
+            assert_that!(is_sidecar_host(Path::new(&format!("movie.{extension}")))).is_true();
+            assert_that!(is_sidecar_host(Path::new(&format!(
+                "movie.{}",
+                extension.to_ascii_uppercase()
+            ))))
+            .is_true();
+        }
+    }
+
+    /// A sidecar beside anything else would never be matched back to it, so it would get no
+    /// row and the page would have nothing to open.
+    #[test]
+    fn is_sidecar_host_should_reject_what_the_matcher_never_looks_at() {
+        for name in ["music.flac", "movie.mpg", "movie.wmv", "notes.txt", "movie"] {
+            assert_that!(is_sidecar_host(Path::new(name))).is_false();
+        }
     }
 
     #[test]

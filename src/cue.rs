@@ -1021,10 +1021,39 @@ impl TimelineWindow {
     /// starting at minus twenty-eight seconds, which would waste half the track on time
     /// that does not exist.
     fn spanning(on: &Cue, duration: Duration, width: u16, span: Duration) -> Self {
-        // A track can outlast its video — subtitles running past the last frame are
-        // common — and the probed duration can be missing entirely. Either way the
-        // window still has to contain the cue it was built for.
-        let duration = duration.max(on.end).max(Duration::from_millis(1));
+        Self::centred(on.midpoint(), on.end, duration, width, span)
+    }
+
+    /// The window for a bare instant, with no cue to anchor it on.
+    ///
+    /// What the timeline is drawn from on a track that holds no cues at all — a subtitle
+    /// track the reader has just created and not yet typed a line into. [`Self::fitted`]
+    /// shortens its window until the cues in it are drawable, which is a question an empty
+    /// track cannot be asked, so this simply takes the longest step: there is nothing in the
+    /// window to crowd it, and the widest view of the media is the most useful thing to aim
+    /// the cursor at.
+    pub fn around(at: Duration, duration: Duration, width: u16) -> Self {
+        Self::centred(at, at, duration, width, WINDOW_STEPS[0])
+    }
+
+    /// The window of a given length centred on `midpoint`, clamped to the media's bounds.
+    ///
+    /// Clamping at both ends matters: a cue two seconds in must not produce a window
+    /// starting at minus twenty-eight seconds, which would waste half the track on time
+    /// that does not exist.
+    ///
+    /// `reach` is how far into the media the caller is known to need — a cue's end, or the
+    /// instant itself. A track can outlast its video (subtitles running past the last frame
+    /// are common) and the probed duration can be missing entirely, so the window still has
+    /// to contain what it was built for either way.
+    fn centred(
+        midpoint: Duration,
+        reach: Duration,
+        duration: Duration,
+        width: u16,
+        span: Duration,
+    ) -> Self {
+        let duration = duration.max(reach).max(Duration::from_millis(1));
         if duration <= span {
             return Self {
                 start: Duration::ZERO,
@@ -1032,7 +1061,7 @@ impl TimelineWindow {
                 width,
             };
         }
-        let start = on.midpoint().saturating_sub(span / 2).min(duration - span);
+        let start = midpoint.saturating_sub(span / 2).min(duration - span);
         Self {
             start,
             end: start + span,
@@ -2395,6 +2424,47 @@ mod tests {
         // Assert
         assert_that!(window.start).is_equal_to(Duration::ZERO);
         assert_that!(window.end).is_equal_to(Duration::from_secs(30));
+    }
+
+    /// A track with no cues has nothing to anchor a window on, and it still needs a timeline:
+    /// it is what the reader aims `i` with on a track they have just created. `around` is the
+    /// cue-free constructor, clamped at both ends of the media exactly as `fitted` is — a
+    /// cursor at 0:00 must not produce a window starting before the file begins, and one at
+    /// the end must not produce one running past it.
+    #[test]
+    fn a_window_around_an_instant_should_be_clamped_to_the_media_at_both_ends() {
+        // Arrange: ten minutes, comfortably longer than the longest window step.
+        let media = Duration::from_secs(600);
+
+        // Act / Assert: at the very start, the window begins there rather than before it.
+        let opening = TimelineWindow::around(Duration::ZERO, media, 100);
+        assert_that!(opening.start).is_equal_to(Duration::ZERO);
+        assert_that!(opening.end > Duration::ZERO).is_true();
+
+        // Act / Assert: at the very end, it stops there rather than running past.
+        let closing = TimelineWindow::around(media, media, 100);
+        assert_that!(closing.end).is_equal_to(media);
+        assert_that!(closing.start < media).is_true();
+        assert_that!(closing.end - closing.start).is_equal_to(opening.end - opening.start);
+
+        // Act / Assert: in the middle it is centred on the instant.
+        let middle = TimelineWindow::around(Duration::from_secs(300), media, 100);
+        let half = (middle.end - middle.start) / 2;
+        assert_that!(middle.start).is_equal_to(Duration::from_secs(300) - half);
+    }
+
+    /// Media shorter than the window is shown whole, the same answer `fitted` gives — and an
+    /// unprobed file reporting no duration at all still yields a window with width to draw in
+    /// rather than a zero-length one that would divide by zero.
+    #[test]
+    fn a_window_around_an_instant_should_span_short_or_unknown_media() {
+        // Act / Assert
+        let short = TimelineWindow::around(Duration::from_secs(5), Duration::from_secs(20), 100);
+        assert_that!(short.start).is_equal_to(Duration::ZERO);
+        assert_that!(short.end).is_equal_to(Duration::from_secs(20));
+
+        let unknown = TimelineWindow::around(Duration::ZERO, Duration::ZERO, 100);
+        assert_that!(unknown.end > unknown.start).is_true();
     }
 
     /// A minute of a typeset track holds several hundred events, which no width can draw as

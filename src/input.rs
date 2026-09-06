@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{
-    App, AudioSettingsMode, ContainerSettingsMode, Dialog, Layer, SubtitleSettingsMode,
-    VideoSettingsMode,
+    App, AudioSettingsMode, ContainerSettingsMode, CreateTrackField, Dialog, Layer,
+    SubtitleSettingsMode, VideoSettingsMode,
 };
 use crate::subtitle_edit::{self, CueEdge, TimingScope};
 
@@ -155,6 +155,85 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
             }
             _ => {}
         },
+        // No help panel. `Enter` opens `Format`'s or `Language`'s list and then takes the
+        // choice under the cursor, `Esc` backs out one level at a time, and `h`/`l` pick an
+        // answer directly on the two-state `Placement`/`Action` rows — the grammar
+        // `Dialog::PreviewSettings` already uses for its own switches. `Language`'s list is
+        // searchable exactly the way the subtitle settings dialog's own `Language` row is —
+        // see `Dialog::SubtitleSettings`'s `LanguageDropdown` arm below, which this mirrors.
+        Some(Dialog::CreateTrack) => {
+            let searching = app.create_track_popup.as_ref().is_some_and(|popup| {
+                popup.field == CreateTrackField::Language && popup.language_search.is_active
+            });
+            if searching {
+                input.reset_sequence();
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => app.cancel_create_track_language_search(),
+                    (KeyCode::Down, KeyModifiers::NONE)
+                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                        app.move_create_track_cursor(1)
+                    }
+                    (KeyCode::Up, KeyModifiers::NONE)
+                    | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        app.move_create_track_cursor(-1)
+                    }
+                    (KeyCode::Enter, _) => app.activate_create_track(),
+                    _ => {
+                        handle_text_input_key(app, key);
+                    }
+                }
+            } else {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_create_track_cursor(1);
+                    }
+                    (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_create_track_cursor(-1);
+                    }
+                    (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.start_create_track_language_search();
+                    }
+                    (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_create_track_choice(false);
+                    }
+                    (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => {
+                        input.reset_sequence();
+                        app.move_create_track_choice(true);
+                    }
+                    (KeyCode::Char('G'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        input.reset_sequence();
+                        app.move_create_track_to_endpoint(true);
+                    }
+                    (KeyCode::Enter, _) => {
+                        input.reset_sequence();
+                        app.activate_create_track();
+                    }
+                    // The Create/Back buttons' mnemonics, reachable from anywhere in the
+                    // popup regardless of which row holds the cursor or whether a list is
+                    // open — a mnemonic exists precisely so the reader need not navigate to
+                    // press it. Unreachable while `searching`, so typing "Czech" or
+                    // "Bulgarian" into the language filter never fires one by accident.
+                    (KeyCode::Char('c' | 'C'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        input.reset_sequence();
+                        app.create_track_now();
+                    }
+                    (KeyCode::Char('b' | 'B'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        input.reset_sequence();
+                        app.close_create_track();
+                    }
+                    _ if is_back_key(key) => {
+                        input.reset_sequence();
+                        app.escape_create_track();
+                    }
+                    _ if input.is_double_g(key) => app.move_create_track_to_endpoint(false),
+                    _ => {}
+                }
+            }
+        }
         Some(Dialog::ConfirmCancel) => match (key.code, key.modifiers) {
             (KeyCode::Char('h') | KeyCode::Left, KeyModifiers::NONE) => {
                 input.reset_sequence();
@@ -1081,6 +1160,13 @@ fn handle_layer_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Inp
         (KeyCode::Char('c'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
             input.reset_sequence();
             app.open_subtitle_edit();
+        }
+        // `a` for add, beside the `c` that edits an existing track. It does not collide with
+        // the `za` fold chord, which is reached only through `InputState::z_command` on the
+        // file list.
+        (KeyCode::Char('a'), KeyModifiers::NONE) if app.layer == Layer::Streams => {
+            input.reset_sequence();
+            app.open_create_track();
         }
         // `p` rather than Space, which is otherwise the obvious key for this: the help
         // text is asserted to contain no "Space" binding
@@ -2562,8 +2648,11 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// `a` opens the "what should I make?" popup, and marks nothing as default on the way —
+    /// which is what it did before it meant anything, and is the mistake a key this close to
+    /// the default-track machinery would most plausibly make.
     #[test]
-    fn a_should_not_mark_the_selected_stream_as_default() {
+    fn a_should_open_the_new_track_dialog_rather_than_marking_a_default() {
         // Arrange
         let (mut app, directory) = subtitle_settings_app();
         app.close_subtitle_settings();
@@ -2573,8 +2662,55 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('a')));
 
         // Assert
+        assert_eq!(app.dialog, Some(Dialog::CreateTrack));
         assert!(app.default_streams.is_empty());
         assert!(app.default_sidecars.is_empty());
+
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The dialog's own keys: `j`/`k` move between rows, `Enter` opens `Format`'s list and
+    /// then takes the choice under the cursor, `h`/`l` pick an answer directly on the
+    /// two-state `Placement` row, and a back key peels the open list before the whole popup.
+    #[test]
+    fn the_create_track_dialog_should_answer_the_ordinary_list_keys() {
+        // Arrange
+        let (mut app, directory) = subtitle_settings_app();
+        app.close_subtitle_settings();
+        let mut input = InputState::default();
+        handle_key(&mut app, &mut input, key(KeyCode::Char('a')));
+
+        // Act: Enter opens the format list.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert!(app.create_track_popup.as_ref().unwrap().open);
+
+        // Act: `Esc` closes the list without losing the dialog.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        let popup = app
+            .create_track_popup
+            .as_ref()
+            .expect("the dialog should still be up");
+        assert!(!popup.open);
+        assert_eq!(popup.field, crate::app::CreateTrackField::Format);
+
+        // Act: opened and taken again, the list closes with the choice kept.
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        handle_key(&mut app, &mut input, key(KeyCode::Enter));
+        assert!(!app.create_track_popup.as_ref().unwrap().open);
+
+        // Act: `j` past the language row to placement, and `l` picks External directly.
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        assert_eq!(
+            app.create_track_popup.as_ref().unwrap().field,
+            crate::app::CreateTrackField::Placement
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('l')));
+        assert_eq!(
+            app.create_track_popup.as_ref().unwrap().placement,
+            crate::app::NewTrackPlacement::External
+        );
 
         drop(app);
         fs::remove_dir_all(directory).unwrap();
@@ -2644,6 +2780,21 @@ mod tests {
         assert_eq!(app.cancel_edit_choice, CancelEditChoice::KeepProcessing);
         handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
         assert_eq!(app.cancel_edit_choice, CancelEditChoice::CancelProcessing);
+
+        // Arrange / Act / Assert: the new track popup's four rows.
+        app.dialog = Some(Dialog::CreateTrack);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+        handle_key(&mut app, &mut input, key(KeyCode::Char('G')));
+        assert_eq!(
+            app.create_track_popup.as_ref().unwrap().field,
+            crate::app::CreateTrackField::Action
+        );
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_eq!(
+            app.create_track_popup.as_ref().unwrap().field,
+            crate::app::CreateTrackField::Kind
+        );
 
         drop(app);
         fs::remove_dir_all(directory).unwrap();

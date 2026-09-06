@@ -1727,6 +1727,30 @@ fn validate_subtitle_sources(
                         "A subtitle sidecar changed; reload it before converting.".to_string()
                     );
                 }
+                // **An empty track cannot go into a container.** ffmpeg would be handed a
+                // subtitle stream holding nothing and most muxers refuse it outright, so
+                // without this a save fails somewhere the reader cannot act on. This is on the
+                // common path rather than in a corner: a track created with `a` is internal by
+                // default and so carries the import mark from the moment it exists, while its
+                // file is still the empty one `a` wrote.
+                //
+                // **Exactly zero bytes, which is the state `a` produces**, rather than "parses
+                // to no cues": a file with something in it is the reader's own content, and
+                // whether ffmpeg can make a track of it is ffmpeg's question to answer. The
+                // staged insertions count, since they are the cues a save is about to write.
+                //
+                // Only for an import — leaving an empty sidecar *as* a sidecar writes it back
+                // out unchanged and fails nothing.
+                if change.import_into_media
+                    && change.cues.inserts.is_empty()
+                    && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0)
+                {
+                    return Err(format!(
+                        "{} has no cues yet, so it cannot go into the file. Add a cue, or move \
+                         the track back out.",
+                        sidecar.display_name
+                    ));
+                }
             }
         }
         if change.needs_ocr() && change.ocr_language.as_deref().unwrap_or("").is_empty() {
@@ -7001,6 +7025,71 @@ mod tests {
         assert_that!(rewritten.unwrap_err().as_str()).contains("sidecar changed");
         assert_that!(retyped.unwrap_err().as_str()).contains("sidecar changed");
         assert_that!(companion_rewritten.unwrap_err().as_str()).contains("sidecar changed");
+    }
+
+    /// A track with no cues cannot go into a container: ffmpeg would be handed a subtitle
+    /// stream holding nothing and most muxers refuse it outright, so without this the save
+    /// fails somewhere the reader cannot act on.
+    ///
+    /// This is on the common path rather than in a corner. A track created with `a` is
+    /// internal by default, so it carries the import mark from the moment it exists — while
+    /// its file is still the empty one `a` wrote. Pressing `Ctrl+S` before typing a line is
+    /// therefore the ordinary way to reach it, and it is answered in a sentence.
+    #[test]
+    fn an_empty_sidecar_should_be_refused_for_import_until_it_has_a_cue() {
+        // Arrange: an empty sidecar marked to go into the media, exactly as `a` leaves one.
+        let directory = scratch_directory("empty-sidecar-import");
+        let _cleanup = DirectoryCleanup(Some(directory.clone()));
+        let info = media(serde_json::json!([track(0, "video", "h264")]));
+        let path = directory.join("movie.und.srt");
+        fs::write(&path, "").unwrap();
+        let mut sidecar = sidecar_entry(&path, None, SubtitleFormat::SubRip);
+        sidecar.fingerprint = FileFingerprint::for_path(&path).unwrap();
+        let mut change = SubtitleChange {
+            cues: Default::default(),
+            source: SubtitleSource::Sidecar(path.clone()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: true,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act / Assert: refused, naming the file so the reader knows which track to fill in.
+        let empty =
+            validate_subtitle_sources(&info, std::slice::from_ref(&change), &[sidecar.clone()]);
+        assert_that!(empty.unwrap_err().as_str()).contains("has no cues yet");
+
+        // Act / Assert: a staged insertion is the cue a save is about to write, so it counts
+        // even though the file on disk is still empty — which is the whole normal workflow.
+        change.cues.inserts.insert(
+            0,
+            crate::subtitle::CueInsert {
+                text: "First line".to_string(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+            },
+        );
+        let with_a_cue =
+            validate_subtitle_sources(&info, std::slice::from_ref(&change), &[sidecar.clone()]);
+        assert_that!(with_a_cue).is_ok();
+
+        // Act / Assert: left as a sidecar it is nobody's business but the reader's — writing
+        // an empty file back out unchanged fails nothing.
+        change.cues.inserts.clear();
+        change.import_into_media = false;
+        change.metadata = Some(crate::subtitle::SubtitleMetadata {
+            language: "eng".to_string(),
+            title: None,
+            forced: false,
+            cc: false,
+            hearing_impaired: false,
+            original: false,
+            commentary: false,
+        });
+        let left_alone = validate_subtitle_sources(&info, &[change], &[sidecar]);
+        assert_that!(left_alone).is_ok();
     }
 
     #[test]

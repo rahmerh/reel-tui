@@ -20,11 +20,12 @@ use crate::{
     app::{
         App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
         ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
-        ContainerSettingsPopup, CueTarget, CustomResolutionField, Dialog, InputReject, Layer,
-        LeaveCuesChoice, PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState,
-        StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode,
-        SubtitleSettingsPopup, TextInputConfig, TextInputSite, TextInputState, TrackRef,
-        VideoSettingsField, VideoSettingsMode, describe_track_groups,
+        ContainerSettingsPopup, CreateTrackAction, CreateTrackField, CueTarget,
+        CustomResolutionField, Dialog, InputReject, Layer, LeaveCuesChoice, NewTrackPlacement,
+        PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState, StagedFileStatus,
+        SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode, SubtitleSettingsPopup,
+        TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
+        VideoSettingsMode, describe_track_groups,
     },
     cue::{
         Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_precise,
@@ -200,12 +201,13 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
+    // A track that parsed to *no* cues is deliberately not here: it draws the ordinary page,
+    // with the cue panel saying it is empty and the timeline drawn around the cursor. A
+    // message over the whole page is right while there is nothing to do yet — the cues are
+    // still being read, or the read failed — and wrong for a track the reader can put a line
+    // into with `i`, which is the only thing there is to do on one.
     let message = match &state.status {
         LoadStatus::Preparing => Some(("Reading cues…".to_string(), Color::Gray)),
-        LoadStatus::Empty => Some((
-            "This subtitle track has no cues.".to_string(),
-            Color::Yellow,
-        )),
         LoadStatus::Failed(message) => Some((message.clone(), Color::Red)),
         LoadStatus::Ready => None,
     };
@@ -667,15 +669,24 @@ fn render_edit_cues(
     let timing = group_timing(&state.cues, inner.width / GROUP_COLUMNS as u16);
     let mut top = inner.y;
 
-    // A filter matching nothing says so, rather than leaving the reader looking at an empty
-    // panel that reads the same as a track still loading. The same answer the subtitle
-    // settings popup gives a language search with no hits.
-    if visible.is_empty() && !marks.query.is_empty() {
+    // An empty panel says why it is empty, rather than leaving the reader looking at
+    // something that reads the same as a track still loading. Two different reasons: a filter
+    // matching nothing — the answer the subtitle settings popup gives a language search with
+    // no hits — and a track that holds no cues at all, which is a subtitle track the reader
+    // has just created and not yet typed a line into. The second is where the whole-page
+    // message used to be; it belongs in this pane, because the pane beside it is a working
+    // timeline the reader aims `i` with.
+    if visible.is_empty() {
+        let (message, colour) = if marks.query.is_empty() {
+            ("This subtitle track has no cues.", Color::Yellow)
+        } else {
+            ("No matching cues", Color::DarkGray)
+        };
         frame.render_widget(
-            Paragraph::new("No matching cues")
+            Paragraph::new(message)
                 .centered()
                 .wrap(Wrap { trim: true })
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(colour)),
             inner,
         );
     }
@@ -1134,14 +1145,13 @@ fn render_edit_timeline(
     selected: Option<usize>,
     area: Rect,
 ) {
-    let Some(cue) = state.selected_cue() else {
-        // "Ready but holding nothing" is reachable state, since `cues` and `selected` are
-        // public — see `the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_\
-        // underneath_it`. The frame is still drawn, but with no span to name in its title
-        // and nothing to lay an axis against.
-        frame.render_widget(Block::bordered().title(" Timeline "), area);
-        return;
-    };
+    // **A track with no cues still gets a working timeline.** It is the pane the reader aims
+    // `i` with — the only thing there is to do on a track they have just created — so a bare
+    // border here would leave them scrubbing with no axis, no cursor mark and no readout.
+    // There is simply no cue to anchor on: the title reads the cursor's moment alone, and the
+    // window comes from `TimelineWindow::around` rather than from `fitted`, which shortens a
+    // window until the cues in it are drawable and so has nothing to ask of an empty track.
+    let cue = state.selected_cue().cloned();
     // The selected cue's exact times go in the title rather than onto the axis. At roughly
     // a second per column there is nowhere on the track to put a ten-character timestamp
     // without it covering the cues around it, and the title is otherwise empty space.
@@ -1179,9 +1189,12 @@ fn render_edit_timeline(
     // two timestamps say where the line is and how long it is only by subtraction, which is
     // arithmetic nobody does while holding a key down. Dropped for a cue at the length the
     // file gives it, so it is a readout rather than a figure that is always there.
-    let mut readings: Vec<String> = match cursor {
-        Some(at) => vec![format_precise(at)],
-        None => [
+    let mut readings: Vec<String> = match (cursor, cue.as_ref()) {
+        (Some(at), _) => vec![format_precise(at)],
+        // No cursor and no cue is a track holding nothing with the panel focused, which the
+        // page leaves the moment its cues land. Nothing to read, so nothing is claimed.
+        (None, None) => Vec::new(),
+        (None, Some(cue)) => [
             Some(format!(
                 "{} → {}",
                 format_timestamp(cue.start),
@@ -1204,7 +1217,11 @@ fn render_edit_timeline(
     while readings.len() > 1 && title_width(&readings) > usize::from(area.width.saturating_sub(2)) {
         readings.remove(0);
     }
-    let title = format!(" Timeline ({}) ", readings.join(" · "));
+    let title = if readings.is_empty() {
+        " Timeline ".to_string()
+    } else {
+        format!(" Timeline ({}) ", readings.join(" · "))
+    };
     let block = Block::bordered()
         .border_style(focus_border(cursor.is_some()))
         .title(if retiming {
@@ -1214,13 +1231,18 @@ fn render_edit_timeline(
         });
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let window = TimelineWindow::fitted(
-        cue,
-        &state.cues,
-        state.duration,
-        inner.width,
-        state.layout.lane_count,
-    );
+    let window = match cue.as_ref() {
+        Some(cue) => TimelineWindow::fitted(
+            cue,
+            &state.cues,
+            state.duration,
+            inner.width,
+            state.layout.lane_count,
+        ),
+        // Nothing on the track to fit a window around, so the cursor is what it is built
+        // from — the widest view of the media, since there is nothing in it to crowd.
+        None => TimelineWindow::around(cursor.unwrap_or_default(), state.duration, inner.width),
+    };
     // **While the timeline holds the cursor the window is the reader's, not the selected
     // cue's.** `fitted` anchors on the selection and is rebuilt from it every draw, so sliding
     // *that* the minimum needed to hold the cursor parks the cursor against whichever edge it
@@ -1256,7 +1278,9 @@ fn render_edit_timeline(
     // is on would be the axis naming a position no key moves.
     lines.push(timeline_ruler(
         &window,
-        selected.and_then(|_| window.span(cue)),
+        selected
+            .zip(cue.as_ref())
+            .and_then(|(_, cue)| window.span(cue)),
         cursor,
         retiming,
     ));
@@ -2743,6 +2767,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_confirm_leave_cues_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::CreateTrack {
+        render_create_track_dialog(frame, app);
+        return;
+    }
     // Matched exhaustively rather than falling through to the error popup: every dialog
     // above returns, so a new `Dialog` variant that forgets to must fail to compile here
     // instead of silently rendering itself as an editing error.
@@ -2760,6 +2788,7 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::ResolveConflicts
         | Dialog::EditCue
         | Dialog::CueLength
+        | Dialog::CreateTrack
         | Dialog::ConfirmLeaveCues => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
@@ -2924,6 +2953,251 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
             min_height: 10,
         },
     );
+}
+
+/// The "what should I make?" popup: kind, format, placement, then Create/Back — all shown
+/// at once, since a track's kind and format have exactly one real answer today.
+///
+/// **Kind is reachable but not editable.** `NewTrackKind` has one variant, so there is
+/// nothing to choose — it is drawn as three boxes with only `Subtitles` lit, `Video` and
+/// `Audio` shown and disabled — but the cursor can still land on the row, so `h`/`l` can
+/// answer with a "not implemented yet" notice rather than the row being invisible to
+/// navigation entirely.
+///
+/// **Placement is a two-button radio row, not a dropdown**, now that its labels are one word
+/// each (`Embedded`/`External`) rather than the sentences the old `Internal —`/`External —`
+/// wording needed a list to hold. `h`/`l` between the two mirrors the preview-settings
+/// popup's toggles.
+///
+/// **Create/Back is the one place a button doubles as a mnemonic keyboard shortcut** — the
+/// letter each is bound to (`c`/`C`, `b`/`B`) is picked out in cyan so the shortcut is visible
+/// without opening the keybindings popup.
+///
+/// **`Language` is asked here rather than left to a second visit to the subtitle settings
+/// dialog**, because a save refuses an undetermined sidecar outright — a track created with
+/// no answer here could not be written at all. It is the same searchable dropdown that
+/// dialog's own `Language` row uses (`app.filtered_create_track_languages`, windowed ten
+/// entries around the cursor the way `SubtitleSettingsMode::LanguageDropdown` already is),
+/// so a reader who has used that picker once needs nothing new to use this one.
+fn render_create_track_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.create_track_popup.as_ref() else {
+        return;
+    };
+    let choices = app.create_track_choices();
+    let mut lines = Vec::new();
+    let mut focus_line = 0;
+
+    let kind_selected = popup.field == CreateTrackField::Kind;
+    if kind_selected {
+        focus_line = lines.len();
+    }
+    lines.push(create_track_kind_line(kind_selected));
+    lines.push(Line::default());
+
+    let format_selected = popup.field == CreateTrackField::Format;
+    let format_open = format_selected && popup.open;
+    if format_selected && !popup.open {
+        focus_line = lines.len();
+    }
+    lines.push(setting_line(
+        "Format",
+        popup.format.label(),
+        format_selected && !popup.open,
+        false,
+        format_open,
+    ));
+    if format_open {
+        focus_line = lines.len() + popup.cursor;
+        push_create_track_choices(&mut lines, &choices, popup.cursor);
+    }
+
+    let language_selected = popup.field == CreateTrackField::Language;
+    let language_open = language_selected && popup.open;
+    if language_selected && !popup.open {
+        focus_line = lines.len();
+    }
+    // Empty until the reader picks one — see `CreateTrackField`'s doc comment for why this
+    // deliberately does not default to the guess `Enter` on the row offers.
+    let language_label = crate::subtitle::language_choice(&popup.language)
+        .map(|choice| choice.label())
+        .unwrap_or_else(|| "Choose a language…".to_string());
+    lines.push(setting_line(
+        "Language",
+        &language_label,
+        language_selected && !popup.open,
+        false,
+        language_open,
+    ));
+    if language_open {
+        lines.push(text_field_line(
+            TextField::new(
+                "Search",
+                FieldValue::Editing(&popup.language_search.input),
+                TextInputConfig::LANGUAGE_SEARCH.width,
+            )
+            .selected(popup.language_search.is_active)
+            .suffix(match_suffix(choices.len()))
+            .reject(app.text_input_reject(TextInputSite::CreateTrackLanguageSearch)),
+        ));
+        let start = popup.cursor.saturating_sub(5).min(choices.len());
+        focus_line = lines.len() + popup.cursor.saturating_sub(start);
+        push_create_track_language_choices(&mut lines, &choices, popup.cursor, start);
+    }
+
+    let placement_selected = popup.field == CreateTrackField::Placement;
+    if placement_selected {
+        focus_line = lines.len();
+    }
+    lines.push(choice_pair_line(
+        "Placement",
+        "Embedded",
+        "External",
+        popup.placement == NewTrackPlacement::Internal,
+        placement_selected,
+        // Marked as changed when it is not the default, the rule the preview settings
+        // popup follows: the reader can see at a glance that they moved it.
+        popup.placement != NewTrackPlacement::default(),
+    ));
+
+    lines.push(Line::default());
+    let action_selected = popup.field == CreateTrackField::Action;
+    if action_selected {
+        focus_line = lines.len();
+    }
+    lines.push(create_track_action_line(
+        popup.action,
+        action_selected,
+        !popup.language.is_empty(),
+    ));
+
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: " New track ".to_string(),
+            focus_line,
+            help: None,
+            min_height: 10,
+        },
+    );
+}
+
+/// The fixed "what kind of track" radio row: only `Subtitles` is a real choice today, so it
+/// is drawn lit and the other two disabled rather than as a dropdown over a list of one.
+///
+/// Reachable by the cursor (`selected`) like any other row, even though `h`/`l` cannot move
+/// it — a row the cursor can never land on would look like it was skipped by accident rather
+/// than like a deliberate "there is nothing to choose here yet".
+fn create_track_kind_line(selected: bool) -> Line<'static> {
+    Line::from(vec![
+        // Not `changed`: that is the yellow-italic staged-edit look every dropdown row here
+        // uses for an answer moved off its default, and this one is neither staged nor
+        // movable. Plain white (or the row's own focused style) is what a dropdown's
+        // chosen-but-untouched answer wears, so `Subtitles` reads the same way `Placement`'s
+        // default answer does.
+        action_option(" Subtitles ", choice_style(selected, false, true)),
+        Span::raw("  "),
+        action_option(" Video ", choice_style(false, false, false)),
+        Span::raw("  "),
+        action_option(" Audio ", choice_style(false, false, false)),
+    ])
+    .centered()
+}
+
+/// The Create/Back button row: each label's first letter is its mnemonic shortcut
+/// (`App::create_track_now`, `App::close_create_track`), bound in `input.rs` regardless of
+/// which row holds the cursor — `h`/`l` and `Enter` reach the same two buttons through the
+/// ordinary focus-and-choose grammar every other row here uses.
+/// `can_create` grays `Create` out — without disabling it outright, since `c`/`C` still work
+/// and answer with the same "choose a language" notice `Enter` on the row would — while a
+/// language is still unchosen. `Back` is unaffected: leaving the popup never needed one.
+fn create_track_action_line(
+    action: CreateTrackAction,
+    selected: bool,
+    can_create: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for choice in CreateTrackAction::ORDER {
+        if choice != CreateTrackAction::Create {
+            spans.push(Span::raw(" "));
+        }
+        let enabled = choice != CreateTrackAction::Create || can_create;
+        let style = choice_style(choice == action && selected, false, enabled);
+        let rest = &choice.label()[choice.mnemonic().len_utf8()..];
+        spans.extend(mnemonic_option(choice.mnemonic(), rest, style));
+    }
+    Line::from(spans).centered()
+}
+
+/// A button like [`action_option`], with its mnemonic letter picked out in cyan so the
+/// reader can see which key activates it without opening the keybindings popup — the New
+/// Track popup's Create/Back row is the first place a button doubles as a keyboard shortcut.
+/// The padding matches `action_option`'s: a space either side of the label, split across the
+/// two spans at the letter.
+///
+/// Left alone when the button already sits on a cyan background (the row is focused and this
+/// is the chosen answer) — cyan text on a cyan fill would be invisible, and a focused button
+/// is already the most prominent thing on the row without it. Left alone on a grayed-out
+/// button too (`Create` before a language is chosen), so it reads as unavailable even though
+/// its mnemonic still answers, with a notice, rather than doing nothing silently.
+fn mnemonic_option(letter: char, rest: &str, style: Style) -> Vec<Span<'static>> {
+    let letter_style = if style.bg == Some(Color::Cyan) || style.fg == Some(Color::DarkGray) {
+        style
+    } else {
+        style.fg(Color::Cyan)
+    };
+    vec![
+        Span::styled(format!(" {letter}"), letter_style),
+        Span::styled(format!("{rest} "), style),
+    ]
+}
+
+fn push_create_track_choices(lines: &mut Vec<Line<'static>>, choices: &[String], cursor: usize) {
+    let last = choices.len().saturating_sub(1);
+    for (position, label) in choices.iter().enumerate() {
+        lines.push(dropdown_line(
+            label,
+            position == cursor,
+            position == cursor,
+            true,
+            false,
+            position == last,
+        ));
+    }
+}
+
+/// The `Language` row's list, windowed the way `SubtitleSettingsMode::LanguageDropdown`'s
+/// already is — ten entries around the cursor, since the full common-language list is too
+/// long to draw whole in a popup this size. `start` comes from the caller rather than being
+/// recomputed here, so the window this draws and the `focus_line` the caller scrolls to
+/// cannot disagree about where it begins.
+fn push_create_track_language_choices(
+    lines: &mut Vec<Line<'static>>,
+    choices: &[String],
+    cursor: usize,
+    start: usize,
+) {
+    let end = (start + 10).min(choices.len());
+    let last = end.saturating_sub(1);
+    for (position, label) in choices.iter().enumerate().take(end).skip(start) {
+        lines.push(dropdown_line(
+            label,
+            position == cursor,
+            position == cursor,
+            true,
+            false,
+            position == last,
+        ));
+    }
+    if choices.is_empty() {
+        lines.push(Line::from(vec![
+            tree_guide_span(true),
+            Span::styled(
+                "No matching languages",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
 }
 
 fn container_choice_line(choice: &ContainerChoice, cursor: bool, last: bool) -> Line<'static> {
@@ -3343,6 +3617,17 @@ fn keybindings_text() -> Text<'static> {
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
+    keybinding(
+        &mut lines,
+        "a",
+        "Add a new subtitle track to this file, inside it or beside it, and open it for editing",
+    );
+    keybinding(
+        &mut lines,
+        "c / b",
+        "In the popup `a` opens: Create it, or Back out without doing so — the mnemonic \
+         letters picked out in cyan on those buttons, reachable from any row",
+    );
     keybinding(
         &mut lines,
         "c",
@@ -5575,17 +5860,38 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
 /// focused or changed styling and the other its dimming — so which answer is *true* reads at
 /// a glance, and which row the cursor is on reads exactly as it does on a dropdown row.
 fn toggle_line(label: &str, yes: bool, selected: bool, changed: bool) -> Line<'static> {
+    choice_pair_line(label, "Yes", "No", yes, selected, changed)
+}
+
+/// The general shape `toggle_line`'s Yes/No pair specialises, and the New Track popup's
+/// Placement row (`Embedded`/`External`) uses directly — a labelled row of two named
+/// buttons rather than the fixed words a plain switch reads as.
+fn choice_pair_line(
+    label: &str,
+    left: &str,
+    right: &str,
+    left_chosen: bool,
+    selected: bool,
+    changed: bool,
+) -> Line<'static> {
     Line::from(vec![
         field_label_span(
             "▹",
             label,
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
-        action_option(" Yes ", choice_style(yes && selected, yes && changed, yes)),
+        action_option(
+            format!(" {left} "),
+            choice_style(left_chosen && selected, left_chosen && changed, left_chosen),
+        ),
         Span::raw(" "),
         action_option(
-            " No ",
-            choice_style(!yes && selected, !yes && changed, !yes),
+            format!(" {right} "),
+            choice_style(
+                !left_chosen && selected,
+                !left_chosen && changed,
+                !left_chosen,
+            ),
         ),
     ])
 }
@@ -7467,6 +7773,9 @@ mod tests {
                 });
             }
             Dialog::ConfirmLeaveCues => {}
+            Dialog::CreateTrack => {
+                app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+            }
             Dialog::PreviewSettings => {
                 app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup::default());
             }
@@ -8961,6 +9270,253 @@ mod tests {
             .map(|(index, _)| index)
             .collect();
         assert_that!(scrolled_bars).is_equal_to(vec![last_row, last_row + 1]);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// The kind row is fixed rather than a dropdown — `Subtitles` is the only real kind, so
+    /// it is drawn lit and `Video`/`Audio` are drawn but disabled, never opening a list.
+    #[test]
+    fn the_new_track_dialog_should_show_video_and_audio_disabled() {
+        // Act
+        let line = create_track_kind_line(false);
+
+        // Assert
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_that!(text.contains("Subtitles")).is_true();
+        assert_that!(text.contains("Video")).is_true();
+        assert_that!(text.contains("Audio")).is_true();
+        let disabled = |label: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains(label))
+                .expect("label present")
+                .style
+                .fg
+                == Some(Color::DarkGray)
+        };
+        assert_that!(disabled("Video")).is_true();
+        assert_that!(disabled("Audio")).is_true();
+        assert_that!(disabled("Subtitles")).is_false();
+    }
+
+    /// The format row opens its own list, and the placement row beside it keeps showing its
+    /// answer while that happens — a reader choosing one should not lose sight of the other.
+    #[test]
+    fn the_new_track_dialog_should_list_the_formats_while_that_row_is_open() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-format-open", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Format,
+            open: true,
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("SubRip")).is_true();
+        assert_that!(screen.contains("Placement")).is_true();
+        assert_that!(screen.contains("Embedded")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A placement the reader moved off the default is drawn as *changed*, the rule the preview
+    /// settings popup follows — so "did I leave this as external?" is answerable at a glance,
+    /// with the yellow italic every staged-but-unwritten value in the application wears.
+    #[test]
+    fn the_new_track_dialog_should_mark_a_placement_moved_off_the_default() {
+        // Act: the row as the renderer builds it, for each answer.
+        let default = choice_pair_line("Placement", "Embedded", "External", true, false, false);
+        let moved = choice_pair_line("Placement", "Embedded", "External", false, false, true);
+
+        // Assert
+        let italic = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+        };
+        assert_that!(italic(&default)).is_false();
+        assert_that!(italic(&moved)).is_true();
+    }
+
+    /// The renderer is reached from `render_dialog`, which draws whatever `App::dialog` names —
+    /// so it has to be inert on its own when the popup is not there.
+    #[test]
+    fn the_new_track_dialog_should_draw_nothing_without_a_popup() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-no-popup", &[]);
+        app.create_track_popup = None;
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("New track")).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every row shows the moment the popup opens — kind, format, placement and the
+    /// Create/Back buttons — since there is no longer a step to answer before the rest
+    /// appears.
+    #[test]
+    fn the_new_track_dialog_should_show_every_field_at_once() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-single-screen", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("New track")).is_true();
+        assert_that!(screen.contains("Subtitles")).is_true();
+        assert_that!(screen.contains("Format")).is_true();
+        assert_that!(screen.contains("SubRip")).is_true();
+        assert_that!(screen.contains("Language")).is_true();
+        assert_that!(screen.contains("Placement")).is_true();
+        assert_that!(screen.contains("Embedded")).is_true();
+        assert_that!(screen.contains("Create")).is_true();
+        assert_that!(screen.contains("Back")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `Language` row shows the guessed language's full name, not its bare code — the
+    /// same label the subtitle settings dialog's own `Language` row wears.
+    #[test]
+    fn the_new_track_dialog_should_show_the_guessed_language_by_name() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-label", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("English (eng)")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An unchosen `Language` reads as a prompt rather than as a blank value — the same
+    /// wording the subtitle settings dialog's own `Language` row uses before it has an answer.
+    #[test]
+    fn the_new_track_dialog_should_prompt_for_a_language_before_one_is_chosen() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-unchosen", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("Choose a language…")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Create` is grayed out until a language is chosen — the same disabled look `Video` and
+    /// `Audio` wear on the kind row — while `Back` stays available throughout.
+    #[test]
+    fn the_new_track_dialog_should_gray_create_until_a_language_is_chosen() {
+        // Act
+        let unchosen =
+            create_track_action_line(crate::app::CreateTrackAction::Create, false, false);
+        let chosen = create_track_action_line(crate::app::CreateTrackAction::Create, false, true);
+
+        // Assert
+        let create_is_gray = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .take_while(|span| !span.content.contains('B'))
+                .any(|span| span.style.fg == Some(Color::DarkGray))
+        };
+        assert_that!(create_is_gray(&unchosen)).is_true();
+        assert_that!(create_is_gray(&chosen)).is_false();
+    }
+
+    /// Opening the `Language` row's list draws the search bar and the filtered choices, the
+    /// same windowed shape `SubtitleSettingsMode::LanguageDropdown` already draws.
+    #[test]
+    fn the_new_track_dialog_should_list_languages_with_a_search_bar_while_that_row_is_open() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-open", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Language,
+            open: true,
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert: the search field is drawn, and at least one real language beside the guess.
+        assert_that!(screen.contains("Search")).is_true();
+        assert_that!(screen.contains("English (eng)")).is_true();
+        assert_that!(screen.contains("match")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A query that matches nothing says so, rather than leaving a dropdown with no rows and
+    /// no explanation.
+    #[test]
+    fn the_new_track_dialog_should_say_when_no_language_matches_the_query() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-no-match", &[]);
+        let mut popup = crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Language,
+            open: true,
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        };
+        popup.language_search.input = TextInputState::new("zzzzz".to_string());
+        app.create_track_popup = Some(popup);
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("No matching languages")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An open row shows its choices with the cursor marked, the way every other settings
+    /// popup's dropdown does — that mark is the only thing saying which one `Enter` will take.
+    /// Format is the one row left that opens a list at all.
+    #[test]
+    fn the_new_track_dialog_should_mark_the_cursor_in_an_open_list() {
+        // Arrange: the format list open on its only entry.
+        let (mut app, directory) = test_app("new-track-open-list", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Format,
+            open: true,
+            cursor: 0,
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert: the one answer is listed, marked under the cursor.
+        assert_that!(screen.contains("SubRip")).is_true();
+        let marked = screen
+            .lines()
+            .find(|line| line.contains("> "))
+            .expect("the cursor row should be marked");
+        assert_that!(marked.contains("SubRip")).is_true();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -12551,11 +13107,11 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", the four that match
-        // on "tracks" — the SRT timing preview, the cue editor, the timing mode, and marking
-        // a cue for deletion — and global retiming, which names both a track that is out of
-        // sync and the SubRip tracks it works on.
-        assert_eq!(count, 7);
+        // "Move track down / up", "Mark or unmark track for deletion", "Add a new subtitle
+        // track", the four that match on "tracks" — the SRT timing preview, the cue editor,
+        // the timing mode, and marking a cue for deletion — and global retiming, which names
+        // both a track that is out of sync and the SubRip tracks it works on.
+        assert_eq!(count, 8);
     }
 
     #[test]
@@ -13803,13 +14359,24 @@ mod tests {
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
         assert_that!(screen.contains("Reading cues")).is_true();
 
-        // Act / Assert: read, but the track holds nothing.
+        // Act / Assert: read, but the track holds nothing. The page is drawn in full — this
+        // is a track the reader can put a line into, and the timeline is what they aim `i`
+        // with — so the emptiness is said in the one pane that has something to say about it
+        // rather than over the whole page. The message wraps in the narrow panel, hence the
+        // two halves.
         app.subtitle_edit
             .as_mut()
             .unwrap()
             .apply_prepared(Vec::new(), crate::preview::CueStyle::SubRip);
         let screen = drawn(80, 20, |frame| render(frame, &mut app));
-        assert_that!(screen.contains("no cues")).is_true();
+        assert_that!(screen.contains("This subtitle track has no")).is_true();
+        assert_that!(screen.contains("cues.")).is_true();
+        assert_that!(screen.contains(" Cues ")).is_true();
+        assert_that!(screen.contains(" Preview ")).is_true();
+        // A working timeline: its title reads the cursor's moment, and the ruler carries the
+        // cursor's own mark. Without these the reader would be scrubbing a bare border.
+        assert_that!(screen.contains("Timeline (00:00:00.00)")).is_true();
+        assert_that!(screen.contains('▼')).is_true();
 
         // Act / Assert: it went wrong, and says so.
         app.subtitle_edit

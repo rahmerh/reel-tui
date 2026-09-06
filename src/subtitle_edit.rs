@@ -266,14 +266,20 @@ impl PreviewSupport {
 }
 
 /// How far the page has got in loading a track's cues.
+///
+/// **A track that parsed to no cues is `Ready`, not a state of its own.** It used to be
+/// `Empty`, drawn as a message over the whole page — which made an empty track a dead end,
+/// since `i` can only add a cue while the timeline holds the cursor and `focus_timeline`
+/// refused anything but `Ready`. A track the reader has just created has no cues by
+/// definition, so the page has to be workable without them: emptiness is now drawn from
+/// `cues.is_empty()` in the one pane that has something to say about it, rather than carried
+/// as a status every guard would have to learn about.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoadStatus {
     /// Cues are being extracted or read. The page is open and drawn during this.
     Preparing,
+    /// The cues arrived — including the case where there are none of them.
     Ready,
-    /// The track parsed but holds no cues — an empty or wholly unparseable file.
-    /// Distinct from `Failed`, because nothing went wrong, there is just nothing to see.
-    Empty,
     Failed(String),
 }
 
@@ -881,11 +887,7 @@ impl SubtitleEditState {
         self.frames.style = Arc::new(style);
         self.layout = pack_lanes(&cues, MAX_LANES);
         self.groups = group_overlaps(&cues);
-        self.status = if cues.is_empty() {
-            LoadStatus::Empty
-        } else {
-            LoadStatus::Ready
-        };
+        self.status = LoadStatus::Ready;
         // Every cue is the file's until the reader adds one: this is the reading the staged
         // rewrites' positions are keyed against.
         self.origins = (0..cues.len()).map(CueOrigin::File).collect();
@@ -919,6 +921,15 @@ impl SubtitleEditState {
         // against has just been replaced.
         self.leave_timeline();
         self.select_cue();
+        // **A track with no cues arrives with the cursor in the timeline**, because the cue
+        // panel is the pane that marks a selection and there is nothing here for it to mark.
+        // The timeline is also where `i` means "make a cue at this moment", which is the only
+        // thing a reader can do on a track like this — a subtitle track they have just
+        // created, or an empty sidecar sitting beside their media. Decided here rather than
+        // when the page opens, because this is when the emptiness is known.
+        if self.cues.is_empty() {
+            self.focus_timeline();
+        }
     }
 
     /// Where the cursor should land when this page's cues arrive.
@@ -978,7 +989,7 @@ impl SubtitleEditState {
     /// wrong question.
     pub fn still_frame(&self) -> Option<&Protocol> {
         match self.cursor() {
-            Some(at) if self.cursor_seed() != Some(at) => None,
+            Some(at) if self.cursor_seed() != at => None,
             _ => self.frame(),
         }
     }
@@ -1285,6 +1296,13 @@ impl SubtitleEditState {
         self.refilter();
         self.leave_timeline();
         self.select_cue();
+        // Un-adding the last cue a track has puts the page back into the state it arrives in
+        // for a track that never had one — cursor in the timeline, where `i` can make another.
+        // Left in the cue panel it would be a cursor on a list with no rows, and the reader
+        // would have to know to press `Ctrl+J` to get anywhere.
+        if self.cues.is_empty() {
+            self.focus_timeline();
+        }
     }
 
     /// Shifts the selected cue through time, keeping its duration, and reports the new
@@ -1569,11 +1587,8 @@ impl SubtitleEditState {
         if self.focus == EditFocus::Timeline || self.status != LoadStatus::Ready {
             return false;
         }
-        let Some(seed) = self.cursor_seed() else {
-            return false;
-        };
         self.focus = EditFocus::Timeline;
-        self.cursor = seed;
+        self.cursor = self.cursor_seed();
         // A span playing for the cue the reader has just stopped pointing at is the same
         // defect `select_cue` exists to prevent, arrived at from the other direction: the
         // cue panel no longer marks a selection while the cursor is here, so a playback
@@ -1706,9 +1721,15 @@ impl SubtitleEditState {
     /// rather than at each of its two callers, since the other is [`Self::still_frame`], which
     /// asks whether the cursor is *still* standing here: two spellings of the same moment that
     /// drifted apart would leave the pane showing a picture of a moment the cursor has left.
-    fn cursor_seed(&self) -> Option<Duration> {
+    ///
+    /// The start of the media when there is no cue to seed from, which is a track holding no
+    /// cues at all — one the reader has just created. There is nowhere else for a cursor to
+    /// begin on a track with nothing in it, and it has to begin somewhere for `i` to have a
+    /// moment to make a cue at.
+    fn cursor_seed(&self) -> Duration {
         self.selected_cue()
             .map(|cue| seek_for(cue, self.duration).min(self.cursor_ceiling()))
+            .unwrap_or_default()
     }
 
     /// What the frame worker needs in order to draw the moment the cursor stands on.
@@ -2738,11 +2759,12 @@ mod tests {
         assert_that!(state.is_busy()).is_false();
     }
 
-    /// An empty track is not a failure — the file was read, it simply holds no cues —
-    /// and reporting it as one would send the user hunting for a problem that is not
-    /// there.
+    /// An empty track is not a failure — the file was read, it simply holds no cues — and
+    /// reporting it as one would send the user hunting for a problem that is not there. It is
+    /// `Ready` rather than a state of its own because it is a page the reader can work in:
+    /// the cursor lands in the timeline, where `i` makes the track's first cue.
     #[test]
-    fn apply_prepared_should_report_an_empty_track_separately_from_a_failure() {
+    fn apply_prepared_should_make_an_empty_track_ready_with_the_cursor_in_the_timeline() {
         // Arrange
         let mut state = state();
 
@@ -2750,8 +2772,85 @@ mod tests {
         state.apply_prepared(Vec::new(), CueStyle::SubRip);
 
         // Assert
-        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Empty);
+        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Ready);
         assert_that!(state.is_busy()).is_false();
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
+    }
+
+    /// The cue panel is the only pane that marks a selection, so a track with nothing in it
+    /// has nothing for it to mark — and the timeline is where `i` means "make a cue at this
+    /// moment", which is the only thing there is to do on such a track. Left in the panel the
+    /// reader would have to know to press `Ctrl+J` before anything would answer them.
+    #[test]
+    fn focus_timeline_should_take_the_cursor_on_a_track_with_no_cues() {
+        // Arrange
+        let mut state = state();
+        state.apply_prepared(Vec::new(), CueStyle::SubRip);
+        state.leave_timeline();
+
+        // Act
+        let taken = state.focus_timeline();
+
+        // Assert
+        assert_that!(taken).is_true();
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
+    }
+
+    /// There is nowhere else for a cursor to begin on a track with nothing in it, and it has
+    /// to begin somewhere for `i` to have a moment to make a cue at.
+    #[test]
+    fn cursor_seed_should_be_the_start_of_the_media_when_there_is_no_cue_to_seed_from() {
+        // Arrange
+        let mut state = state();
+        state.apply_prepared(Vec::new(), CueStyle::SubRip);
+
+        // Assert
+        assert_that!(state.cursor_seed()).is_equal_to(Duration::ZERO);
+    }
+
+    /// The first cue makes the track an ordinary one: the row is drawn, the panel marks it,
+    /// and the cursor comes home out of the timeline the way it does after any insertion.
+    #[test]
+    fn inserting_the_first_cue_should_put_the_cursor_back_in_the_cue_panel() {
+        // Arrange
+        let mut state = state();
+        state.apply_prepared(Vec::new(), CueStyle::SubRip);
+
+        // Act
+        let at = state.insert_cue(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            "First line".to_string(),
+        );
+
+        // Assert
+        assert_that!(at).is_equal_to(0);
+        assert_that!(state.cues.len()).is_equal_to(1);
+        assert_that!(state.cursor()).is_equal_to(None);
+        assert_that!(state.status.clone()).is_equal_to(LoadStatus::Ready);
+    }
+
+    /// Un-adding the only cue puts the page back into the state it arrives in for a track that
+    /// never had one, rather than leaving the cursor on a list with no rows in it.
+    #[test]
+    fn removing_the_last_cue_should_hand_the_cursor_back_to_the_timeline() {
+        // Arrange
+        let mut state = state();
+        state.apply_prepared(Vec::new(), CueStyle::SubRip);
+        let at = state.insert_cue(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            "First line".to_string(),
+        );
+
+        // Act
+        state.remove_cue(at);
+
+        // Assert
+        assert_that!(state.cues.is_empty()).is_true();
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
     }
 
     #[test]
@@ -5297,17 +5396,19 @@ mod tests {
         assert_that!(state.window_start()).is_none();
     }
 
-    /// A page that read its cues and then had them taken away draws no timeline at all.
+    /// A page whose cues were taken away still has a timeline to walk, seeded at the start of
+    /// the media. This used to be a refusal, which made a track with no cues a dead end: `i`
+    /// can only make one while the timeline holds the cursor, so a reader could neither add a
+    /// line nor see where one would go.
     #[test]
-    fn the_cursor_should_be_refused_a_timeline_with_no_cues_left_in_it() {
+    fn the_cursor_should_take_a_timeline_with_no_cues_left_in_it() {
         // Arrange
         let mut state = ready(3);
         state.cues = Vec::new();
 
         // Act / Assert
-        assert_that!(state.focus_timeline()).is_false();
-        assert_that!(state.cursor()).is_none();
-        assert_that!(state.scrub_requested()).is_false();
+        assert_that!(state.focus_timeline()).is_true();
+        assert_that!(state.cursor()).is_equal_to(Some(Duration::ZERO));
     }
 
     /// The keys belong to the pane holding the cursor, so a move asked for while the cue

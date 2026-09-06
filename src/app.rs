@@ -150,6 +150,13 @@ const CUE_LENGTH_TOO_SHORT: &str = "A cue has to be on screen for at least 0.05s
 /// this is the one place the check is needed.
 const CUE_LENGTH_LONGER_THAN_MEDIA: &str = "A cue cannot be on screen for longer than the media.";
 
+/// How far `a` will count looking for a free name before giving up.
+///
+/// A bound rather than a loop that cannot end: the names it tries are `clip.und.srt`,
+/// `clip.und.1.srt` and so on, and a directory holding a hundred of those is one where the
+/// reader wants a word rather than a hundred and first file.
+const MAX_NEW_TRACK_NUMBER: usize = 99;
+
 /// The subtitle edit page's cue editor: one cue's text, being rewritten.
 ///
 /// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
@@ -531,6 +538,7 @@ pub enum TextInputSite {
     VideoLanguageSearch,
     SubtitleTitle,
     LanguageSearch,
+    CreateTrackLanguageSearch,
     CustomResolution,
     CueLength,
     FileSearch,
@@ -812,6 +820,10 @@ pub enum Dialog {
     PreviewSettings,
     /// The subtitle edit page's cue editor, opened with `i` — see `App::open_cue_editor`.
     EditCue,
+    /// "What should I make?", opened with `a` from the track list — see
+    /// `App::open_create_track`. Two steps in one dialog: what kind of track, then its format
+    /// and whether it goes in the container or beside it.
+    CreateTrack,
     /// How long the selected cue is on screen, typed rather than nudged. Opened with `D`
     /// from the subtitle edit page's timing mode — see `App::open_cue_length_dialog`.
     CueLength,
@@ -1263,6 +1275,183 @@ impl ContainerSettingsField {
     }
 }
 
+/// What `a` on the track list can make. Subtitles is the only answer today; the list is
+/// what makes audio a row rather than a rewrite.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackKind {
+    #[default]
+    Subtitles,
+}
+
+impl NewTrackKind {
+    pub const ORDER: [Self; 1] = [Self::Subtitles];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtitles => "Subtitles",
+        }
+    }
+}
+
+/// The format a new subtitle track is written in.
+///
+/// **SubRip alone, and that is a property of the cue editor rather than of this list.**
+/// Adding, editing, retiming and deleting a cue are all SubRip-only — an ASS cue names a
+/// style and positions itself against the script rather than carrying its own appearance —
+/// so any other choice here would create a track the reader cannot put a line into. A track
+/// can still be *converted* afterwards, from the ordinary subtitle settings dialog.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackFormat {
+    #[default]
+    SubRip,
+}
+
+impl NewTrackFormat {
+    pub const ORDER: [Self; 1] = [Self::SubRip];
+
+    pub fn format(self) -> SubtitleFormat {
+        match self {
+            Self::SubRip => SubtitleFormat::SubRip,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.format().label()
+    }
+}
+
+/// Where a newly created track ends up when the reader saves.
+///
+/// Every new track begins life as a sidecar file beside the media, because that is the only
+/// thing the staging model can key a change against — see `App::create_subtitle_track`.
+/// *Internal* additionally stages the import mark `Ctrl+H` sets, so the save converts the
+/// sidecar to whatever the container takes, muxes it in and deletes the file; *external*
+/// stages nothing and the sidecar is what the save writes. The reader can change their mind
+/// afterwards with `Ctrl+H`/`Ctrl+L` on the row, so this is a default rather than a
+/// commitment.
+///
+/// Labelled `Embedded`/`External` on the popup's radio row — the same word the track list
+/// already uses for `Embedded subtitles (N)` — rather than the longer sentence this used to
+/// carry: those fit a dropdown row, not two buttons on one line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackPlacement {
+    /// In the media file itself. The default: a track that travels with the file is what
+    /// most readers mean by adding subtitles to it.
+    #[default]
+    Internal,
+    /// A separate file beside the media.
+    External,
+}
+
+impl NewTrackPlacement {
+    pub const ORDER: [Self; 2] = [Self::Internal, Self::External];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Internal => "Embedded",
+            Self::External => "External",
+        }
+    }
+}
+
+/// Which row of the "New track" popup holds the cursor.
+///
+/// `Format` is where the cursor starts — the first row the reader can actually answer,
+/// `Kind` having nothing left to decide. `Kind` is still reachable — the reader can walk
+/// `k`/`gg` up to it and see it lit — but `h`/`l` cannot move it off `Subtitles`, since
+/// `Video` and `Audio` are not real choices yet (`App::move_create_track_choice` answers
+/// with a "not implemented" notice instead of moving anything). Selectable without being
+/// editable, the way a disabled field elsewhere in the application is still reachable by the
+/// cursor even though it refuses every key that would change it.
+///
+/// `Language` sits beside `Format` for the reason it exists at all: a save refuses an
+/// undetermined sidecar outright, so a track created in the wrong language is a track the
+/// reader has to open the subtitle settings dialog to fix before they can even see whether
+/// their guess was right. Asking here, once, is cheaper than a detour through a second
+/// dialog for the common case of a guess that misses.
+///
+/// **Its answer starts empty**, and `Action`'s `Create` button is refused until it isn't —
+/// see `App::confirm_create_track`. It also opens with no guess at all: a new subtitle
+/// track is as often a translation as it is a transcript of the film's own audio, so the
+/// audio's language is no better a starting point than any other entry in the list — the
+/// row simply opens on the list's own first entry, alphabetically, the way a fresh dropdown
+/// with nothing "current" to seed it always does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CreateTrackField {
+    Kind,
+    #[default]
+    Format,
+    Language,
+    Placement,
+    /// The Create/Back button row at the foot of the popup.
+    Action,
+}
+
+/// The Create/Back button row `Dialog::CreateTrack` ends on.
+///
+/// A tiny enum rather than a `bool` so the two buttons read the same way every other
+/// two-state row in the popup does (`NewTrackPlacement`, and `PreviewSettingsField`'s
+/// toggles) — `ORDER`, `label` and a mnemonic letter, picked with `h`/`l` or that letter
+/// directly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CreateTrackAction {
+    #[default]
+    Create,
+    Back,
+}
+
+impl CreateTrackAction {
+    pub const ORDER: [Self; 2] = [Self::Create, Self::Back];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Create => "Create",
+            Self::Back => "Back",
+        }
+    }
+
+    /// The letter highlighted in the button and bound as its shortcut, always the label's
+    /// first character.
+    pub fn mnemonic(self) -> char {
+        self.label().chars().next().expect("label is non-empty")
+    }
+}
+
+/// The cursor for `Dialog::CreateTrack`, following the container settings popup's grammar
+/// for its two dropdowns (`Format`, `Language`): `Enter` opens the list and then commits the
+/// highlighted choice, `Esc` closes it. `Placement` and `Action` are two-state rows moved
+/// with `h`/`l`, the shape the preview-settings popup's toggles already use.
+///
+/// Not `Copy`, unlike every other field-and-cursor struct like it in the application — the
+/// searchable language list needs a typed query (`language_search`, a `SearchState`, which
+/// owns a `String`), and that is the one thing a `Copy` bundle cannot hold. Every place that
+/// used to take a bitwise copy of the whole popup now clones it instead.
+#[derive(Clone, Debug, Default)]
+pub struct CreateTrackPopup {
+    pub field: CreateTrackField,
+    /// Whether the focused dropdown's list is expanded. A closed row's `Enter` opens it; an
+    /// open row's `Enter` takes the choice under the cursor. Meaningless for
+    /// `Placement`/`Action`, which have no list to open.
+    pub open: bool,
+    /// Position within whichever list is open — `Format`'s or the filtered language list —
+    /// meaningless while `open` is false. Shared between the two rather than each keeping its
+    /// own, because only one of them can be open at a time.
+    pub cursor: usize,
+    pub kind: NewTrackKind,
+    pub format: NewTrackFormat,
+    /// The canonical language code the track will be created with, chosen here before the
+    /// track exists — see `CreateTrackField`'s doc comment for why this is asked up front
+    /// rather than left to a second visit to the subtitle settings dialog.
+    pub language: String,
+    /// The `Language` row's search bar. Its own field rather than reusing `cursor`'s list for
+    /// anything more, because a typed query is what the shared `SearchState`/`TextInputSite`
+    /// machinery every other language picker in the application goes through needs — see
+    /// `App::filtered_create_track_languages`.
+    pub language_search: SearchState,
+    pub placement: NewTrackPlacement,
+    pub action: CreateTrackAction,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContainerSettingsMode {
     #[default]
@@ -1515,6 +1704,17 @@ pub struct App {
     pub preview_settings_popup: Option<PreviewSettingsPopup>,
     /// The subtitle edit page's open cue editor, if `i` has raised one.
     pub cue_editor: Option<CueEditor>,
+    /// The open "what should I make?" popup, if `a` has raised one.
+    pub create_track_popup: Option<CreateTrackPopup>,
+    /// The subtitle file `a` wrote this session, while the page it opened is still up.
+    ///
+    /// An `a` pressed by mistake has to cost nothing, which is the rule the page already
+    /// applies to a cue editor closed with nothing typed in it — so the file is taken back
+    /// off the disk if the reader leaves without putting a line in it. Held here rather than
+    /// on the page's own state because the deletion happens as the page closes, and because
+    /// only `App` can see the staged edits the guard has to consult. See
+    /// `App::discard_empty_new_track`.
+    pub new_track: Option<PathBuf>,
     /// The subtitle edit page's open cue length dialog, if `D` has raised one.
     pub cue_length: Option<CueLengthDraft>,
     /// Which answer the "discard the unwritten cue edits?" prompt is pointing at.
@@ -1667,6 +1867,8 @@ impl App {
             preview_defaults: PreviewSettings::default(),
             preview_settings_popup: None,
             cue_editor: None,
+            create_track_popup: None,
+            new_track: None,
             cue_length: None,
             leave_cues_choice: LeaveCuesChoice::default(),
             preview: None,
@@ -1787,6 +1989,50 @@ impl App {
                 self.reconcile_files(Vec::new());
             }
         }
+    }
+
+    /// Carries the open file's staged subtitle changes across a change to its sidecar list,
+    /// dropping only the ones whose track is genuinely no longer there.
+    ///
+    /// Two things move when a sidecar appears or disappears, and both have to be followed:
+    ///
+    /// - A change is keyed by `SubtitleSource::Sidecar(path)`, so it survives when a sidecar
+    ///   with that path is still present *and still the same file* — same fingerprint, same
+    ///   format. An embedded track's change is never affected by any of this.
+    /// - `left_subtitle_order` holds `TrackRef::Sidecar(index)`, which are **positions in a
+    ///   vector a new sidecar can be inserted into the middle of** — the list is sorted by
+    ///   name. Left alone, the left column would silently re-point at another file.
+    ///
+    /// Answers whether anything was dropped, so the caller can tell a loss worth a notice
+    /// from an ordinary arrival.
+    fn remap_subtitle_changes(&mut self, old_sidecars: &[SidecarEntry]) -> bool {
+        let before = self.subtitle_changes.len();
+        let sidecars = &self.sidecars;
+        self.subtitle_changes
+            .retain(|source, _change| match source {
+                SubtitleSource::Embedded(_) => true,
+                // Path and fingerprint, and deliberately not format: a sidecar's format is read
+                // off its extension, so a change keyed to this path was necessarily made against
+                // this format. Comparing them as well would be an arm nothing can reach.
+                SubtitleSource::Sidecar(path) => sidecars.iter().any(|sidecar| {
+                    sidecar.path == *path
+                        && Some(sidecar.fingerprint)
+                            == crate::files::FileFingerprint::for_path(path).ok()
+                }),
+            });
+        self.left_subtitle_order = self
+            .left_subtitle_order
+            .iter()
+            .filter_map(|track| match track {
+                TrackRef::Sidecar(old) => {
+                    let path = &old_sidecars.get(*old)?.path;
+                    let now = sidecars.iter().position(|sidecar| sidecar.path == *path)?;
+                    Some(TrackRef::Sidecar(now))
+                }
+                other => Some(*other),
+            })
+            .collect();
+        self.subtitle_changes.len() != before
     }
 
     fn reconcile_files(&mut self, files: Vec<FileEntry>) {
@@ -1932,13 +2178,24 @@ impl App {
                 // is refreshed lazily once resolution actually completes (see
                 // `refresh_cached_outcome`).
             } else if sidecars_changed && !was_processing {
-                self.subtitle_changes.clear();
+                // **Remapped rather than cleared.** This used to throw away every staged
+                // subtitle change on the file, which is far more than the change warrants: a
+                // sidecar appearing beside the media says nothing about the *other* tracks'
+                // conversions, language tags, import marks or cue edits, and the reader has no
+                // way to get them back. It also made a file appearing a destructive event,
+                // which `a` performs deliberately.
+                let dropped = self.remap_subtitle_changes(&old_sidecars);
                 self.subtitle_settings_popup = None;
                 self.selected_stream = self
                     .selected_stream
                     .min(self.stream_count().saturating_sub(1));
-                self.notice =
-                    Some("Matching subtitle sidecars changed; reloaded them.".to_string());
+                // Only when something was actually lost. Raised unconditionally it would put a
+                // stale-sounding line on the footer every time a sidecar is created or
+                // removed, describing work that did not happen.
+                if dropped {
+                    self.notice =
+                        Some("Matching subtitle sidecars changed; reloaded them.".to_string());
+                }
             }
             return;
         }
@@ -2808,6 +3065,478 @@ impl App {
         }
     }
 
+    /// `a` on the track list: asks what to make, then makes it.
+    ///
+    /// Every refusal is raised **before anything is written**. A file left behind by a press
+    /// that then declines to open the page would be the worst of both answers, and the two
+    /// most likely refusals — a format this build cannot preview, a file no sidecar can
+    /// attach to — are exactly the ones a reader would otherwise discover that way.
+    pub fn open_create_track(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        // No file, or a probe still out: there is no track list drawn to have pressed `a` on,
+        // so this is inert rather than a refusal with something to say.
+        let Some(file) = self.selected_file() else {
+            return;
+        };
+        let path = file.path.clone();
+        if self.media_info().is_none() {
+            return;
+        }
+        // A sidecar written beside a file the matcher will never look at is an orphan: it
+        // would not appear as a row, and the page would have nothing to open. `is_sidecar_host`
+        // is the matcher's own answer, so the two cannot drift apart.
+        if !crate::subtitle::is_sidecar_host(&path) {
+            self.notice =
+                Some("Reel can only add a subtitle track beside a video file.".to_string());
+            return;
+        }
+        // No `preview_blocked` check here, deliberately. It would be the natural fourth
+        // refusal, and it is unreachable: the only format this can create is SubRip, which
+        // that gate never turns away — reading SubRip cues needs no decoder and no external
+        // tool. A build with no libass still opens the page and says so in the preview pane
+        // (`PreviewSupport::NoSubtitleBurn`), which is right: the cues are editable whether or
+        // not a frame can be drawn behind them. Add the check when a second format appears.
+        self.notice = None;
+        // `language` starts empty rather than seeded with the guess — see `CreateTrackField`'s
+        // doc comment for why an unconfirmed answer must not be indistinguishable from a
+        // chosen one. The guess still steers where the `Language` list opens (see
+        // `activate_create_track`), so it costs the reader nothing to accept.
+        self.create_track_popup = Some(CreateTrackPopup::default());
+        self.dialog = Some(Dialog::CreateTrack);
+    }
+
+    /// The labels of whichever dropdown is focused — `Format`'s fixed list, or the `Language`
+    /// list filtered by what the reader has typed.
+    ///
+    /// One answer read by the renderer and by the cursor, so what is drawn and what `Enter`
+    /// takes cannot come to disagree about how long the list is. `Placement` and `Action` are
+    /// two-state rows moved with `h`/`l` rather than dropdowns, so they have no list here.
+    pub fn create_track_choices(&self) -> Vec<String> {
+        let Some(popup) = self.create_track_popup.as_ref() else {
+            return Vec::new();
+        };
+        match popup.field {
+            CreateTrackField::Format => NewTrackFormat::ORDER
+                .iter()
+                .map(|format| format.label().to_string())
+                .collect(),
+            CreateTrackField::Language => self
+                .filtered_create_track_languages()
+                .iter()
+                .map(LanguageChoice::label)
+                .collect(),
+            CreateTrackField::Kind | CreateTrackField::Placement | CreateTrackField::Action => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// The `Language` row's list, filtered by what the reader has typed — the same shape
+    /// `filtered_subtitle_languages` already gives the subtitle settings dialog. The popup's
+    /// own guessed (or last chosen) language stands in for "the track's current one", so a
+    /// guess outside the common list is still selectable rather than silently missing from
+    /// the list it was seeded from.
+    pub fn filtered_create_track_languages(&self) -> Vec<LanguageChoice> {
+        let Some(popup) = self.create_track_popup.as_ref() else {
+            return Vec::new();
+        };
+        let mut choices = common_language_choices();
+        if let Some(current) = language_choice(&popup.language)
+            && !choices.iter().any(|choice| choice.code == current.code)
+        {
+            choices.push(current);
+            choices.sort_by(|left, right| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+                    .then_with(|| left.code.cmp(&right.code))
+            });
+        }
+        choices.retain(|choice| choice.matches(&popup.language_search.value));
+        choices
+    }
+
+    /// `j`/`k` in the popup: through whichever dropdown is open, or between the popup's five
+    /// rows.
+    pub fn move_create_track_cursor(&mut self, delta: isize) {
+        let choices = self.create_track_choices().len();
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            let last = choices.saturating_sub(1);
+            popup.cursor = popup.cursor.saturating_add_signed(delta).min(last);
+            return;
+        }
+        popup.field = match (popup.field, delta < 0) {
+            (CreateTrackField::Kind, true) => CreateTrackField::Kind,
+            (CreateTrackField::Kind, false) => CreateTrackField::Format,
+            (CreateTrackField::Format, true) => CreateTrackField::Kind,
+            (CreateTrackField::Format, false) => CreateTrackField::Language,
+            (CreateTrackField::Language, true) => CreateTrackField::Format,
+            (CreateTrackField::Language, false) => CreateTrackField::Placement,
+            (CreateTrackField::Placement, true) => CreateTrackField::Language,
+            (CreateTrackField::Placement, false) => CreateTrackField::Action,
+            (CreateTrackField::Action, true) => CreateTrackField::Placement,
+            (CreateTrackField::Action, false) => CreateTrackField::Action,
+        };
+    }
+
+    /// `gg`/`G` in the popup, so it navigates like every other list in the application.
+    pub fn move_create_track_to_endpoint(&mut self, last: bool) {
+        let choices = self.create_track_choices().len();
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            popup.cursor = if last { choices.saturating_sub(1) } else { 0 };
+        } else {
+            popup.field = if last {
+                CreateTrackField::Action
+            } else {
+                CreateTrackField::Kind
+            };
+        }
+    }
+
+    /// `h`/`l` in the popup: picks an answer directly on `Placement` and `Action`, the same
+    /// grammar `App::set_preview_toggle` uses for the preview-settings popup's switches.
+    /// Inert on `Format` and `Language`, and while a list is open — a dropdown row's value is
+    /// chosen from its list, not moved left or right.
+    ///
+    /// **On `Kind` it is refused rather than inert.** The row is reachable so the reader can
+    /// see it is there, but `Video`/`Audio` are not real choices yet, so there is nowhere for
+    /// the cursor to go — a silent no-op there would read as a broken key rather than as a
+    /// feature that does not exist, which is why it raises the same kind of notice a track the
+    /// application cannot yet edit does elsewhere.
+    pub fn move_create_track_choice(&mut self, right: bool) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            return;
+        }
+        match popup.field {
+            CreateTrackField::Kind => {
+                self.notice =
+                    Some("Creating video or audio tracks is not implemented yet.".to_string());
+            }
+            CreateTrackField::Format | CreateTrackField::Language => {}
+            CreateTrackField::Placement => {
+                popup.placement = if right {
+                    NewTrackPlacement::External
+                } else {
+                    NewTrackPlacement::Internal
+                };
+            }
+            CreateTrackField::Action => {
+                popup.action = if right {
+                    CreateTrackAction::Back
+                } else {
+                    CreateTrackAction::Create
+                };
+            }
+        }
+    }
+
+    /// `Enter`: open `Format`'s or `Language`'s list, or take the choice under the cursor;
+    /// flip `Placement`; perform whichever of Create/Back `Action` is currently on.
+    pub fn activate_create_track(&mut self) {
+        let choices = self.create_track_choices().len();
+        let Some(field) = self.create_track_popup.as_ref().map(|popup| popup.field) else {
+            return;
+        };
+        match field {
+            // Nothing to open: there is no list behind `Kind`, and `Subtitles` is already
+            // the only real answer it could commit.
+            CreateTrackField::Kind => {}
+            CreateTrackField::Format => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if !popup.open {
+                    popup.open = true;
+                    popup.cursor = NewTrackFormat::ORDER
+                        .iter()
+                        .position(|format| *format == popup.format)
+                        .unwrap_or_default();
+                    return;
+                }
+                let cursor = popup.cursor.min(choices.saturating_sub(1));
+                popup.open = false;
+                popup.format = NewTrackFormat::ORDER[cursor];
+            }
+            CreateTrackField::Language => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if !popup.open {
+                    // The list opens on an empty query, so the reader sees every common
+                    // language rather than whatever was left typed from an earlier visit.
+                    popup.language_search.clear();
+                    popup.open = true;
+                    // The cursor opens on the list's own first entry rather than a guess
+                    // taken from the media's audio track — a new subtitle track is as
+                    // often a translation as it is a transcript of what is spoken, so the
+                    // audio's language is no better a starting point than any other entry
+                    // in the list. See `CreateTrackField`'s doc comment.
+                    popup.cursor = 0;
+                    return;
+                }
+                let choices = self.filtered_create_track_languages();
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if let Some(choice) = choices.get(popup.cursor) {
+                    popup.language = choice.code.clone();
+                }
+                popup.open = false;
+                popup.language_search.clear();
+            }
+            CreateTrackField::Placement => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                popup.placement = match popup.placement {
+                    NewTrackPlacement::Internal => NewTrackPlacement::External,
+                    NewTrackPlacement::External => NewTrackPlacement::Internal,
+                };
+            }
+            CreateTrackField::Action => {
+                let popup = self.create_track_popup.as_ref().unwrap();
+                match popup.action {
+                    CreateTrackAction::Create => {
+                        let answers = popup.clone();
+                        self.confirm_create_track(answers);
+                    }
+                    CreateTrackAction::Back => self.close_create_track(),
+                }
+            }
+        }
+    }
+
+    /// `Esc`: close `Format`'s open list, otherwise close the whole popup.
+    ///
+    /// There is only one screen now, so there is no step left to back out to — a closed list
+    /// has nowhere further to retreat to short of the popup itself.
+    pub fn escape_create_track(&mut self) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            popup.open = false;
+            // Harmless when `Format`'s list was the one open — the search is already empty —
+            // and what leaves a stale query behind for the reader's next visit to `Language`
+            // otherwise.
+            popup.language_search.clear();
+            return;
+        }
+        self.close_create_track();
+    }
+
+    pub fn close_create_track(&mut self) {
+        self.create_track_popup = None;
+        self.dialog = None;
+    }
+
+    /// `/` while the `Language` row's list is open: starts typing a query, the same searchable
+    /// picker `App::start_subtitle_language_search` opens for the subtitle settings dialog's
+    /// own `Language` row.
+    pub fn start_create_track_language_search(&mut self) {
+        self.clear_text_input_reject();
+        if let Some(popup) = self
+            .create_track_popup
+            .as_mut()
+            .filter(|popup| popup.field == CreateTrackField::Language && popup.open)
+        {
+            popup.language_search.activate();
+        }
+    }
+
+    /// `Esc` while typing that query: drops it and shows every common language again, without
+    /// closing the list — the reader is narrowing a search, not answering the row.
+    pub fn cancel_create_track_language_search(&mut self) {
+        if let Some(popup) = self
+            .create_track_popup
+            .as_mut()
+            .filter(|popup| popup.field == CreateTrackField::Language && popup.open)
+        {
+            popup.language_search.clear();
+            popup.cursor = 0;
+        }
+    }
+
+    /// `c`/`C`: the Create button's mnemonic, reachable from anywhere in the popup regardless
+    /// of which row holds the cursor or whether `Format`'s list is open — closing that list
+    /// silently rather than requiring it be closed first, since a mnemonic exists precisely so
+    /// the reader need not navigate to press it.
+    pub fn create_track_now(&mut self) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        popup.open = false;
+        let answers = popup.clone();
+        self.confirm_create_track(answers);
+    }
+
+    /// Takes the popup's answers and makes the track.
+    ///
+    /// Given the answers rather than reading them back off `self.create_track_popup`: its only
+    /// caller has them in hand, and re-reading would add a "there is no popup" arm that cannot
+    /// happen and could not be tested.
+    fn confirm_create_track(&mut self, popup: CreateTrackPopup) {
+        // Refused rather than silently falling back to a guess: a language chosen without
+        // the reader ever seeing it is the same defect an unreviewed guess would be, one
+        // step later. The popup stays open, exactly as `Ctrl+S` on an empty new track is
+        // refused rather than closing the page on a file that was never written to.
+        if popup.language.is_empty() {
+            self.notice = Some("Choose a language before creating the track.".to_string());
+            return;
+        }
+        self.close_create_track();
+        match popup.kind {
+            NewTrackKind::Subtitles => {
+                self.create_subtitle_track(popup.format.format(), popup.placement, popup.language);
+            }
+        }
+    }
+
+    /// Writes an empty subtitle file beside the media and opens the edit page on it.
+    ///
+    /// **A new track is a real file from the moment it exists, and that is the whole design.**
+    /// The application's unit of staging is a change to a track that is already there:
+    /// `SubtitleChange` is keyed by `SubtitleSource::{Embedded, Sidecar}`, `edit::
+    /// validate_subtitle_sources` resolves every staged source to a real stream or a
+    /// fingerprint-matching sidecar, and `track_rows` is built from the probe and the
+    /// directory scan. A track that does not exist has nothing to be keyed by, nothing to
+    /// fingerprint and no row to be selected on — so a staged "new track" would need a third
+    /// `SubtitleSource`, a phantom `SidecarEntry`, and a `preview::prepare` that reads cues
+    /// out of nothing. Writing zero bytes is enormously cheaper, and it is also the honest
+    /// framing: a sidecar is its own file rather than an edit to the media, so creating one
+    /// changes nothing about the media at all.
+    ///
+    /// The property that actually matters — an `a` pressed by mistake costing nothing — is
+    /// bought by `discard_empty_new_track` on the way off the page instead.
+    ///
+    /// The cues typed into it are staged and written by `Ctrl+S` exactly like every other cue
+    /// edit; only this empty container file is eager.
+    fn create_subtitle_track(
+        &mut self,
+        format: SubtitleFormat,
+        placement: NewTrackPlacement,
+        language: String,
+    ) {
+        let Some(media) = self.selected_file().map(|file| file.path.clone()) else {
+            return;
+        };
+        // `self.directory` rather than the media's own parent: they are the same directory —
+        // every file here came from scanning it — and this way there is no "a file with no
+        // parent" arm that cannot happen.
+        let directory = self.directory.clone();
+        let Some(stem) = media.file_stem().and_then(|stem| stem.to_str()) else {
+            return;
+        };
+        // **A real language rather than `und`, chosen before the file exists.** The sidecar
+        // matcher requires a language as the name's first component, and a save *refuses*
+        // `und` outright (`edit::validate_subtitle_sources`) — so a track created as
+        // undetermined could not be written at all. The popup's `Language` row is where the
+        // reader answers that, rather than through a second visit to the subtitle settings
+        // dialog afterward.
+        let Some(path) = (0..=MAX_NEW_TRACK_NUMBER).find_map(|number| {
+            let name = crate::subtitle::sidecar_filename(
+                stem,
+                &language,
+                false,
+                false,
+                (number > 0).then_some(number),
+                format,
+            );
+            let candidate = directory.join(name);
+            (!candidate.exists()).then_some(candidate)
+        }) else {
+            self.notice = Some("There are already too many subtitle files for this one.".into());
+            return;
+        };
+        // An empty SubRip file is exactly what a track with no cues is — `cue::write_srt` of
+        // nothing is the empty string — so there is no placeholder cue to explain away.
+        if let Err(error) = std::fs::write(&path, crate::cue::write_srt(&[])) {
+            self.notice = Some(format!("Could not create the subtitle file: {error}"));
+            return;
+        }
+        self.new_track = Some(path.clone());
+        // Synchronously, rather than waiting on the directory monitor: the page is about to
+        // open on this file, and it can only do that once the scan has given it a row and a
+        // `SidecarEntry` to be addressed by. The precedent is the rescan after a batch.
+        if let Ok(files) = scan_directory(&self.directory) {
+            self.reconcile_files(files);
+        }
+        let source = SubtitleSource::Sidecar(path.clone());
+        if placement == NewTrackPlacement::Internal {
+            // Byte for byte what `Ctrl+H` stages on any other sidecar, which is what makes the
+            // placement a default the reader can change their mind about rather than a
+            // commitment taken at creation.
+            let mut change = self.subtitle_change(&source, format);
+            change.import_into_media = true;
+            self.store_subtitle_change(source.clone(), change);
+        }
+        let Some(row) = self.track_row_of(&source) else {
+            return;
+        };
+        self.selected_stream = row;
+        // The reconcile above may have raised its own "sidecars changed" line, which is about
+        // a file appearing rather than about what the reader just did.
+        self.notice = None;
+        self.open_subtitle_edit();
+    }
+
+    /// Takes back the file `a` made, when the reader leaves without putting a line in it.
+    ///
+    /// An `a` pressed by mistake has to cost nothing — the rule the page already applies to a
+    /// cue editor closed with nothing typed in it. Every one of these conditions is
+    /// load-bearing:
+    ///
+    /// - **It has to be this page's own track.** Another page's, or a sidecar the session did
+    ///   not create, is somebody else's file.
+    /// - **No save may be in flight.** `confirm_process_all` closes the page while the file is
+    ///   still empty and the reader's first cue lives in `staged_edits`, so an unguarded hook
+    ///   here would delete a file out from under its own save.
+    /// - **Nothing staged against it**, in either the live map or the per-file snapshot. A
+    ///   cue typed in, or an import mark the reader kept, is work to be written rather than an
+    ///   accident to be swept up. **The import mark is deliberately not such work**: it came
+    ///   from the popup rather than from the reader's editing — a new track is internal by
+    ///   default, so it carries one from the moment it exists — and a mark on a file that is
+    ///   about to be removed means nothing. Counting it would make the *default* placement the
+    ///   one case that leaves litter behind.
+    /// - **Still empty on disk**, read from the filesystem rather than from the page's cue
+    ///   list, because the disk is what would be left behind.
+    fn discard_empty_new_track(&mut self) {
+        let Some(path) = self.new_track.take() else {
+            return;
+        };
+        let source = SubtitleSource::Sidecar(path.clone());
+        let is_this_page = self
+            .subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.source == source);
+        if !is_this_page || self.active_batch.is_some() || self.pending_reopen.is_some() {
+            return;
+        }
+        // Any cue at all — typed, or one of the file's own that a rewrite is keyed against —
+        // is the reader having worked on this track.
+        let edited = |change: &SubtitleChange| !change.cues.is_empty();
+        let worked_on = self.subtitle_changes.get(&source).is_some_and(edited)
+            || self
+                .staged_edits
+                .values()
+                .any(|edit| edit.subtitle_changes.get(&source).is_some_and(edited));
+        if worked_on {
+            return;
+        }
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+            let _ = std::fs::remove_file(&path);
+            // The mark goes with the file: an import staged against a track that no longer
+            // exists is a save that fails on something the reader cannot see.
+            self.subtitle_changes.remove(&source);
+            for edit in self.staged_edits.values_mut() {
+                edit.subtitle_changes.remove(&source);
+            }
+        }
+    }
+
     pub fn open_stream_details(&mut self) {
         let details_available = match self.selected_track() {
             Some(TrackRef::Container) => self.media_info().is_some(),
@@ -2951,6 +3680,10 @@ impl App {
     /// The single place `subtitle_edit` is cleared, so there is one answer to "what
     /// happens to the workspace" rather than one per exit path.
     fn close_subtitle_edit(&mut self) {
+        // Before the page is taken, since the guard has to ask what it was open on. The one
+        // place the page state is cleared, so there is one answer here exactly as there is
+        // for the workspace.
+        self.discard_empty_new_track();
         if self.subtitle_edit.take().is_some() {
             // Before the page goes: dropping the state releases the audio device on its
             // own, but a span still being decoded for it would otherwise run to completion
@@ -4456,7 +5189,18 @@ impl App {
 
     /// Closes the page and puts the cursor back on the track list.
     fn leave_subtitle_edit(&mut self) {
+        let created = self.new_track.clone();
         self.close_subtitle_edit();
+        // A file `discard_empty_new_track` has just removed still has a row on the list the
+        // reader is about to land on, so the scan happens here rather than inside the close —
+        // `queue_probe` calls that one mid-reselection, and a reconcile there would clobber
+        // the selection it is in the middle of setting. On every other path the directory
+        // monitor picks the deletion up within a second.
+        if created.is_some_and(|path| !path.exists())
+            && let Ok(files) = scan_directory(&self.directory)
+        {
+            self.reconcile_files(files);
+        }
         // A refusal raised on this page was about a key pressed on this page. Carried out of
         // it, the footer on the track list would paint it over a view it says nothing about
         // — the reader having asked a question here and been answered there.
@@ -6257,6 +7001,13 @@ impl App {
         }) {
             return Some(TextInputSite::LanguageSearch);
         }
+        if self.create_track_popup.as_ref().is_some_and(|popup| {
+            popup.field == CreateTrackField::Language
+                && popup.open
+                && popup.language_search.is_active
+        }) {
+            return Some(TextInputSite::CreateTrackLanguageSearch);
+        }
         if self.custom_resolution_input_active() {
             return Some(TextInputSite::CustomResolution);
         }
@@ -6316,6 +7067,10 @@ impl App {
             )),
             TextInputSite::LanguageSearch => Some((
                 &mut self.subtitle_settings_popup.as_mut()?.language_search.input,
+                TextInputConfig::LANGUAGE_SEARCH,
+            )),
+            TextInputSite::CreateTrackLanguageSearch => Some((
+                &mut self.create_track_popup.as_mut()?.language_search.input,
                 TextInputConfig::LANGUAGE_SEARCH,
             )),
             TextInputSite::CustomResolution => {
@@ -6402,6 +7157,11 @@ impl App {
             TextInputSite::LanguageSearch => {
                 if let Some(popup) = self.subtitle_settings_popup.as_mut() {
                     popup.language_cursor = 0;
+                }
+            }
+            TextInputSite::CreateTrackLanguageSearch => {
+                if let Some(popup) = self.create_track_popup.as_mut() {
+                    popup.cursor = 0;
                 }
             }
             TextInputSite::KeybindingsSearch => self.keybindings_scroll = 0,
@@ -10425,6 +11185,44 @@ fn summarize_batch_outcome(
     }
 }
 
+/// Refuses a save that would put a subtitle track holding nothing into the container.
+///
+/// ffmpeg is handed a subtitle stream with no cues and most muxers turn it down, so without
+/// this the save fails in the worker with a message about a file the reader cannot act on.
+/// It is stated *here*, in the pre-flight, so `Ctrl+S` answers before dispatching anything —
+/// the same shape the undetermined-language refusal beside it has.
+///
+/// This is on the common path rather than in a corner: a track created with `a` is internal by
+/// default, so it carries the import mark from the moment it exists, while its file is still
+/// the empty one `a` wrote. `edit::validate_subtitle_sources` states it again in the worker,
+/// which is the layer that must not be bypassed — a staged edit can reach it from a batch this
+/// pre-flight never saw.
+fn empty_import_error_for(
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    sidecars: &[SidecarEntry],
+) -> Option<String> {
+    for sidecar in sidecars {
+        let source = SubtitleSource::Sidecar(sidecar.path.clone());
+        let Some(change) = subtitle_changes.get(&source) else {
+            continue;
+        };
+        // Exactly zero bytes, which is the state `a` leaves a new track in — a file with
+        // something in it is the reader's own content. Staged insertions are the cues a save
+        // is about to write, so they count even though the file has not changed yet.
+        if change.import_into_media
+            && change.cues.inserts.is_empty()
+            && std::fs::metadata(&sidecar.path).is_ok_and(|metadata| metadata.len() == 0)
+        {
+            return Some(format!(
+                "{} has no cues yet, so it cannot go into the file. Add a cue, or move the \
+                 track back out.",
+                sidecar.display_name
+            ));
+        }
+    }
+    None
+}
+
 /// Free-function core of `App::subtitle_language_error` — see
 /// `container_conflicts_for_plan`.
 fn subtitle_language_error_for(
@@ -10688,6 +11486,9 @@ fn validate_staged_edit(
         subtitle_changes,
         sidecars,
     ) {
+        return Err(error);
+    }
+    if let Some(error) = empty_import_error_for(subtitle_changes, sidecars) {
         return Err(error);
     }
     // `ContainerFormat::detect` cross-checks the extension against ffprobe's own
@@ -12763,14 +13564,126 @@ mod tests {
         std::fs::write(directory.join("movie.nld.srt"), b"1\n").unwrap();
         app.reconcile_files(scan_directory(&directory).unwrap());
 
-        // Assert: the sidecar list is rebuilt and the subtitle work that referred to
-        // the old one is dropped, while the container change stays staged.
+        // Assert: the sidecar list is rebuilt, and every staged edit survives it. A file
+        // appearing beside the media says nothing about an *embedded* track's export, and
+        // this used to throw it away along with every other subtitle change on the file —
+        // which the reader had no way of getting back. Nor is there a notice, because
+        // nothing was lost to tell them about.
         assert_that!(app.sidecars.len()).is_equal_to(2);
-        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_changes.is_empty()).is_false();
         assert_that!(app.subtitle_settings_popup.is_none()).is_true();
         assert_that!(app.container_target).contains(ContainerFormat::Mp4);
+        assert_that!(app.notice.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The other half of the remap: a change whose sidecar is genuinely gone *is* dropped,
+    /// and the reader is told, since that is work they can no longer save.
+    #[test]
+    fn reconcile_files_should_drop_only_the_changes_whose_sidecar_has_gone() {
+        // Arrange: two sidecars, each carrying a staged import.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let english = directory.join("movie.eng.srt");
+        let dutch = directory.join("movie.nld.srt");
+        std::fs::write(&english, b"1\n").unwrap();
+        std::fs::write(&dutch, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        for index in 0..2 {
+            focus_track(&mut app, TrackRef::Sidecar(index));
+            app.transfer_subtitle(-1);
+        }
+        assert_that!(app.subtitle_changes.len()).is_equal_to(2);
+
+        // Act: one of them is deleted from under the staged work.
+        std::fs::remove_file(&english).unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert: the survivor keeps its import, addressed by path rather than by the
+        // position it used to hold — the vector it indexes into has just shrunk.
+        assert_that!(app.sidecars.len()).is_equal_to(1);
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Sidecar(dutch))
+        )
+        .is_true();
+        assert_that!(app.subtitle_changes.len()).is_equal_to(1);
         assert_that!(app.notice.clone())
             .contains("Matching subtitle sidecars changed; reloaded them.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `left_subtitle_order` holds *positions* in the sidecar vector, and the list is sorted
+    /// A sidecar swapped for one of another format is a *different file* — the format lives in
+    /// the extension — so the staged change names a path that is no longer there and goes,
+    /// rather than being carried onto the stranger that replaced it.
+    #[test]
+    fn reconcile_files_should_drop_a_change_whose_sidecar_was_swapped_for_another_format() {
+        // Arrange: a staged import on a SubRip sidecar.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let subrip = directory.join("movie.eng.srt");
+        std::fs::write(&subrip, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.transfer_subtitle(-1);
+        assert_that!(app.subtitle_changes.len()).is_equal_to(1);
+
+        // Act: the SubRip file goes and an ASS one takes its place, so the list changes and
+        // the surviving entry is a different format at a different path.
+        std::fs::remove_file(&subrip).unwrap();
+        std::fs::write(directory.join("movie.eng.ass"), b"[Script Info]\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert
+        assert_that!(app.sidecars.len()).is_equal_to(1);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Matching subtitle sidecars changed; reloaded them.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// by name — so a sidecar inserted ahead of an imported one moves it. Left unremapped the
+    /// left column silently re-points at another file, which was masked only by the blanket
+    /// clear this replaced.
+    #[test]
+    fn reconcile_files_should_keep_the_left_column_on_the_same_sidecar_when_one_is_inserted() {
+        // Arrange: one imported sidecar, sitting at index 0.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let dutch = directory.join("movie.nld.srt");
+        std::fs::write(&dutch, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.transfer_subtitle(-1);
+        app.left_subtitle_order = vec![TrackRef::Sidecar(0)];
+
+        // Act: a sidecar that sorts *before* it arrives, pushing it to index 1.
+        std::fs::write(directory.join("movie.eng.srt"), b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert: the left column follows the file rather than the index.
+        assert_that!(app.sidecars.len()).is_equal_to(2);
+        assert_that!(app.sidecars[1].path.clone()).is_equal_to(dutch);
+        assert_that!(app.left_subtitle_order.clone()).is_equal_to(vec![TrackRef::Sidecar(1)]);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -15394,6 +16307,100 @@ mod tests {
             .contains("Choose a language for movie.und.srt; Undetermined is not allowed.");
         assert_that!(relabelled_sidecar).is_none();
         assert_that!(nothing_open).is_none();
+    }
+
+    /// A subtitle track holding nothing cannot go into a container: ffmpeg is handed a stream
+    /// with no cues and most muxers refuse it. Answered in the pre-flight so `Ctrl+S` says so
+    /// before dispatching, rather than failing in a worker with a message about a file the
+    /// reader can no longer act on.
+    ///
+    /// This is the state internal-by-default makes reachable — a track created with `a`
+    /// carries the import mark from the moment it exists, while its file is still empty — so
+    /// it is the reader's likeliest first mistake rather than a corner case.
+    #[test]
+    fn an_empty_sidecar_marked_for_import_should_be_refused_before_anything_is_dispatched() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-empty-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let empty = directory.join("movie.eng.srt");
+        std::fs::write(&empty, "").unwrap();
+        let filled = directory.join("movie.nld.srt");
+        std::fs::write(&filled, "1\n00:00:01,000 --> 00:00:02,000\nx\n\n").unwrap();
+        let sidecar = |path: &std::path::Path| SidecarEntry {
+            path: path.to_path_buf(),
+            companion: None,
+            display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint::for_path(path).unwrap(),
+            companion_fingerprint: None,
+        };
+        let importing = |path: &std::path::Path| SubtitleChange {
+            cues: Default::default(),
+            source: SubtitleSource::Sidecar(path.to_path_buf()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: true,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act / Assert: the empty one is refused, naming itself.
+        let refused = empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), importing(&empty))]),
+            &[sidecar(&empty)],
+        );
+        assert_that!(refused.clone().unwrap_or_default().as_str()).contains("has no cues yet");
+        assert_that!(refused.unwrap_or_default().as_str()).contains("movie.eng.srt");
+
+        // Act / Assert: one with cues in it goes through, and so does an empty one that is
+        // staying put — writing an empty sidecar back out unchanged fails nothing.
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(filled.clone()), importing(&filled))]),
+            &[sidecar(&filled)],
+        ))
+        .is_none();
+        let mut staying = importing(&empty);
+        staying.import_into_media = false;
+        staying.export_target = Some(SubtitleFormat::Ass);
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), staying)]),
+            &[sidecar(&empty)],
+        ))
+        .is_none();
+
+        // Act / Assert: a staged insertion is the cue the save is about to write, so it counts
+        // even though the file on disk is still empty — the ordinary workflow.
+        let mut with_a_cue = importing(&empty);
+        with_a_cue.cues.inserts.insert(
+            0,
+            crate::subtitle::CueInsert {
+                text: "First line".to_string(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+            },
+        );
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), with_a_cue)]),
+            &[sidecar(&empty)],
+        ))
+        .is_none();
+
+        // And a sidecar nothing is staged against is nobody's business.
+        assert_that!(empty_import_error_for(&BTreeMap::new(), &[sidecar(&empty)])).is_none();
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -20347,6 +21354,20 @@ mod tests {
                     title_input: active,
                 });
             }
+            TextInputSite::CreateTrackLanguageSearch => {
+                let language_search = SearchState {
+                    input: active,
+                    match_count: 0,
+                    field_width: 0,
+                };
+                app.create_track_popup = Some(CreateTrackPopup {
+                    field: CreateTrackField::Language,
+                    open: true,
+                    language: "eng".to_string(),
+                    language_search,
+                    ..CreateTrackPopup::default()
+                });
+            }
             TextInputSite::CustomResolution => {
                 app.video_settings_popup = Some(VideoSettingsPopup {
                     stream_index: 0,
@@ -20395,7 +21416,7 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 12] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 13] = [
         TextInputSite::ContainerMetadata,
         TextInputSite::AudioTitle,
         TextInputSite::AudioLanguageSearch,
@@ -20403,6 +21424,7 @@ mod tests {
         TextInputSite::VideoLanguageSearch,
         TextInputSite::SubtitleTitle,
         TextInputSite::LanguageSearch,
+        TextInputSite::CreateTrackLanguageSearch,
         TextInputSite::CustomResolution,
         TextInputSite::CueLength,
         TextInputSite::FileSearch,
@@ -20466,6 +21488,7 @@ mod tests {
                 TextInputSite::VideoLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
+                TextInputSite::CreateTrackLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
                 TextInputSite::CueLength => TextInputConfig::CUE_LENGTH,
                 TextInputSite::FileSearch => app.file_search.config(),
@@ -20647,7 +21670,8 @@ mod tests {
             let (typed, after_word) = match site {
                 TextInputSite::LanguageSearch
                 | TextInputSite::AudioLanguageSearch
-                | TextInputSite::VideoLanguageSearch => ("onetwo", ""),
+                | TextInputSite::VideoLanguageSearch
+                | TextInputSite::CreateTrackLanguageSearch => ("onetwo", ""),
                 TextInputSite::CustomResolution => ("1234", ""),
                 TextInputSite::CueLength => ("00:02.500", ""),
                 _ => ("one two", "one "),
@@ -22554,6 +23578,921 @@ mod tests {
         assert_that!(workspace.exists()).is_false();
 
         // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An app on a real media file with a working subtitle toolchain, ready for `a`.
+    fn app_ready_to_create_a_track() -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+        app
+    }
+
+    /// Walks the popup through the real key sequence, choosing the given placement and
+    /// English as the language — the tests using this helper assert on `movie.eng.srt` by
+    /// name, so the language is searched for explicitly rather than left on the list's own
+    /// first (alphabetical) entry.
+    ///
+    /// `Enter` opens the format list, `Enter` takes its only entry, `j` to the language row,
+    /// `Enter` opens its list, `/`+typing narrows it to English, `Enter` takes it, `j` to the
+    /// placement row, `h`/`l` picks the answer directly, `j` moves to the action row, and
+    /// `Enter` performs `Create` (the row's default).
+    fn create_track_with(app: &mut App, placement: NewTrackPlacement) {
+        app.open_create_track();
+        app.activate_create_track();
+        app.activate_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "english".chars() {
+            app.input_text_char(character);
+        }
+        app.activate_create_track();
+        app.move_create_track_cursor(1);
+        app.move_create_track_choice(placement == NewTrackPlacement::External);
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+    }
+
+    #[test]
+    fn a_should_open_the_create_track_dialog_on_the_format_row() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_create_track();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CreateTrack));
+        let popup = app.create_track_popup.expect("the popup should be open");
+        assert_that!(popup.field).is_equal_to(CreateTrackField::Format);
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.placement).is_equal_to(NewTrackPlacement::Internal);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `h`/`l` on the fixed kind row cannot move anything — there is nowhere for the cursor
+    /// to go — so it answers with the same "not implemented yet" wording the rest of the
+    /// application uses for a feature missing on the type the reader tried it on.
+    #[test]
+    fn moving_the_kind_choice_should_say_video_and_audio_are_not_implemented() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(-1);
+
+        // Act
+        app.move_create_track_choice(true);
+
+        // Assert
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not implemented yet")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.as_ref().unwrap().kind)
+            .is_equal_to(NewTrackKind::Subtitles);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `Language` row starts on the same guess `create_subtitle_track` used to make
+    /// silently — the file's audio, or English where nothing says otherwise — so the reader
+    /// is correcting a guess already on screen rather than answering a blank field.
+    #[test]
+    fn opening_the_create_track_popup_should_leave_the_language_unchosen() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_create_track();
+
+        // Assert: empty, not a silent guess standing in for an answer — see
+        // `CreateTrackField`'s doc comment.
+        assert_that!(app.create_track_popup.as_ref().unwrap().language.as_str()).is_equal_to("");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The row's own answer starts empty, and the list it opens on takes no guess from the
+    /// media's audio either — a new subtitle track is as often a translation as it is a
+    /// transcript of what is spoken, so the cursor simply opens on the list's own first
+    /// entry regardless of what the file's audio is tagged.
+    #[test]
+    fn opening_the_create_track_language_list_should_start_on_the_list_s_first_entry() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "tags": {"language": "fre"},
+                },
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: the answer is still unchosen, and the cursor is on the top of the list
+        // rather than on the file's own (French) audio language.
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.language.as_str()).is_equal_to("");
+        assert_that!(popup.cursor).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `/` filters the language list, and choosing an entry from it changes `popup.language`
+    /// — the same searchable picker the subtitle settings dialog already offers, reached here
+    /// before the track exists rather than through a second visit to fix a wrong guess.
+    #[test]
+    fn choosing_a_language_in_the_create_track_popup_should_change_it() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+
+        // Act: open the list, narrow it to French, and take the only match.
+        app.activate_create_track();
+        assert_that!(app.create_track_popup.as_ref().unwrap().open).is_true();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages().len()).is_equal_to(1);
+        app.activate_create_track();
+
+        // Assert
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.language.as_str()).is_equal_to("fra");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The file created carries whichever language the reader chose in the popup — proving
+    /// the popup's answer actually reaches the sidecar rather than something derived from
+    /// the media a second time when the track is written.
+    #[test]
+    fn creating_a_track_should_use_the_language_chosen_in_the_popup() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        app.activate_create_track();
+        app.move_create_track_cursor(1); // Language -> Placement
+        app.move_create_track_choice(true); // External
+        app.move_create_track_cursor(1); // Placement -> Action
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: the sidecar's name carries the chosen language, not the guessed one.
+        assert_that!(directory.join("movie.fra.srt").exists()).is_true();
+        assert_that!(directory.join("movie.eng.srt").exists()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Typing a query that matches nothing leaves the row's own answer untouched — `Enter`
+    /// on an empty list has nothing to commit, so it closes the list without changing
+    /// `language`, the same as `Esc` would.
+    #[test]
+    fn the_create_track_language_search_should_report_no_matches_without_changing_the_answer() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+
+        // Act
+        for character in "zzzzz".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages()).is_empty();
+        app.activate_create_track();
+
+        // Assert: the list closed — there was nothing under the cursor to take — and the
+        // row is still unanswered.
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.language.as_str()).is_equal_to("");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` while typing drops the query and shows every common language again, without
+    /// closing the list — narrowing a search is not the same as answering the row.
+    #[test]
+    fn cancelling_the_create_track_language_search_should_restore_the_full_list() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages().len()).is_equal_to(1);
+
+        // Act
+        app.cancel_create_track_language_search();
+
+        // Assert
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor).is_equal_to(0);
+        assert_that!(app.filtered_create_track_languages().len()).is_greater_than(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Enter` on `Create` (or its mnemonic) before a language is chosen writes nothing and
+    /// keeps the popup up, with a notice naming what is missing — the same shape every other
+    /// refusal in this popup already takes, rather than silently falling back to a guess the
+    /// reader never saw.
+    #[test]
+    fn creating_a_track_should_be_refused_until_a_language_is_chosen() {
+        // Arrange: the cursor reaches Action without ever answering Language.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Action);
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: refused, in words, with the popup still up and nothing written.
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Choose a language")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.is_some()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `c`/`C` mnemonic answers the same refusal as `Enter` on `Create` — it reaches the
+    /// same guard, since both go through `App::confirm_create_track`.
+    #[test]
+    fn the_create_track_mnemonic_should_also_refuse_without_a_language() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act
+        app.create_track_now();
+
+        // Assert
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Choose a language")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.is_some()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar written beside a file the matcher will never look at is an orphan: it gets no
+    /// row, so the page would have nothing to open. Refused with a sentence rather than
+    /// silently, since the reader pressed a key and is owed an answer.
+    #[test]
+    fn a_should_refuse_a_file_no_sidecar_can_attach_to() {
+        // Arrange: a video in a container the sidecar matcher does not scan. It reaches the
+        // track list perfectly well — the refusal is on the file's extension, because that is
+        // what decides whether a sidecar beside it would ever be found again.
+        let mut app = test_file_app(&["movie.mpg"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+
+        // Act
+        app.open_create_track();
+
+        // Assert
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Reel can only add a subtitle track beside a video file.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every refusal is raised before anything is written — a file left behind by a press that
+    /// then declines to open the page would be the worst of both answers.
+    #[test]
+    fn a_should_write_nothing_until_the_popup_is_answered() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let before = std::fs::read_dir(&directory).unwrap().count();
+
+        // Act: open it, walk it, and back out again.
+        app.open_create_track();
+        app.activate_create_track();
+        app.activate_create_track();
+        app.escape_create_track();
+        app.escape_create_track();
+
+        // Assert
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(before);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A build with no libass still gets the page: the cues are editable whether or not a
+    /// frame can be drawn behind them, and the pane says why it is blank. Reading SubRip needs
+    /// no external tool at all, so there is nothing here for a capability check to refuse.
+    #[test]
+    fn a_should_make_a_track_on_a_build_that_cannot_draw_frames() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities::default();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.eng.srt").exists()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act / Assert: wrong layer.
+        app.layer = Layer::Files;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+
+        // Act / Assert: a dialog already up.
+        app.layer = Layer::Streams;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_create_track();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` peels one level at a time — the open list, then the dialog — so changing your
+    /// mind about one choice does not cost the whole popup.
+    #[test]
+    fn escape_should_back_out_of_the_create_track_dialog_one_level_at_a_time() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.activate_create_track();
+        assert_that!(app.create_track_popup.as_ref().unwrap().open).is_true();
+
+        // Act / Assert: the open list closes first.
+        app.escape_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.field).is_equal_to(CreateTrackField::Format);
+
+        // And only then does the dialog go — there is no step left to peel.
+        app.escape_create_track();
+        assert_that!(app.create_track_popup.is_none()).is_true();
+        assert_that!(app.dialog.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg`/`G` move between the popup's four rows when no list is open, and through the
+    /// open list when one is — the same two axes every other settings popup has.
+    #[test]
+    fn the_create_track_dialog_should_navigate_like_every_other_list() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act / Assert: between the rows.
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Action);
+        app.move_create_track_to_endpoint(false);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Kind);
+
+        // Act / Assert: and through the open list, which cannot run off its end.
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor)
+            .is_equal_to(NewTrackFormat::ORDER.len() - 1);
+        app.move_create_track_cursor(5);
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor)
+            .is_equal_to(NewTrackFormat::ORDER.len() - 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The file is named for the media, with `und` for a language the reader has not been
+    /// asked for — the sidecar matcher requires one as the name's first component.
+    #[test]
+    fn creating_a_track_should_write_an_empty_sidecar_named_for_the_media() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert: written, empty, and the page is open on it with the cursor where `i` works.
+        let path = directory.join("movie.eng.srt");
+        assert_that!(path.exists()).is_true();
+        assert_that!(std::fs::read_to_string(&path).unwrap()).is_equal_to(String::new());
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Sidecar(path));
+        // External stages nothing at all: the sidecar is what the save writes.
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Internal is the default, and it is the import mark `Ctrl+H` sets rather than a second
+    /// mechanism — so the save converts the sidecar, muxes it in and deletes the file.
+    #[test]
+    fn creating_an_internal_track_should_stage_the_import() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::Internal);
+
+        // Assert
+        let source = SubtitleSource::Sidecar(directory.join("movie.eng.srt"));
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the import should be staged");
+        assert_that!(change.import_into_media).is_true();
+        // Which is what puts the row among the container's own subtitles rather than in the
+        // sidecar column beside them.
+        assert_that!(
+            app.active_left_subtitle_tracks()
+                .contains(&TrackRef::Sidecar(0))
+        )
+        .is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The track's language never comes from the media's own audio — a subtitle track is as
+    /// often a translation as a transcript of what is spoken, so an audio tag naming a
+    /// language nothing else in the popup asks about must not silently steer what gets
+    /// written. Whatever the audio says, the language actually written is whichever one the
+    /// reader picked in the popup (`create_track_with` searches for English), never the
+    /// audio's own tag.
+    #[test]
+    fn a_new_track_s_language_should_never_come_from_the_media_s_audio() {
+        // Arrange: audio tagged Dutch.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "tags": {"language": "nld"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.nld.srt").exists()).is_false();
+        assert_that!(directory.join("movie.eng.srt").exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A second track beside the first takes the next free number, the convention the rest of
+    /// the application's sidecar naming already uses.
+    #[test]
+    fn creating_a_track_should_number_past_a_name_that_is_taken() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        // Something in it, so leaving does not take it back off the disk.
+        std::fs::write(
+            directory.join("movie.eng.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nx\n\n",
+        )
+        .unwrap();
+        app.back();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.eng.1.srt").exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An `a` pressed by mistake has to cost nothing, which is the rule the page already
+    /// applies to a cue editor closed with nothing typed in it.
+    #[test]
+    fn leaving_an_untouched_new_track_should_take_the_file_back_off_the_disk() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::Internal);
+        let path = directory.join("movie.eng.srt");
+        assert_that!(path.exists()).is_true();
+
+        // Act
+        app.back();
+
+        // Assert: the file goes, and the import mark it was carrying goes with it — leaving
+        // that behind would stage an edit against a track that no longer exists.
+        assert_that!(path.exists()).is_false();
+        assert_that!(app.new_track.is_none()).is_true();
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.sidecars.is_empty()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue typed into it is work to be written rather than an accident to be swept up.
+    #[test]
+    fn leaving_a_new_track_with_a_cue_in_it_should_keep_the_file() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+
+        // Act: the question is raised rather than the page simply closing, since leaving would
+        // discard the cue — and answering "stay" must not delete the file either.
+        app.request_leave_subtitle_edit();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Discarding the cue edits takes the file with them: the reader has said they want none
+    /// of it, and what is left is the empty file `a` wrote.
+    #[test]
+    fn discarding_the_cue_edits_on_a_new_track_should_take_the_file_too() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+        app.request_leave_subtitle_edit();
+
+        // Act
+        app.resolve_leave_subtitle_edit(true);
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(path.exists()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar the session did not create is somebody else's file, however empty it is.
+    #[test]
+    fn leaving_a_page_should_never_delete_a_sidecar_it_did_not_make() {
+        // Arrange: an empty sidecar already on disk, opened the ordinary way with `c`.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let path = directory.join("movie.eng.srt");
+        std::fs::write(&path, "").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.open_subtitle_edit();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every popup entry point is reachable from a key `main` still delivers, so each has to
+    /// be inert on its own when there is no popup — the guard the rest of the dialogs keep.
+    #[test]
+    fn the_create_track_entry_points_should_be_inert_with_no_popup() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act / Assert
+        assert_that!(app.create_track_choices().is_empty()).is_true();
+        app.move_create_track_cursor(1);
+        app.move_create_track_to_endpoint(true);
+        app.activate_create_track();
+        app.escape_create_track();
+        assert_that!(app.create_track_popup.is_none()).is_true();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// There is no track list drawn to have pressed `a` on when no file is selected or the
+    /// probe is still out, so it is inert rather than a refusal with something to say.
+    #[test]
+    fn a_should_be_inert_before_there_is_a_file_to_add_a_track_to() {
+        // Act / Assert: no file selected at all.
+        let mut app = test_file_app(&[]);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.is_none()).is_true();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        // Act / Assert: a file, but its metadata has not arrived.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.outcome = None;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Format and Language are reachable in both directions, and Format opens its own list —
+    /// even though it holds one entry today.
+    #[test]
+    fn the_create_track_dialog_should_open_either_row_of_its_second_step() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act / Assert: down to language and back up to format.
+        app.move_create_track_cursor(1);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Language);
+        app.move_create_track_cursor(-1);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Format);
+
+        // Act / Assert: the format row opens and commits like any other, leaving the reader on
+        // the row — there is still a placement to answer.
+        app.activate_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_true();
+        assert_that!(app.create_track_choices())
+            .is_equal_to(vec![NewTrackFormat::SubRip.label().to_string()]);
+        app.activate_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.format).is_equal_to(NewTrackFormat::SubRip);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup outlives the state that allowed it — a background reconcile can take the file
+    /// away while the reader is still choosing — so the answers are re-checked before a file is
+    /// written rather than trusted.
+    #[test]
+    fn creating_a_track_should_do_nothing_once_the_file_it_was_for_has_gone() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act: the file vanishes from under the open dialog.
+        std::fs::remove_file(directory.join("movie.mkv")).unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        app.move_create_track_cursor(1);
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+
+        // Assert: nothing written, and no page opened on a file that is not there.
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(0);
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The three things that must stop the cleanup, each of which would otherwise delete a file
+    /// somebody is still using.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_work_still_in_flight() {
+        // Arrange / Act / Assert: a save in flight. `confirm_process_all` closes the page while
+        // the file is still empty and the reader's cue lives in `staged_edits`, so an unguarded
+        // hook here would delete a file out from under its own save.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: Vec::new(),
+            started: std::time::Instant::now(),
+        });
+        app.back();
+        assert_that!(path.exists()).is_true();
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        // Arrange / Act / Assert: a page waiting to be reopened after a save.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media: directory.join("movie.mkv"),
+            source: SubtitleSource::Sidecar(path.clone()),
+            cue: 0,
+        });
+        app.back();
+        assert_that!(path.exists()).is_true();
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        // Arrange / Act / Assert: the page has moved to another track. Only the page's own
+        // file is ever swept up.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.subtitle_edit = None;
+        app.back();
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue snapshotted into `staged_edits` is work waiting to be written, even though the
+    /// live map has been cleared — so it holds the file just as a live one does.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_a_cue_snapshotted_into_the_staged_edits() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+        app.snapshot_current_edits();
+        app.subtitle_changes.clear();
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory already holding a hundred subtitle files for one video is one where the
+    /// reader wants a word rather than a hundred and first file.
+    #[test]
+    fn creating_a_track_should_give_up_rather_than_number_for_ever() {
+        // Arrange: every name the numbering would try is taken.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        for number in 0..=MAX_NEW_TRACK_NUMBER {
+            let name = crate::subtitle::sidecar_filename(
+                "movie",
+                "eng",
+                false,
+                false,
+                (number > 0).then_some(number),
+                SubtitleFormat::SubRip,
+            );
+            std::fs::write(directory.join(name), "").unwrap();
+        }
+        let before = std::fs::read_dir(&directory).unwrap().count();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(app.notice.clone())
+            .contains("There are already too many subtitle files for this one.".to_string());
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(before);
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory that cannot be written to is reported rather than left looking like a key
+    /// that did nothing.
+    #[test]
+    fn creating_a_track_should_report_a_directory_it_cannot_write_to() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let mut permissions = std::fs::metadata(&directory).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&directory, permissions).unwrap();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(app.notice.clone().unwrap_or_default().as_str())
+            .contains("Could not create the subtitle file");
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        let mut permissions = std::fs::metadata(&directory).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&directory, permissions).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page can close without the reader leaving it — selecting another file does exactly
+    /// that — and a cue typed into the new track is work to be written either way.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_a_cue_still_staged_live() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+
+        // Act: the page closes without the reader having answered a leave prompt.
+        app.close_subtitle_edit();
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 

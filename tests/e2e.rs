@@ -40,7 +40,7 @@ use reel_tui::app::{
 };
 use reel_tui::cli::{HELP_TEXT, USAGE, VERSION_TEXT};
 use reel_tui::edit::VideoRotation;
-use reel_tui::subtitle::ToolCapabilities;
+use reel_tui::subtitle::{SubtitleSource, ToolCapabilities};
 use reel_tui::subtitle_edit::WarmState;
 
 /// An FFmpeg older than the supported floor has to stop `reel` at the door.
@@ -5669,6 +5669,421 @@ fn frame_path(key: &(String, String)) -> PathBuf {
 }
 
 /// Opens the subtitle edit page on the sidecar track and waits for its cues.
+/// The one thing the application could not do was *make* a subtitle track. `a` on the track
+/// list asks what to create and where it should live, then drops the reader onto the subtitle
+/// edit page with an empty track open — where `i` from the timeline puts the first line in.
+///
+/// Driven end to end and asserted **on the file**, because every layer short of it agrees
+/// while the feature is broken: the popup opens either way, the page's list can be right while
+/// the staged change is keyed against the wrong thing, and a save that never writes the cue
+/// leaves a file that still parses.
+///
+/// This run picks *external*, so the sidecar is what survives the save. The empty case is here
+/// for the same reason it is in the cue-insertion scenario: an `a` pressed by mistake has to
+/// cost nothing, and a stray zero-byte file left beside the media is a mess the reader made by
+/// exploring.
+#[test]
+fn creating_an_external_subtitle_track_should_write_a_sidecar_and_ctrl_s_should_fill_it() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune each
+    // other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test =
+        "creating_an_external_subtitle_track_should_write_a_sidecar_and_ctrl_s_should_fill_it";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-track-create-external");
+    let directory = scratch.path().to_path_buf();
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(9.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = directory.join("clip.eng.srt");
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    // Act: `a`, then Enter to take the only format, `j` to language, `Enter` to open its
+    // list, `/`+typing to search for English and `Enter` to take it, `j`/`l` to choose
+    // External placement, and `j`/`Enter` to press Create.
+    app.press(key(KeyCode::Char('a')));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::CreateTrack),
+        "a should ask what to create"
+    );
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('/')));
+    for character in "english".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+
+    // Assert: a real, empty file, with the page open on it and the cursor where `i` works.
+    assert!(
+        sidecar.exists(),
+        "the track should be a real file beside the media"
+    );
+    assert_eq!(
+        fs::read_to_string(&sidecar).unwrap(),
+        "",
+        "a track with no cues in it is an empty SubRip file"
+    );
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "creating a track should drop the reader into the editor"
+    );
+    app.wait_until("the new track's (absent) cues to be read", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.is_busy())
+    });
+    assert!(
+        app.app.timeline_focused(),
+        "an empty track has no cue for the panel to mark, so the timeline takes the cursor"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains(" Cues ") && screen.contains("Timeline ("),
+        "the page should draw both panes rather than a message over the whole of it:\n{screen}"
+    );
+
+    // Act / Assert: leaving without typing anything takes the file back off the disk, and its
+    // row with it. This is the assertion that most needs making on the filesystem.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.layer, Layer::Streams, "Esc should leave the page");
+    assert!(
+        !sidecar.exists(),
+        "an `a` pressed by mistake must leave nothing behind"
+    );
+    assert!(
+        app.app.sidecars.is_empty(),
+        "and no row naming a file that is gone"
+    );
+
+    // Act: make one again, and this time put a line in it.
+    app.press(key(KeyCode::Char('a')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('/')));
+    for character in "english".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.wait_until("the new track to be ready", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.is_busy())
+    });
+    // The cursor is seeded at 0:00 and `l` is half a second, so this lands on 1.5s.
+    for _ in 0..3 {
+        app.press(key(KeyCode::Char('l')));
+    }
+    app.press(key(KeyCode::Char('i')));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::EditCue),
+        "i should open the editor on a cue that does not exist yet"
+    );
+    for character in "First line".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+
+    // Assert: the track is an ordinary one now — a row, a selection, and staged work.
+    let state = app.app.subtitle_edit.as_ref().expect("the page is open");
+    assert_eq!(state.cues.len(), 1, "the typed line should be a row");
+    assert!(
+        state.cursor().is_none(),
+        "and the cursor should come home to the panel that marks it"
+    );
+    assert!(
+        app.app.has_unsaved_cue_edits(),
+        "a cue in a new track is staged like every other cue edit"
+    );
+
+    // Act: write it. The save rewrites the file the page is reading, so the page is closed and
+    // comes back on the other side of a re-probe — which is also what clears the notice, hence
+    // waiting for the page rather than reading a success line.
+    app.process_all();
+    app.wait_until("the subtitle edit page to come back", |app| {
+        app.layer == Layer::SubtitleEdit
+            && app
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| !state.cues.is_empty())
+    });
+    app.assert_no_temp_leftovers();
+    assert!(
+        !app.app.has_unsaved_cue_edits(),
+        "a written cue should stop being unsaved work"
+    );
+
+    // Assert: on the file, which is the only place this can be proved.
+    let written = fs::read_to_string(&sidecar).expect("the sidecar should hold the cue");
+    assert_eq!(
+        written, "1\n00:00:01,500 --> 00:00:03,500\nFirst line\n\n",
+        "the save should write the cue the reader typed, at the moment they aimed at"
+    );
+}
+
+/// The default placement is *internal*: the track goes into the media file itself. That is the
+/// existing import mark staged at creation, so a save converts the sidecar to whatever the
+/// container takes, muxes it in and deletes the file.
+///
+/// Asserted on the **container**, since that is where the track ends up and nothing short of
+/// ffprobe can see it. The first half covers the state internal-by-default makes reachable: a
+/// `Ctrl+S` pressed before a line is typed would hand ffmpeg a subtitle stream holding
+/// nothing, which most muxers refuse — so it is answered in a sentence instead.
+#[test]
+fn creating_an_internal_subtitle_track_should_mux_the_first_cue_into_the_container() {
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "creating_an_internal_subtitle_track_should_mux_the_first_cue_into_the_container";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac", "ffmpeg:srt"]);
+
+    let scratch = Scratch::new("subtitle-track-create-internal");
+    let directory = scratch.path().to_path_buf();
+    let media = scratch.join("clip.mkv");
+    write_media(
+        &media,
+        &MediaSpec::mkv()
+            .size(320, 240)
+            .duration(9.0)
+            .audio(&["eng"]),
+    );
+    let sidecar = directory.join("clip.eng.srt");
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    assert!(
+        !harness::codec_names(&harness::probe(&media)).contains(&"subrip".to_string()),
+        "the fixture should start with no subtitle track at all"
+    );
+
+    // Act: `a`, Enter to take the only format, `j` to language, `Enter` to open its list,
+    // `/`+typing to search for English and `Enter` to take it, `j` past placement leaving it
+    // on its default, `j`/`Enter` to press Create.
+    app.press(key(KeyCode::Char('a')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('/')));
+    for character in "english".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.wait_until("the new track to be ready", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.is_busy())
+    });
+
+    // Assert: the import is staged, which is what puts the row among the container's own
+    // subtitle tracks rather than in the sidecar column beside them.
+    assert!(
+        app.app
+            .subtitle_changes
+            .get(&SubtitleSource::Sidecar(sidecar.clone()))
+            .is_some_and(|change| change.import_into_media),
+        "internal should stage the same import mark Ctrl+H sets"
+    );
+
+    // Act / Assert: saving before a line is typed is refused in words rather than failing in
+    // ffmpeg — the state internal-by-default makes reachable, and the reader's first likely
+    // mistake. It is answered in the pre-flight, so nothing is dispatched at all.
+    app.press(harness::ctrl('s'));
+    let refusal = app.app.edit_error.clone().unwrap_or_default();
+    assert!(
+        refusal.contains("has no cues yet"),
+        "an empty track cannot go into the container, and must say so: {refusal:?}\nscreen:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.app.active_batch.is_none(),
+        "and nothing should have been dispatched"
+    );
+    app.press(key(KeyCode::Esc));
+
+    // Act: put a line in and save for real.
+    app.press(key(KeyCode::Char('i')));
+    for character in "Internal line".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Esc));
+    app.process_all();
+    app.assert_batch_succeeded();
+    app.assert_no_temp_leftovers();
+
+    // Assert: the container gained the track, and the sidecar was consumed by the import.
+    assert!(
+        !sidecar.exists(),
+        "an import consumes its sidecar rather than leaving both copies behind"
+    );
+    let info = harness::probe(&media);
+    let subtitles: Vec<&std::collections::BTreeMap<String, serde_json::Value>> = info
+        .streams
+        .iter()
+        .filter(|stream| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("subtitle")
+        })
+        .collect();
+    assert_eq!(
+        subtitles.len(),
+        1,
+        "the media file should have gained exactly one subtitle track, got codecs {:?}",
+        harness::codec_names(&info)
+    );
+
+    // And the cue itself, read back out of the container — the only place this can be proved,
+    // since every layer above it agrees while the wrong bytes are muxed in.
+    let read_back = directory.join("read-back.srt");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&media)
+        .args(["-map", "0:s:0", "-c:s", "subrip"])
+        .arg(&read_back)
+        .status()
+        .expect("ffmpeg should run");
+    assert!(status.success(), "the muxed track should extract cleanly");
+    let cues = fs::read_to_string(&read_back).unwrap();
+    assert!(
+        cues.contains("Internal line"),
+        "the muxed track should carry the cue the reader typed, got: {cues:?}"
+    );
+}
+
+/// A save refuses an undetermined sidecar outright, so the new-track popup's `Language` row
+/// asks up front rather than leaving the reader to fix a wrong guess through a second visit
+/// to the subtitle settings dialog after the fact. The row starts unanswered — this fixture's
+/// audio names no language, so the list it opens on merely *starts* on the English guess —
+/// and the reader picks French instead, asserted on the file since the sidecar's name is the
+/// only place a wrong language would actually show up.
+#[test]
+fn creating_a_track_should_use_the_language_chosen_in_the_new_track_popup() {
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "creating_a_track_should_use_the_language_chosen_in_the_new_track_popup";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("subtitle-track-create-language");
+    let directory = scratch.path().to_path_buf();
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().size(320, 240).duration(9.0).audio(&[]),
+    );
+    let unchosen = directory.join("clip.eng.srt");
+    let chosen = directory.join("clip.fra.srt");
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    // Act: `a`, Enter to take the only format, `j` to the language row, `Enter` to open its
+    // list, `/` to search, type "french", `Enter` to take the only match, `j`/`l` to choose
+    // External placement, and `j`/`Enter` to press Create.
+    app.press(key(KeyCode::Char('a')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('/')));
+    for character in "french".chars() {
+        app.press(key(KeyCode::Char(character)));
+    }
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+
+    // Assert: the file the popup wrote carries the language actually chosen, and nothing
+    // else was ever written under some other language.
+    assert!(
+        chosen.exists(),
+        "the sidecar should be named for the language chosen in the popup"
+    );
+    assert!(
+        !unchosen.exists(),
+        "no other language should have been written"
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Pressing Create — by `Enter` on the row or by its `c`/`C` mnemonic — before the reader has
+/// answered `Language` writes nothing and leaves the popup open, the same shape every other
+/// refusal in the application takes. Real key presses driving the real dispatch is the point:
+/// a unit test on `App::confirm_create_track` alone cannot show that the mnemonic reaches the
+/// same guard `Enter` does.
+#[test]
+fn creating_a_track_should_refuse_the_mnemonic_and_the_enter_key_without_a_language() {
+    let scratch = Scratch::new("subtitle-track-create-no-language");
+    let directory = scratch.path().to_path_buf();
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv().size(320, 240).duration(9.0).audio(&[]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+
+    // Act: `a`, Enter to take the only format, straight to the mnemonic without ever
+    // answering Language.
+    app.press(key(KeyCode::Char('a')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('c')));
+
+    // Assert: refused in words, the popup still up, and nothing written.
+    let refusal = app.app.notice.clone().unwrap_or_default();
+    assert!(
+        refusal.contains("Choose a language"),
+        "the mnemonic should refuse to create without a language: {refusal:?}"
+    );
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::CreateTrack),
+        "the popup should still be up"
+    );
+    assert_eq!(
+        fs::read_dir(&directory).unwrap().count(),
+        1,
+        "only the media file should be there — nothing was written"
+    );
+
+    // Act: `Enter` on Create refuses the same way, reaching the same guard.
+    app.press(key(KeyCode::Char('j'))); // Format -> Language
+    app.press(key(KeyCode::Char('j'))); // Language -> Placement
+    app.press(key(KeyCode::Char('j'))); // Placement -> Action
+    app.press(key(KeyCode::Enter));
+    let refusal = app.app.notice.clone().unwrap_or_default();
+    assert!(
+        refusal.contains("Choose a language"),
+        "Enter on Create should refuse the same way: {refusal:?}"
+    );
+    assert_eq!(app.app.dialog, Some(Dialog::CreateTrack));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn open_sidecar_edit_page(app: &mut Harness) {
     let row = app
         .app
