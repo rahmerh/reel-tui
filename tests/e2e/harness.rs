@@ -1198,7 +1198,9 @@ impl Harness {
     /// The cue panel marks a search hit by reversing the matched run rather than by
     /// colouring it — the page already spends five colours, and reversing is legible
     /// against each of them — so "which words matched" is a question about a modifier
-    /// that only the buffer can answer. Nothing else in this UI reverses a cell.
+    /// that only the buffer can answer. The only other reversed cells are the timeline's
+    /// handles on the ends of the cue being timed, which exist only while the timing mode is
+    /// on — so a scenario reading this with the mode off reads the search hits alone.
     pub fn reversed_text(&self) -> String {
         self.terminal
             .backend()
@@ -1319,8 +1321,8 @@ pub fn ctrl(code: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)
 }
 
-/// A terminal sends `Alt+x` as an `Esc` prefix rather than as a bit on the byte, which is why
-/// the cue resize's inverse direction is bound here rather than on `Ctrl+Shift`.
+/// A terminal sends `Alt+x` as an `Esc` prefix rather than as a bit on the byte. Scenarios use
+/// it to prove that `Alt+H`/`Alt+L`, which once shrank a cue, are bound to nothing now.
 pub fn alt(code: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(code), KeyModifiers::ALT)
 }

@@ -5181,9 +5181,9 @@ fn auto_sync_should_refuse_a_track_with_no_audio_to_measure_against() {
 
 /// The second commonest thing wrong with a subtitle track is not a line in the wrong place
 /// but a line up for the wrong length — one that goes away while the mouth is still moving,
-/// or hangs over the shot after it. `Ctrl+H`/`Alt+H` and `Ctrl+L`/`Alt+L` move one end of the
-/// selected cue and `D` types a length outright, all inside the same timing mode `h`/`l`
-/// shift a cue in.
+/// or hangs over the shot after it. Inside the same timing mode `h`/`l` shift a cue in,
+/// `Ctrl+H`/`Ctrl+L` select the cue's start, the whole cue or its end, `h`/`l` then move only
+/// what is selected, and `D` types a length outright.
 ///
 /// Asserted on the sidecar, because every layer short of it agrees while the feature is
 /// broken: the keys move the page's own copy of the cue either way, the dialog opens
@@ -5229,32 +5229,49 @@ fn resizing_a_cue_should_stage_its_new_length_and_ctrl_s_should_write_it() {
         (cue.start, cue.end)
     };
 
-    // Act / Assert: with the mode off the edge keys do nothing, so a stray press on a page
-    // nobody is retiming cannot edit the file.
+    // Act / Assert: with the mode off the selection keys do nothing, so a stray press on a
+    // page nobody is retiming can neither edit the file nor leave an edge selected.
     app.press(ctrl('l'));
     app.press(ctrl('h'));
     assert!(
-        !app.app.has_unsaved_cue_edits(),
-        "the resize keys should be inert outside the timing mode"
+        !app.app.has_unsaved_cue_edits() && app.app.timing_scope().grip().is_none(),
+        "the selection keys should be inert outside the timing mode"
     );
 
-    // Act: into the mode, the end out by two presses and the start out by one.
+    // Act / Assert: into the mode on the whole cue, then one step right selects the end, and
+    // the title brackets it so the reader can see which half the next press moves.
     app.press(key(KeyCode::Char('t')));
     app.press(ctrl('l'));
-    app.press(ctrl('l'));
-    app.press(ctrl('h'));
+    app.pump();
+    let screen = app.screen();
+    assert!(
+        screen.contains("Timeline (00:00:01.0 → [00:00:02.0])"),
+        "the title should bracket the end once it is selected:\n{screen}"
+    );
 
-    // Assert: one end moved per press, and the page says the line is now on screen longer.
+    // Act: the end out by two steps, then two steps left to the start and out by one.
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Char('l')));
+    app.press(ctrl('h'));
+    app.press(ctrl('h'));
+    app.press(key(KeyCode::Char('h')));
+
+    // Assert: each press moved only the end selected, and the page says the line is now on
+    // screen longer, with the start the one bracketed.
     assert_eq!(
         span(&app),
         (Duration::from_millis(950), Duration::from_millis(2100)),
-        "each edge key should move one end and leave the other"
+        "h and l should move only the selected end and leave the other"
     );
     app.pump();
     let screen = app.screen();
     assert!(
         screen.contains("1.15s long") && screen.contains("1 edited"),
         "the page should say how long the cue now is and that it is unwritten:\n{screen}"
+    );
+    assert!(
+        screen.contains("Timeline (["),
+        "the title should bracket the start once it is selected:\n{screen}"
     );
 
     // Act / Assert: `D` opens the length dialog holding the length the cue really has.
@@ -5310,10 +5327,20 @@ fn resizing_a_cue_should_stage_its_new_length_and_ctrl_s_should_write_it() {
         app.press(key(KeyCode::Char(character)));
     }
     app.press(key(KeyCode::Enter));
+    // The start is still selected, and later — a step and a leap — would take it through the
+    // end.
+    app.press(key(KeyCode::Char('l')));
+    app.press(key(KeyCode::Char('L')));
+    // Then the end, earlier by a step and a leap.
+    app.press(ctrl('l'));
+    app.press(ctrl('l'));
+    app.press(key(KeyCode::Char('h')));
+    app.press(key(KeyCode::Char('H')));
+    // And the keys that once shrank a cue, which are bound to nothing now.
     app.press(alt('l'));
     app.press(alt('h'));
 
-    // Assert: it sat on the floor and neither press moved anything — from either end.
+    // Assert: it sat on the floor and no press moved anything — from either end.
     assert_eq!(
         span(&app),
         (Duration::from_millis(950), Duration::from_millis(1000)),

@@ -40,7 +40,7 @@ use crate::{
         stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
     subtitle_edit::{
-        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, GROUP_COLUMNS, LoadStatus, SubtitleEditState,
+        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, CueGrip, GROUP_COLUMNS, LoadStatus, SubtitleEditState,
         TimingScope, WarmState,
     },
 };
@@ -193,7 +193,7 @@ fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
         TimingScope::Track => app
             .track_shift()
             .map(|moved| format!("global {}", format_shift(moved))),
-        TimingScope::Off | TimingScope::Cue => app.selected_cue_shift().map(format_shift),
+        TimingScope::Off | TimingScope::Cue(_) => app.selected_cue_shift().map(format_shift),
     };
     // And how long it now is, when that is not the length the file gives it. Read beside the
     // shift because it comes from the same place and answers the other half of the same
@@ -1221,11 +1221,7 @@ fn render_edit_timeline(
         // page leaves the moment its cues land. Nothing to read, so nothing is claimed.
         (None, None) => Vec::new(),
         (None, Some(cue)) => [
-            Some(format!(
-                "{} → {}",
-                format_timestamp(cue.start),
-                format_timestamp(cue.end)
-            )),
+            Some(cue_times_reading(cue, state.timing.grip())),
             shift,
             length,
         ]
@@ -1438,6 +1434,25 @@ fn timeline_ruler(
 /// way — and which way is half of what the reader is checking. Hundredths rather than the
 /// tenths the timestamps beside it carry, since the step is fifty milliseconds and a
 /// tenth-second readout would sit still for every other press.
+/// The selected cue's two times for the timeline's title, with brackets round whatever part of
+/// it `h`/`l` are moving: `[start → end]` for the whole cue, `[start] → end` for its start and
+/// `start → [end]` for its end.
+///
+/// **In the title rather than only on the cue's bar**, because the title is where the timing
+/// mode's readout already is and the bar can be a handful of columns wide — too narrow for
+/// bracket glyphs to say anything. The bar still gets handles (see [`timeline_lines`]); this
+/// is the half that can be read in words. No brackets outside the cue scale, where `h`/`l`
+/// move no part of this cue.
+fn cue_times_reading(cue: &Cue, grip: Option<CueGrip>) -> String {
+    let (start, end) = (format_timestamp(cue.start), format_timestamp(cue.end));
+    match grip {
+        None => format!("{start} → {end}"),
+        Some(CueGrip::Start) => format!("[{start}] → {end}"),
+        Some(CueGrip::Whole) => format!("[{start} → {end}]"),
+        Some(CueGrip::End) => format!("{start} → [{end}]"),
+    }
+}
+
 /// How many columns the timeline's title takes with these readings in it.
 ///
 /// Counted in characters rather than bytes: the readings carry `→` and are joined by `·`,
@@ -1590,6 +1605,30 @@ fn timeline_lines(
         let span_width = usize::from(last - first) + 1;
         for (offset, glyph) in cue_glyphs(span_width).chars().enumerate() {
             grid[lane][usize::from(first) + offset] = (glyph, style);
+        }
+        // **Every end `h`/`l` are about to move is drawn as a solid handle**: the left end
+        // for the start, the right end for the end, and both for the whole cue. The whole cue
+        // needs them as much as an edge does — marking only an edge left the default selection
+        // looking like no selection at all. Reversed rather than recoloured, because the
+        // selection's colour is already doing a job in the mode and a reversed cell reads as
+        // "grabbed" in any colour. Only where that end really is inside the window: `span`
+        // clamps a cue reaching past an edge onto the edge column, and a handle there would be
+        // pointing at a moment the end is not at.
+        if Some(index) == selected {
+            let (moves_start, moves_end) = match timing.grip() {
+                Some(CueGrip::Start) => (true, false),
+                Some(CueGrip::Whole) => (true, true),
+                Some(CueGrip::End) => (false, true),
+                None => (false, false),
+            };
+            let handles = [
+                (moves_start && cue.start >= window.start).then_some(first),
+                (moves_end && cue.end <= window.end).then_some(last),
+            ];
+            for column in handles.into_iter().flatten() {
+                let cell = &mut grid[lane][usize::from(column)];
+                cell.1 = cell.1.add_modifier(Modifier::REVERSED);
+            }
         }
     }
 
@@ -3700,7 +3739,8 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "t",
-        "Move the selected cue's timing (SubRip tracks); Esc leaves, Ctrl-s writes it",
+        "Time the selected cue, starting with the whole cue selected (SubRip tracks); Esc \
+         leaves, Ctrl-s writes it",
     );
     keybinding(
         &mut lines,
@@ -3723,27 +3763,22 @@ fn keybindings_text() -> Text<'static> {
         &mut lines,
         "h / l",
         "Move the timeline cursor 0.5s back or on while it holds the cursor, otherwise move \
-         the cue — or every cue, while retiming globally — 0.05s earlier or later while \
-         timing, otherwise move between cues that share a moment or choose Yes or No on a \
-         preview settings switch",
+         the selected part of the cue — or every cue, while retiming globally — 0.05s \
+         earlier or later while timing, otherwise move between cues that share a moment or \
+         choose Yes or No on a preview settings switch",
     );
     keybinding(
         &mut lines,
         "H / L",
-        "Move the timeline cursor five seconds back or on, or the cue — or every cue — half \
-         a second earlier or later while timing",
+        "Move the timeline cursor five seconds back or on, or the selected part of the cue — \
+         or every cue — half a second earlier or later while timing",
     );
     keybinding(
         &mut lines,
         "Ctrl-h / Ctrl-l",
         "Move the timeline cursor 0.05s back or on while it holds the cursor, the same step \
-         a cue is nudged by, otherwise grow the selected cue 0.05s from its start or its \
-         end while timing, changing how long it is on screen",
-    );
-    keybinding(
-        &mut lines,
-        "Alt-h / Alt-l",
-        "Shrink the selected cue 0.05s from its start or its end while timing",
+         a cue is nudged by, otherwise select the cue's start, the whole cue or its end while \
+         timing — moving the start or end changes how long the cue is on screen",
     );
     keybinding(
         &mut lines,
@@ -13201,7 +13236,6 @@ mod tests {
             // The cue resize keys. This popup is the only place a key is documented, so a
             // binding missing from here is a binding nobody can find.
             "Ctrl-h / Ctrl-l",
-            "Alt-h / Alt-l",
             "mm:ss.mmm",
         ];
 
@@ -16217,7 +16251,7 @@ mod tests {
 
         // Act
         let (cue_normally, playhead_normally) = colours(TimingScope::Off);
-        let (cue_retiming, playhead_retiming) = colours(TimingScope::Cue);
+        let (cue_retiming, playhead_retiming) = colours(TimingScope::Cue(CueGrip::Whole));
 
         // Assert: cyan cue, yellow playhead — and in the mode, the other way round.
         assert_that!(cue_normally).is_equal_to(Some(Color::Cyan));
@@ -16229,6 +16263,56 @@ mod tests {
         // is the property the swap exists to keep.
         assert_that!(cue_normally != playhead_normally).is_true();
         assert_that!(cue_retiming != playhead_retiming).is_true();
+    }
+
+    /// Every end the next `h`/`l` moves is drawn as a solid handle — reversed — and nothing
+    /// else is: the start alone, the end alone, both for the whole cue, and never an end the
+    /// window has clamped the cue onto, which would point at a moment the end is not at.
+    ///
+    /// The whole cue getting handles is the regression this pins: marking only an edge left the
+    /// default selection looking like no selection at all.
+    #[test]
+    fn timeline_lines_should_draw_handles_on_every_end_that_moves() {
+        // Arrange: a cue at 10s → 20s, one lane.
+        let cues = vec![edit_cue(10_000, 20_000, "line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let handles = |window: &crate::cue::TimelineWindow, timing: TimingScope| {
+            timeline_lines(&cues, &layout, window, Some(0), None, None, timing)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| span.content.chars().map(move |glyph| (glyph, span.style)))
+                .enumerate()
+                .filter(|(_, (_, style))| style.add_modifier.contains(Modifier::REVERSED))
+                .map(|(column, (glyph, _))| (column, glyph))
+                .collect::<Vec<_>>()
+        };
+        // One column per second.
+        let whole = window_over(0, 60, 61);
+
+        // Act / Assert: the start's column, then the end's.
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::Start)))
+            .is_equal_to(vec![(10, '|')]);
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::End))).is_equal_to(vec![(20, '|')]);
+
+        // Act / Assert: both for the whole cue, since both ends move together.
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::Whole)))
+            .is_equal_to(vec![(10, '|'), (20, '|')]);
+
+        // Act / Assert: nothing with the mode off, or at track scale.
+        assert_that!(handles(&whole, TimingScope::Off).len()).is_equal_to(0);
+        assert_that!(handles(&whole, TimingScope::Track).len()).is_equal_to(0);
+
+        // Act / Assert: a window inside the cue clamps both ends onto its edges, and no
+        // selection gets a handle there.
+        let inside = window_over(12, 18, 61);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::Start)).len()).is_equal_to(0);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::End)).len()).is_equal_to(0);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::Whole)).len()).is_equal_to(0);
+
+        // Act / Assert: with only the start clamped, the whole cue keeps its end's handle.
+        let later = window_over(12, 30, 61);
+        assert_that!(handles(&later, TimingScope::Cue(CueGrip::Whole)))
+            .is_equal_to(vec![(27, '|')]);
     }
 
     /// At the wider scale every cue takes the retiming yellow, because every cue is what the
@@ -16248,38 +16332,47 @@ mod tests {
         let layout = crate::cue::pack_lanes(&cues, 4);
         let window = window_over(0, 20, 61);
 
-        // Act: the lanes as they are drawn at each scale.
+        // Act: the style of every cue's end mark, `|`, as the lanes are drawn at each scale.
+        // Counted per mark rather than per span: the selected cue's ends carry handles in the
+        // mode, which splits its bar into several spans without making it more than one cue.
         let styles = |timing: TimingScope| {
             timeline_lines(&cues, &layout, &window, Some(0), None, None, timing)
                 .iter()
                 .flat_map(|line| line.spans.clone())
-                .filter(|span| span.content.contains('|'))
-                .map(|span| (span.style.fg, span.style.add_modifier))
+                .flat_map(|span| {
+                    let style = (span.style.fg, span.style.add_modifier);
+                    span.content
+                        .chars()
+                        .filter(|glyph| *glyph == '|')
+                        .map(move |_| style)
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         };
 
-        // Assert: at cue scale only the selection is yellow and its neighbours stay dim.
-        let narrow = styles(TimingScope::Cue);
+        // Assert: at cue scale only the selection's two ends are yellow, and its neighbours
+        // stay dim.
+        let narrow = styles(TimingScope::Cue(CueGrip::Whole));
         assert_that!(
             narrow
                 .iter()
                 .filter(|(fg, _)| *fg == Some(Color::Yellow))
                 .count()
         )
-        .is_equal_to(1);
+        .is_equal_to(2);
         assert_that!(narrow.iter().any(|(fg, _)| *fg == Some(Color::DarkGray))).is_true();
 
-        // Assert: at track scale every cue is yellow, and exactly one of them is bold — so
-        // the reader can still see which one the other keys are about.
+        // Assert: at track scale every cue is yellow, and exactly one of them — its two ends —
+        // is bold, so the reader can still see which one the other keys are about.
         let wide = styles(TimingScope::Track);
+        assert_that!(wide.len()).is_equal_to(6);
         assert_that!(wide.iter().all(|(fg, _)| *fg == Some(Color::Yellow))).is_true();
         assert_that!(
             wide.iter()
                 .filter(|(_, modifier)| modifier.contains(Modifier::BOLD))
                 .count()
         )
-        .is_equal_to(1);
-        assert_that!(wide.len() > 1).is_true();
+        .is_equal_to(2);
     }
 
     /// The ruler's `▲` marks are the selected cue's two ends, so they follow it to yellow —
@@ -16769,14 +16862,45 @@ mod tests {
 
         // Assert: the times moved with the cue, and the shift says how far.
         let screen = draw(&mut app, 100, 30).join("\n");
-        assert_that!(screen.contains("Timeline (00:00:05.1 → 00:00:07.1 · +0.15s)")).is_true();
+        assert_that!(screen.contains("Timeline ([00:00:05.1 → 00:00:07.1] · +0.15s)")).is_true();
 
         // Act / Assert: and back at the file's timing the shift goes rather than reading
         // zero, so the title is only ever carrying a number worth reading.
         app.reset_selected_cue_timing();
         let screen = draw(&mut app, 100, 30).join("\n");
-        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("Timeline ([00:00:05.0 → 00:00:07.0])")).is_true();
         assert_that!(screen.contains("0.00s")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The title brackets whatever part of the cue `h`/`l` are moving, so the reader can see
+    /// which half their next press changes — and brackets nothing where `h`/`l` move no part
+    /// of this cue.
+    #[test]
+    fn the_timeline_title_should_bracket_the_part_of_the_cue_that_moves() {
+        // Arrange: a cue at 5.0s → 7.0s.
+        let (mut app, directory) =
+            edit_page_app("edit-grip-title", vec![edit_cue(5000, 7000, "Hello")]);
+        let screen = |app: &mut App| draw(app, 100, 30).join("\n");
+
+        // Act / Assert: outside the mode, no brackets.
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+
+        // Act / Assert: the whole cue, then its start, then its end.
+        app.toggle_cue_timing_mode();
+        assert_that!(screen(&mut app).contains("Timeline ([00:00:05.0 → 00:00:07.0])")).is_true();
+        app.move_cue_grip(false);
+        assert_that!(screen(&mut app).contains("Timeline ([00:00:05.0] → 00:00:07.0)")).is_true();
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → [00:00:07.0])")).is_true();
+
+        // Act / Assert: at track scale every cue moves, so no part of this one is bracketed.
+        app.toggle_global_retiming();
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
 
         // Cleanup
         drop(app);
@@ -16795,28 +16919,28 @@ mod tests {
             edit_page_app("edit-length-title", vec![edit_cue(5000, 7000, "Hello")]);
         app.toggle_cue_timing_mode();
 
-        // Act: the end out by ten presses, so the line is on screen half a second longer.
-        for _ in 0..10 {
-            app.move_selected_cue_edge(crate::subtitle_edit::CueEdge::End, true);
-        }
+        // Act: the end selected and moved out by ten steps, so the line is on screen half a
+        // second longer.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(10);
 
         // Assert: the times moved with the end, and the length says what it now is.
         let screen = draw(&mut app, 100, 30).join("\n");
-        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.5 · 2.50s long)")).is_true();
+        assert_that!(screen.contains("Timeline (00:00:05.0 → [00:00:07.5] · 2.50s long)"))
+            .is_true();
 
-        // Act / Assert: shifted as well, both figures stand, each saying which it is.
-        for _ in 0..3 {
-            app.nudge_selected_cue(1);
-        }
+        // Act / Assert: shifted as well, with the whole cue selected, both figures stand, each
+        // saying which it is.
+        app.move_cue_grip(false);
+        app.nudge_selected_cue(3);
         let screen = draw(&mut app, 100, 30).join("\n");
         assert_that!(screen.contains("· +0.15s · 2.50s long)")).is_true();
 
         // Act / Assert: back at the file's length the figure goes rather than reading the
         // same number on every cue the reader walks past — even though the cue is still
         // shifted, so the two are dropped independently.
-        for _ in 0..10 {
-            app.move_selected_cue_edge(crate::subtitle_edit::CueEdge::End, false);
-        }
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(-10);
         let screen = draw(&mut app, 100, 30).join("\n");
         assert_that!(screen.contains("· +0.15s)")).is_true();
         assert_that!(screen.contains("long")).is_false();

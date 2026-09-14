@@ -43,7 +43,7 @@ use crate::{
         stream_forced, stream_hearing_impaired, stream_language, stream_original, stream_title,
     },
     subtitle_edit::{
-        self, CueEdge, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
+        self, CueGrip, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
         WarmState,
     },
 };
@@ -4774,9 +4774,13 @@ impl App {
         }
     }
 
-    /// `t`: turns the timing mode on or off at cue scale, where `h`/`l` move the selection.
+    /// `t`: turns the timing mode on or off at cue scale, where `h`/`l` move the selected cue.
+    ///
+    /// Always on with the whole cue selected: `Ctrl+H`/`Ctrl+L` pick an edge from there
+    /// ([`Self::move_cue_grip`]), and a visit that ended on one does not leave the next `t`
+    /// silently resizing where the reader expects it to move the line.
     pub fn toggle_cue_timing_mode(&mut self) {
-        self.toggle_timing_scope(TimingScope::Cue);
+        self.toggle_timing_scope(TimingScope::Cue(CueGrip::Whole));
     }
 
     /// `T`: turns the timing mode on or off at track scale — global retiming, where `h`/`l`
@@ -4790,6 +4794,9 @@ impl App {
     }
 
     /// Turns the timing mode on at the given scale, or off if it is already at that scale.
+    ///
+    /// "At that scale" is compared by variant, so `t` leaves the cue scale whichever part of
+    /// the cue is selected rather than switching the selection back to the whole cue.
     ///
     /// **The scales replace each other rather than stacking**, which is what
     /// [`TimingScope`] being one value buys: pressing `T` while `t` is on retimes the track
@@ -4815,11 +4822,12 @@ impl App {
             return;
         }
         if let Some(state) = self.subtitle_edit.as_mut() {
-            state.timing = if state.timing == scope {
-                TimingScope::Off
-            } else {
-                scope
-            };
+            state.timing =
+                if std::mem::discriminant(&state.timing) == std::mem::discriminant(&scope) {
+                    TimingScope::Off
+                } else {
+                    scope
+                };
         }
         self.notice = None;
     }
@@ -4880,8 +4888,8 @@ impl App {
             .is_some_and(|state| std::mem::take(&mut state.timing).is_on())
     }
 
-    /// `h`/`l` and `H`/`L` in timing mode at cue scale: shifts the selected cue and stages
-    /// the result.
+    /// `h`/`l` and `H`/`L` in timing mode at cue scale: moves the selected part of the
+    /// selected cue — its start, the whole of it, or its end — and stages the result.
     pub fn nudge_selected_cue(&mut self, steps: i64) {
         if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
             return;
@@ -4889,11 +4897,11 @@ impl App {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        if state.timing != TimingScope::Cue {
+        let TimingScope::Cue(grip) = state.timing else {
             return;
-        }
-        // A cue marked to go has no timing worth arguing about, and nudging one would put a
-        // shift readout on the title for a line that will not be in the file.
+        };
+        // A cue marked to go has no timing worth arguing about, and moving one would put a
+        // readout on the title for a line that will not be in the file.
         if self.selected_cue_is_deleted() {
             self.notice = Some(CUE_MARKED_FOR_DELETION.into());
             return;
@@ -4911,7 +4919,7 @@ impl App {
         let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
-        let Some((_, start, end)) = state.nudge_selected(steps) else {
+        let Some((_, start, end)) = state.move_grabbed(grip, steps) else {
             return;
         };
         self.stage_cue_change(&source, origin, file, move |_, from, to| {
@@ -4920,63 +4928,38 @@ impl App {
         });
     }
 
-    /// `Ctrl+H`/`Alt+H` and `Ctrl+L`/`Alt+L` in timing mode at cue scale: moves one end of
-    /// the selected cue and stages the result.
+    /// `Ctrl+H`/`Ctrl+L` in timing mode at cue scale: moves what `h`/`l` move one step left
+    /// or right along the selected cue — its start, the whole of it, its end.
     ///
-    /// The guards are [`Self::nudge_selected_cue`]'s, in the same order and for the same
-    /// reasons — this is that key's other axis, not a new kind of edit. What it changes is
-    /// how long the line is on screen rather than when, which is the second commonest thing
-    /// wrong with a subtitle track and the one the page had no key for.
-    pub fn move_selected_cue_edge(&mut self, edge: CueEdge, later: bool) {
-        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
-            return;
-        }
-        let Some(state) = self.subtitle_edit.as_ref() else {
-            return;
-        };
-        if state.timing != TimingScope::Cue {
-            return;
-        }
-        // A cue marked to go has no length worth arguing about, exactly as it has no timing
-        // worth nudging.
-        if self.selected_cue_is_deleted() {
-            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
-            return;
-        }
-        let Some(state) = self.subtitle_edit.as_ref() else {
-            return;
-        };
-        let (source, selected) = (state.source.clone(), state.selected);
-        let Some(origin) = state.selected_origin() else {
-            return;
-        };
-        // Taken before the resize, for the reason the nudge takes it before the move: with
-        // nothing staged yet the page's own copy of the cue is the snapshot, and the resize
-        // is about to move it.
-        let file = self.file_cue_snapshot(&source, selected);
+    /// Stops at either end rather than wrapping (see [`CueGrip`]). Stages nothing and stops no
+    /// playback, because it changes which part of the cue the next press moves rather than
+    /// the cue. Not refused on a cue marked to go either: the refusal belongs to the press
+    /// that would move it, which is where the reader learns why.
+    pub fn move_cue_grip(&mut self, right: bool) {
         let Some(state) = self.subtitle_edit.as_mut() else {
             return;
         };
-        let Some((_, start, end)) = state.move_selected_edge(edge, later) else {
+        let TimingScope::Cue(grip) = state.timing else {
             return;
         };
-        self.stage_cue_change(&source, origin, file, move |_, from, to| {
-            *from = start;
-            *to = end;
-        });
+        let Some(next) = (if right { grip.right() } else { grip.left() }) else {
+            return;
+        };
+        state.timing = TimingScope::Cue(next);
+        self.notice = None;
     }
 
     /// `D` in timing mode at cue scale: opens the dialog for typing how long the selected cue
     /// is on screen.
     ///
-    /// The edge keys move fifty milliseconds a press, which is the right size for landing a
+    /// `h`/`l` move an edge fifty milliseconds a press, which is the right size for landing a
     /// line against a mouth and the wrong size for saying "this sign should be up for eight
     /// seconds". This is that answer, typed once.
     ///
-    /// **Gated on a running playback where the edge keys are not**, because it is a dialog:
-    /// a span's pixels reach the terminal outside the cell buffer a popup is drawn into, so
-    /// one opened over a playback is invisible and swallows every key. The edge keys are a
-    /// mode's keys and have no such problem — which is exactly why the timing mode is a mode.
+    /// **Gated on a running playback where `h`/`l` are not**, because it is a dialog: a
+    /// span's pixels reach the terminal outside the cell buffer a popup is drawn into, so one
+    /// opened over a playback is invisible and swallows every key. `h`/`l` are a mode's keys
+    /// and have no such problem — which is exactly why the timing mode is a mode.
     pub fn open_cue_length_dialog(&mut self) {
         if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
         {
@@ -4985,7 +4968,7 @@ impl App {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        if state.timing != TimingScope::Cue {
+        if !matches!(state.timing, TimingScope::Cue(_)) {
             return;
         }
         if self.selected_cue_is_deleted() {
@@ -5135,7 +5118,7 @@ impl App {
         let Some(state) = self.subtitle_edit.as_ref() else {
             return;
         };
-        if state.timing != TimingScope::Cue {
+        if !matches!(state.timing, TimingScope::Cue(_)) {
             return;
         }
         if self.selected_cue_is_deleted() {
@@ -25570,7 +25553,7 @@ mod tests {
         // Arrange
         let (mut app, directory) = cue_editing_app();
         app.toggle_cue_timing_mode();
-        assert_that!(app.timing_scope() == TimingScope::Cue).is_true();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_true();
 
         // Act: three steps later, in two bursts.
         app.nudge_selected_cue(2);
@@ -25606,18 +25589,21 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The other axis of the same mode: the modified `h`/`l` move one end and leave the other,
-    /// so what changes is how long the line is on screen rather than when it is.
+    /// With an edge selected, `h`/`l` move that end and leave the other, so what changes is
+    /// how long the line is on screen rather than when it is.
     #[test]
     fn resizing_a_cue_should_stage_it_against_the_length_the_file_gives_it() {
         // Arrange: a cue the file has running 1s → 2s.
         let (mut app, directory) = cue_editing_app();
         app.toggle_cue_timing_mode();
 
-        // Act: the end out by two presses, then the start back by one.
-        app.move_selected_cue_edge(CueEdge::End, true);
-        app.move_selected_cue_edge(CueEdge::End, true);
-        app.move_selected_cue_edge(CueEdge::Start, false);
+        // Act: the end selected and moved out by two steps, then the start selected and moved
+        // back by one.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(2);
+        app.move_cue_grip(false);
+        app.move_cue_grip(false);
+        app.nudge_selected_cue(-1);
 
         // Assert: one entry, holding the file's timing and the new one.
         let change = app
@@ -25649,9 +25635,10 @@ mod tests {
 
         // Act / Assert: back to the length the file gives it and the readout stands down,
         // even though the cue is still shifted.
-        app.move_selected_cue_edge(CueEdge::End, false);
-        app.move_selected_cue_edge(CueEdge::End, false);
-        app.move_selected_cue_edge(CueEdge::Start, true);
+        app.nudge_selected_cue(1);
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(-2);
         assert_that!(app.selected_cue_length_change()).is_none();
         assert_that!(app.has_unsaved_cue_edits()).is_false();
 
@@ -25659,16 +25646,107 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// The resize keys are the timing mode's, so they are inert with the mode off and at the
-    /// scale where `h`/`l` move the whole file — and refused outright on a cue the reader has
-    /// said is leaving, exactly as a nudge is.
+    /// A press that moves nothing — an edge already against the floor — stages nothing new,
+    /// so a held key there neither rewrites the staged timing nor re-renders a frame per
+    /// repeat.
+    #[test]
+    fn an_edge_press_against_the_floor_should_leave_the_staged_timing_alone() {
+        // Arrange: a cue the file has running 1s → 2s, with its end selected.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        app.move_cue_grip(true);
+        let staged = |app: &App| {
+            app.subtitle_changes
+                .get(&SubtitleSource::Embedded(2))
+                .and_then(|change| change.cues.edits.get(&0))
+                .map(|edit| (edit.start, edit.end))
+        };
+
+        // Act: the end pulled in by far more than the cue has, which stops on the floor.
+        app.nudge_selected_cue(-100);
+        let floor = Duration::from_secs(1) + subtitle_edit::MIN_CUE_LENGTH;
+        assert_that!(staged(&app)).is_equal_to(Some((Duration::from_secs(1), floor)));
+
+        // Act: pressed again, and held, against the floor.
+        app.nudge_selected_cue(-1);
+        app.nudge_selected_cue(-10);
+
+        // Assert: the page's cue and the staged edit are both exactly where the floor left them.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end).is_equal_to(floor);
+        assert_that!(staged(&app)).is_equal_to(Some((Duration::from_secs(1), floor)));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+H`/`Ctrl+L` walk the selection along the cue — start, whole cue, end — and stop
+    /// at both ends. `t` always turns the mode on with the whole cue selected, turns it off
+    /// from any selection, and the selection follows the cursor to another cue.
+    #[test]
+    fn the_cue_grip_should_walk_along_the_cue_and_start_on_the_whole_cue_each_time() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: left to the start, and no further.
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Start));
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Start));
+
+        // Act / Assert: right through the whole cue to the end, and no further — a real step
+        // clears a stale refusal the way every other movement on the page does.
+        app.notice = Some(CUE_MARKED_FOR_DELETION.into());
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+        assert_that!(app.notice.is_none()).is_true();
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::End));
+
+        // Assert: choosing what moves moved nothing.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: the selection follows the cursor to the next cue.
+        app.select_next();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::End));
+
+        // Act / Assert: `t` leaves from the end, and the next `t` starts on the whole cue.
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: `T` replaces an edge selection, and `t` from there starts whole again.
+        app.move_cue_grip(true);
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: with no page open there is nothing to select.
+        app.subtitle_edit = None;
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Selecting an edge is the timing mode's, so it is inert with the mode off and at the
+    /// scale where `h`/`l` move the whole file — and moving one is refused outright on a cue
+    /// the reader has said is leaving, exactly as a nudge is.
     #[test]
     fn resizing_should_be_refused_outside_the_cue_scale_and_on_a_deleted_cue() {
         // Arrange
         let (mut app, directory) = cue_editing_app();
 
-        // Act / Assert: with the mode off, nothing.
-        app.move_selected_cue_edge(CueEdge::End, true);
+        // Act / Assert: with the mode off, no edge to select and nothing moved.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(1);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
         assert_that!(app.has_unsaved_cue_edits()).is_false();
         assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
             .is_equal_to(Duration::from_secs(2));
@@ -25676,7 +25754,8 @@ mod tests {
         // Act / Assert: at track scale, nothing either — `T` is aimed at the file, and one
         // cue's length is not something a whole-file key changes.
         app.toggle_global_retiming();
-        app.move_selected_cue_edge(CueEdge::End, true);
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
         app.open_cue_length_dialog();
         assert_that!(app.dialog).is_none();
         assert_that!(app.has_unsaved_cue_edits()).is_false();
@@ -25690,7 +25769,8 @@ mod tests {
         app.select_previous();
         assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
         app.notice = None;
-        app.move_selected_cue_edge(CueEdge::End, true);
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(1);
         assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_MARKED_FOR_DELETION));
         assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
             .is_equal_to(Duration::from_secs(2));
@@ -26445,7 +26525,7 @@ mod tests {
         app.toggle_cue_timing_mode();
 
         // Assert: not in the mode, and told why.
-        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
         assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
 
         // Act / Assert: and the keys the mode would have given meaning to stay inert.
@@ -26470,7 +26550,7 @@ mod tests {
 
         // Act: `Esc` off the page, and answer "discard".
         app.back();
-        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
         assert_that!(app.dialog).is_equal_to(None);
         app.back();
         assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
@@ -30278,7 +30358,7 @@ mod tests {
         // Act / Assert: the first press leaves the mode and nothing else — the cursor stays
         // where the reader put it.
         assert_that!(app.back()).is_true();
-        assert_that!(app.timing_scope() == TimingScope::Cue).is_false();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
         assert_that!(app.timeline_focused()).is_true();
         assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
 
