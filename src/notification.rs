@@ -22,12 +22,51 @@ pub fn completion_notification_sender(enabled: bool) -> Option<Sender<PathBuf>> 
     enabled.then(spawn_completion_notification_worker)
 }
 
-/// The one call that actually reaches the notification service. Split out from the
-/// closure that used it so a test can invoke this exact line directly — a failed
-/// `.show()` (no session bus, no notification daemon) is discarded either way, so the
-/// call is safe to make for real rather than needing a fake to stand in for it.
+/// Builds the notification for a finished file and hands it to the desktop.
 fn deliver_completion_notification(path: &Path, icon: Option<&Path>) {
-    let _ = completion_notification(path, icon).show();
+    show_notification(&completion_notification(path, icon));
+}
+
+/// The one call that actually reaches the notification service.
+///
+/// Compiled out of test builds. This used to be called for real on the grounds that a
+/// failed `.show()` is discarded anyway — true in CI, but `cargo test` also runs on a
+/// developer's own desktop, where there *is* a session bus and a running daemon, so every
+/// test run popped a real notification. Redirecting under `cfg(test)` rather than trusting
+/// the environment to be inhospitable is the same approach `DiskCache::cache_dir` takes to
+/// keep tests off the user's real cache.
+#[cfg(not(test))]
+fn show_notification(notification: &Notification) {
+    // Best-effort: no bus, no daemon, or a daemon that refuses must never turn a
+    // successfully processed file into an application error.
+    let _ = notification.show();
+}
+
+#[cfg(test)]
+fn show_notification(notification: &Notification) {
+    SHOWN.with(|shown| {
+        shown.borrow_mut().push(ShownNotification {
+            body: notification.body.clone(),
+            icon: notification.icon.clone(),
+        });
+    });
+}
+
+/// What a test saw in place of a notification the desktop would have shown.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShownNotification {
+    body: String,
+    icon: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread so tests running in parallel cannot see each other's notifications.
+    /// Every delivery a test makes happens on the thread that made it: the worker seam
+    /// used elsewhere in this module takes its own closure rather than routing here.
+    static SHOWN: std::cell::RefCell<Vec<ShownNotification>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Split out from `spawn_completion_notification_worker` so a test can substitute a
@@ -155,11 +194,30 @@ mod tests {
         );
     }
 
+    fn shown() -> Vec<ShownNotification> {
+        SHOWN.with(|shown| shown.borrow().clone())
+    }
+
     #[test]
-    fn deliver_completion_notification_should_not_panic_without_a_notification_service() {
-        // Act / Assert: a discarded `.show()` error (no session bus in this test
-        // environment) must never surface as a panic.
-        deliver_completion_notification(Path::new("Movie.mkv"), None);
+    fn deliver_completion_notification_should_hand_the_built_notification_to_the_desktop() {
+        // Arrange
+        SHOWN.with(|shown| shown.borrow_mut().clear());
+
+        // Act
+        deliver_completion_notification(
+            Path::new("/media/films/Movie.mkv"),
+            Some(Path::new("/tmp/icon.png")),
+        );
+
+        // Assert: the file's name and the icon both survive the hand-off, so a
+        // regression that dropped either would not reach the desktop unnoticed.
+        assert_eq!(
+            shown(),
+            vec![ShownNotification {
+                body: "Movie.mkv finished processing.".to_string(),
+                icon: "/tmp/icon.png".to_string(),
+            }]
+        );
     }
 
     /// A directory this test alone owns, so it cannot observe another test's write to

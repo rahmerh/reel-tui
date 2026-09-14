@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use isolang::Language;
 use ratatui::{
@@ -8,6 +12,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
+use ratatui_image::Image;
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -15,10 +20,16 @@ use crate::{
     app::{
         App, AudioSettingsField, AudioSettingsMode, CancelEditChoice, CharClass,
         ConfirmProcessAllChoice, ContainerChoice, ContainerSettingsField, ContainerSettingsMode,
-        ContainerSettingsPopup, CustomResolutionField, Dialog, InputReject, Layer, ResetChoice,
-        SearchState, StagedFileStatus, SubtitleDisplayState, SubtitleSettingsField,
-        SubtitleSettingsMode, SubtitleSettingsPopup, TextInputConfig, TextInputSite,
-        TextInputState, TrackRef, VideoSettingsField, VideoSettingsMode, describe_track_groups,
+        ContainerSettingsPopup, CreateTrackAction, CreateTrackField, CueTarget,
+        CustomResolutionField, Dialog, InputReject, Layer, LeaveCuesChoice, NewTrackPlacement,
+        PreviewSettingsField, PreviewSettingsMode, ResetChoice, SearchState, StagedFileStatus,
+        SubtitleDisplayState, SubtitleSettingsField, SubtitleSettingsMode, SubtitleSettingsPopup,
+        TextInputConfig, TextInputSite, TextInputState, TrackRef, VideoSettingsField,
+        VideoSettingsMode, describe_track_groups,
+    },
+    cue::{
+        Cue, CueGroup, LaneLayout, TimelineWindow, format_clock, format_compact, format_precise,
+        format_timestamp, match_ranges,
     },
     edit::{AudioSettings, ContainerFormat, stream_index},
     probe::{MediaInfo, ProbeOutcome},
@@ -27,6 +38,10 @@ use crate::{
         SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleSource,
         canonical_language_code, language_choice, stream_cc, stream_commentary, stream_forced,
         stream_hearing_impaired, stream_language, stream_original, stream_title,
+    },
+    subtitle_edit::{
+        CUE_CONNECTOR_ROWS, CUE_FORK_ROWS, CueGrip, GROUP_COLUMNS, LoadStatus, SubtitleEditState,
+        TimingScope, WarmState,
     },
 };
 
@@ -73,6 +88,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The one view that replaces the whole frame rather than drawing over the file list.
+    if app.layer == Layer::SubtitleEdit {
+        render_subtitle_edit(frame, app, area);
+        if let Some(dialog) = app.dialog {
+            dim_backdrop(frame);
+            render_dialog(frame, app, dialog);
+        }
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -93,6 +118,1591 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         dim_backdrop(frame);
         render_dialog(frame, app, dialog);
     }
+}
+
+/// Draws the subtitle edit page over the entire frame.
+///
+/// Only the cue list is built out so far; the timeline track and the video preview take
+/// the space below and above it once they exist.
+/// Rows one cue's block occupies: two borders with a line of text between them. The
+/// timing rides on the top border, which is what keeps a cue down to three rows.
+const CUE_BLOCK_ROWS: u16 = crate::subtitle_edit::CUE_BLOCK_ROWS as u16;
+
+/// Columns the cue panel needs to show " 00:00:05.0 → 00:00:07.0 " on a block's top
+/// border, plus that block's corners and the panel's own borders. Its content is
+/// fixed-format, so it gets a floor rather than a share of the width.
+const CUE_PANEL_WIDTH: u16 = 30;
+
+/// Rows the timeline track spends on everything that is not a lane: its two borders and
+/// the time axis beneath the lanes.
+const TIMELINE_CHROME: u16 = 3;
+
+/// Seconds between the axis's ticks, longest first.
+///
+/// Ten across a minute-wide window lands six readings — enough to judge a cue's width
+/// against, few enough not to become a texture. **The interval has to follow the window**,
+/// which is no longer always a minute: on a dense track shortened to eight seconds a
+/// ten-second tick can land a single reading, or none at all once the selected cue's marks
+/// take precedence over the one it lands on, leaving an axis with no numbers on it. Every
+/// value here reads as a round number, so no window makes the reader do arithmetic.
+const TICKS: [u64; 6] = [30, 15, 10, 5, 2, 1];
+
+/// Readings the axis aims for. Six is what a sixty-second window has always shown.
+const TICK_TARGET: u64 = 6;
+
+/// Draws the subtitle edit page over the entire frame.
+///
+/// Three panes: the frame at the selected cue on the left, the cue list on the right, and
+/// the timeline track across the bottom. The track's height follows the lane count, so a
+/// track whose cues never overlap spends one row on it and gives the rest to the preview.
+fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Read before the page is borrowed, because `App`'s accessors take the whole of it
+    // while `subtitle_edit` is held mutably below.
+    let badge = playback_settings_badge(
+        app.preview_settings(),
+        app.preview_defaults(),
+        app.non_default_audio_stream(),
+    );
+    let dialog_open = app.dialog.is_some();
+    // Which of this track's cues have been rewritten but not written out. Read here for the
+    // same reason the badge is, and shown on the cue panel: a staged edit is invisible once
+    // the editor closes, and invisible unsaved work is work a reader thinks is saved.
+    let edited = app.staged_cue_edits();
+    // And which are marked to be taken out of it, read here for the same reason and shown in
+    // the same corner. Kept apart from the rewrites rather than merged: the rows wear
+    // different colours and the counts answer different questions.
+    let deleted = app.staged_cue_deletions();
+    // How far what the keys are moving has been moved, for the timeline's title. Read here
+    // for the same reason `edited` is: it comes from the staged edits rather than the page.
+    //
+    // **The scale decides which figure it is.** While `h`/`l` move the whole track, the
+    // selected cue's own shift answers a question nobody is asking and would be read as what
+    // the keys are doing; while they move one cue, the track's figure would be. The wide one
+    // is labelled because the two are otherwise the same shape, and a bare `+2.35s` under a
+    // reader who has just pressed `T` must not be mistaken for one line's.
+    // Why a key the reader just pressed did nothing, read here for the same reason as the
+    // rest: this page draws its own frame and returns before `render_footer`, the one place
+    // this field is otherwise drawn, so without carrying it onto the page's own status row
+    // every refusal it raises is set and silently dropped.
+    let notice = app.notice.clone();
+    // Why the last keystroke aimed at the cue panel's filter bar did not land, if it did
+    // not. Read here for the reason everything above it is: `App`'s accessors take the
+    // whole of it, and the page is borrowed mutably below.
+    let search_reject = app.text_input_reject(TextInputSite::CueSearch);
+    let shift = match app.timing_scope() {
+        TimingScope::Track => app
+            .track_shift()
+            .map(|moved| format!("global {}", format_shift(moved))),
+        TimingScope::Off | TimingScope::Cue(_) => app.selected_cue_shift().map(format_shift),
+    };
+    // And how long it now is, when that is not the length the file gives it. Read beside the
+    // shift because it comes from the same place and answers the other half of the same
+    // question: the shift says the line moved, this says it was stretched. There is no
+    // track-scale version, because a whole-track shift moves both ends of every cue and so
+    // cannot change any of their lengths.
+    let length = app.selected_cue_length_change().map(format_length_reading);
+    let Some(state) = app.subtitle_edit.as_mut() else {
+        return;
+    };
+
+    // A track that parsed to *no* cues is deliberately not here: it draws the ordinary page,
+    // with the cue panel saying it is empty and the timeline drawn around the cursor. A
+    // message over the whole page is right while there is nothing to do yet — the cues are
+    // still being read, or the read failed — and wrong for a track the reader can put a line
+    // into with `i`, which is the only thing there is to do on one.
+    let message = match &state.status {
+        LoadStatus::Preparing => Some(("Reading cues…".to_string(), Color::Gray)),
+        LoadStatus::Failed(message) => Some((message.clone(), Color::Red)),
+        LoadStatus::Ready => None,
+    };
+    if let Some((message, color)) = message {
+        let block = Block::bordered().title(" Subtitle edit ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .centered()
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(color)),
+            inner,
+        );
+        return;
+    }
+
+    // No minimum-size guard here: `render` already refuses anything under 50x10, and the
+    // deepest possible track (four lanes, plus its ruler) needs exactly ten rows, so there
+    // is no reachable size this layout cannot draw — but there is no room to spare either,
+    // which is why the axis is one row and not two. The cue panel's width is clamped rather
+    // than proportional so its fixed-format timestamps survive the narrowest of them.
+    //
+    // The axis is the first thing to go when the page cannot afford both it and a row of
+    // the cue list. The list is the only thing here you can move, and a page that cannot
+    // show which cue is selected is broken in a way a missing axis is not. Only the very
+    // deepest track at the very smallest size actually hits this. The ruler line is still
+    // built and simply clipped by the `Paragraph`, so the two shapes cannot drift apart.
+    //
+    // The status row is charged to the same budget: it appears only while the background
+    // frame pass has something to say, so on the sizes where it and the axis cannot both
+    // fit, the axis gives way for as long as the pass runs and comes back when it ends.
+    let status = edit_status_line(state, notice.as_deref());
+    let status_height = u16::from(status.is_some());
+    let lanes = state.layout.lane_count as u16;
+    let cue_panel_floor = CUE_BLOCK_ROWS + 2;
+    let track_height = if area
+        .height
+        .saturating_sub(lanes + TIMELINE_CHROME + status_height)
+        >= cue_panel_floor
+    {
+        lanes + TIMELINE_CHROME
+    } else {
+        lanes + TIMELINE_CHROME - 1
+    };
+    let cue_width = (area.width * 35 / 100).clamp(CUE_PANEL_WIDTH, 48);
+    let rows = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(track_height),
+        Constraint::Length(status_height),
+    ])
+    .split(area);
+    let columns =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(cue_width)]).split(rows[0]);
+
+    // Read once and handed to all three panes, so no two of them can disagree about which
+    // one holds the cursor — the timeline draws it, the cue panel gives its border up, and
+    // the preview shows that moment instead of the selected cue's.
+    let cursor = state.cursor();
+    // **While the timeline holds the cursor, no cue is marked anywhere.** The selection is
+    // where the *other* pane's cursor is parked, and drawing it while the reader is walking
+    // a moment puts two things on screen that both look like "here" — one of which no key
+    // being pressed is moving. Both panes are told by the same `None`, so the filled block
+    // in the list and the cyan bracket on the track cannot disagree about whether there is a
+    // selection at all. The page still has a `selected` underneath, which is what `Ctrl+K`
+    // comes back to and what the timeline's window is fitted around.
+    let selected = cursor.is_none().then_some(state.selected);
+    // Cloned out of the page before it is borrowed mutably below, for the reason the badge
+    // and the counts are: the panel needs the query at every level of its drawing.
+    let query = state.cue_query().to_string();
+    render_edit_preview(frame, state, columns[0], badge.as_deref(), dialog_open);
+    render_edit_cues(
+        frame,
+        state,
+        columns[1],
+        CueMarks {
+            edited: &edited,
+            deleted: &deleted,
+            selected,
+            query: &query,
+        },
+        search_reject,
+    );
+    render_edit_timeline(frame, state, shift, length, cursor, selected, rows[1]);
+    if let Some((message, color)) = status {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(&message, rows[2].width as usize),
+                Style::default().fg(color),
+            )),
+            rows[2],
+        );
+    }
+}
+
+/// What the page has to say about the background frame pass, if anything.
+///
+/// Deliberately almost nothing here says anything at all. A pass that has finished, or one
+/// that was never going to run because the terminal draws no images, leaves the row absent —
+/// there is nothing there for the user to act on, and a line that says "done" forever is
+/// just furniture. A network mount is the exception: the frames are missing for a reason
+/// the user did not choose, so the page says so rather than leaving them wondering why
+/// this directory feels slower than the last one. **A pass that is running says so on the
+/// cue panel's border** (`render_edit_cues`), not here: it is a count of that panel's rows,
+/// and it left this row occupied for the whole of a long pass, hiding the messages that are
+/// about what the reader is doing right now.
+///
+/// This is a status line, not control help — the keybindings popup (`?`) remains the only
+/// place this application documents its keys.
+fn edit_status_line(state: &SubtitleEditState, notice: Option<&str>) -> Option<(String, Color)> {
+    // **A refusal comes before everything else, because it is the only line here that is
+    // about the key the reader has just pressed.** Everything below describes something the
+    // page is doing; this describes something it declined to do, and a key that appears to
+    // do nothing is indistinguishable from a key that is broken.
+    //
+    // It cannot sit here stale and hide the lines below it: every movement on this page
+    // clears it (`App::select_next`, `move_cue_within_group`, `focus_timeline`,
+    // `move_timeline_cursor`), and `frame_error` — the one it could otherwise mask — is
+    // keyed on the selected cue and so only has anything to say once the cursor has moved.
+    //
+    // Yellow, which is what `render_footer` gives the same string on every other layer: the
+    // page draws its own frame and never reaches that footer, so this is the same message in
+    // the same colour rather than a second channel for it.
+    if let Some(notice) = notice {
+        return Some((format!(" {notice}"), Color::Yellow));
+    }
+    // A cue that could not be drawn comes first. It is the only line here that explains
+    // something the user is looking *at* — an empty pane under the cursor — where the
+    // others describe work going on elsewhere, and it clears itself as soon as the cursor
+    // moves to a cue that drew.
+    //
+    // Here rather than in the pane, unlike the permanent reasons: this one changes as the
+    // cursor moves, and text in the pane that changes per keypress is the flicker the
+    // pane had its fallback removed to stop.
+    if let Some(reason) = state.playback_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
+    if let Some(reason) = state.frame_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
+    // Beside the cue's for the same reason: the reader is looking at an empty pane and this
+    // is what explains it. Below it because the two never coexist — the cursor's frame only
+    // takes the pane while the timeline holds the cursor, and only then can it fail.
+    if let Some(reason) = state.scrub_error() {
+        return Some((format!(" {reason}"), Color::Red));
+    }
+    // Ahead of the background pass's count, because this one the user is waiting on: a
+    // span takes a second or two to decode and the page would otherwise sit there looking
+    // as though `p` did nothing at all.
+    if state.preparing_playback().is_some() {
+        return Some((" Preparing playback…".to_string(), Color::Cyan));
+    }
+    match state.warm {
+        // The running pass says its count on the cue panel's own border instead, where it
+        // sits next to the rows it is counting.
+        WarmState::Working { .. } => None,
+        WarmState::OffForNetwork => Some((
+            " Preview frames are not generated on network mounts.".to_string(),
+            Color::DarkGray,
+        )),
+        WarmState::Off | WarmState::Done => None,
+    }
+}
+
+/// How the next playback differs from what the config file asked for, if it does.
+///
+/// Absent when nothing has been changed, so the ordinary page is unchanged and the badge
+/// only ever appears because the user made it appear. It goes in the preview pane's title
+/// rather than on the status row because that row already carries one message at a time and
+/// "Preparing playback…" is the one worth reading while a span decodes.
+///
+/// Padding and frame rate are deliberately left out: they change how long a playback takes
+/// to decode rather than what it looks like, and a title listing all five would be longer
+/// than most panes are wide. This is a status line, not control help — the keybindings
+/// popup (`?`) remains the only place this application documents its keys.
+///
+/// `audio` is the chosen audio track, when it is not the file's first. A preview playing the
+/// commentary track sounds like the wrong film and there is nothing else on screen to say
+/// why. The *video* track is left out for the opposite reason: the picture is its own
+/// evidence.
+fn playback_settings_badge(
+    settings: crate::app::PreviewSettings,
+    defaults: crate::app::PreviewSettings,
+    audio: Option<u64>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(stream) = audio {
+        parts.push(format!("audio #{stream}"));
+    }
+    if settings.playback_speed != defaults.playback_speed {
+        parts.push(settings.playback_speed.to_string());
+    }
+    if settings.playback_loop != defaults.playback_loop {
+        parts.push(
+            if settings.playback_loop {
+                "loop"
+            } else {
+                "once"
+            }
+            .to_string(),
+        );
+    }
+    if settings.playback_muted != defaults.playback_muted {
+        parts.push(
+            if settings.playback_muted {
+                "muted"
+            } else {
+                "sound"
+            }
+            .to_string(),
+        );
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The frame at the selected cue, with that cue burned into it.
+///
+/// An empty pane when there is no frame for the cue under the cursor. The cue's text used
+/// to fill that gap, and it read as a flicker rather than as a fallback: the picture is
+/// what the pane is for, so every cursor move flashed the line as plain text for a moment
+/// before the real frame replaced it. With the cues either side of the selection kept
+/// encoded and ready (`SubtitleEditState::nearby_frame_targets`) there is usually no gap
+/// left to fill, and the cue's text is on screen in the list beside this anyway.
+///
+/// The one thing that *is* written here is a reason no frame will ever arrive — no libass,
+/// no image protocol. That is fixed for the page's lifetime, so it reads as an explanation
+/// rather than as a flicker, and without it the pane is an unexplained empty box for a
+/// user whose build simply cannot do this. A failure on one *cue* is a different thing and
+/// goes to the status row, because it changes as the cursor moves.
+fn render_edit_preview(
+    frame: &mut Frame,
+    state: &mut SubtitleEditState,
+    area: Rect,
+    badge: Option<&str>,
+    dialog_open: bool,
+) {
+    let title = match badge {
+        Some(badge) => format!(" Preview · {badge} "),
+        None => " Preview ".to_string(),
+    };
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Recorded for the frame worker, which has to scale to a pane only the renderer has
+    // measured, and which has to be told when that measurement changes.
+    state.set_preview_cells(inner.as_size());
+
+    if let Some(reason) = state.support.reason() {
+        let padding = usize::from(inner.height).saturating_sub(2) / 2;
+        let mut lines = vec![Line::from(""); padding];
+        lines.push(Line::styled(reason, Style::default().fg(Color::DarkGray)));
+        frame.render_widget(
+            Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+
+    // **The picture is left out for as long as a dialog is up, and that is a correctness
+    // fix rather than a matter of taste.**
+    //
+    // A frame reaches the terminal through its own image protocol, not through the cell
+    // buffer: the widget writes the escape sequence into the pane's first cell and marks
+    // every other cell it covers *skipped*, and the diff that decides what to redraw never
+    // emits a skipped cell. A dialog drawn over the pane paints ordinary cells on top of
+    // that, and when it *shrinks* — a dropdown closing, the help panel going away — the
+    // cells it gives back are skipped once more and nothing is ever written over them. The
+    // border it drew stays on screen, under and around the smaller dialog, which is the
+    // popup drawn twice at two sizes that this exists to stop.
+    //
+    // Opening and closing one was already safe, and only by accident: `dim_backdrop`
+    // restyles the cell the escape sequence lives in, which makes the diff re-send the
+    // picture. Leaving it out for the dialog's whole life extends that to every shape the
+    // dialog takes in between — while one is up the pane is ordinary cells, and ordinary
+    // cells redraw correctly. The same reasoning as `App::playback_in_progress`: pixels and
+    // a dialog cannot share a region, so they are kept apart rather than ordered.
+    if dialog_open {
+        return;
+    }
+
+    // `Image` draws nothing at all — not even clipped — when the protocol is larger than
+    // the area it is given, so a frame encoded for a pane that has since shrunk is left
+    // out rather than rendered into an empty box. Only in-flight frames can be that stale:
+    // a measured resize drops every frame on hand.
+    //
+    // The playback's frame takes the pane while one is running, and the still one is what
+    // is left when it stops. Before the first frame of a span is drawn — while it decodes,
+    // and for the moment between the sound starting and the device's first callback — the
+    // playback has no frame and the still one stays, so `p` never blanks the pane.
+    //
+    // The timeline cursor's frame sits between the two: a playback is the most recent thing
+    // the reader asked for and wins outright, and the selected cue's frame is the fallback
+    // that keeps `Ctrl+J` from blanking the pane — the cursor lands on that cue's own moment,
+    // so until it moves, the cue's frame *is* the right picture for it. **Only until it
+    // moves**, which is `still_frame` rather than `frame`: past that the cue's still is a
+    // picture of a moment the cursor has left, and the pane would be showing it under a title
+    // naming a different one.
+    if let Some(protocol) = state
+        .playback_frame()
+        .or_else(|| state.scrub_frame())
+        .or_else(|| state.still_frame())
+        .filter(|protocol| protocol.size().width <= inner.width)
+        .filter(|protocol| protocol.size().height <= inner.height)
+    {
+        frame.render_widget(Image::new(protocol), inner);
+    }
+}
+
+/// Which of the two timings a grouped block can afford, decided once for the whole track.
+///
+/// See [`group_timing`] for why it is a decision rather than a per-cue formatting call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupTiming {
+    /// `0:05.0→0:07.0`, or `1:05:05.0→1:05:07.0` on media past the hour.
+    Span { with_hours: bool },
+    /// `0:05.0` alone, when even the compact span will not fit half a panel.
+    StartOnly { with_hours: bool },
+}
+
+/// What a grouped block's top border can say, given how wide half the panel is.
+///
+/// A grouped block is half a panel wide — fourteen to twenty-three columns — and
+/// `00:00:05.0 → 00:00:07.0` is twenty-three characters on its own, so the full timing that
+/// an ungrouped block carries cannot be drawn on one at any terminal size. The compact form
+/// (`cue::format_compact`) is what replaces it, and where even that will not fit, the start
+/// alone: eleven columns at its widest, which fits the panel's own thirty-column floor.
+///
+/// **Decided once for the track rather than per cue**, and measured against the widest
+/// reading the track can produce — which is the last cue's end, since the list is start
+/// ordered. The reasoning is `cue::format_clock`'s: a column of timings that changed width
+/// or shape halfway down the list would make the reader work out which format they were
+/// looking at before they could read the number, on the page whose whole purpose is reading
+/// those numbers. It is recomputed each draw because it depends on the panel's width, but
+/// never varies within one.
+fn group_timing(cues: &[Cue], block_width: u16) -> GroupTiming {
+    let furthest = cues.last().map(|cue| cue.end).unwrap_or_default();
+    let with_hours = furthest >= Duration::from_secs(3600);
+    let widest = format_compact(furthest, with_hours).chars().count();
+    // The block's two borders, the title's own leading and trailing space, and the arrow
+    // between the two readings.
+    let span_width = widest * 2 + 5;
+    if span_width <= usize::from(block_width) {
+        GroupTiming::Span { with_hours }
+    } else {
+        GroupTiming::StartOnly { with_hours }
+    }
+}
+
+impl GroupTiming {
+    /// The title one grouped block's top border carries.
+    fn title(self, cue: &Cue) -> String {
+        match self {
+            Self::Span { with_hours } => format!(
+                " {}→{} ",
+                format_compact(cue.start, with_hours),
+                format_compact(cue.end, with_hours)
+            ),
+            Self::StartOnly { with_hours } => {
+                format!(" {} ", format_compact(cue.start, with_hours))
+            }
+        }
+    }
+}
+
+/// What the cue panel's border says about the work staged against this track, or `None` when
+/// there is none.
+///
+/// Two counts rather than one total, each in the colour its rows wear, so the reader can tell
+/// three rewrites from three lines about to leave the file without opening the panel to look.
+/// The separator is dim because it is punctuation between two answers rather than a third.
+fn staged_cue_counts(marks: CueMarks) -> Option<Line<'static>> {
+    let mut spans = Vec::new();
+    if !marks.edited.is_empty() {
+        spans.push(Span::styled(
+            format!(" {} edited ", marks.edited.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !marks.deleted.is_empty() {
+        if !spans.is_empty() {
+            // Bare, because both counts carry their own edge space and a separator with more
+            // would open a gap on one side of it.
+            spans.push(Span::styled("·", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!(" {} deleted ", marks.deleted.len()),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
+}
+
+/// The cue list, drawn one *group* to a row rather than one cue.
+///
+/// A group is a run of cues that are on screen together (`cue::group_overlaps`). The
+/// ordinary cue overlaps nothing and is a group of one, drawn exactly as it always was: a
+/// full-width block with the full `00:00:05.0 → 00:00:07.0` timing, and a `↓` to the next
+/// row. A group of several is drawn as a fork into two blocks side by side — see
+/// [`render_edit_group`], which owns everything that is new here.
+///
+/// Rows are asked for by height rather than counted out by the caller: a lone cue is three
+/// rows and a group is six, so how many rows a screenful holds depends on which groups are
+/// in it and the arithmetic belongs where the group heights are (`SubtitleEditState::
+/// cue_scroll`).
+fn render_edit_cues(
+    frame: &mut Frame,
+    state: &mut SubtitleEditState,
+    area: Rect,
+    marks: CueMarks,
+    search_reject: Option<InputReject>,
+) {
+    // The same border the file list and the track list wear when they hold the cursor. Two
+    // panes on this page now take keys, and without this there is nothing on screen saying
+    // which of them `h` is about to talk to.
+    //
+    // Whether this panel is focused and whether it marks a cue are one question rather than
+    // two, which is why they arrive as one value: a filled block in an unfocused panel would
+    // be a cursor in a pane that has none.
+    let mut block = Block::bordered()
+        .border_style(focus_border(marks.selected.is_some()))
+        .title(" Cues ");
+    // The background pass's count sits on this panel's border rather than on the status
+    // row: it is a count of *these* rows' frames, and the status row carries one message at
+    // a time — where "Preparing playback…" is the one worth reading while a span decodes.
+    //
+    // The count of *staged* cues takes the same corner when the pass is over, which is when
+    // editing happens: a staged edit is invisible the moment the editor closes, and
+    // invisible unsaved work is work the reader believes is saved. The pass wins the corner
+    // while it runs because it is finite and about to stop; the edits are still there after.
+    //
+    // Rewrites and deletions are counted apart rather than added together, and each in the
+    // colour its rows wear: they are different work with different consequences, and a single
+    // number would make the reader open the panel to find out which they had. Each half is
+    // dropped at zero, so the ordinary case of one kind of edit reads exactly as it did.
+    //
+    // The pass also says how many of those frames it had to *render*, because `done` alone
+    // cannot tell a cache that is working from one that is being rebuilt: both count to the
+    // same total at the same rate. It is the difference between `[400/1200]` on a revisited
+    // track — nothing rendered, the cache doing exactly its job — and `[400/1200 · 400 new]`,
+    // which says every frame is being drawn again and is the symptom of a key that moved.
+    // Dropped at zero rather than shown as `· 0 new`, so the ordinary case stays the short
+    // one and the count only appears when there is something to notice.
+    if let WarmState::Working {
+        done,
+        total,
+        rendered,
+    } = state.warm
+    {
+        let progress = if rendered > 0 {
+            format!(" [{done}/{total} · {rendered} new] ")
+        } else {
+            format!(" [{done}/{total}] ")
+        };
+        block =
+            block.title(Line::styled(progress, Style::default().fg(Color::Cyan)).right_aligned());
+    } else if let Some(counts) = staged_cue_counts(marks) {
+        block = block.title(counts.right_aligned());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // **The bar is charged to this panel and to nothing else.** The page's status row at
+    // `rows[2]` comes out of the whole frame, so a bar put there would shrink the *preview*
+    // pane — and a preview resize drops the timeline cursor's frame and disturbs a span
+    // that is playing. Taken out of `inner`, no pane outside this border changes size, so
+    // opening a search cannot interrupt anything the reader is watching.
+    //
+    // Drawn while the bar is active *or* holds a query, the rule the file panel follows: a
+    // filter left in force with the bar closed still has to say what it is filtering by.
+    let (inner, bar) = if state.cue_search().is_active || !state.cue_query().is_empty() {
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    state.cue_scroll(usize::from(inner.height));
+
+    let visible = state.visible_groups().to_vec();
+    let last = visible.len().saturating_sub(1);
+    let timing = group_timing(&state.cues, inner.width / GROUP_COLUMNS as u16);
+    let mut top = inner.y;
+
+    // An empty panel says why it is empty, rather than leaving the reader looking at
+    // something that reads the same as a track still loading. Two different reasons: a filter
+    // matching nothing — the answer the subtitle settings popup gives a language search with
+    // no hits — and a track that holds no cues at all, which is a subtitle track the reader
+    // has just created and not yet typed a line into. The second is where the whole-page
+    // message used to be; it belongs in this pane, because the pane beside it is a working
+    // timeline the reader aims `i` with.
+    if visible.is_empty() {
+        let (message, colour) = if marks.query.is_empty() {
+            ("This subtitle track has no cues.", Color::Yellow)
+        } else {
+            ("No matching cues", Color::DarkGray)
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .centered()
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(colour)),
+            inner,
+        );
+    }
+
+    for (position, group) in visible
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(state.list_scroll)
+        .take(state.list_rows)
+    {
+        render_edit_group(
+            frame,
+            state,
+            state.groups[group],
+            timing,
+            marks,
+            Rect {
+                x: inner.x,
+                y: top,
+                width: inner.width,
+                // Saturating rather than guarded: `cue_scroll` above already limits the
+                // loop to the groups that start inside the panel, so a height of zero here
+                // is unreachable — and a zero-height group draws nothing, where the
+                // subtraction underflowing would panic.
+                height: (state.group_height(group) as u16).min(inner.bottom().saturating_sub(top)),
+            },
+        );
+        top += state.group_height(group) as u16;
+
+        // Between the rows rather than after each one: the arrow says "and then this", so
+        // the last group has nothing to point at. Counted in *drawn* rows, so a filtered
+        // list does not hang an arrow off its own end.
+        if top < inner.bottom() && position < last {
+            frame.render_widget(
+                Paragraph::new("↓")
+                    .centered()
+                    .style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    x: inner.x,
+                    y: top,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+        top += CUE_CONNECTOR_ROWS as u16;
+    }
+
+    if let Some(bar) = bar {
+        let line = search_line(state.cue_search_mut(), bar, search_reject);
+        frame.render_widget(Paragraph::new(line), bar);
+    }
+}
+
+/// One row of the cue list: a lone cue's block, or a fork into the cues sharing its moment.
+///
+/// A group of one is the ordinary case and is drawn as it always was, full width and with
+/// the full timing. Everything below is about the rest.
+///
+/// **Two members side by side, and the later-starting one a row lower.** The step is not
+/// proportional to the overlap and is not meant to be — it says which of the two comes in
+/// first, and nothing more. Because cues arrive start-ordered, the step is always downward
+/// to the right, which means the case actually carrying information is the one where the
+/// step is *not* taken: two members with identical starts are drawn level, and that is the
+/// panel saying "these two appear together" rather than "this one comes in after". The
+/// group is charged the fourth row either way, so `h` and `l` move the cursor through it
+/// without the list reflowing underneath.
+///
+/// **Exactly two, however many the group holds**, because half a panel is the narrowest a
+/// block with a timing on it can be (`subtitle_edit::GROUP_COLUMNS`). The fork's crossbar runs off
+/// the panel's edge on whichever side the group reaches past what is drawn, and `h`/`l` page
+/// through it. That lives on the crossbar because the fork is part of the group rather than
+/// the connector into it, so it is drawn at every scroll position — a line that vanished
+/// when the list happened to scroll would be worse than none at all.
+fn render_edit_group(
+    frame: &mut Frame,
+    state: &SubtitleEditState,
+    group: CueGroup,
+    timing: GroupTiming,
+    marks: CueMarks,
+    area: Rect,
+) {
+    // Fetched as one slice and matched on rather than indexed twice: `cues` is public and
+    // can be emptied under a `groups` that still describes the old list, so the "there is
+    // nothing there" case has to be answered somewhere — and answering it once, for both
+    // members at a time, leaves no second guard that only the first one's absence protects.
+    let (first, shown) = state.group_window(group);
+    let members = state.cues.get(first..first + shown).unwrap_or_default();
+    let [cue, rest @ ..] = members else {
+        return;
+    };
+    let [second] = rest else {
+        render_edit_cue(
+            frame,
+            cue,
+            marks.at(first),
+            &format!(
+                " {} → {} ",
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            ),
+            marks.query,
+            area,
+        );
+        return;
+    };
+
+    // The left block keeps the odd column, so the two together span the panel exactly and
+    // no gap opens between them.
+    let right_width = area.width / GROUP_COLUMNS as u16;
+    let left_width = area.width - right_width;
+    // The blocks are what must survive a panel too short to hold the whole group: at the
+    // smallest size `render` allows, the cue list gets two rows, and a fork drawn into them
+    // would leave the cue under the cursor off screen entirely. The fork is decoration about
+    // an arrangement the side-by-side blocks already show.
+    let fork_rows = if area.height > CUE_FORK_ROWS as u16 + 1 {
+        CUE_FORK_ROWS as u16
+    } else {
+        0
+    };
+    if fork_rows > 0 {
+        render_edit_fork(
+            frame,
+            Rect {
+                height: fork_rows,
+                ..area
+            },
+            left_width,
+            group.first < first,
+            group.end() > first + shown,
+        );
+    }
+
+    let blocks = area.y + fork_rows;
+    // Level when the two start together, which is the one arrangement here that says
+    // something the left-to-right order does not.
+    let step = u16::from(second.start > cue.start);
+    for (offset, (position, cue)) in [(first, cue), (first + 1, second)].into_iter().enumerate() {
+        let y = blocks + step * offset as u16;
+        render_edit_cue(
+            frame,
+            cue,
+            marks.at(position),
+            &timing.title(cue),
+            marks.query,
+            Rect {
+                x: area.x + if offset == 0 { 0 } else { left_width },
+                y,
+                width: if offset == 0 { left_width } else { right_width },
+                height: CUE_BLOCK_ROWS.min(area.bottom().saturating_sub(y)),
+            },
+        );
+    }
+}
+
+/// The two rows above a group: a crossbar splitting into an arrow over each of its blocks.
+///
+/// Drawn as characters into a `Paragraph` rather than as a `Block`'s border, because what is
+/// wanted is a stem branching rather than anything enclosing.
+///
+/// **A group reaching past the pair on screen is said by the crossbar running off the panel
+/// rather than by a marker on its end.** The bar carries on to the panel's edge and the
+/// corner over the outer block becomes a `┬`, so the eye reads a line continuing past the
+/// wall — the same thing a cut-off diagram says. A `‹`/`›` had to be noticed and then
+/// decoded; the line needs neither, and it costs no row of its own either way.
+fn render_edit_fork(
+    frame: &mut Frame,
+    area: Rect,
+    left_width: u16,
+    more_before: bool,
+    more_after: bool,
+) {
+    // Centred over each block, which is where each block's own arrow has to land. Built by
+    // mapping the row rather than by writing into it, so there is no index to guard and no
+    // width this can be handed that it has to refuse.
+    let width = usize::from(area.width);
+    let left = usize::from(left_width / 2);
+    let right = usize::from(left_width + (area.width - left_width) / 2);
+    let stem = width / 2;
+
+    let bar: String = (0..width)
+        .map(|column| match column {
+            _ if column == left => {
+                if more_before {
+                    '┬'
+                } else {
+                    '┌'
+                }
+            }
+            _ if column == right => {
+                if more_after {
+                    '┬'
+                } else {
+                    '┐'
+                }
+            }
+            _ if column < left => {
+                if more_before {
+                    '─'
+                } else {
+                    ' '
+                }
+            }
+            _ if column > right => {
+                if more_after {
+                    '─'
+                } else {
+                    ' '
+                }
+            }
+            _ if column == stem => '┴',
+            _ => '─',
+        })
+        .collect();
+    let arrows: String = (0..width)
+        .map(|column| {
+            if column == left || column == right {
+                '↓'
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(bar), Line::from(arrows)])
+            .style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
+/// One cue as a block: its timing on the top border, its text inside, and how many of the
+/// file's entries it stands for on the right of that border when it stands for more than one.
+///
+/// The selected one is filled solid rather than outlined — its border is painted the same
+/// cyan as its background, so the block reads as one shape and needs no marker character
+/// to say which cue the cursor is on.
+///
+/// **The count is what stops the fold being silent.** A row standing for four events looks
+/// exactly like a row standing for one, so without it the list simply has fewer rows than
+/// the file has entries and nothing on screen says why — see `cue::collapse`. Absent at one,
+/// because `×1` on every ordinary row would be noise on every track with no effects in it at
+/// all.
+///
+/// Right-aligned on the same border rather than appended to the timing, and **dropped
+/// outright when the two would not both fit**. Ratatui does not arbitrate between two titles
+/// that overlap: the right-aligned one simply paints over the left, so a wide enough count on
+/// a narrow enough panel would eat a digit off the end time and leave a plausible, wrong
+/// timestamp on screen. The timestamps are what this page is for; the count is a note about
+/// how the row was built, so it is the one that gives way. At the sizes the panel is actually
+/// drawn at — a floor of thirty columns, against a timing of twenty-three — an ordinary count
+/// fits, with the two titles' decorative spaces sharing the column where they meet.
+fn render_edit_cue(
+    frame: &mut Frame,
+    cue: &Cue,
+    row: CueRowState,
+    timing: &str,
+    query: &str,
+    area: Rect,
+) {
+    let selected = row.selected;
+    let folded = (cue.events > 1)
+        .then(|| format!(" ×{} ", cue.events))
+        // Measured on what the two titles *say*, plus one column between them, rather than on
+        // the strings themselves: both carry a decorative space at the edge they meet on, and
+        // those two spaces landing in the same column costs nothing. Anything past that eats
+        // a digit off the end time.
+        .filter(|folded| {
+            timing.trim().chars().count() + folded.trim().chars().count()
+                < usize::from(area.width).saturating_sub(2)
+        });
+    let (block, text_style) = if selected {
+        let fill = Style::default().bg(Color::Cyan).fg(Color::White);
+        let mut block = Block::bordered()
+            .style(fill)
+            // Border painted in the fill's own colour so it disappears into it: the
+            // block reads as one solid shape rather than an outline round a fill.
+            .border_style(Style::default().bg(Color::Cyan).fg(Color::Cyan))
+            .title(Line::styled(timing, fill.bold()));
+        if let Some(folded) = folded {
+            block = block.title(Line::styled(folded, fill).right_aligned());
+        }
+        (block, fill)
+    } else {
+        let timing_style = Style::default().fg(row.timing_colour());
+        let mut block = Block::bordered()
+            .border_style(Style::default().fg(Color::White))
+            .title(Line::styled(timing, timing_style));
+        if let Some(folded) = folded {
+            block = block.title(Line::styled(folded, timing_style).right_aligned());
+        }
+        (block, Style::default().fg(Color::Gray))
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Multi-line cues collapse onto one row with a separator rather than stealing a row
+    // from the cue below them.
+    //
+    // `truncate_end`, not `truncate`: a cue is read from its start, so the opening words
+    // are what identify it. The tail-preserving variant exists for paths, where the
+    // filename is the part that matters.
+    let text = truncate_end(
+        &cue.text.replace('\n', " / "),
+        usize::from(inner.width).saturating_sub(1).max(1),
+    );
+    // Highlighted on the string that is about to be drawn rather than on `cue.text`, so
+    // what lights up is what the reader can actually see: the newline folding and the
+    // truncation both move where a match falls, and a match past the end of the row is one
+    // there is nothing to paint.
+    frame.render_widget(
+        Paragraph::new(Line::from(highlight_matches(
+            &format!(" {text}"),
+            query,
+            row.text_style(text_style),
+        ))),
+        inner,
+    );
+}
+
+/// Splits a row's words into spans so the part the search matched can be told apart.
+///
+/// **The match reverses the row's own style rather than taking a colour of its own.** This
+/// page already spends cyan on the selected cue, yellow on staged and retiming work, red on
+/// a cue marked to go, green on the timeline cursor and magenta on lane overflow; a sixth
+/// colour would have to stay legible against every one of them, and against the selected
+/// row's cyan fill in particular. Reversing is legible against each by construction, and it
+/// is the same move `CueRowState::text_style` already makes when the fill takes its colours
+/// away — a modifier is what survives there.
+///
+/// Returns the whole string as one span when nothing matches, which is every row of an
+/// unfiltered list, so the ordinary case allocates one span exactly as it did before.
+fn highlight_matches(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
+    let ranges = match_ranges(text, query);
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let lit = base.add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for range in ranges {
+        if range.start > at {
+            spans.push(Span::styled(
+                characters[at..range.start].iter().collect::<String>(),
+                base,
+            ));
+        }
+        spans.push(Span::styled(
+            characters[range.start..range.end]
+                .iter()
+                .collect::<String>(),
+            lit,
+        ));
+        at = range.end;
+    }
+    if at < characters.len() {
+        spans.push(Span::styled(
+            characters[at..].iter().collect::<String>(),
+            base,
+        ));
+    }
+    spans
+}
+
+/// What one cue row is saying about itself beyond its words.
+///
+/// **Deletion outranks a rewrite, which is the ranking the track list's rows already follow**
+/// (`TrackRowState`): a row marked to go is not also an edited row, because going *is* the
+/// edit — there is no version of it that will ever be read.
+///
+/// Both marks are a modifier as well as a colour, and that is what makes them survive the
+/// selection: the selected row is filled cyan and owns its colours, so yellow or red on it
+/// would be unreadable and the italic or the strikethrough is all that carries over.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CueRowState {
+    selected: bool,
+    edited: bool,
+    deleted: bool,
+}
+
+impl CueRowState {
+    /// The style of the row's words.
+    ///
+    /// A rewritten cue is said by its own words rather than by a marker beside them — the
+    /// words *are* what changed, and the row is otherwise identical to one nobody touched.
+    /// A deleted one is said by a line through those words, which is the one mark that
+    /// means "this is going" without needing a legend.
+    fn text_style(self, base: Style) -> Style {
+        if self.deleted {
+            let struck = base.add_modifier(Modifier::CROSSED_OUT);
+            if self.selected {
+                struck
+            } else {
+                struck.fg(Color::Red)
+            }
+        } else if self.edited {
+            let italic = base.add_modifier(Modifier::ITALIC);
+            if self.selected {
+                italic
+            } else {
+                italic.fg(Color::Yellow)
+            }
+        } else {
+            base
+        }
+    }
+
+    /// The colour of the timing on an unselected row's border, so a row marked to go reads as
+    /// one red thing rather than as struck-through words under an ordinary timestamp.
+    fn timing_colour(self) -> Color {
+        if self.deleted {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }
+    }
+}
+
+/// Everything the cue panel knows about its rows beyond the cues themselves: which have
+/// been rewritten, which are marked to go, which one is selected, and what the filter is
+/// matching.
+///
+/// Gathered into one value because all four are read at every level of the panel — the
+/// border counts the first two, the group needs the query to page onto a match, and the row
+/// has to rank all of them — and passing them one by one made every function between the
+/// panel and the row take an argument it only forwards.
+#[derive(Clone, Copy, Debug)]
+struct CueMarks<'a> {
+    edited: &'a BTreeSet<usize>,
+    deleted: &'a BTreeSet<usize>,
+    /// The cue the panel is marking, or `None` while the timeline holds the cursor — the
+    /// one value that decides both the focus border and whether any row is filled at all.
+    selected: Option<usize>,
+    /// What the panel is filtered by, trimmed, or empty when it is not filtered.
+    query: &'a str,
+}
+
+impl CueMarks<'_> {
+    fn at(self, position: usize) -> CueRowState {
+        CueRowState {
+            selected: self.selected == Some(position),
+            edited: self.edited.contains(&position),
+            deleted: self.deleted.contains(&position),
+        }
+    }
+}
+
+fn render_edit_timeline(
+    frame: &mut Frame,
+    state: &mut SubtitleEditState,
+    shift: Option<String>,
+    length: Option<String>,
+    cursor: Option<Duration>,
+    selected: Option<usize>,
+    area: Rect,
+) {
+    // **A track with no cues still gets a working timeline.** It is the pane the reader aims
+    // `i` with — the only thing there is to do on a track they have just created — so a bare
+    // border here would leave them scrubbing with no axis, no cursor mark and no readout.
+    // There is simply no cue to anchor on: the title reads the cursor's moment alone, and the
+    // window comes from `TimelineWindow::around` rather than from `fitted`, which shortens a
+    // window until the cues in it are drawable and so has nothing to ask of an empty track.
+    let cue = state.selected_cue().cloned();
+    // The selected cue's exact times go in the title rather than onto the axis. At roughly
+    // a second per column there is nowhere on the track to put a ten-character timestamp
+    // without it covering the cues around it, and the title is otherwise empty space.
+    //
+    // Parenthetical rather than separated by " · ": that separator is the house style for
+    // inline control hints, which this page is forbidden from carrying, and
+    // `the_edit_page_should_not_carry_inline_control_hints` watches for it by name.
+    //
+    // The shift is appended only once the cue has actually moved, and it is what makes this
+    // a readout rather than a label: after three presses the times alone cannot say whether
+    // the reader is a tenth of a second in or a whole one, which is the only question they
+    // are asking. Yellow in the timing mode, matching the cue the keys are pointing at.
+    // Either scale of the mode takes the yellow and the colour swap: the swap is there
+    // because a yellow playhead inside a yellow span is invisible, and that pair is on screen
+    // exactly when someone retimes against a playing span — which is as true of a whole-track
+    // shift as of one cue's nudge.
+    let retiming = state.timing.is_on();
+    // **The title answers for whichever pane holds the cursor, never for both at once.** The
+    // two readouts answer different questions — the cue's times say what is being judged, the
+    // cursor's moment says where the picture in the pane comes from — and only one of them is
+    // the one being moved. Showing both put three timestamps in a row that changes shape as
+    // the focus does, and the reader had to work out which two belonged together before
+    // reading either. The cue's own times are on its row in the panel throughout, so nothing
+    // is lost by standing them down while the timeline is being walked.
+    //
+    // Hundredths here where the cue's times carry tenths (`cue::format_precise`): the cursor's
+    // fine step is fifty milliseconds, and a tenths readout would sit still for every other
+    // press.
+    //
+    // The moment stands bare rather than behind a `▼` matching the ruler's mark. Now that the
+    // title carries one reading at a time there is nothing for a glyph to tell it apart from,
+    // and a triangle inside a parenthesised title reads as debris rather than as a label.
+    //
+    // The length joins the shift once the cue has been resized, and for the same reason: the
+    // two timestamps say where the line is and how long it is only by subtraction, which is
+    // arithmetic nobody does while holding a key down. Dropped for a cue at the length the
+    // file gives it, so it is a readout rather than a figure that is always there.
+    let mut readings: Vec<String> = match (cursor, cue.as_ref()) {
+        (Some(at), _) => vec![format_precise(at)],
+        // No cursor and no cue is a track holding nothing with the panel focused, which the
+        // page leaves the moment its cues land. Nothing to read, so nothing is claimed.
+        (None, None) => Vec::new(),
+        (None, Some(cue)) => [
+            Some(cue_times_reading(cue, state.timing.grip())),
+            shift,
+            length,
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
+    // **The cue's times are what goes when the title will not fit, not the figure beside
+    // them.** The pane is as wide as the page and the page's floor is fifty columns, where
+    // two timestamps and a labelled global figure do not both fit inside a border — and
+    // ratatui clips a title from the right, so left alone the reader would lose the one
+    // number they are pressing a key to change and keep the two they are not. Nothing is
+    // lost by dropping them: the cue's own times are on its row in the panel throughout,
+    // which is the same reason the cursor's reading stands the pair down entirely.
+    while readings.len() > 1 && title_width(&readings) > usize::from(area.width.saturating_sub(2)) {
+        readings.remove(0);
+    }
+    let title = if readings.is_empty() {
+        " Timeline ".to_string()
+    } else {
+        format!(" Timeline ({}) ", readings.join(" · "))
+    };
+    let block = Block::bordered()
+        .border_style(focus_border(cursor.is_some()))
+        .title(if retiming {
+            Line::styled(title, Style::default().fg(Color::Yellow))
+        } else {
+            Line::raw(title)
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let window = match cue.as_ref() {
+        Some(cue) => TimelineWindow::fitted(
+            cue,
+            &state.cues,
+            state.duration,
+            inner.width,
+            state.layout.lane_count,
+        ),
+        // Nothing on the track to fit a window around, so the cursor is what it is built
+        // from — the widest view of the media, since there is nothing in it to crowd.
+        None => TimelineWindow::around(cursor.unwrap_or_default(), state.duration, inner.width),
+    };
+    // **While the timeline holds the cursor the window is the reader's, not the selected
+    // cue's.** `fitted` anchors on the selection and is rebuilt from it every draw, so sliding
+    // *that* the minimum needed to hold the cursor parks the cursor against whichever edge it
+    // left by, on every frame — and moving back the other way then drags the whole track under
+    // a cursor that never leaves the edge. Restoring where the window actually was first is
+    // what makes the cursor travel through it and reach an edge before anything scrolls.
+    //
+    // The length still comes from `fitted`, because the pane's width and the track's density
+    // decide that and both can change mid-scroll; only the start is the reader's. Before the
+    // first draw of a visit there is nothing remembered and the selection's own window stands,
+    // which is what makes arriving in the pane change nothing on screen.
+    let window = match cursor {
+        Some(at) => {
+            let held = match state.window_start() {
+                Some(start) => window.starting_at(start),
+                None => window,
+            };
+            held.containing(at, state.duration)
+        }
+        None => window,
+    };
+    let mut lines = timeline_lines(
+        &state.cues,
+        &state.layout,
+        &window,
+        selected,
+        state.playback_position(),
+        cursor,
+        state.timing,
+    );
+    // The selection's two `▲` marks go with the selection: while the cursor is here, the one
+    // moment being pointed at is the cursor's, and a second pair of marks under a cue nobody
+    // is on would be the axis naming a position no key moves.
+    lines.push(timeline_ruler(
+        &window,
+        selected
+            .zip(cue.as_ref())
+            .and_then(|(_, cue)| window.span(cue)),
+        cursor,
+        retiming,
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+    // Last, once every read of the page above is done with — this is the one place that knows
+    // both how long a window is and where this one ended up.
+    if cursor.is_some() {
+        state.set_window_start(window.start);
+    }
+}
+
+/// What the timeline cursor is drawn in.
+///
+/// Green, which nothing else on this page uses. Cyan and yellow are already spoken for by the
+/// selected cue and the playhead — and they *swap* between those two in the timing mode, so
+/// there is no spare shade of either to lend a third meaning. A reader nudging a cue with a
+/// span playing and the cursor parked somewhere else has all three on screen at once.
+const CURSOR_COLOUR: Color = Color::Green;
+
+/// The time axis drawn beneath the lanes: a reading every ten seconds, and the selected
+/// cue's two ends.
+///
+/// A reading's first character sits on the column its moment maps to, so the numbers mark
+/// the positions themselves and the axis needs no tick glyphs under them.
+///
+/// `selected` is the cue's column span, taken from `TimelineWindow::span` rather than
+/// re-derived here, so the marks land exactly under the bracket ends drawn above them even
+/// where the window has clamped a cue that runs past its edge.
+/// Seconds between the axis's readings for a window of this length.
+///
+/// The longest interval that still lands [`TICK_TARGET`] readings, so the axis keeps the
+/// roundest numbers it can afford at whatever length the window has shortened to. A window
+/// shorter than six seconds takes the last interval and gets fewer readings rather than
+/// sub-second ones, which would be a different kind of unreadable.
+fn axis_tick(span: Duration) -> u64 {
+    let seconds = span.as_secs();
+    TICKS
+        .into_iter()
+        .find(|tick| seconds / tick >= TICK_TARGET)
+        .unwrap_or(TICKS[TICKS.len() - 1])
+}
+
+/// Every tick of the axis that lands inside the window, as its moment and its column.
+///
+/// Shared by the ruler that labels the ticks and the lanes that rule a line down each one,
+/// so the two cannot come to disagree about where a tick is. A gridline standing under no
+/// reading is merely unlabelled — the ruler drops a reading that would crowd its neighbour
+/// or paint through a mark — but a gridline standing *beside* a reading would be the axis
+/// contradicting itself, and deriving the columns twice is how that happens.
+fn axis_columns(window: &TimelineWindow) -> Vec<(Duration, u16)> {
+    let tick = axis_tick(window.end.saturating_sub(window.start));
+    let mut at = Duration::from_secs(window.start.as_secs().div_euclid(tick) * tick);
+    let mut columns = Vec::new();
+    while at <= window.end {
+        let moment = at;
+        // Before the `continue`, so a moment the window has no column for still advances
+        // the walk. `TICKS` has no zero in it, so this always terminates.
+        at += Duration::from_secs(tick);
+        if let Some(column) = window.column(moment) {
+            columns.push((moment, column));
+        }
+    }
+    columns
+}
+
+fn timeline_ruler(
+    window: &TimelineWindow,
+    selected: Option<(u16, u16)>,
+    cursor: Option<Duration>,
+    retiming: bool,
+) -> Line<'static> {
+    // No width guard: `TimelineWindow::column` and `span` both answer `None` for a window
+    // with no columns, so a track drawn no cells wide places no readings and no marks and
+    // falls out as an empty line — the same contract `timeline_lines` indexes under.
+    let mut cells = vec![(' ', Style::default()); usize::from(window.width)];
+
+    // One decision for the whole axis: readings of two different widths would make the
+    // gaps between them lie about the interval they are spaced at.
+    let with_hours = window.end.as_secs() >= 3600;
+    // Reserved before anything is written. A reading with a mark painted through it leaves
+    // a plausible but wrong time on the axis, which is worse than no reading at all.
+    // The cursor's column is reserved alongside the selection's two ends, and for the same
+    // reason: a reading with a mark painted through it leaves a plausible but wrong time on
+    // the axis, which is worse than no reading at all.
+    let cursor_column = cursor.and_then(|at| window.column(at));
+    let marks: Vec<u16> = selected
+        .into_iter()
+        .flat_map(|(first, last)| [first, last])
+        .chain(cursor_column)
+        .collect();
+
+    let mut written_to = None;
+    for (moment, column) in axis_columns(window) {
+        let reading = format_clock(moment, with_hours);
+        let span = column..=column + reading.chars().count() as u16 - 1;
+        // Dropped whole rather than clipped or crowded: half a timestamp is a different,
+        // wrong moment, and two readings run together are unreadable as either.
+        let crowded = written_to.is_some_and(|last| column <= last + 1);
+        if *span.end() >= window.width || crowded || marks.iter().any(|mark| span.contains(mark)) {
+            continue;
+        }
+        for (offset, glyph) in reading.chars().enumerate() {
+            cells[usize::from(column) + offset] = (glyph, Style::default().fg(Color::DarkGray));
+        }
+        written_to = Some(*span.end());
+    }
+
+    // Painted last, the same way the selected cue's span is painted last onto a crowded
+    // lane. A triangle rather than a box-drawing glyph: the repo already ships `▸` and
+    // `▀`, so this is known to render, and it cannot be read as part of a reading.
+    for mark in marks {
+        cells[usize::from(mark)] = ('▲', Style::default().fg(selection_colour(retiming)).bold());
+    }
+
+    // Last of all, so it wins the column outright where it lands on one of the selection's
+    // ends — the reader moved the cursor there and is looking for it, where the selection's
+    // ends are also stated by the bracket drawn directly above them. `▼` mirrors the `▲`
+    // beside it, which is what makes it read as a mark on the same axis rather than as a
+    // second kind of thing.
+    if let Some(column) = cursor_column {
+        cells[usize::from(column)] = ('▼', Style::default().fg(CURSOR_COLOUR).bold());
+    }
+    Line::from(runs(cells))
+}
+
+/// How far a cue has been moved, as the timeline's title says it.
+///
+/// Always signed, including for a forward shift, because "0.40s" alone does not say which
+/// way — and which way is half of what the reader is checking. Hundredths rather than the
+/// tenths the timestamps beside it carry, since the step is fifty milliseconds and a
+/// tenth-second readout would sit still for every other press.
+/// The selected cue's two times for the timeline's title, with brackets round whatever part of
+/// it `h`/`l` are moving: `[start → end]` for the whole cue, `[start] → end` for its start and
+/// `start → [end]` for its end.
+///
+/// **In the title rather than only on the cue's bar**, because the title is where the timing
+/// mode's readout already is and the bar can be a handful of columns wide — too narrow for
+/// bracket glyphs to say anything. The bar still gets handles (see [`timeline_lines`]); this
+/// is the half that can be read in words. No brackets outside the cue scale, where `h`/`l`
+/// move no part of this cue.
+fn cue_times_reading(cue: &Cue, grip: Option<CueGrip>) -> String {
+    let (start, end) = (format_timestamp(cue.start), format_timestamp(cue.end));
+    match grip {
+        None => format!("{start} → {end}"),
+        Some(CueGrip::Start) => format!("[{start}] → {end}"),
+        Some(CueGrip::Whole) => format!("[{start} → {end}]"),
+        Some(CueGrip::End) => format!("{start} → [{end}]"),
+    }
+}
+
+/// How many columns the timeline's title takes with these readings in it.
+///
+/// Counted in characters rather than bytes: the readings carry `→` and are joined by `·`,
+/// each of which is one column and three bytes, so a byte count would drop a reading that
+/// fits and leave the title short of the pane it was measured against.
+fn title_width(readings: &[String]) -> usize {
+    " Timeline () ".chars().count()
+        + readings
+            .iter()
+            .map(|reading| reading.chars().count())
+            .sum::<usize>()
+        + readings.len().saturating_sub(1) * " · ".chars().count()
+}
+
+/// How long the selected cue is on screen, for the timeline's title.
+///
+/// The word is what tells it apart from the shift beside it: the two are otherwise the same
+/// shape, and a bare `2.50s` next to a bare `+0.15s` would leave the reader working out which
+/// of them is the number their last press changed. Hundredths, matching the shift, since both
+/// move in fifty-millisecond steps.
+fn format_length_reading(length: Duration) -> String {
+    let millis = length.as_millis();
+    format!("{}.{:02}s long", millis / 1000, (millis % 1000) / 10)
+}
+
+fn format_shift(millis: i64) -> String {
+    let sign = if millis.is_negative() { '-' } else { '+' };
+    let millis = millis.unsigned_abs();
+    format!("{sign}{}.{:02}s", millis / 1000, (millis % 1000) / 10)
+}
+
+/// What the selected cue is drawn in on the timeline and its ruler.
+///
+/// Yellow while the cue is being retimed, which is the colour every staged-but-unwritten
+/// thing in the application wears and is what a nudged cue is about to become. Cyan
+/// otherwise, the selection colour everywhere else on the page.
+fn selection_colour(retiming: bool) -> Color {
+    if retiming { Color::Yellow } else { Color::Cyan }
+}
+
+/// What the playhead is drawn in — always the other one.
+///
+/// The two swap rather than the selection simply changing, because the pair has to stay
+/// distinguishable: a yellow playhead inside a yellow cue is invisible, and the reader
+/// nudging a cue against a playing span is looking at exactly that pair.
+fn playhead_colour(retiming: bool) -> Color {
+    if retiming { Color::Cyan } else { Color::Yellow }
+}
+
+/// Lays every cue out across the track, one line per lane.
+///
+/// A pure function over the cue list rather than something that draws as it goes, so the
+/// column arithmetic that decides whether a cue is visible at all can be asserted directly.
+///
+/// **Every cue is drawn the same way, whatever the track's density.** A dense typeset track
+/// is made readable by shortening the window it is drawn in (`TimelineWindow::fitted`), never
+/// by demoting the cues the cursor is not on to something plainer: a timeline where only the
+/// selection's neighbours are drawn in full loses where every other line begins and ends,
+/// which is most of what the pane is worth reading for.
+///
+/// **The timing mode swaps two colours rather than adding a third.** The selected cue is
+/// normally cyan and the playhead yellow, chosen that way because they must not be the same;
+/// in the timing mode the selection takes yellow — the colour everything staged-but-unwritten
+/// wears — and hands cyan to the playhead. Painting the selection yellow without moving the
+/// playhead would hide a yellow `│` inside a yellow span, which is exactly the pair on
+/// screen when a reader nudges a cue with a span still playing.
+///
+/// **At the wider scale every cue takes that yellow, not only the selected one**, because at
+/// that scale every cue is what the keys are moving. A pane that marked one line while `h`
+/// moved all of them would be pointing at the wrong thing — and the selection is not lost,
+/// since it keeps the bold the others do not have. The colour is the answer to "what am I
+/// about to move", which is the question this pane is being read for while the mode is on.
+fn timeline_lines(
+    cues: &[Cue],
+    layout: &LaneLayout,
+    window: &TimelineWindow,
+    selected: Option<usize>,
+    playhead: Option<Duration>,
+    cursor: Option<Duration>,
+    timing: TimingScope,
+) -> Vec<Line<'static>> {
+    let retiming = timing.is_on();
+    let width = window.width as usize;
+    // `pack_lanes` already guarantees at least one lane, including for an empty track, so
+    // there is nothing to clamp here.
+    let lanes = layout.lane_count;
+    let mut grid = vec![vec![(' ', Style::default()); width]; lanes];
+
+    // Ruled first, so everything with something to say wins the column over them: a cue's
+    // bracket, the playhead and the cursor are all painted on top. They exist because the
+    // ruler's readings sit *below* the lanes, and judging which second a cue starts on by
+    // eye across four lanes of blank space is the one thing this pane is read for.
+    //
+    // Dark gray and unbolded, the same style the reading under each one carries, because a
+    // gridline and its number are one thing seen twice rather than two marks to tell apart.
+    // The columns come from `axis_columns` for the same reason.
+    //
+    // **Dashed rather than the solid `│` the playhead and the cursor use.** Three vertical
+    // bars separated only by colour is one distinction too many for a pane that is read at a
+    // glance and can carry all three at once, and the two that mark a *moment* are the ones
+    // that have to stand out — a gridline is scenery. It also keeps `│` unambiguous in the
+    // tests, which read the buffer's glyphs and cannot see a colour without asking for it.
+    for (_, column) in axis_columns(window) {
+        for lane in &mut grid {
+            // Bounds-checked for the reason the playhead below is: `column` answers for any
+            // moment inside the window, which is not the same as any column of this grid.
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('┊', Style::default().fg(Color::DarkGray));
+            }
+        }
+    }
+
+    // The selected cue is painted last so that it stays visible where a crowded lane has
+    // stacked another cue on top of it. With no selection there is nothing to keep on top,
+    // and the ordinary order is the whole list once.
+    let order = (0..cues.len())
+        .filter(|index| Some(*index) != selected)
+        .chain(selected);
+    for index in order {
+        let Some(cue) = cues.get(index) else {
+            continue;
+        };
+        let Some((first, last)) = window.span(cue) else {
+            continue;
+        };
+        let lane = layout
+            .lanes
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .min(lanes.saturating_sub(1));
+        let style = if Some(index) == selected {
+            Style::default().fg(selection_colour(retiming)).bold()
+        } else if timing == TimingScope::Track {
+            // Every cue is moving, so every cue wears the colour that says so — the
+            // selection keeps the bold, which is what still tells it from its neighbours.
+            // The overflow marking below gives way for as long as the mode is on: it is a
+            // fact about the lanes rather than about the edit, and while the reader is
+            // moving the whole track what they need the pane to answer is what is moving.
+            Style::default().fg(selection_colour(true))
+        } else if layout.overflowed.get(index).copied().unwrap_or(false) {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        // Indexed rather than bounds-checked: `span` clamps both ends inside the window
+        // and `cue_glyphs` returns exactly the columns it was asked for, so the last
+        // glyph lands on `last`, which is at most `width - 1`. A guard here would be a
+        // branch nothing can take.
+        let span_width = usize::from(last - first) + 1;
+        for (offset, glyph) in cue_glyphs(span_width).chars().enumerate() {
+            grid[lane][usize::from(first) + offset] = (glyph, style);
+        }
+        // **Every end `h`/`l` are about to move is drawn as a solid handle**: the left end
+        // for the start, the right end for the end, and both for the whole cue. The whole cue
+        // needs them as much as an edge does — marking only an edge left the default selection
+        // looking like no selection at all. Reversed rather than recoloured, because the
+        // selection's colour is already doing a job in the mode and a reversed cell reads as
+        // "grabbed" in any colour. Only where that end really is inside the window: `span`
+        // clamps a cue reaching past an edge onto the edge column, and a handle there would be
+        // pointing at a moment the end is not at.
+        if Some(index) == selected {
+            let (moves_start, moves_end) = match timing.grip() {
+                Some(CueGrip::Start) => (true, false),
+                Some(CueGrip::Whole) => (true, true),
+                Some(CueGrip::End) => (false, true),
+                None => (false, false),
+            };
+            let handles = [
+                (moves_start && cue.start >= window.start).then_some(first),
+                (moves_end && cue.end <= window.end).then_some(last),
+            ];
+            for column in handles.into_iter().flatten() {
+                let cell = &mut grid[lane][usize::from(column)];
+                cell.1 = cell.1.add_modifier(Modifier::REVERSED);
+            }
+        }
+    }
+
+    // Painted last and through every lane, for the same reason the ruler's `▲` marks are:
+    // it has to stay readable over whatever it crosses, and what it crosses is exactly the
+    // cue it is being read against.
+    //
+    // Yellow because cyan is the selected cue's, and the whole judgement being made is
+    // where this sits relative to that — two things in one colour would be one thing. In
+    // the timing mode the selection takes yellow and hands cyan back here, which keeps that
+    // rule rather than breaking it.
+    if let Some(column) = playhead.and_then(|at| window.column(at)) {
+        for lane in &mut grid {
+            // Bounds-checked rather than indexed, unlike the cues above: `column` answers
+            // for any moment inside the window, and the playhead's moment comes from the
+            // audio device rather than from the cue list this grid was sized against.
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('│', Style::default().fg(playhead_colour(retiming)).bold());
+            }
+        }
+    }
+
+    // The timeline cursor goes on top of everything, including the playhead: it is the one
+    // mark on this pane the reader is actively moving, so losing it behind something else
+    // would leave them pressing a key with nothing on screen answering. Green, because both
+    // the other colours here already mean something and swap between meanings — see
+    // `CURSOR_COLOUR`.
+    if let Some(column) = cursor.and_then(|at| window.column(at)) {
+        for lane in &mut grid {
+            if let Some(cell) = lane.get_mut(usize::from(column)) {
+                *cell = ('│', Style::default().fg(CURSOR_COLOUR).bold());
+            }
+        }
+    }
+
+    grid.into_iter()
+        .map(|lane| Line::from(runs(lane)))
+        .collect()
+}
+
+/// The bracketed span a cue of `width` columns is drawn as.
+///
+/// Narrow cues degrade rather than disappear: the brackets are dropped before the body is,
+/// so even a cue occupying a single column still marks that column.
+fn cue_glyphs(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "|".to_string(),
+        2 => "||".to_string(),
+        3 => "|─|".to_string(),
+        4 => "|<>|".to_string(),
+        _ => format!("|<{}>|", "─".repeat(width - 4)),
+    }
+}
+
+/// Collapses a painted row into one span per run of identical styling.
+fn runs(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let mut style: Option<Style> = None;
+    for (glyph, cell_style) in cells {
+        if style != Some(cell_style) && !text.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut text),
+                style.unwrap_or_default(),
+            ));
+        }
+        style = Some(cell_style);
+        text.push(glyph);
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style.unwrap_or_default()));
+    }
+    spans
 }
 
 fn dim_backdrop(frame: &mut Frame) {
@@ -321,7 +1931,10 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn details_selected_stream(app: &App) -> Option<usize> {
-    (app.layer != Layer::Files && app.dialog.is_none()).then_some(app.selected_stream)
+    // Named layers rather than "anything but Files": the subtitle edit page replaces
+    // this pane entirely, so it has no track cursor to show here.
+    (matches!(app.layer, Layer::Streams | Layer::StreamDetails) && app.dialog.is_none())
+        .then_some(app.selected_stream)
 }
 
 fn subtitle_columns_fit(_content_width: u16, embedded: usize, external: usize) -> bool {
@@ -1182,6 +2795,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_subtitle_settings_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::PreviewSettings {
+        render_preview_settings_dialog(frame, app);
+        return;
+    }
     if dialog == Dialog::ConfirmCancel {
         render_batch_progress_dialog(frame, app);
         render_cancel_edit_dialog(frame, app);
@@ -1203,6 +2820,26 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_resolve_conflicts_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::EditCue {
+        render_cue_editor(frame, app);
+        return;
+    }
+    if dialog == Dialog::CueLength {
+        render_cue_length_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::ConfirmLeaveCues {
+        render_confirm_leave_cues_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::CreateTrack {
+        render_create_track_dialog(frame, app);
+        return;
+    }
+    if dialog == Dialog::AutoSyncing {
+        render_auto_sync_dialog(frame, app);
+        return;
+    }
     // Matched exhaustively rather than falling through to the error popup: every dialog
     // above returns, so a new `Dialog` variant that forgets to must fail to compile here
     // instead of silently rendering itself as an editing error.
@@ -1212,11 +2849,17 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::AudioSettings
         | Dialog::VideoSettings
         | Dialog::SubtitleSettings
+        | Dialog::PreviewSettings
         | Dialog::ConfirmCancel
         | Dialog::ConfirmProcessAll
         | Dialog::BatchProcessing
         | Dialog::ConfirmReset
-        | Dialog::ResolveConflicts => unreachable!("handled and returned above"),
+        | Dialog::ResolveConflicts
+        | Dialog::EditCue
+        | Dialog::CueLength
+        | Dialog::CreateTrack
+        | Dialog::AutoSyncing
+        | Dialog::ConfirmLeaveCues => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
             app.edit_error
@@ -1382,6 +3025,251 @@ fn render_container_settings_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
+/// The "what should I make?" popup: kind, format, placement, then Create/Back — all shown
+/// at once, since a track's kind and format have exactly one real answer today.
+///
+/// **Kind is reachable but not editable.** `NewTrackKind` has one variant, so there is
+/// nothing to choose — it is drawn as three boxes with only `Subtitles` lit, `Video` and
+/// `Audio` shown and disabled — but the cursor can still land on the row, so `h`/`l` can
+/// answer with a "not implemented yet" notice rather than the row being invisible to
+/// navigation entirely.
+///
+/// **Placement is a two-button radio row, not a dropdown**, now that its labels are one word
+/// each (`Embedded`/`External`) rather than the sentences the old `Internal —`/`External —`
+/// wording needed a list to hold. `h`/`l` between the two mirrors the preview-settings
+/// popup's toggles.
+///
+/// **Create/Back is the one place a button doubles as a mnemonic keyboard shortcut** — the
+/// letter each is bound to (`c`/`C`, `b`/`B`) is picked out in cyan so the shortcut is visible
+/// without opening the keybindings popup.
+///
+/// **`Language` is asked here rather than left to a second visit to the subtitle settings
+/// dialog**, because a save refuses an undetermined sidecar outright — a track created with
+/// no answer here could not be written at all. It is the same searchable dropdown that
+/// dialog's own `Language` row uses (`app.filtered_create_track_languages`, windowed ten
+/// entries around the cursor the way `SubtitleSettingsMode::LanguageDropdown` already is),
+/// so a reader who has used that picker once needs nothing new to use this one.
+fn render_create_track_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.create_track_popup.as_ref() else {
+        return;
+    };
+    let choices = app.create_track_choices();
+    let mut lines = Vec::new();
+    let mut focus_line = 0;
+
+    let kind_selected = popup.field == CreateTrackField::Kind;
+    if kind_selected {
+        focus_line = lines.len();
+    }
+    lines.push(create_track_kind_line(kind_selected));
+    lines.push(Line::default());
+
+    let format_selected = popup.field == CreateTrackField::Format;
+    let format_open = format_selected && popup.open;
+    if format_selected && !popup.open {
+        focus_line = lines.len();
+    }
+    lines.push(setting_line(
+        "Format",
+        popup.format.label(),
+        format_selected && !popup.open,
+        false,
+        format_open,
+    ));
+    if format_open {
+        focus_line = lines.len() + popup.cursor;
+        push_create_track_choices(&mut lines, &choices, popup.cursor);
+    }
+
+    let language_selected = popup.field == CreateTrackField::Language;
+    let language_open = language_selected && popup.open;
+    if language_selected && !popup.open {
+        focus_line = lines.len();
+    }
+    // Empty until the reader picks one — see `CreateTrackField`'s doc comment for why this
+    // deliberately does not default to the guess `Enter` on the row offers.
+    let language_label = crate::subtitle::language_choice(&popup.language)
+        .map(|choice| choice.label())
+        .unwrap_or_else(|| "Choose a language…".to_string());
+    lines.push(setting_line(
+        "Language",
+        &language_label,
+        language_selected && !popup.open,
+        false,
+        language_open,
+    ));
+    if language_open {
+        lines.push(text_field_line(
+            TextField::new(
+                "Search",
+                FieldValue::Editing(&popup.language_search.input),
+                TextInputConfig::LANGUAGE_SEARCH.width,
+            )
+            .selected(popup.language_search.is_active)
+            .suffix(match_suffix(choices.len()))
+            .reject(app.text_input_reject(TextInputSite::CreateTrackLanguageSearch)),
+        ));
+        let start = popup.cursor.saturating_sub(5).min(choices.len());
+        focus_line = lines.len() + popup.cursor.saturating_sub(start);
+        push_create_track_language_choices(&mut lines, &choices, popup.cursor, start);
+    }
+
+    let placement_selected = popup.field == CreateTrackField::Placement;
+    if placement_selected {
+        focus_line = lines.len();
+    }
+    lines.push(choice_pair_line(
+        "Placement",
+        "Embedded",
+        "External",
+        popup.placement == NewTrackPlacement::Internal,
+        placement_selected,
+        // Marked as changed when it is not the default, the rule the preview settings
+        // popup follows: the reader can see at a glance that they moved it.
+        popup.placement != NewTrackPlacement::default(),
+    ));
+
+    lines.push(Line::default());
+    let action_selected = popup.field == CreateTrackField::Action;
+    if action_selected {
+        focus_line = lines.len();
+    }
+    lines.push(create_track_action_line(
+        popup.action,
+        action_selected,
+        !popup.language.is_empty(),
+    ));
+
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: " New track ".to_string(),
+            focus_line,
+            help: None,
+            min_height: 10,
+        },
+    );
+}
+
+/// The fixed "what kind of track" radio row: only `Subtitles` is a real choice today, so it
+/// is drawn lit and the other two disabled rather than as a dropdown over a list of one.
+///
+/// Reachable by the cursor (`selected`) like any other row, even though `h`/`l` cannot move
+/// it — a row the cursor can never land on would look like it was skipped by accident rather
+/// than like a deliberate "there is nothing to choose here yet".
+fn create_track_kind_line(selected: bool) -> Line<'static> {
+    Line::from(vec![
+        // Not `changed`: that is the yellow-italic staged-edit look every dropdown row here
+        // uses for an answer moved off its default, and this one is neither staged nor
+        // movable. Plain white (or the row's own focused style) is what a dropdown's
+        // chosen-but-untouched answer wears, so `Subtitles` reads the same way `Placement`'s
+        // default answer does.
+        action_option(" Subtitles ", choice_style(selected, false, true)),
+        Span::raw("  "),
+        action_option(" Video ", choice_style(false, false, false)),
+        Span::raw("  "),
+        action_option(" Audio ", choice_style(false, false, false)),
+    ])
+    .centered()
+}
+
+/// The Create/Back button row: each label's first letter is its mnemonic shortcut
+/// (`App::create_track_now`, `App::close_create_track`), bound in `input.rs` regardless of
+/// which row holds the cursor — `h`/`l` and `Enter` reach the same two buttons through the
+/// ordinary focus-and-choose grammar every other row here uses.
+/// `can_create` grays `Create` out — without disabling it outright, since `c`/`C` still work
+/// and answer with the same "choose a language" notice `Enter` on the row would — while a
+/// language is still unchosen. `Back` is unaffected: leaving the popup never needed one.
+fn create_track_action_line(
+    action: CreateTrackAction,
+    selected: bool,
+    can_create: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for choice in CreateTrackAction::ORDER {
+        if choice != CreateTrackAction::Create {
+            spans.push(Span::raw(" "));
+        }
+        let enabled = choice != CreateTrackAction::Create || can_create;
+        let style = choice_style(choice == action && selected, false, enabled);
+        let rest = &choice.label()[choice.mnemonic().len_utf8()..];
+        spans.extend(mnemonic_option(choice.mnemonic(), rest, style));
+    }
+    Line::from(spans).centered()
+}
+
+/// A button like [`action_option`], with its mnemonic letter picked out in cyan so the
+/// reader can see which key activates it without opening the keybindings popup — the New
+/// Track popup's Create/Back row is the first place a button doubles as a keyboard shortcut.
+/// The padding matches `action_option`'s: a space either side of the label, split across the
+/// two spans at the letter.
+///
+/// Left alone when the button already sits on a cyan background (the row is focused and this
+/// is the chosen answer) — cyan text on a cyan fill would be invisible, and a focused button
+/// is already the most prominent thing on the row without it. Left alone on a grayed-out
+/// button too (`Create` before a language is chosen), so it reads as unavailable even though
+/// its mnemonic still answers, with a notice, rather than doing nothing silently.
+fn mnemonic_option(letter: char, rest: &str, style: Style) -> Vec<Span<'static>> {
+    let letter_style = if style.bg == Some(Color::Cyan) || style.fg == Some(Color::DarkGray) {
+        style
+    } else {
+        style.fg(Color::Cyan)
+    };
+    vec![
+        Span::styled(format!(" {letter}"), letter_style),
+        Span::styled(format!("{rest} "), style),
+    ]
+}
+
+fn push_create_track_choices(lines: &mut Vec<Line<'static>>, choices: &[String], cursor: usize) {
+    let last = choices.len().saturating_sub(1);
+    for (position, label) in choices.iter().enumerate() {
+        lines.push(dropdown_line(
+            label,
+            position == cursor,
+            position == cursor,
+            true,
+            false,
+            position == last,
+        ));
+    }
+}
+
+/// The `Language` row's list, windowed the way `SubtitleSettingsMode::LanguageDropdown`'s
+/// already is — ten entries around the cursor, since the full common-language list is too
+/// long to draw whole in a popup this size. `start` comes from the caller rather than being
+/// recomputed here, so the window this draws and the `focus_line` the caller scrolls to
+/// cannot disagree about where it begins.
+fn push_create_track_language_choices(
+    lines: &mut Vec<Line<'static>>,
+    choices: &[String],
+    cursor: usize,
+    start: usize,
+) {
+    let end = (start + 10).min(choices.len());
+    let last = end.saturating_sub(1);
+    for (position, label) in choices.iter().enumerate().take(end).skip(start) {
+        lines.push(dropdown_line(
+            label,
+            position == cursor,
+            position == cursor,
+            true,
+            false,
+            position == last,
+        ));
+    }
+    if choices.is_empty() {
+        lines.push(Line::from(vec![
+            tree_guide_span(true),
+            Span::styled(
+                "No matching languages",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+}
+
 fn container_choice_line(choice: &ContainerChoice, cursor: bool, last: bool) -> Line<'static> {
     let changed = choice.staged && !choice.current;
     let mut line = dropdown_line(&choice.label, cursor, choice.staged, true, changed, last);
@@ -1407,12 +3295,20 @@ fn render_cancel_edit_dialog(frame: &mut Frame, app: &App) {
         Line::from(vec![
             action_option(
                 " Keep processing ",
-                app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
+                choice_style(
+                    app.cancel_edit_choice == CancelEditChoice::KeepProcessing,
+                    false,
+                    true,
+                ),
             ),
             Span::raw("  "),
             action_option(
                 " Cancel processing ",
-                app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
+                choice_style(
+                    app.cancel_edit_choice == CancelEditChoice::CancelProcessing,
+                    false,
+                    true,
+                ),
             ),
         ])
         .centered(),
@@ -1443,9 +3339,15 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
         Line::from(scope.label()).centered(),
         Line::from(""),
         Line::from(vec![
-            action_option(" Keep edits ", app.reset_choice == ResetChoice::KeepEdits),
+            action_option(
+                " Keep edits ",
+                choice_style(app.reset_choice == ResetChoice::KeepEdits, false, true),
+            ),
             Span::raw("  "),
-            action_option(" Reset edits ", app.reset_choice == ResetChoice::ResetEdits),
+            action_option(
+                " Reset edits ",
+                choice_style(app.reset_choice == ResetChoice::ResetEdits, false, true),
+            ),
         ])
         .centered(),
     ];
@@ -1465,15 +3367,192 @@ fn render_confirm_reset_dialog(frame: &mut Frame, app: &App) {
     );
 }
 
-fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, focused: bool) -> Span<'static> {
-    Span::styled(
-        label.into(),
-        if focused {
-            focused_style(false)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    )
+/// The cue editor: one cue's text, in a box big enough to see the shape of it.
+///
+/// **Deliberately the largest popup in the application.** What is being judged is how the
+/// line will read on screen — where it breaks, how long each half is — so the box is sized
+/// from the terminal rather than from the text, and a cue that is two short lines is shown as
+/// two short lines rather than reflowed to fill a narrow field. `Wrap` is off for the same
+/// reason: a line long enough to wrap is a line the reader should see is too long.
+///
+/// The cue's timing goes in the title, because the editor covers the list it was opened from
+/// and "which cue is this" is the one thing the reader loses by opening it.
+fn render_cue_editor(frame: &mut Frame, app: &App) {
+    let Some(editor) = app.cue_editor.as_ref() else {
+        return;
+    };
+    // A new cue is titled by the moment it will land on rather than by a number, because it
+    // has neither: it is not in the list yet, and until something is typed it never will be.
+    let timing = match editor.target {
+        CueTarget::New(at) => format!(" New cue · {} ", format_timestamp(at)),
+        CueTarget::Cue(origin) => app
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| {
+                let position = state.position_of(origin)?;
+                let cue = state.cues.get(position)?;
+                Some(format!(
+                    " Cue {} · {} → {} ",
+                    position + 1,
+                    format_timestamp(cue.start),
+                    format_timestamp(cue.end)
+                ))
+            })
+            .unwrap_or_else(|| " Cue ".to_string()),
+    };
+
+    let area = centered_percent(
+        frame.area(),
+        CUE_EDITOR_WIDTH_PERCENT,
+        CUE_EDITOR_HEIGHT_PERCENT,
+    );
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::styled(timing, Style::default().fg(Color::Cyan)));
+    // Right-aligned opposite the timing, the way the cue panel carries its frame count: it
+    // is the answer to "will leaving keep this", which is worth having in view while typing.
+    let block = if editor.is_modified() {
+        block.title(Line::styled(" edited ", Style::default().fg(Color::Yellow)).right_aligned())
+    } else {
+        block
+    };
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line<'static>> = editor
+        .lines
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    // A real terminal caret rather than a styled cell: it blinks, it is where the terminal
+    // puts an IME's candidates, and it is the one cursor the reader already knows how to
+    // find. Clamped inside the pane so a line longer than the box cannot park it outside.
+    let column = inner.x + (editor.column as u16).min(inner.width.saturating_sub(1));
+    let row = inner.y + (editor.row as u16).min(inner.height.saturating_sub(1));
+    frame.set_cursor_position((column, row));
+}
+
+/// How long the selected cue is on screen, typed rather than nudged — the subtitle edit
+/// page's `D`.
+///
+/// The smallest popup in the application, because it asks one question and holds one answer.
+/// Titled with the cue and the span it currently has, so the number being typed can be
+/// judged against where the line actually sits without leaving the dialog to look.
+fn render_cue_length_dialog(frame: &mut Frame, app: &App) {
+    let Some(draft) = app.cue_length.as_ref() else {
+        return;
+    };
+    let title = app
+        .subtitle_edit
+        .as_ref()
+        .and_then(|state| {
+            let position = state.position_of(draft.origin)?;
+            let cue = state.cues.get(position)?;
+            Some(format!(
+                " Cue {} · {} → {} ",
+                position + 1,
+                format_timestamp(cue.start),
+                format_timestamp(cue.end)
+            ))
+        })
+        .unwrap_or_else(|| " Cue length ".to_string());
+
+    let area = centered_fixed(frame.area(), CUE_LENGTH_WIDTH, CUE_LENGTH_HEIGHT);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::styled(title, Style::default().fg(Color::Cyan)));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let line = text_field_line(
+        TextField::new(
+            "On screen for",
+            FieldValue::Editing(&draft.input),
+            TextInputConfig::CUE_LENGTH.width,
+        )
+        .selected(true)
+        .reject(app.text_input_reject(TextInputSite::CueLength)),
+    );
+    frame.render_widget(Paragraph::new(vec![Line::from(""), line]), inner);
+}
+
+/// Columns the cue length popup takes.
+///
+/// Wider than the field needs, because the field's own refusal message is drawn on the end of
+/// its row: sized to the value alone, a typed letter would be answered by a reason clipped
+/// halfway through, which is no answer at all.
+const CUE_LENGTH_WIDTH: u16 = 64;
+/// Rows it takes: a blank line and the field, inside a border.
+const CUE_LENGTH_HEIGHT: u16 = 4;
+
+/// "Leaving discards them" — the question `Esc` asks on the way off the subtitle edit page.
+fn render_confirm_leave_cues_dialog(frame: &mut Frame, app: &App) {
+    // The same question for two departures, and the second half names which. Switching to
+    // another subtitle track leaves this track's page as surely as `Esc` does — the cue list
+    // is rebuilt from the file — so saying "leaving" there would describe something the
+    // reader did not press.
+    let consequence = if app.switching_subtitle_track() {
+        "Ctrl+S writes them; switching tracks discards them."
+    } else {
+        "Ctrl+S writes them; leaving discards them."
+    };
+    let lines = vec![
+        Line::from("Cue edits are staged but not written yet.").centered(),
+        Line::from(consequence).centered(),
+        Line::from(""),
+        Line::from(vec![
+            action_option(
+                " Stay here ",
+                choice_style(
+                    app.leave_cues_choice == LeaveCuesChoice::StayHere,
+                    false,
+                    true,
+                ),
+            ),
+            Span::raw("  "),
+            action_option(
+                " Discard edits ",
+                choice_style(
+                    app.leave_cues_choice == LeaveCuesChoice::DiscardEdits,
+                    false,
+                    true,
+                ),
+            ),
+        ])
+        .centered(),
+    ];
+    let area = centered_fixed(frame.area(), 64, 8);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(padded_popup_text(Text::from(lines)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Unsaved cue edits "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// One button in a row of them — a confirm dialog's Keep/Cancel pair, or a settings row's
+/// Yes/No.
+///
+/// The padding is the caller's, and part of the look: a button reads as a button because its
+/// label has a space either side of it inside the highlight.
+///
+/// Takes the style rather than deriving one, because the two kinds of row mean different
+/// things by "lit". A confirm dialog highlights where the *cursor* is; a settings row
+/// highlights the answer *in force* and shades it by whether that row is focused and whether
+/// it differs from what was configured. Both come out of [`choice_style`], so a button, a
+/// dropdown row and a field value all say "chosen", "changed" and "inert" the same way.
+fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, style: Style) -> Span<'static> {
+    Span::styled(label.into(), style)
 }
 
 pub fn filter_keybindings_text(text: Text<'static>, query: &str) -> (Text<'static>, usize) {
@@ -1575,7 +3654,11 @@ fn keybindings_text() -> Text<'static> {
     let mut lines = Vec::new();
     keybindings_section(&mut lines, "General");
     keybinding(&mut lines, "?", "Open or close keybindings");
-    keybinding(&mut lines, "/", "Search files, keybindings, or languages");
+    keybinding(
+        &mut lines,
+        "/",
+        "Search files, cues, keybindings, or languages",
+    );
     keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
     keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
     keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
@@ -1609,11 +3692,121 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "K",
-        "Explain the highlighted container, video, audio, or subtitle field",
+        "Explain the highlighted container, video, audio, subtitle, or preview field",
     );
     keybinding(&mut lines, "i", "Toggle container or stream information");
     keybinding(&mut lines, "d", "Mark or unmark track for deletion");
+    keybinding(
+        &mut lines,
+        "a",
+        "Add a new subtitle track to this file, inside it or beside it, and open it for editing",
+    );
+    keybinding(
+        &mut lines,
+        "c / b",
+        "In the popup `a` opens: Create it, or Back out without doing so — the mnemonic \
+         letters picked out in cyan on those buttons, reachable from any row",
+    );
+    keybinding(
+        &mut lines,
+        "c",
+        "Edit a subtitle track: its text, its timing, and the frames they land on",
+    );
     keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
+
+    // The page's navigation is the general `j/k`, `gg/G` and `Esc` above; this is the one
+    // key it adds. It lives here because this popup is the only place the application
+    // documents a key — see the no-inline-control-help rule in `AGENTS.md`.
+    keybindings_section(&mut lines, "Subtitle editing");
+    keybinding(
+        &mut lines,
+        "/",
+        "Filter the cue list to the lines whose words match, with the match highlighted; \
+         Esc drops the filter",
+    );
+    keybinding(
+        &mut lines,
+        "p",
+        "Play a few seconds around the selected cue — or around the timeline cursor",
+    );
+    keybinding(
+        &mut lines,
+        ":",
+        "Preview settings for this session: speed, loop, sound, padding, frame rate, and which \
+         video, audio and subtitle track the page previews. Closing it opens the page again on \
+         the chosen tracks",
+    );
+    keybinding(
+        &mut lines,
+        "t",
+        "Time the selected cue, starting with the whole cue selected (SubRip tracks); Esc \
+         leaves, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "T",
+        "Global retiming: move every cue's timing together, for a track that is out of sync \
+         throughout (SubRip tracks); Esc leaves, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "A",
+        "Auto sync: measure how far this track is out of sync with its own audio and stage \
+         the correction (SubRip tracks); Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "Ctrl-j / Ctrl-k",
+        "Put the cursor in the timeline / back in the cue list",
+    );
+    keybinding(
+        &mut lines,
+        "h / l",
+        "Move the timeline cursor 0.5s back or on while it holds the cursor, otherwise move \
+         the selected part of the cue — or every cue, while retiming globally — 0.05s \
+         earlier or later while timing, otherwise move between cues that share a moment or \
+         choose Yes or No on a preview settings switch",
+    );
+    keybinding(
+        &mut lines,
+        "H / L",
+        "Move the timeline cursor five seconds back or on, or the selected part of the cue — \
+         or every cue — half a second earlier or later while timing",
+    );
+    keybinding(
+        &mut lines,
+        "Ctrl-h / Ctrl-l",
+        "Move the timeline cursor 0.05s back or on while it holds the cursor, the same step \
+         a cue is nudged by, otherwise select the cue's start, the whole cue or its end while \
+         timing — moving the start or end changes how long the cue is on screen",
+    );
+    keybinding(
+        &mut lines,
+        "D",
+        "Type exactly how long the selected cue is on screen, as mm:ss.mmm, while timing",
+    );
+    keybinding(
+        &mut lines,
+        "r",
+        "Put the cue back to the timing the file gives it — or every cue, while retiming \
+         globally — while timing",
+    );
+    keybinding(
+        &mut lines,
+        "i",
+        "Edit the selected cue's text, or add a cue at the timeline cursor (SubRip tracks); \
+         Esc keeps the edit, Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "d",
+        "Mark or unmark the selected cue for deletion (SubRip tracks); Ctrl-s writes it",
+    );
+    keybinding(
+        &mut lines,
+        "R",
+        "Reset every preview setting, in the preview settings dialog",
+    );
 
     keybindings_section(&mut lines, "Text input");
     keybinding(
@@ -1624,7 +3817,7 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         "/",
-        "Search the file list, keybindings, or languages",
+        "Search the file list, the cue list, keybindings, or languages",
     );
     keybinding(&mut lines, "Left/Right", "Move the text cursor");
     keybinding(
@@ -1664,6 +3857,39 @@ fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
         Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
         Span::raw(description.to_string()),
     ]));
+}
+
+/// `Dialog::AutoSyncing`: the one dialog on the subtitle edit page with nothing to
+/// choose and nowhere to back out of, up for as long as the background decode takes and
+/// not a moment longer. Modelled on `render_progress_dialog`'s indeterminate loader —
+/// there is no measured progress here at all, since a whole-track audio decode reports
+/// no fraction along the way — but smaller, since there is no label line to fit a
+/// filename into.
+fn render_auto_sync_dialog(frame: &mut Frame, app: &App) {
+    let area = centered_fixed(frame.area(), 46, 5);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Auto sync ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+        .margin(1)
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("Syncing subtitles to audio…")
+            .centered()
+            .style(Style::default().fg(Color::Cyan).bold()),
+        rows[0],
+    );
+    let tick = (app
+        .sync_started
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(0)
+        / 80) as usize;
+    frame.render_widget(Paragraph::new(loader_line(tick)).centered(), rows[1]);
 }
 
 /// The original single-file design: one centered box, one label line, one gauge (or
@@ -1795,12 +4021,20 @@ fn render_confirm_process_all_dialog(frame: &mut Frame, app: &mut App) {
     let buttons = Line::from(vec![
         action_option(
             " \u{25b6} Start ",
-            app.confirm_process_all_choice == ConfirmProcessAllChoice::Start,
+            choice_style(
+                app.confirm_process_all_choice == ConfirmProcessAllChoice::Start,
+                false,
+                true,
+            ),
         ),
         Span::raw("  "),
         action_option(
             " Cancel ",
-            app.confirm_process_all_choice == ConfirmProcessAllChoice::Cancel,
+            choice_style(
+                app.confirm_process_all_choice == ConfirmProcessAllChoice::Cancel,
+                false,
+                true,
+            ),
         ),
     ])
     .centered();
@@ -2010,8 +4244,11 @@ fn render_resolve_conflicts_dialog(frame: &mut Frame, app: &mut App) {
     // appears unprompted, so an Enter already in flight must not acknowledge it. See
     // `App::conflict_countdown`.
     let button = match app.conflict_countdown() {
-        Some(seconds) => action_option(format!(" Understood ({seconds}) "), false),
-        None => action_option(" Understood ", true),
+        Some(seconds) => action_option(
+            format!(" Understood ({seconds}) "),
+            choice_style(false, false, true),
+        ),
+        None => action_option(" Understood ", choice_style(true, false, true)),
     };
     frame.render_widget(Paragraph::new(Line::from(button).centered()), chunks[1]);
 }
@@ -2404,7 +4641,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                 app.default_streams.contains(&popup.stream_index),
                 selected(field),
                 changed(field),
-                None,
             )),
             field => {
                 let checked = field
@@ -2415,7 +4651,6 @@ fn render_audio_settings_dialog(frame: &mut Frame, app: &App) {
                     checked,
                     selected(field),
                     changed(field),
-                    None,
                 ));
             }
         }
@@ -2669,14 +4904,12 @@ fn render_video_settings_dialog(frame: &mut Frame, app: &App) {
                 app.default_streams.contains(&popup.stream_index),
                 selected(field),
                 changed(field),
-                None,
             )),
             VideoSettingsField::Commentary => lines.push(subtitle_checkbox_line(
                 field.label(),
                 settings.metadata.commentary,
                 selected(field),
                 changed(field),
-                None,
             )),
         }
     }
@@ -2941,10 +5174,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
             )
             .selected(selected(SubtitleSettingsField::Title))
             .changed(changed(SubtitleSettingsField::Title))
-            .reason(
-                app.subtitle_field_reason(SubtitleSettingsField::Title)
-                    .as_deref(),
-            )
             .reject(app.text_input_reject(TextInputSite::SubtitleTitle)),
         ));
     }
@@ -2996,7 +5225,6 @@ fn render_subtitle_settings_dialog(frame: &mut Frame, app: &App) {
                     checked,
                     selected(field),
                     changed(field),
-                    app.subtitle_field_reason(field).as_deref(),
                 ));
             }
         }
@@ -3178,13 +5406,6 @@ fn subtitle_field_help_text(app: &App, popup: &SubtitleSettingsPopup) -> Text<'s
     if let Some(context) = context {
         paragraphs.push((context, Style::default().fg(Color::Gray)));
     }
-    if let Some(reason) = app.subtitle_field_reason(popup.field) {
-        paragraphs.push((
-            format!("Unavailable: {reason}"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
     help_paragraphs(paragraphs)
 }
 
@@ -3324,8 +5545,6 @@ struct TextField<'a> {
     chrome: FieldChrome,
     /// Trailing dim text, such as a match count.
     suffix: Option<String>,
-    /// Why the field is unavailable; also renders it disabled.
-    reason: Option<&'a str>,
     /// Why the last keystroke did not land, if it did not.
     reject: Option<InputReject>,
 }
@@ -3340,7 +5559,6 @@ impl<'a> TextField<'a> {
             changed: false,
             chrome: FieldChrome::Row,
             suffix: None,
-            reason: None,
             reject: None,
         }
     }
@@ -3365,11 +5583,6 @@ impl<'a> TextField<'a> {
         self
     }
 
-    fn reason(mut self, reason: Option<&'a str>) -> Self {
-        self.reason = reason;
-        self
-    }
-
     fn reject(mut self, reject: Option<InputReject>) -> Self {
         self.reject = reject;
         self
@@ -3383,6 +5596,7 @@ fn reject_message(reject: InputReject) -> String {
         InputReject::Character(CharClass::Digits) => "digits only".to_string(),
         InputReject::Character(CharClass::Word) => "no spaces".to_string(),
         InputReject::Character(CharClass::Text) => "unsupported character".to_string(),
+        InputReject::Character(CharClass::Timecode) => "digits, : and . only".to_string(),
         InputReject::Full(max_len) => format!("{max_len} character limit"),
     }
 }
@@ -3438,16 +5652,12 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
         changed,
         chrome,
         suffix,
-        reason,
         reject,
     } = field;
-    let enabled = reason.is_none();
     let editing = matches!(&value, FieldValue::Editing(input) if input.is_active);
     let reject = reject.filter(|_| editing);
 
-    let mut value_style = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else if changed {
+    let mut value_style = if changed {
         changed_style()
     } else {
         Style::default().fg(Color::White)
@@ -3496,7 +5706,7 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
     let label_style = Style::default().fg(if selected { Color::Cyan } else { Color::Gray });
     let mut frame_style = if reject.is_some() {
         Style::default().fg(Color::Red).bold()
-    } else if selected && enabled {
+    } else if selected {
         Style::default().fg(Color::Cyan).bold()
     } else {
         Style::default().fg(Color::DarkGray)
@@ -3549,12 +5759,6 @@ fn text_field_line(field: TextField<'_>) -> Line<'static> {
     if let Some(suffix) = suffix {
         spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
     }
-    if let Some(reason) = reason {
-        spans.push(Span::styled(
-            format!("  {reason}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
     if let Some(reject) = reject {
         spans.push(Span::styled(
             format!("  {}", reject_message(reject)),
@@ -3584,33 +5788,22 @@ fn subtitle_checkbox_line(
     checked: bool,
     selected: bool,
     changed: bool,
-    reason: Option<&str>,
 ) -> Line<'static> {
-    let enabled = reason.is_none() || checked;
-    let box_style = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else if selected {
+    let box_style = if selected {
         focused_style(changed)
     } else if changed {
         changed_style()
     } else {
         Style::default().fg(Color::White)
     };
-    let mut spans = vec![
+    Line::from(vec![
         field_label_span(
             "",
             label,
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(if checked { "[x]" } else { "[ ]" }, box_style),
-    ];
-    if let Some(reason) = reason {
-        spans.push(Span::styled(
-            format!("  {reason}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    ])
 }
 
 fn setting_line(
@@ -3635,6 +5828,220 @@ fn setting_line(
             Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
         ),
         Span::styled(format!("[ {value} ]"), value_style),
+    ])
+}
+
+/// How the subtitle edit page's scrub playback is done, for this session.
+///
+/// Five stepped values and nothing else — no dropdowns, no text entry, no help panel — so
+/// this is the plainest use of the shared [`SettingsDialog`] in the application. A value
+/// differing from what `config.toml` asked for is drawn as *changed*, which is what makes
+/// "did I leave the speed at half?" answerable at a glance.
+fn preview_field_help_title(field: PreviewSettingsField) -> String {
+    format!(" Information about {} ", field.label())
+}
+
+/// What each row of the preview-settings popup does, and what it costs.
+///
+/// Says the trade rather than the mechanism: what a setting is *for* is the thing a reader
+/// cannot work out from the row itself, while what it does to the ffmpeg command is
+/// something they never see. Kept short, because this is the shortest dialog in the
+/// application and the panel beside it is no taller — the entries that do run to a second
+/// paragraph earn it by naming a surprise, such as a slow speed lowering the frame rate.
+fn preview_field_help_text(field: PreviewSettingsField) -> Text<'static> {
+    let description = match field {
+        PreviewSettingsField::Speed => {
+            "How fast the preview runs, from a quarter of real time up to double. Sound is stretched with it and keeps its pitch, so speech at half speed is still speech.\n\nA slower preview holds more frames for the same stretch of media, so a long span at a low speed may be given a lower frame rate than the one set below."
+        }
+        PreviewSettingsField::Loop => {
+            "Whether the span starts again when it reaches its end, instead of stopping.\n\nPress p or Esc to stop a preview that is looping."
+        }
+        PreviewSettingsField::Sound => {
+            "The sound is what a subtitle's timing is judged against, so this is normally left on. Turn it off to scrub through a track quietly, or when the speech is not what you are checking."
+        }
+        PreviewSettingsField::Padding => {
+            "How much of the media either side of the cue the preview covers. Most useful to be kept short, for quick preview playbacks."
+        }
+        PreviewSettingsField::FrameRate => {
+            "How many frames a second the preview aims for. A ceiling, not a promise."
+        }
+        PreviewSettingsField::VideoTrack => {
+            "Which of the file's video streams the preview is drawn from. Cover art is left out — a still image would show the same frame for every cue.\n\nThe page is opened again on the chosen stream when this popup closes, so its frames are rendered afresh."
+        }
+        PreviewSettingsField::AudioTrack => {
+            "Which of the file's audio streams the preview plays, and which one automatic sync measures against. A commentary track is rarely the one a subtitle should be judged by.\n\nTakes effect on the next preview playback."
+        }
+        PreviewSettingsField::SubtitleTrack => {
+            "Which subtitle track this page is editing. Choosing another opens the page on it when this popup closes, so two tracks can be compared against the same picture.\n\nGreyed tracks cannot be previewed: they are marked for deletion, or they hold pictures rather than text. Cue edits that have not been written are asked about first."
+        }
+    };
+    help_paragraphs(vec![(
+        description.to_string(),
+        Style::default().fg(Color::White),
+    )])
+}
+
+fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
+    let Some(popup) = app.preview_settings_popup.as_ref() else {
+        return;
+    };
+    let settings = app.preview_settings();
+    let defaults = app.preview_defaults();
+    let expanded = popup.mode == PreviewSettingsMode::Dropdown;
+    let mut lines = Vec::new();
+    let mut focus_line = 0;
+
+    for (row, field) in PreviewSettingsField::ORDER.into_iter().enumerate() {
+        // A blank row where the tracks end and the playback settings begin: *what* is being
+        // previewed and *how* it plays are two questions, and run together the popup reads
+        // as one list of eight. Found from the order rather than pinned to a field, so
+        // rearranging either half cannot leave the gap in the wrong place.
+        if row > 0 && PreviewSettingsField::ORDER[row - 1].is_track() && !field.is_track() {
+            lines.push(Line::from(""));
+        }
+        let selected = field == popup.field;
+        let (value, changed) = match field {
+            PreviewSettingsField::Speed => (
+                settings.playback_speed.to_string(),
+                settings.playback_speed != defaults.playback_speed,
+            ),
+            PreviewSettingsField::Loop => (
+                String::new(),
+                settings.playback_loop != defaults.playback_loop,
+            ),
+            PreviewSettingsField::Sound => (
+                String::new(),
+                settings.playback_muted != defaults.playback_muted,
+            ),
+            PreviewSettingsField::Padding => (
+                format!("{:.2} s", settings.playback_pad.as_secs_f64()),
+                settings.playback_pad != defaults.playback_pad,
+            ),
+            // The rate this track will actually be decoded at, which on a source slower than
+            // the setting is the source's. The *changed* marker still compares the settings,
+            // so a row lowered by the media rather than by the user is not marked as one the
+            // user touched.
+            PreviewSettingsField::FrameRate => (
+                format!("{} fps", app.effective_playback_fps()),
+                settings.playback_fps != defaults.playback_fps,
+            ),
+            // A track row's value is the label of whatever it names, and *changed* means the
+            // reader has pointed it somewhere else in this visit — `config.toml` has nothing
+            // to say about tracks, so there is no default to compare against. The choice is
+            // pending until the popup closes, which is exactly what the marker says.
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => {
+                let choices = app.preview_choices(field);
+                let cursor = app.preview_choice_cursor(field);
+                (
+                    choices
+                        .get(cursor)
+                        .cloned()
+                        .unwrap_or_else(|| "None".to_string()),
+                    app.preview_track_pending(field),
+                )
+            }
+        };
+        if selected && !(expanded && !field.is_toggle()) {
+            focus_line = lines.len();
+        }
+        if field.is_toggle() {
+            // Phrased as sound rather than as muting, so `Yes` is the ordinary state on this
+            // row the way it is on the one above it.
+            let yes = match field {
+                PreviewSettingsField::Sound => !settings.playback_muted,
+                _ => settings.playback_loop,
+            };
+            lines.push(toggle_line(field.label(), yes, selected, changed));
+            continue;
+        }
+        let open = selected && expanded;
+        lines.push(setting_line(field.label(), &value, selected, changed, open));
+        if !open {
+            continue;
+        }
+        // The same tree-guide children the container, audio and subtitle dropdowns use, so a
+        // list opened here reads exactly like a list opened anywhere else.
+        let choices = app.preview_choices(field);
+        let in_force = app.preview_choice_cursor(field);
+        let last = choices.len().saturating_sub(1);
+        for (index, choice) in choices.iter().enumerate() {
+            if index == popup.cursor {
+                focus_line = lines.len();
+            }
+            lines.push(dropdown_line(
+                choice,
+                index == popup.cursor,
+                index == in_force,
+                app.preview_choice_enabled(field, index),
+                index == in_force && changed,
+                index == last,
+            ));
+        }
+    }
+
+    render_settings_dialog(
+        frame,
+        SettingsDialog {
+            text: padded_popup_text(Text::from(lines)),
+            title: " Preview settings ".to_string(),
+            focus_line,
+            help: popup.help_visible.then(|| {
+                (
+                    preview_field_help_text(popup.field),
+                    preview_field_help_title(popup.field),
+                )
+            }),
+            min_height: 10,
+        },
+    );
+}
+
+/// A two-state field, drawn as the same [`action_option`] buttons the confirm dialogs use,
+/// with the answer in force lit.
+///
+/// A dropdown would be the wrong shape here: both states fit on the row, so opening a list
+/// to choose between them hides the answer in order to ask the question. `Enter` flips it,
+/// and `h`/`l` pick the left button or the right one.
+///
+/// Both buttons go through [`choice_style`], which is where the lit one picks up the row's
+/// focused or changed styling and the other its dimming — so which answer is *true* reads at
+/// a glance, and which row the cursor is on reads exactly as it does on a dropdown row.
+fn toggle_line(label: &str, yes: bool, selected: bool, changed: bool) -> Line<'static> {
+    choice_pair_line(label, "Yes", "No", yes, selected, changed)
+}
+
+/// The general shape `toggle_line`'s Yes/No pair specialises, and the New Track popup's
+/// Placement row (`Embedded`/`External`) uses directly — a labelled row of two named
+/// buttons rather than the fixed words a plain switch reads as.
+fn choice_pair_line(
+    label: &str,
+    left: &str,
+    right: &str,
+    left_chosen: bool,
+    selected: bool,
+    changed: bool,
+) -> Line<'static> {
+    Line::from(vec![
+        field_label_span(
+            "▹",
+            label,
+            Style::default().fg(if selected { Color::Cyan } else { Color::Gray }),
+        ),
+        action_option(
+            format!(" {left} "),
+            choice_style(left_chosen && selected, left_chosen && changed, left_chosen),
+        ),
+        Span::raw(" "),
+        action_option(
+            format!(" {right} "),
+            choice_style(
+                !left_chosen && selected,
+                !left_chosen && changed,
+                !left_chosen,
+            ),
+        ),
     ])
 }
 
@@ -4547,6 +6954,19 @@ fn popup_area(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
+/// Share of the terminal the cue editor takes, in each direction.
+///
+/// Sized from the terminal rather than from the cue, because what is being judged is how the
+/// line will read on screen — a box that shrank to fit two short lines would say nothing
+/// about how much room they have.
+const CUE_EDITOR_WIDTH_PERCENT: u16 = 70;
+const CUE_EDITOR_HEIGHT_PERCENT: u16 = 50;
+
+/// A centred box taking a share of the area in each direction.
+fn centered_percent(area: Rect, width: u16, height: u16) -> Rect {
+    centered_fixed(area, area.width * width / 100, area.height * height / 100)
+}
+
 /// Share of the terminal every `i` panel takes, whichever track it describes. One width
 /// for all of them: a panel that resized itself to its content made the container, video
 /// and subtitle panels three different shapes.
@@ -4813,13 +7233,7 @@ fn format_sample_rate(hertz: f64) -> String {
 }
 
 fn format_frame_rate(rate: &str) -> Option<String> {
-    let (numerator, denominator) = rate.split_once('/')?;
-    let numerator: f64 = numerator.parse().ok()?;
-    let denominator: f64 = denominator.parse().ok()?;
-    if denominator == 0.0 {
-        return None;
-    }
-    let fps = numerator / denominator;
+    let fps = crate::probe::parse_frame_rate(rate)?;
     if (fps - fps.round()).abs() < 0.01 {
         Some(format!("{fps:.0}"))
     } else {
@@ -4995,6 +7409,80 @@ mod tests {
         assert_that!(&text).contains("running.mkv");
         assert_that!(&text).contains("done.mkv");
         assert_that!(&text).contains("stopped.mkv");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file that failed is the one row in the batch worth reading, so it says what went
+    /// wrong rather than showing a gauge — a bar at any percentage would be describing
+    /// progress on something that has stopped.
+    #[test]
+    fn a_failed_file_should_say_why_instead_of_drawing_a_gauge() {
+        // Arrange: one failure, and one running file with no label of its own so the
+        // fallback that names it after the file is drawn too.
+        let (mut app, directory) = test_app("batch-failure", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![
+                crate::staging::BatchItem {
+                    path: app.directory.join("broken.mkv"),
+                    label: Some("Saving".to_string()),
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Failed("muxer refused".to_string()),
+                    output_path: None,
+                },
+                crate::staging::BatchItem {
+                    path: app.directory.join("working.mkv"),
+                    label: None,
+                    fraction: None,
+                    status: crate::staging::BatchItemStatus::Running,
+                    output_path: None,
+                },
+            ],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert: the failure names itself and its reason, and draws no gauge under it —
+        // a bar for work that has stopped would report progress that cannot happen.
+        assert_that!(&text).contains("broken.mkv Failed: muxer refused");
+
+        // Assert: and a running file with no label of its own falls back to a word, so the
+        // row is never a bare filename with nothing said about it.
+        assert_that!(&text).contains("working.mkv Processing");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The single-file box has one label line, and a phase that has not reported yet
+    /// leaves it empty. A blank line in the middle of a modal box reads as the save having
+    /// stalled, so the file being worked on names itself until a real phase arrives.
+    #[test]
+    fn a_save_with_no_phase_yet_should_name_the_file_it_is_working_on() {
+        // Arrange: one item, no label — the state a save is in between dispatch and the
+        // first progress report.
+        let (mut app, directory) = test_app("progress-label", &["movie.mkv"]);
+        app.dialog = Some(Dialog::BatchProcessing);
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: vec![crate::staging::BatchItem {
+                path: app.directory.join("movie.mkv"),
+                label: None,
+                fraction: None,
+                status: crate::staging::BatchItemStatus::Running,
+                output_path: None,
+            }],
+            started: std::time::Instant::now(),
+        });
+
+        // Act
+        let text = drawn(100, 30, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&text).contains("Processing movie.mkv");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -5414,6 +7902,32 @@ mod tests {
         app.layer = Layer::Streams;
         match dialog {
             Dialog::Keybindings => {}
+            Dialog::EditCue => {
+                app.cue_editor = Some(crate::app::CueEditor {
+                    source: SubtitleSource::Embedded(2),
+                    target: CueTarget::Cue(crate::subtitle_edit::CueOrigin::File(0)),
+                    original: "Hello there".to_string(),
+                    lines: vec!["Hello there".to_string()],
+                    row: 0,
+                    column: 0,
+                });
+            }
+            Dialog::CueLength => {
+                let mut input = TextInputState::new("00:02.000".to_string());
+                input.activate();
+                app.cue_length = Some(crate::app::CueLengthDraft {
+                    source: SubtitleSource::Embedded(2),
+                    origin: crate::subtitle_edit::CueOrigin::File(0),
+                    input,
+                });
+            }
+            Dialog::ConfirmLeaveCues => {}
+            Dialog::CreateTrack => {
+                app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+            }
+            Dialog::PreviewSettings => {
+                app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup::default());
+            }
             Dialog::ContainerSettings => {
                 app.container_settings_popup = Some(ContainerSettingsPopup {
                     field: ContainerSettingsField::Title,
@@ -5533,6 +8047,9 @@ mod tests {
             Dialog::ConfirmReset => {
                 app.request_reset_current_file();
             }
+            Dialog::AutoSyncing => {
+                app.sync_started = Some(std::time::Instant::now());
+            }
             Dialog::ResolveConflicts => {
                 let path = app.directory.join("movie.mkv");
                 let fingerprint = crate::files::FileFingerprint {
@@ -5570,9 +8087,10 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 11] = [
+        const DIALOGS: [(Dialog, &str); 16] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
+            (Dialog::PreviewSettings, "Preview settings"),
             (Dialog::VideoSettings, "Video track #0 settings"),
             (Dialog::AudioSettings, "Audio track #1 settings"),
             (Dialog::SubtitleSettings, "Subtitle track #2"),
@@ -5585,6 +8103,10 @@ mod tests {
             (Dialog::BatchProcessing, "Remuxing movie.mkv"),
             (Dialog::ConfirmReset, "Reset this file's edits?"),
             (Dialog::ResolveConflicts, "Changed:   video tracks"),
+            (Dialog::EditCue, "Hello there"),
+            (Dialog::CueLength, "On screen for"),
+            (Dialog::ConfirmLeaveCues, "Cue edits are staged"),
+            (Dialog::AutoSyncing, "Syncing subtitles to audio"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -6620,6 +9142,57 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The side-by-side layout draws each column from whichever kind of row landed in it, so
+    /// a transfer puts an embedded stream in the *external* column and a sidecar in the
+    /// *embedded* one. Those two arms are the crossed-over pair, and they are exactly the
+    /// ones an untransferred file never reaches — so a layout that drew them wrongly, or not
+    /// at all, would look perfect on every file nobody has staged a transfer on.
+    #[test]
+    fn the_side_by_side_columns_should_draw_a_track_that_has_crossed_over() {
+        // Arrange: an embedded subtitle marked for export and a sidecar marked for import.
+        let (mut app, directory) = probed_app("overview-transfer-columns");
+        select_track(&mut app, TrackRef::Embedded(2));
+        assert!(app.transfer_subtitle(1), "export should be accepted");
+        select_track(&mut app, TrackRef::Sidecar(0));
+        assert!(app.transfer_subtitle(-1), "import should be accepted");
+
+        // Act: the side-by-side layout, with the cursor on the sidecar that crossed over so
+        // the selected-row arm is taken on that side too.
+        let (lines, selected) = overview(&app, true);
+        let joined = lines.join("\n");
+
+        // Assert: both counts held, since one track went each way.
+        assert_that!(joined.as_str()).contains("Embedded subtitles (2)");
+        assert_that!(joined.as_str()).contains("External subtitles (2)");
+
+        // Assert: the exported track is still drawn — it carries a `#index`, which a sidecar
+        // never does, so finding it at all is finding it in the external column.
+        assert!(
+            joined.contains("#2"),
+            "the exported track should still be drawn in the column it moved to:\n{joined}",
+        );
+
+        // Assert: and the cursor's own row reports a line, or the details pane would have
+        // nothing to scroll to for a track that has crossed over.
+        assert!(
+            selected.is_some(),
+            "a transferred track under the cursor should report its line:\n{joined}",
+        );
+
+        // Act / Assert: the same with the cursor on the exported embedded track, which is the
+        // other crossed-over arm's selected case.
+        let mut app = app;
+        select_track(&mut app, TrackRef::Embedded(2));
+        let (lines, selected) = overview(&app, true);
+        assert!(
+            selected.is_some(),
+            "the exported track should report its line too:\n{}",
+            lines.join("\n"),
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn overview_should_reach_the_same_tracks_stacked_as_side_by_side() {
         // Arrange
@@ -6850,6 +9423,253 @@ mod tests {
             .map(|(index, _)| index)
             .collect();
         assert_that!(scrolled_bars).is_equal_to(vec![last_row, last_row + 1]);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// The kind row is fixed rather than a dropdown — `Subtitles` is the only real kind, so
+    /// it is drawn lit and `Video`/`Audio` are drawn but disabled, never opening a list.
+    #[test]
+    fn the_new_track_dialog_should_show_video_and_audio_disabled() {
+        // Act
+        let line = create_track_kind_line(false);
+
+        // Assert
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_that!(text.contains("Subtitles")).is_true();
+        assert_that!(text.contains("Video")).is_true();
+        assert_that!(text.contains("Audio")).is_true();
+        let disabled = |label: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains(label))
+                .expect("label present")
+                .style
+                .fg
+                == Some(Color::DarkGray)
+        };
+        assert_that!(disabled("Video")).is_true();
+        assert_that!(disabled("Audio")).is_true();
+        assert_that!(disabled("Subtitles")).is_false();
+    }
+
+    /// The format row opens its own list, and the placement row beside it keeps showing its
+    /// answer while that happens — a reader choosing one should not lose sight of the other.
+    #[test]
+    fn the_new_track_dialog_should_list_the_formats_while_that_row_is_open() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-format-open", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Format,
+            open: true,
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("SubRip")).is_true();
+        assert_that!(screen.contains("Placement")).is_true();
+        assert_that!(screen.contains("Embedded")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A placement the reader moved off the default is drawn as *changed*, the rule the preview
+    /// settings popup follows — so "did I leave this as external?" is answerable at a glance,
+    /// with the yellow italic every staged-but-unwritten value in the application wears.
+    #[test]
+    fn the_new_track_dialog_should_mark_a_placement_moved_off_the_default() {
+        // Act: the row as the renderer builds it, for each answer.
+        let default = choice_pair_line("Placement", "Embedded", "External", true, false, false);
+        let moved = choice_pair_line("Placement", "Embedded", "External", false, false, true);
+
+        // Assert
+        let italic = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+        };
+        assert_that!(italic(&default)).is_false();
+        assert_that!(italic(&moved)).is_true();
+    }
+
+    /// The renderer is reached from `render_dialog`, which draws whatever `App::dialog` names —
+    /// so it has to be inert on its own when the popup is not there.
+    #[test]
+    fn the_new_track_dialog_should_draw_nothing_without_a_popup() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-no-popup", &[]);
+        app.create_track_popup = None;
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("New track")).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every row shows the moment the popup opens — kind, format, placement and the
+    /// Create/Back buttons — since there is no longer a step to answer before the rest
+    /// appears.
+    #[test]
+    fn the_new_track_dialog_should_show_every_field_at_once() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-single-screen", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("New track")).is_true();
+        assert_that!(screen.contains("Subtitles")).is_true();
+        assert_that!(screen.contains("Format")).is_true();
+        assert_that!(screen.contains("SubRip")).is_true();
+        assert_that!(screen.contains("Language")).is_true();
+        assert_that!(screen.contains("Placement")).is_true();
+        assert_that!(screen.contains("Embedded")).is_true();
+        assert_that!(screen.contains("Create")).is_true();
+        assert_that!(screen.contains("Back")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `Language` row shows the guessed language's full name, not its bare code — the
+    /// same label the subtitle settings dialog's own `Language` row wears.
+    #[test]
+    fn the_new_track_dialog_should_show_the_guessed_language_by_name() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-label", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("English (eng)")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An unchosen `Language` reads as a prompt rather than as a blank value — the same
+    /// wording the subtitle settings dialog's own `Language` row uses before it has an answer.
+    #[test]
+    fn the_new_track_dialog_should_prompt_for_a_language_before_one_is_chosen() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-unchosen", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup::default());
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("Choose a language…")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Create` is grayed out until a language is chosen — the same disabled look `Video` and
+    /// `Audio` wear on the kind row — while `Back` stays available throughout.
+    #[test]
+    fn the_new_track_dialog_should_gray_create_until_a_language_is_chosen() {
+        // Act
+        let unchosen =
+            create_track_action_line(crate::app::CreateTrackAction::Create, false, false);
+        let chosen = create_track_action_line(crate::app::CreateTrackAction::Create, false, true);
+
+        // Assert
+        let create_is_gray = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .take_while(|span| !span.content.contains('B'))
+                .any(|span| span.style.fg == Some(Color::DarkGray))
+        };
+        assert_that!(create_is_gray(&unchosen)).is_true();
+        assert_that!(create_is_gray(&chosen)).is_false();
+    }
+
+    /// Opening the `Language` row's list draws the search bar and the filtered choices, the
+    /// same windowed shape `SubtitleSettingsMode::LanguageDropdown` already draws.
+    #[test]
+    fn the_new_track_dialog_should_list_languages_with_a_search_bar_while_that_row_is_open() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-open", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Language,
+            open: true,
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert: the search field is drawn, and at least one real language beside the guess.
+        assert_that!(screen.contains("Search")).is_true();
+        assert_that!(screen.contains("English (eng)")).is_true();
+        assert_that!(screen.contains("match")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A query that matches nothing says so, rather than leaving a dropdown with no rows and
+    /// no explanation.
+    #[test]
+    fn the_new_track_dialog_should_say_when_no_language_matches_the_query() {
+        // Arrange
+        let (mut app, directory) = test_app("new-track-language-no-match", &[]);
+        let mut popup = crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Language,
+            open: true,
+            language: "eng".to_string(),
+            ..crate::app::CreateTrackPopup::default()
+        };
+        popup.language_search.input = TextInputState::new("zzzzz".to_string());
+        app.create_track_popup = Some(popup);
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert
+        assert_that!(screen.contains("No matching languages")).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An open row shows its choices with the cursor marked, the way every other settings
+    /// popup's dropdown does — that mark is the only thing saying which one `Enter` will take.
+    /// Format is the one row left that opens a list at all.
+    #[test]
+    fn the_new_track_dialog_should_mark_the_cursor_in_an_open_list() {
+        // Arrange: the format list open on its only entry.
+        let (mut app, directory) = test_app("new-track-open-list", &[]);
+        app.create_track_popup = Some(crate::app::CreateTrackPopup {
+            field: crate::app::CreateTrackField::Format,
+            open: true,
+            cursor: 0,
+            ..crate::app::CreateTrackPopup::default()
+        });
+
+        // Act
+        let screen = drawn(80, 20, |frame| render_create_track_dialog(frame, &app));
+
+        // Assert: the one answer is listed, marked under the cursor.
+        assert_that!(screen.contains("SubRip")).is_true();
+        let marked = screen
+            .lines()
+            .find(|line| line.contains("> "))
+            .expect("the cursor row should be marked");
+        assert_that!(marked.contains("SubRip")).is_true();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -7327,6 +10147,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -7464,6 +10285,86 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The popup's title is how the reader knows which subtitle they are editing, and the
+    /// two sources are named differently because only one of them has a number: an
+    /// embedded track is a stream in the file, while a sidecar is a file of its own and is
+    /// called by its name on disk.
+    #[test]
+    fn the_subtitle_popup_should_name_a_sidecar_by_its_file_and_a_track_by_its_number() {
+        // Arrange
+        let (mut app, directory) = test_app("subtitle-popup-title", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"}}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.container_target = Some(ContainerFormat::Matroska);
+        let sidecar_path = directory.join("movie.eng.srt");
+        app.sidecars.push(SidecarEntry {
+            path: sidecar_path.clone(),
+            companion: None,
+            display_name: "movie.eng.srt".to_string(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint {
+                length: 0,
+                modified: None,
+            },
+            companion_fingerprint: None,
+        });
+        let popup = |source, field, help_visible| SubtitleSettingsPopup {
+            source,
+            source_format: SubtitleFormat::SubRip,
+            field,
+            mode: SubtitleSettingsMode::Summary,
+            help_visible,
+            codec_cursor: 0,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
+        };
+
+        // Act: a sidecar-sourced popup.
+        app.subtitle_settings_popup = Some(popup(
+            SubtitleSource::Sidecar(sidecar_path),
+            SubtitleSettingsField::Language,
+            false,
+        ));
+        let sidecar = drawn(100, 30, |frame| {
+            render_subtitle_settings_dialog(frame, &app)
+        });
+
+        // Assert: the file names the dialog, rather than a stream number it does not have.
+        assert_that!(&sidecar).contains("movie.eng.srt");
+        assert!(
+            !sidecar.contains("Subtitle track #"),
+            "a sidecar is not a track in the file: {sidecar}"
+        );
+
+        // Act: the same popup over the embedded track.
+        app.subtitle_settings_popup = Some(popup(
+            SubtitleSource::Embedded(1),
+            SubtitleSettingsField::Language,
+            false,
+        ));
+        let embedded = drawn(100, 30, |frame| {
+            render_subtitle_settings_dialog(frame, &app)
+        });
+
+        // Assert: the stream number names this one.
+        assert_that!(&embedded).contains("Subtitle track #1");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn subtitle_field_help_should_change_with_the_field_and_explain_sidecar_effects() {
         let (mut app, directory) = test_app("subtitle-field-help", &[]);
@@ -7580,6 +10481,51 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(!content_local.contains("[Network Mode]"));
+    }
+
+    /// A notice takes the whole footer row, which is the point: it is what the application
+    /// has to say about the key just pressed, and the status furniture it displaces is
+    /// unchanging and will still be there a moment later.
+    #[test]
+    fn a_notice_should_take_the_footer_rather_than_share_it() {
+        // Arrange
+        let (probe_tx, _) = std::sync::mpsc::channel();
+        let (conflict_tx, _) = std::sync::mpsc::channel();
+        let (edit_tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(
+            std::env::temp_dir(),
+            probe_tx,
+            conflict_tx,
+            edit_tx.clone(),
+            edit_tx,
+        )
+        .unwrap();
+        app.is_network_mount = true;
+        app.notice = Some("Unmark this track for deletion first.".to_string());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+
+        // Act
+        terminal
+            .draw(|frame| render_footer(frame, &app, frame.area()))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        // Assert
+        assert!(
+            content.contains("Unmark this track for deletion first."),
+            "the notice should be on the row: {content}",
+        );
+        assert!(
+            !content.contains("[Network Mode]"),
+            "and it should have the row to itself: {content}",
+        );
     }
 
     #[test]
@@ -8457,6 +11403,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let change = SubtitleChange {
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8508,6 +11455,7 @@ mod tests {
             companion_fingerprint: None,
         };
         let imported = SubtitleChange {
+            cues: Default::default(),
             source: SubtitleSource::Sidecar(sidecar.path.clone()),
             source_format: SubtitleFormat::SubRip,
             embedded_target: Some(SubtitleFormat::Ass),
@@ -8526,6 +11474,7 @@ mod tests {
         )
         .unwrap();
         let exported = SubtitleChange {
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8645,6 +11594,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -8734,6 +11684,7 @@ mod tests {
 
             // Act: the embedded track, staying embedded.
             let change = SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -8758,6 +11709,7 @@ mod tests {
 
             // Act: the sidecar, being imported into the same container.
             let change = SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar.path.clone()),
                 import_into_media: true,
                 metadata: Some(metadata.clone()),
@@ -8815,6 +11767,7 @@ mod tests {
         )
         .unwrap();
         let change = SubtitleChange {
+            cues: Default::default(),
             source: SubtitleSource::Embedded(2),
             source_format: SubtitleFormat::SubRip,
             embedded_target: None,
@@ -9624,6 +12577,59 @@ mod tests {
             .is_equal_to("1920×1080 · 16:9 · 1080p");
     }
 
+    /// The `i` panel is where a user decides whether a file is worth keeping, and a codec
+    /// is most of that decision. A name FFmpeg happens to use (`hevc`, `mpeg2video`) is
+    /// not the name the format is known by, so each is translated; anything unrecognised
+    /// is upper-cased rather than dropped, so a codec added to FFmpeg later still names
+    /// itself here.
+    #[test]
+    fn video_codec_descriptions_should_name_the_format_rather_than_ffmpegs_word_for_it() {
+        // Arrange
+        let stream = |codec: &str| BTreeMap::from([("codec_name".to_string(), Value::from(codec))]);
+
+        // Act / Assert
+        for (codec, expected) in [
+            ("h264", "H.264 (AVC)"),
+            ("hevc", "HEVC (H.265)"),
+            ("av1", "AV1"),
+            ("vp9", "VP9"),
+            ("vp8", "VP8"),
+            ("mpeg4", "MPEG-4 Visual"),
+            ("mpeg2video", "MPEG-2 Video"),
+            ("prores", "Apple ProRes"),
+            ("mjpeg", "Motion JPEG"),
+            ("unknown", "Unknown"),
+            ("theora", "THEORA"),
+        ] {
+            assert_that!(video_format_description(&stream(codec)))
+                .is_equal_to(expected.to_string());
+        }
+        // A stream with no codec at all still describes itself.
+        assert_that!(video_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
+    }
+
+    /// Whether a file is HDR decides whether it is worth re-encoding, and the answer is
+    /// carried by the transfer characteristic rather than by anything named "HDR". A
+    /// transfer this code does not recognise says nothing at all, which is better than
+    /// guessing SDR for a file that is not.
+    #[test]
+    fn dynamic_range_should_be_read_off_the_transfer_characteristic() {
+        // Arrange
+        let stream = |transfer: &str| {
+            BTreeMap::from([("color_transfer".to_string(), Value::from(transfer))])
+        };
+
+        // Act / Assert
+        assert_that!(video_dynamic_range(&stream("smpte2084"))).is_equal_to(Some("HDR10".into()));
+        assert_that!(video_dynamic_range(&stream("arib-std-b67")))
+            .is_equal_to(Some("HLG HDR".into()));
+        for transfer in ["bt709", "gamma22", "gamma28", "smpte170m", "bt470bg"] {
+            assert_that!(video_dynamic_range(&stream(transfer))).is_equal_to(Some("SDR".into()));
+        }
+        assert_that!(video_dynamic_range(&stream("log316"))).is_equal_to(None);
+        assert_that!(video_dynamic_range(&BTreeMap::new())).is_equal_to(None);
+    }
+
     #[test]
     fn audio_codec_descriptions_should_cover_the_pcm_family_and_fall_back_in_caps() {
         // Arrange / Act / Assert: PCM arrives under many codec names (`pcm_s16le`,
@@ -9638,8 +12644,16 @@ mod tests {
         // An unrecognised codec is upper-cased rather than dropped.
         assert_that!(audio_format_description(&stream("nellymoser")))
             .is_equal_to("NELLYMOSER".to_string());
-        assert_that!(audio_format_description(&stream("flac")))
-            .is_equal_to("FLAC · Lossless".to_string());
+        for (codec, expected) in [
+            ("flac", "FLAC · Lossless"),
+            ("alac", "ALAC · Lossless"),
+            ("opus", "Opus"),
+            ("vorbis", "Vorbis"),
+            ("mp3", "MP3"),
+        ] {
+            assert_that!(audio_format_description(&stream(codec)))
+                .is_equal_to(expected.to_string());
+        }
         // A stream with no codec at all still describes itself.
         assert_that!(audio_format_description(&BTreeMap::new())).is_equal_to("Unknown".to_string());
     }
@@ -9748,6 +12762,7 @@ mod tests {
         app.subtitle_changes.insert(
             embedded_source.clone(),
             SubtitleChange {
+                cues: Default::default(),
                 source: embedded_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -9779,6 +12794,7 @@ mod tests {
         app.subtitle_changes.insert(
             sidecar_source.clone(),
             SubtitleChange {
+                cues: Default::default(),
                 source: sidecar_source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -10210,13 +13226,17 @@ mod tests {
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted container, video, audio, or subtitle field",
+            "Explain the highlighted container, video, audio, subtitle, or preview field",
             "i",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
             "Home/End",
             "Backspace/Delete",
             "languages",
+            // The cue resize keys. This popup is the only place a key is documented, so a
+            // binding missing from here is a binding nobody can find.
+            "Ctrl-h / Ctrl-l",
+            "mm:ss.mmm",
         ];
 
         // Act
@@ -10239,7 +13259,13 @@ mod tests {
 
         assert_that!(&content).contains("Move track down / up");
         assert_that!(&content).does_not_contain("Open or close keybindings");
-        assert_eq!(count, 2);
+        // "Move track down / up", "Mark or unmark track for deletion", "Add a new subtitle
+        // track", the four that match on "tracks" — the SRT timing preview, the cue editor,
+        // the timing mode, and marking a cue for deletion — global retiming, which names
+        // both a track that is out of sync and the SubRip tracks it works on, automatic
+        // sync, which names both this track and the SubRip tracks it works on too, and the
+        // preview settings, which now name the three tracks the page can be pointed at.
+        assert_eq!(count, 10);
     }
 
     #[test]
@@ -10384,7 +13410,7 @@ mod tests {
             "Original",
             "Commentary",
         ] {
-            let line = subtitle_checkbox_line(label, false, false, false, None);
+            let line = subtitle_checkbox_line(label, false, false, false);
 
             assert_eq!(
                 line.to_string().chars().position(|glyph| glyph == '['),
@@ -10402,7 +13428,7 @@ mod tests {
         let rows = [
             setting_line("Codec", "SubRip / SRT", false, false, false),
             setting_line("Hearing impaired", "value", false, false, true),
-            subtitle_checkbox_line("Hearing impaired", true, false, false, None),
+            subtitle_checkbox_line("Hearing impaired", true, false, false),
             text_field_line(TextField::new(
                 "Title",
                 FieldValue::Editing(&input),
@@ -10655,7 +13681,7 @@ mod tests {
                 )
                 .suffix(match_suffix(999)),
             ),
-            subtitle_checkbox_line("Hearing impaired", false, false, false, None),
+            subtitle_checkbox_line("Hearing impaired", false, false, false),
         ];
 
         // Assert: nothing wraps, which would desynchronise the popup's line-based
@@ -10859,6 +13885,92 @@ mod tests {
                 render_subtitle_settings_dialog(frame, &app)
             });
         }
+        app.subtitle_settings_popup = None;
+
+        // Act / Assert: every preview field. This popup is five rows where the others are
+        // eight or more, so its panel is the shortest in the application and the one a long
+        // explanation overruns first.
+        for field in PreviewSettingsField::ORDER {
+            app.preview_settings_popup = Some(crate::app::PreviewSettingsPopup {
+                field,
+                mode: crate::app::PreviewSettingsMode::Summary,
+                help_visible: true,
+                cursor: 0,
+                video: None,
+                audio: None,
+                subtitle: None,
+            });
+            let help = preview_field_help_text(field);
+            fits(format!("{field:?}"), &help, &|frame| {
+                render_preview_settings_dialog(frame, &app)
+            });
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The video popup has three lists and they are not the same shape: Resolution and
+    /// Rotation are plain dropdowns, while Language carries a search field of its own and
+    /// draws a ten-row window around its cursor rather than every language there is. A
+    /// list that drew nothing under its own row would leave the reader pressing `j`
+    /// against a summary that never changes.
+    #[test]
+    fn each_of_the_video_popups_lists_should_draw_under_the_row_it_belongs_to() {
+        // Arrange
+        let (mut app, directory) = test_app("video-lists", &[]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "streams": [{
+                    "index": 0, "codec_type": "video", "codec_name": "h264",
+                    "width": 1920, "height": 1080
+                }]
+            }))
+            .unwrap(),
+        ));
+        let popup = |field, mode| crate::app::VideoSettingsPopup {
+            stream_index: 0,
+            field,
+            mode,
+            codec_cursor: 0,
+            resolution_cursor: 1,
+            rotation_cursor: 0,
+            custom_resolution: None,
+            help_visible: false,
+            language_cursor: 0,
+            language_search: SearchState::default(),
+            title_input: TextInputState::default(),
+        };
+
+        // Act: the resolution list, expanded.
+        app.video_settings_popup = Some(popup(
+            VideoSettingsField::Resolution,
+            VideoSettingsMode::Dropdown,
+        ));
+        let resolutions = drawn(80, 24, |frame| render_video_settings_dialog(frame, &app));
+
+        // Assert: the choices are drawn, including the one the cursor is on.
+        assert_that!(&resolutions).contains("Resolution");
+        assert_that!(&resolutions).contains("1280×720 / 16:9");
+        assert_that!(&resolutions).contains("Custom");
+
+        // Act: the language list, which is a search field plus a ten-row window around the
+        // cursor. The cursor is put well down the list so the window really is a window.
+        let mut language_popup = popup(
+            VideoSettingsField::Language,
+            VideoSettingsMode::LanguageDropdown,
+        );
+        language_popup.language_cursor = 20;
+        app.video_settings_popup = Some(language_popup);
+        let languages = drawn(80, 24, |frame| render_video_settings_dialog(frame, &app));
+
+        // Assert: the field the query is typed into is on screen with its count, and the
+        // list is the stretch around the cursor rather than the head of the alphabet.
+        assert_that!(&languages).contains("Search");
+        assert_that!(&languages).contains("(185 matches)");
+        assert!(
+            !languages.contains("Abkhazian"),
+            "the window should have scrolled past the first language: {languages}"
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -11273,10 +14385,4072 @@ mod tests {
     #[test]
     fn action_option_should_keep_an_unfocused_action_available() {
         // Act
-        let action = action_option(" Keep processing ", false);
+        let action = action_option(" Keep processing ", choice_style(false, false, true));
 
         // Assert
         assert_eq!(action.style.fg, Some(Color::White));
         assert_eq!(action.style.bg, None);
+    }
+
+    #[test]
+    fn keybindings_text_should_list_the_subtitle_timing_key() {
+        // Act
+        let text = keybindings_text();
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Assert
+        assert_that!(rendered.contains("Edit a subtitle track")).is_true();
+    }
+
+    /// The subtitle edit page is the only view that owns the whole frame. If it merely drew on
+    /// top, the file list and details pane would still be underneath it.
+    #[test]
+    fn render_should_replace_the_whole_frame_with_the_subtitle_edit_page() {
+        // Arrange
+        let (mut app, directory) = test_app("edit-page", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: std::time::Duration::from_millis(62_300),
+                end: std::time::Duration::from_millis(64_000),
+                text: "Hello there".to_string(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            crate::preview::CueStyle::SubRip,
+        );
+
+        // Act
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert: all three panes are there, along with the cue, and the file panel the
+        // page replaced is not.
+        assert_that!(screen.contains("Preview")).is_true();
+        assert_that!(screen.contains("Cues")).is_true();
+        assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains("Hello there")).is_true();
+        assert_that!(screen.contains("00:01:02.3")).is_true();
+        assert_that!(screen.contains("movie.mkv")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_edit_page_should_report_progress_and_emptiness_without_pretending_to_have_cues() {
+        // Arrange
+        let (mut app, directory) = test_app("edit-states", &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
+        app.open_subtitle_edit();
+
+        // Act / Assert: still reading.
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("Reading cues")).is_true();
+
+        // Act / Assert: read, but the track holds nothing. The page is drawn in full — this
+        // is a track the reader can put a line into, and the timeline is what they aim `i`
+        // with — so the emptiness is said in the one pane that has something to say about it
+        // rather than over the whole page. The message wraps in the narrow panel, hence the
+        // two halves.
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new(), crate::preview::CueStyle::SubRip);
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("This subtitle track has no")).is_true();
+        assert_that!(screen.contains("cues.")).is_true();
+        assert_that!(screen.contains(" Cues ")).is_true();
+        assert_that!(screen.contains(" Preview ")).is_true();
+        // A working timeline: its title reads the cursor's moment, and the ruler carries the
+        // cursor's own mark. Without these the reader would be scrubbing a bare border.
+        assert_that!(screen.contains("Timeline (00:00:00.00)")).is_true();
+        assert_that!(screen.contains('▼')).is_true();
+
+        // Act / Assert: it went wrong, and says so.
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .fail("ffprobe said no".to_string());
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("ffprobe said no")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A folded row says so, and a row that stands on its own says nothing.
+    ///
+    /// Without the count the fold is invisible: a row standing for four events is drawn
+    /// exactly like one standing for one, so the list simply has fewer rows than the file has
+    /// entries with nothing on screen to explain it. `×1` on every ordinary row would be the
+    /// opposite mistake — noise on every track with no effects in it at all.
+    #[test]
+    fn a_row_standing_for_several_entries_should_say_how_many() {
+        // Arrange: one ordinary cue and one folded from four events.
+        let mut folded = edit_cue(2000, 3000, "wo");
+        folded.events = 4;
+        let (mut app, directory) =
+            edit_page_app("edit-count", vec![edit_cue(0, 1000, "fu"), folded]);
+
+        // Act
+        let screen = drawn(80, 20, |frame| render(frame, &mut app));
+
+        // Assert: the count is on the folded row and nowhere else.
+        assert_that!(screen.contains("×4")).is_true();
+        assert_that!(screen.contains("×1")).is_false();
+
+        // Act / Assert: and it survives the row being selected, which repaints the whole
+        // block in the fill's own colours.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        let selected = drawn(80, 20, |frame| render(frame, &mut app));
+        assert_that!(selected.contains("×4")).is_true();
+
+        // Act / Assert: at the narrowest the cue panel is ever drawn — thirty columns, on
+        // the smallest terminal the page will open on — both still fit.
+        let narrow = drawn(50, 20, |frame| render(frame, &mut app));
+        assert_that!(narrow.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(narrow.contains("×4")).is_true();
+
+        // Act / Assert: and a count too wide to sit beside the timing gives way rather than
+        // painting over the end time. Ratatui does not arbitrate between overlapping titles,
+        // so without this the row would read a plausible, wrong timestamp.
+        app.subtitle_edit.as_mut().unwrap().cues[1].events = 100_000;
+        let crowded = drawn(50, 20, |frame| render(frame, &mut app));
+        assert_that!(crowded.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(crowded.contains("×100000")).is_false();
+        // Room again once the panel is wide enough for both.
+        let roomy = drawn(120, 20, |frame| render(frame, &mut app));
+        assert_that!(roomy.contains("00:00:02.0 → 00:00:03.0")).is_true();
+        assert_that!(roomy.contains("×100000")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn edit_cue(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+        crate::cue::Cue {
+            index: 0,
+            start: std::time::Duration::from_millis(start),
+            end: std::time::Duration::from_millis(end),
+            text: text.to_string(),
+            dialogue: Vec::new(),
+            events: 1,
+        }
+    }
+
+    /// An app sitting on the subtitle edit page with `cues` loaded, ready to render.
+    fn edit_page_app(tag: &str, cues: Vec<crate::cue::Cue>) -> (App, std::path::PathBuf) {
+        let (mut app, directory) = test_app(tag, &["movie.mkv"]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.loading = false;
+        app.stream_order = vec![0, 1];
+        app.layer = Layer::Streams;
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| matches!(row, TrackRef::Embedded(1)))
+            .unwrap();
+        // Both gates `open_subtitle_edit` reads to decide `PreviewSupport`. Without them
+        // the page opens knowing it can never draw a frame and fills its pane with the
+        // reason, which is a different view from the one these tests are about.
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities {
+            ffmpeg_filters: std::collections::BTreeSet::from([
+                "subtitles".to_string(),
+                "scale".to_string(),
+            ]),
+            ..crate::subtitle::ToolCapabilities::default()
+        };
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(cues, crate::preview::CueStyle::SubRip);
+        (app, directory)
+    }
+
+    /// Just the cue panel, which is the rightmost `cue_width` columns of the page. Sliced
+    /// by characters rather than bytes: the panel is drawn almost entirely in box-drawing
+    /// glyphs, none of which is one byte wide.
+    fn cue_panel(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let panel = usize::from((width * 35 / 100).clamp(CUE_PANEL_WIDTH, 48));
+        draw(app, width, height)
+            .iter()
+            .map(|line| {
+                let columns: Vec<char> = line.chars().collect();
+                columns[columns.len() - panel..].iter().collect()
+            })
+            .collect()
+    }
+
+    /// Which terminal column `needle` starts at on a drawn row, or `None` when it is not on
+    /// it.
+    ///
+    /// `str::find` answers in *bytes*, and this page is drawn almost entirely in box-drawing
+    /// glyphs that are three bytes each — so a byte offset taken from one of these rows lands
+    /// tens of columns to the right of the text it found, on padding the style under test was
+    /// never applied to. That reads as the styling being absent rather than as the test
+    /// looking in the wrong place.
+    fn column_of(line: &str, needle: &str) -> Option<u16> {
+        line.find(needle)
+            .map(|byte| line[..byte].chars().count() as u16)
+    }
+
+    /// The crossbar of the first group's fork, with the cue panel's own border trimmed off
+    /// either end — so the first and last characters here are the edges the bar either runs
+    /// off or stops short of.
+    fn fork_bar(app: &mut App) -> Vec<char> {
+        let row: Vec<char> = cue_panel(app, 120, 30)[1].chars().collect();
+        row[1..row.len() - 1].to_vec()
+    }
+
+    /// The panel used to draw two cues that share the screen exactly as it drew two that
+    /// follow one another, so it said nothing at all about the one relationship a subtitle
+    /// subtitle edit page exists to show. A fork into two blocks side by side is the answer, and
+    /// the block that starts later sits a row lower.
+    #[test]
+    fn overlapping_cues_should_be_drawn_as_a_fork_into_two_blocks_side_by_side() {
+        // Arrange: a lone cue, then two that overlap, then a lone cue.
+        let (mut app, directory) = edit_page_app(
+            "edit-fork",
+            vec![
+                edit_cue(1000, 3000, "Before this"),
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(6000, 8000, "[sign: BAKERY]"),
+                edit_cue(12000, 14000, "After that"),
+            ],
+        );
+
+        // Act
+        let panel = cue_panel(&mut app, 120, 30);
+
+        // Assert: the lone cues keep the full timing and the plain `↓`; the pair gets the
+        // fork, the compact timing, and the second block one row down and one block over.
+        assert_that!(panel[1].as_str()).contains("┌ 00:00:01.0 → 00:00:03.0");
+        assert_that!(panel[4].as_str()).contains("↓");
+        assert_that!(panel[5].as_str()).contains("┴");
+        assert_that!(panel[6].matches('↓').count()).is_equal_to(2);
+        assert_that!(panel[7].as_str()).contains("┌ 0:05.0→0:07.0");
+        assert_that!(panel[8].as_str()).contains("│ Hello there");
+        // The later cue's block starts on the row below, and to the right of the first.
+        assert_that!(panel[8].as_str()).contains("┌ 0:06.0→0:08.0");
+        assert_that!(panel[9].as_str()).contains("│ [sign: BAKERY]");
+        assert_that!(panel[7].find("0:05.0").unwrap() < panel[8].find("0:06.0").unwrap()).is_true();
+        assert_that!(panel[12].as_str()).contains("┌ 00:00:12.0 → 00:00:14.0");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The step down is always to the right, because cues arrive start-ordered — so the
+    /// arrangement actually carrying information is the one where the step is *not* taken.
+    /// Two cues that begin at the same instant are drawn level, and that is the panel
+    /// saying "these appear together" rather than "this one comes in after".
+    #[test]
+    fn cues_that_begin_together_should_be_drawn_level_rather_than_stepped() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-level",
+            vec![
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(5000, 8000, "[sign: BAKERY]"),
+            ],
+        );
+
+        // Act
+        let panel = cue_panel(&mut app, 120, 30);
+
+        // Assert: both top borders on one row, and both texts on the next.
+        assert_that!(panel[3].as_str()).contains("┌ 0:05.0→0:07.0");
+        assert_that!(panel[3].as_str()).contains("┌ 0:05.0→0:08.0");
+        assert_that!(panel[4].as_str()).contains("│ Hello there");
+        assert_that!(panel[4].as_str()).contains("│ [sign: BAKERY]");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Only two members fit side by side, so a group of more has to say that it reaches
+    /// past what is drawn — otherwise the third cue is simply missing from the list with
+    /// nothing on screen to explain it, which is the defect the `×N` fold count exists to
+    /// prevent one level down. It says it by the crossbar running off the panel on that
+    /// side, which reads as a line continuing rather than as a marker to be decoded.
+    #[test]
+    fn a_group_reaching_past_its_two_visible_cues_should_run_its_bar_off_that_side() {
+        // Arrange: three cues sharing a moment.
+        let (mut app, directory) = edit_page_app(
+            "edit-more",
+            vec![
+                edit_cue(5000, 9000, "first"),
+                edit_cue(6000, 9000, "second"),
+                edit_cue(7000, 9000, "third"),
+            ],
+        );
+
+        // Act: the crossbar of the group's fork, inside the panel's own border.
+        let bar = fork_bar(&mut app);
+
+        // Assert: at the group's head, the bar runs off the way `l` would go and stops
+        // short on the other side.
+        assert_that!(bar.first().copied()).is_equal_to(Some(' '));
+        assert_that!(bar.last().copied()).is_equal_to(Some('─'));
+        assert_that!(bar.contains(&'┬')).is_true();
+        assert_that!(draw(&mut app, 120, 30).join("\n").contains("│ third")).is_false();
+
+        // Act / Assert: two presses turn the page, and the bar turns round with it.
+        app.move_cue_within_group(1);
+        app.move_cue_within_group(1);
+        let bar = fork_bar(&mut app);
+        assert_that!(bar.first().copied()).is_equal_to(Some('─'));
+        assert_that!(bar.last().copied()).is_equal_to(Some(' '));
+        let screen = draw(&mut app, 120, 30).join("\n");
+        assert_that!(screen.contains("│ third")).is_true();
+        assert_that!(screen.contains("│ first")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A group of four is two pages of two: `l` from a page's left member moves the
+    /// highlight across the page it is on, and only the press after that turns to the next
+    /// pair. A window that slid one cue per press moved both blocks every time, so no two
+    /// cues ever stayed still long enough to be compared — which is what the side-by-side
+    /// row is for.
+    #[test]
+    fn moving_sideways_should_cross_the_page_before_turning_it() {
+        // Arrange: four cues sharing a moment.
+        let (mut app, directory) = edit_page_app(
+            "edit-pages",
+            vec![
+                edit_cue(5000, 9000, "first"),
+                edit_cue(6000, 9000, "second"),
+                edit_cue(7000, 9000, "third"),
+                edit_cue(8000, 9000, "fourth"),
+            ],
+        );
+        let group = app.subtitle_edit.as_ref().unwrap().groups[0];
+
+        // Act / Assert: the first press stays on the page it is on.
+        app.move_cue_within_group(1);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.group_window(group)).is_equal_to((0, 2));
+
+        // Act / Assert: the second turns the page, landing on its left member.
+        app.move_cue_within_group(1);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(2);
+        assert_that!(state.group_window(group)).is_equal_to((2, 2));
+
+        // Act / Assert: and back the same way.
+        app.move_cue_within_group(-1);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.selected).is_equal_to(1);
+        assert_that!(state.group_window(group)).is_equal_to((0, 2));
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `00:00:05.0 → 00:00:07.0` is twenty-three characters and half a cue panel is at most
+    /// twenty-three columns, so a grouped block can never carry the full timing. The
+    /// compact span replaces it, and where even that will not fit — a narrow panel, or
+    /// media past the hour — the start alone does. Decided once for the track, so the
+    /// column never changes shape halfway down.
+    #[test]
+    fn a_grouped_block_should_fall_back_to_the_start_alone_when_a_span_will_not_fit() {
+        // Arrange: two overlapping cues an hour into the media, so the compact span needs
+        // its hours field and becomes too wide for half a panel.
+        let (mut app, directory) = edit_page_app(
+            "edit-hours",
+            vec![
+                edit_cue(3_605_000, 3_607_000, "Hello there"),
+                edit_cue(3_606_000, 3_608_000, "[sign: BAKERY]"),
+            ],
+        );
+
+        // Act / Assert: measured on the panel alone, since the timeline's title carries a
+        // span arrow of its own.
+        let panel = cue_panel(&mut app, 120, 30).join("\n");
+        assert_that!(panel.contains("┌ 1:00:05.0 ")).is_true();
+        assert_that!(panel.contains("┌ 1:00:06.0 ")).is_true();
+        assert_that!(panel.contains('→')).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The track's height is the one part of the layout that is data-driven, so an
+    /// overlapping region has to cost the preview pane exactly the rows it gains.
+    #[test]
+    fn the_timeline_should_grow_a_row_per_lane_and_take_them_from_the_preview() {
+        // Arrange: one track whose cues never overlap, one where three do.
+        let (mut flat, flat_dir) = edit_page_app(
+            "edit-lanes-flat",
+            vec![edit_cue(0, 1000, "a"), edit_cue(2000, 3000, "b")],
+        );
+        let (mut stacked, stacked_dir) = edit_page_app(
+            "edit-lanes-stacked",
+            vec![
+                edit_cue(0, 5000, "a"),
+                edit_cue(1000, 6000, "b"),
+                edit_cue(2000, 7000, "c"),
+            ],
+        );
+
+        // Act
+        let flat_screen = drawn(80, 24, |frame| render(frame, &mut flat));
+        let stacked_screen = drawn(80, 24, |frame| render(frame, &mut stacked));
+
+        // Assert: one lane against three, so the preview pane loses two rows.
+        assert_that!(flat.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(1);
+        assert_that!(stacked.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(3);
+        let flat_preview = flat.subtitle_edit.as_ref().unwrap().preview_cells.height;
+        let stacked_preview = stacked.subtitle_edit.as_ref().unwrap().preview_cells.height;
+        assert_that!(flat_preview - stacked_preview).is_equal_to(2);
+        assert_that!(flat_screen.contains("Timeline")).is_true();
+        assert_that!(stacked_screen.contains("Timeline")).is_true();
+
+        // Cleanup
+        drop(flat);
+        drop(stacked);
+        std::fs::remove_dir_all(flat_dir).unwrap();
+        std::fs::remove_dir_all(stacked_dir).unwrap();
+    }
+
+    /// A protocol for a two-colour image occupying exactly `width` x `height` cells, so
+    /// the drawn cells can be told apart from an empty pane and from a solid fill.
+    ///
+    /// The image is sized in pixels from the halfblocks font size, because `Resize::Fit`
+    /// derives the cell size from the image's own proportions — asking for a cell size
+    /// with an image of some other shape silently produces a smaller protocol than asked
+    /// for, which is exactly how an "oversized" fixture ends up fitting after all.
+    /// The distinct image colours a drawn screen carries.
+    ///
+    /// Halfblocks paints a plain space wherever a cell's two halves came out the same
+    /// colour, so the colour is what says a picture was drawn, rather than the `▀` glyph.
+    fn image_shades(
+        painted: &[(String, ratatui::style::Style)],
+    ) -> std::collections::BTreeSet<(u8, u8, u8)> {
+        painted
+            .iter()
+            .filter_map(|(_, style)| match style.bg {
+                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn striped_protocol(width: u16, height: u16) -> Box<ratatui_image::protocol::Protocol> {
+        let font = ratatui_image::picker::Picker::halfblocks().font_size();
+        let mut image = image::RgbImage::new(
+            u32::from(width) * u32::from(font.width),
+            u32::from(height) * u32::from(font.height),
+        );
+        // Bands several cells wide rather than alternating pixels. `Picker::halfblocks`
+        // fits the image down to one pixel per cell across, so a stripe one pixel wide does
+        // not survive the round trip and the fixture comes back a single averaged shade.
+        let band = u32::from(font.width) * 4;
+        for (x, _y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = if (x / band) % 2 == 0 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let protocol = ratatui_image::picker::Picker::halfblocks()
+            .new_protocol(
+                image::DynamicImage::ImageRgb8(image),
+                ratatui::layout::Size::new(width, height),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks should encode any image");
+        assert_eq!(
+            protocol.size(),
+            ratatui::layout::Size::new(width, height),
+            "the fixture must occupy the cells it claims to"
+        );
+        Box::new(protocol)
+    }
+
+    /// Cells and their colours from a rendered frame, which is as much of an image as
+    /// `TestBackend` can be asked about: it stores symbol and style per cell and never
+    /// exposes the escape sequences a kitty or sixel protocol would write instead.
+    fn drawn_cells(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut Frame),
+    ) -> Vec<(String, ratatui::style::Style)> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.style()))
+            .collect()
+    }
+
+    /// The point of the whole feature: the frame the worker drew is what the pane shows.
+    ///
+    /// Asserted through the halfblocks protocol, the one `TestBackend` can see — it draws
+    /// ordinary `▀` cells with foreground and background colours, where kitty, sixel and
+    /// iTerm2 write escape sequences the buffer never stores.
+    #[test]
+    fn the_preview_pane_should_draw_the_frame_the_worker_rendered() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-frame", vec![edit_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+
+        // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: cells carrying real image colour, in more than one shade — a blank
+        // pane has none, and a solid fill would have exactly one.
+        let shades = image_shades(&painted);
+        assert_that!(shades.is_empty()).is_false();
+        assert_that!(shades.len() > 1).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A dialog and the picture cannot share the pane, so the picture stands down for as
+    /// long as one is up.
+    ///
+    /// The frame is not drawn into the cell buffer — the image widget puts an escape
+    /// sequence in the pane's first cell and marks the rest *skipped*, and a skipped cell is
+    /// never re-emitted. So a dialog that shrinks while it is open — a dropdown closing, the
+    /// help panel going away — gives back cells that nothing will ever paint over, and its
+    /// old border stays on screen: the popup drawn twice, at two sizes, one inside the
+    /// other.
+    ///
+    /// Asserted on the halfblocks protocol, which is the one a `TestBackend` can see. The
+    /// skipping is what makes the artifact invisible to a real terminal's buffer, so what
+    /// this test can check is the rule that prevents it: while a dialog is up, the pane
+    /// contributes no image cells at all, and when the dialog goes the picture comes back.
+    #[test]
+    fn a_dialog_over_the_preview_should_take_the_picture_down_rather_than_sit_on_it() {
+        // Arrange: a page with a frame on screen.
+        let (mut app, directory) =
+            edit_page_app("edit-frame-dialog", vec![edit_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: the popup takes the picture down with it, so everything it draws
+        // over is an ordinary cell the diff can redraw when the popup changes shape.
+        app.open_preview_settings();
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+        assert_that!(image_shades(&painted).is_empty()).is_true();
+
+        // Act / Assert: including once a dropdown has grown it — the shape that produced
+        // the doubled border.
+        app.activate_preview_setting();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_true();
+
+        // Act / Assert: and the picture is back the moment the dialog is gone. It is not
+        // discarded, only left undrawn.
+        app.dialog = None;
+        app.preview_settings_popup = None;
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The pane draws the selected cue's still only while the cursor is on that cue's moment.
+    ///
+    /// Arriving in the timeline must not blank the pane — the cursor is seeded on the moment
+    /// the still already shows — but a press away from it makes that picture a picture of
+    /// somewhere else, and the pane's own title names where the cursor now is. Drawing
+    /// nothing is a page a little behind; drawing the cue's frame is a page contradicting
+    /// itself, which is what `p` from the timeline used to do for the second or two its span
+    /// took to decode.
+    #[test]
+    fn the_pane_should_stop_drawing_a_cues_still_once_the_cursor_leaves_its_moment() {
+        // Arrange: a page with the selected cue's frame on screen.
+        let (mut app, directory) = edit_page_app(
+            "edit-frame-cursor",
+            vec![edit_cue(0, 1000, "spoken"), edit_cue(4000, 5000, "later")],
+        );
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width, cells.height));
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: the timeline takes the cursor and the picture stays — the cursor is
+        // standing on the very moment that still was grabbed at.
+        app.focus_timeline();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Act / Assert: one press away from it and the pane goes quiet, rather than showing
+        // the cue's moment under a title naming another.
+        app.move_timeline_cursor(1, crate::subtitle_edit::TIMELINE_STEP);
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_true();
+
+        // Act / Assert: and the cue panel taking the cursor back brings it out again.
+        app.focus_cues();
+        assert_that!(
+            image_shades(&drawn_cells(80, 24, |frame| render(frame, &mut app))).is_empty()
+        )
+        .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame encoded for a pane that has since shrunk is left out rather than handed to
+    /// `Image`, which renders nothing at all — not even clipped — when the protocol is
+    /// bigger than the area, and would leave the pane's own border painted over.
+    #[test]
+    fn a_frame_too_big_for_the_pane_should_be_left_out_rather_than_drawn() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-frame-big", vec![edit_cue(0, 1000, "spoken")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, striped_protocol(cells.width + 10, cells.height + 10));
+
+        // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: no image colour anywhere — an oversized protocol contributes nothing,
+        // and the pane is left empty rather than half-painted.
+        let shades = image_shades(&painted);
+        assert_that!(shades.is_empty()).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A build that can never draw a frame has to say so, or the pane is an unexplained
+    /// empty box for the whole session.
+    ///
+    /// Drawn *in* the pane, unlike a per-cue failure, because it cannot change while the
+    /// page is open — so it reads as an explanation rather than as the flicker the pane
+    /// had its text fallback removed to stop.
+    #[test]
+    fn a_build_that_cannot_draw_frames_should_say_so_in_the_pane() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-unsupported", vec![edit_cue(0, 1000, "spoken")]);
+        app.subtitle_edit.as_mut().unwrap().support =
+            crate::subtitle_edit::PreviewSupport::NoSubtitleBurn;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&screen).contains("Preview is not possible");
+        assert_that!(&screen).contains("libass");
+        // And still not the cue's text standing in for a picture — the pane says why
+        // there will never be one, which is a different thing.
+        assert_that!(screen.matches("spoken").count()).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A terminal with no way to show an image gets its own reason rather than the
+    /// libass one, since telling a user to rebuild FFmpeg would send them somewhere that
+    /// cannot help.
+    #[test]
+    fn a_terminal_that_cannot_show_images_should_say_that_instead() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-no-protocol", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().support =
+            crate::subtitle_edit::PreviewSupport::NoImageProtocol;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: "display images" rather than the whole sentence, which the pane wraps
+        // across lines and this screen dump joins without a separator.
+        assert_that!(&screen).contains("display images");
+        assert_that!(&screen).does_not_contain("libass");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue that could not be drawn goes to the status row, not the pane: it changes as
+    /// the cursor moves, and it clears itself the moment the cursor reaches a cue that
+    /// drew — so it can never be left blaming the wrong line.
+    #[test]
+    fn a_refusal_should_reach_the_status_row_rather_than_being_dropped_silently() {
+        // Arrange: the page, carrying the refusal a key it declined has left behind. Set
+        // directly rather than provoked, because which keys raise which notice is settled in
+        // `app.rs`; what is under test here is that the page draws one at all.
+        let (mut app, directory) = edit_page_app("edit-refusal-row", vec![edit_cue(0, 1000, "a")]);
+        app.notice = Some(
+            "Only SubRip cues can be edited here; this track is another \
+                           format."
+                .to_string(),
+        );
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the reason is on the page, rather than set and never drawn — this page
+        // returns before `render_footer`, which is the only other place it would appear.
+        assert_that!(&screen).contains("Only SubRip cues can be edited here");
+
+        // Act / Assert: and it does not travel to the track list, where it would be painted
+        // over a view it says nothing about.
+        app.back();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.notice.is_none()).is_true();
+        let streams = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(&streams).does_not_contain("Only SubRip cues can be edited here");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cue_that_could_not_be_drawn_should_report_on_the_status_row() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-cue-failure",
+            vec![edit_cue(0, 1000, "first"), edit_cue(2000, 3000, "second")],
+        );
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .fail_frame(0, "Could not draw this frame: no such file".to_string());
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: reported, and outside the pane — which stays empty rather than gaining
+        // text that moves with the cursor.
+        assert_that!(&screen).contains("Could not draw this frame");
+        assert_that!(image_shades(&painted).is_empty()).is_true();
+
+        // Act / Assert: moving to a cue the failure says nothing about drops it.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        let moved = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(&moved).does_not_contain("Could not draw this frame");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The pane used to draw the cue's text whenever it had no frame, which meant every
+    /// move of the cursor flashed the line as plain text for a moment before the picture
+    /// replaced it — the preview reading as broken on every keypress. The text belongs to
+    /// the cue list beside it, and the pane is now simply empty until its frame arrives.
+    #[test]
+    fn a_pane_with_no_frame_should_stay_empty_rather_than_flash_the_cue_text() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-frame-gap", vec![edit_cue(0, 1000, "spoken")]);
+
+        // Act: drawn before any frame has been rendered, which is the gap in question.
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: once, in the cue list — counting is the point, since an empty preview
+        // still leaves a screen that "contains" the line.
+        assert_that!(screen.matches("spoken").count()).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The frame worker scales to a pane only the renderer has measured. Without the
+    /// write-back it would be asked to produce a zero-sized image.
+    #[test]
+    fn rendering_should_report_the_measured_preview_size_back_to_the_page() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-measure", vec![edit_cue(0, 1000, "a")]);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preview_cells)
+            .is_equal_to(ratatui::layout::Size::new(0, 0));
+
+        // Act
+        drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: 80 columns less the cue panel's floor width, less the pane's own
+        // borders, and the rows left after the track takes its lane, its two borders and
+        // its time axis.
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        assert_that!(cells.width).is_equal_to(48);
+        assert_that!(cells.height).is_equal_to(18);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor has to be visible in both places at once — the list says which cue, the
+    /// track says where in the file it sits.
+    #[test]
+    fn the_selected_cue_should_be_marked_in_the_list_and_highlighted_in_the_track() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-selection",
+            vec![
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+            ],
+        );
+        app.subtitle_edit.as_mut().unwrap().select(1);
+
+        // Act
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+        // Assert: exactly one block is filled, and it is the second cue's. Keyed on the
+        // fill rather than on a marker character, because the fill is what a reader sees.
+        let filled: Vec<&ratatui::buffer::Cell> = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.style().bg == Some(Color::Cyan))
+            .collect();
+        assert_that!(filled.is_empty()).is_false();
+        for cell in &filled {
+            if cell.symbol().chars().any(char::is_alphanumeric) {
+                assert_that!(cell.style().fg).is_equal_to(Some(Color::White));
+            }
+        }
+        let timing = screen
+            .find("00:00:05.0")
+            .expect("the selected cue's timing should be on screen");
+        assert_that!(screen[..timing].ends_with('\u{250c}') || screen[..timing].ends_with(' '))
+            .is_true();
+
+        // Assert: and the track paints one cue cyan, the other not.
+        let cyan = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "<" && cell.style().fg == Some(Color::Cyan))
+            .count();
+        let dim = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "<" && cell.style().fg == Some(Color::DarkGray))
+            .count();
+        assert_that!(cyan).is_equal_to(1);
+        assert_that!(dim).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The deepest possible track is four lanes, which with its borders and its time axis
+    /// needs all ten of the rows `render` already guarantees — so there is no reachable
+    /// size the page has to refuse, but none to spare either, and the smallest one still
+    /// has to be legible rather than merely not crash.
+    #[test]
+    fn the_page_should_stay_usable_at_the_smallest_size_render_allows() {
+        // Arrange: four mutually overlapping cues, so the track claims six rows.
+        let (mut app, directory) = edit_page_app(
+            "edit-cramped",
+            vec![
+                edit_cue(0, 9000, "a"),
+                edit_cue(100, 9000, "bcdef"),
+                edit_cue(200, 9000, "c"),
+                edit_cue(300, 9000, "d"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(50, 10, |frame| render(frame, &mut app));
+
+        // Assert: every pane is still drawn, and the cue panel is wide enough that a
+        // timestamp survives whole rather than being truncated away.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().layout.lane_count).is_equal_to(4);
+        assert_that!(screen.contains("Preview")).is_true();
+        assert_that!(screen.contains("Cues")).is_true();
+        assert_that!(screen.contains("Timeline")).is_true();
+        // The four cues are one overlap group, so the panel draws the first two side by
+        // side — and at half a thirty-column panel even the compact span will not fit, so
+        // this is also where `group_timing`'s start-only fallback is exercised for real.
+        // The cue block's own border, rather than the title's copy of the same span.
+        assert_that!(screen.contains("┌ 0:00.0 ")).is_true();
+        assert_that!(screen.contains("┌ 0:00.1 ")).is_true();
+        // With room to spare after it, so the panel's floor width is doing its job.
+        assert_that!(screen.contains("0:00.0 ─")).is_true();
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        assert_that!(cells.width > 0 && cells.height > 0).is_true();
+
+        // Act / Assert: four lanes plus an axis do not fit alongside a whole cue block, so
+        // the axis gives way until the page can afford both. Keyed on the selection marks,
+        // which nothing but the axis draws.
+        assert_that!(screen.contains('▲')).is_false();
+        // Eleven rows buy the block its text row back, still without the axis...
+        let taller = drawn(50, 11, |frame| render(frame, &mut app));
+        assert_that!(taller.contains('▲')).is_false();
+        assert_that!(taller.contains("│ a")).is_true();
+        // ...and twelve fit both.
+        let taller = drawn(50, 12, |frame| render(frame, &mut app));
+        assert_that!(taller.contains('▲')).is_true();
+        assert_that!(taller.contains("┌ 0:00.0 ")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue longer than the window it is centred in overflows both edges, so the marks
+    /// have to be clamped like the bracket above them rather than derived from moments the
+    /// window cannot map. Asserted through a rendered page, because it is the call site
+    /// that chooses between the two.
+    #[test]
+    fn the_axis_should_still_mark_a_cue_that_outruns_the_window() {
+        // Arrange: two minutes of dialogue in a window that shows one.
+        let (mut app, directory) =
+            edit_page_app("edit-long-cue", vec![edit_cue(0, 120_000, "a long one")]);
+
+        // Act
+        let painted = drawn_cells(100, 24, |frame| render(frame, &mut app));
+
+        // Assert: both ends are marked, and in the selection's own colour.
+        let marks: Vec<_> = painted.iter().filter(|(symbol, _)| symbol == "▲").collect();
+        assert_that!(marks.len()).is_equal_to(2);
+        for (_, style) in marks {
+            assert_that!(style.fg).is_equal_to(Some(Color::Cyan));
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every cue is a block: outlined white when it is not the selection, filled solid
+    /// cyan with white text when it is. The fill is the cursor, which is why no marker
+    /// character survives beside the timings.
+    #[test]
+    fn each_cue_should_be_a_block_the_selection_fills() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-blocks",
+            vec![
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+                edit_cue(9000, 11_000, "third"),
+            ],
+        );
+        app.subtitle_edit.as_mut().unwrap().select(1);
+
+        // Act
+        let painted = drawn_cells(80, 24, |frame| render(frame, &mut app));
+        let screen: String = painted.iter().map(|(symbol, _)| symbol.as_str()).collect();
+
+        // Assert: three blocks, each with its timing on its top border.
+        assert_that!(screen.matches("┌ 00:00:01.0 → 00:00:03.0").count()).is_equal_to(1);
+        assert_that!(screen.matches("┌ 00:00:05.0 → 00:00:07.0").count()).is_equal_to(1);
+        assert_that!(screen.matches("┌ 00:00:09.0 → 00:00:11.0").count()).is_equal_to(1);
+        assert_that!(screen.contains('▸')).is_false();
+
+        // Assert: the unselected blocks are outlined white...
+        let outline = painted
+            .iter()
+            .filter(|(symbol, style)| symbol == "└" && style.fg == Some(Color::White))
+            .count();
+        assert_that!(outline).is_equal_to(2);
+
+        // ...and the selected one is filled, borders and all, with white text on it.
+        let filled: Vec<&(String, Style)> = painted
+            .iter()
+            .filter(|(_, style)| style.bg == Some(Color::Cyan))
+            .collect();
+        // Three rows of a block whose width is the panel's, less its own borders.
+        assert_that!(filled.len() > 3).is_true();
+        // Its writing is white; its border shares the fill's colour and so is not.
+        for (symbol, style) in &filled {
+            if symbol.chars().any(char::is_alphanumeric) {
+                assert_that!(style.fg).is_equal_to(Some(Color::White));
+            }
+        }
+        let filled_text: String = filled.iter().map(|(symbol, _)| symbol.as_str()).collect();
+        assert_that!(filled_text.contains("00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(filled_text.contains("second")).is_true();
+        // The cue above it is not filled.
+        assert_that!(filled_text.contains("first")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The arrows say "and then this", so they go between the blocks — never after the
+    /// last one, which has nothing to point at.
+    #[test]
+    fn an_arrow_should_lead_from_each_cue_to_the_next_but_not_past_the_last() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-arrows",
+            vec![
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+                edit_cue(9000, 11_000, "third"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: two arrows for three cues.
+        assert_that!(screen.matches('↓').count()).is_equal_to(2);
+
+        // Act / Assert: and a single cue has none at all.
+        let (mut lone, lone_directory) =
+            edit_page_app("edit-one-arrow", vec![edit_cue(1000, 3000, "only")]);
+        let screen = drawn(80, 24, |frame| render(frame, &mut lone));
+        assert_that!(screen.contains('↓')).is_false();
+
+        // Cleanup
+        drop(app);
+        drop(lone);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(lone_directory).unwrap();
+    }
+
+    /// A panel seven rows tall holds two blocks, because the second needs no arrow under
+    /// it. Getting this wrong wastes a whole cue's worth of the panel.
+    #[test]
+    fn the_panel_should_fit_a_block_in_the_rows_the_last_arrow_does_not_need() {
+        // Arrange: cues enough to overflow any panel this test renders.
+        let cues = (0..8)
+            .map(|index| edit_cue(index * 2000, index * 2000 + 1000, "x"))
+            .collect();
+        let (mut app, directory) = edit_page_app("edit-fit", cues);
+
+        // Act / Assert: the panel's inner height is the page height less the track and the
+        // panel's own borders, so these two sizes bracket the arrow-free last block.
+        for (height, blocks) in [(20, 3), (21, 4)] {
+            drawn(80, height, |frame| render(frame, &mut app));
+            assert_that!(app.subtitle_edit.as_ref().unwrap().list_rows).is_equal_to(blocks);
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The exact times live in the title because there is nowhere on a track drawn at a
+    /// second per column to put a ten-character timestamp without covering the cues
+    /// around it — and because the title is otherwise empty.
+    #[test]
+    fn the_timeline_title_should_carry_the_selected_cues_exact_span_and_follow_it() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-title",
+            vec![
+                edit_cue(1500, 3200, "first"),
+                edit_cue(9000, 11_500, "second"),
+            ],
+        );
+
+        // Act
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert: the same format the cue list prints, so one cue reads identically in
+        // both places.
+        assert_that!(screen.contains("Timeline (00:00:01.5 → 00:00:03.2)")).is_true();
+
+        // Act: move to the next cue.
+        app.select_next();
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Timeline (00:00:09.0 → 00:00:11.5)")).is_true();
+        // Title-scoped: the first cue's times are still in the cue list beside it, which
+        // is the whole reason the title names only the selection.
+        assert_that!(screen.contains("Timeline (00:00:01.5")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn highlight_matches_should_return_one_span_when_nothing_matches() {
+        // Arrange
+        let base = Style::default().fg(Color::Gray);
+
+        // Act / Assert: the unfiltered list is every row, so the ordinary case has to cost
+        // exactly the one span it did before highlighting existed.
+        for query in ["", "   ", "absent"] {
+            let spans = highlight_matches(" hello there", query, base);
+            assert_that!(spans.len()).is_equal_to(1);
+            assert_that!(spans[0].content.as_ref()).is_equal_to(" hello there");
+            assert_that!(spans[0].style).is_equal_to(base);
+        }
+    }
+
+    #[test]
+    fn highlight_matches_should_reverse_only_the_matched_run() {
+        // Arrange
+        let base = Style::default().fg(Color::Gray);
+
+        // Act
+        let spans = highlight_matches(" say hello now", "hello", base);
+
+        // Assert: three spans, and only the middle one is lit — reversing the row's own
+        // style rather than taking a colour, so it stays legible on a selected, edited or
+        // deleted row alike.
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec![" say ", "hello", " now"]);
+        assert_that!(spans[0].style.add_modifier.contains(Modifier::REVERSED)).is_false();
+        assert_that!(spans[1].style.add_modifier.contains(Modifier::REVERSED)).is_true();
+        assert_that!(spans[1].style.fg).is_equal_to(Some(Color::Gray));
+        assert_that!(spans[2].style.add_modifier.contains(Modifier::REVERSED)).is_false();
+    }
+
+    #[test]
+    fn highlight_matches_should_light_every_occurrence_case_insensitively() {
+        // Arrange / Act
+        let spans = highlight_matches("cat CAT cat", "cAt", Style::default());
+
+        // Assert: five spans — three lit, two of separator — and the words keep the case
+        // the file gave them rather than the case that was typed.
+        let lit: Vec<&str> = spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_that!(lit).is_equal_to(vec!["cat", "CAT", "cat"]);
+        assert_that!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .as_str()
+        )
+        .is_equal_to("cat CAT cat");
+    }
+
+    #[test]
+    fn highlight_matches_should_keep_a_hit_that_runs_to_the_end_whole() {
+        // Arrange / Act: the trailing-remainder branch has nothing to add here, which is
+        // the case an off-by-one in it would silently drop.
+        let spans = highlight_matches("say hello", "hello", Style::default());
+
+        // Assert
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec!["say ", "hello"]);
+    }
+
+    #[test]
+    fn highlight_matches_should_survive_multi_byte_text() {
+        // Arrange / Act: every char before the hit is multi-byte, so a byte-sliced version
+        // would panic or cut a character in half.
+        let spans = highlight_matches("écoute — attends", "attends", Style::default());
+
+        // Assert
+        let text: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_that!(text).is_equal_to(vec!["écoute — ", "attends"]);
+    }
+
+    #[test]
+    fn the_cue_panel_should_show_its_search_bar_only_while_it_is_filtering() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-bar",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+
+        // Act / Assert: nothing on screen before the key is pressed.
+        assert_that!(cue_panel(&mut app, 100, 24).join("\n")).does_not_contain("Search");
+
+        // Act: open it.
+        app.start_cue_search();
+
+        // Assert: the bar is drawn, and the count reads for an empty query.
+        assert_that!(cue_panel(&mut app, 100, 24).join("\n")).contains("Search");
+
+        // Act: type a query and close the bar with Enter.
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "bravo".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+        app.finish_cue_search();
+
+        // Assert: a filter left in force with the bar closed still says what it is
+        // filtering by, the rule the file panel follows.
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+        assert_that!(&panel).contains("Search");
+        assert_that!(&panel).contains("bravo");
+        assert_that!(&panel).does_not_contain("alpha");
+
+        // Act: drop the filter.
+        app.clear_cue_search();
+
+        // Assert
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+        assert_that!(&panel).does_not_contain("Search");
+        assert_that!(&panel).contains("alpha");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The bar is charged to the cue panel and to nothing else. Put on the page's status
+    /// row instead it would shrink the *preview* pane, and a preview resize drops the
+    /// timeline cursor's frame and disturbs a span that is playing — so opening a search
+    /// would interrupt whatever the reader was watching.
+    #[test]
+    fn the_search_bar_should_cost_the_cue_panel_a_row_and_the_preview_pane_none() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-height",
+            vec![
+                edit_cue(0, 1000, "alpha"),
+                edit_cue(2000, 3000, "bravo"),
+                edit_cue(4000, 5000, "charlie"),
+                edit_cue(6000, 7000, "delta"),
+            ],
+        );
+
+        // Act: measure the panel's capacity with the bar down and with it up, at a height
+        // where the four rows only just fit — so one row given up is one row lost.
+        let mut closed = 0;
+        let mut open = 0;
+        let mut pane_before = ratatui::layout::Size::new(0, 0);
+        let mut pane_after = ratatui::layout::Size::new(0, 0);
+        for height in 12..40 {
+            app.clear_cue_search();
+            draw(&mut app, 100, height);
+            let shut = app.subtitle_edit.as_ref().unwrap().list_rows;
+            let panes = app.subtitle_edit.as_ref().unwrap().preview_cells;
+            app.start_cue_search();
+            draw(&mut app, 100, height);
+            let up = app.subtitle_edit.as_ref().unwrap().list_rows;
+            if up < shut {
+                closed = shut;
+                open = up;
+                pane_before = panes;
+                pane_after = app.subtitle_edit.as_ref().unwrap().preview_cells;
+                break;
+            }
+        }
+
+        // Assert: the list gave up room and the preview pane did not.
+        assert_that!(closed).is_greater_than(0);
+        assert_that!(open).is_less_than(closed);
+        assert_that!(pane_after).is_equal_to(pane_before);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_matched_row_should_have_the_matching_words_reversed() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-highlight",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+        app.start_cue_search();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "rav".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+
+        // Act: read the cells rather than the text, since the highlight is a modifier.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lit: String = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .map(|cell| cell.symbol())
+            .collect();
+
+        // Assert: exactly the matched substring is reversed — not the whole row, and not
+        // the `b` and `o` around it.
+        assert_that!(lit.as_str()).is_equal_to("rav");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_should_say_so_rather_than_draw_an_empty_panel() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "cue-search-empty",
+            vec![edit_cue(0, 1000, "alpha"), edit_cue(2000, 3000, "bravo")],
+        );
+        app.start_cue_search();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .cue_search_mut()
+            .input
+            .value = "nothing here".to_string();
+        app.subtitle_edit.as_mut().unwrap().refilter();
+
+        // Act
+        let panel = cue_panel(&mut app, 100, 24).join("\n");
+
+        // Assert: an empty panel reads the same as a track still loading, so the filter
+        // says which it is — and the bar's own count agrees with it.
+        assert_that!(&panel).contains("No matching cues");
+        assert_that!(&panel).contains("no matches");
+        assert_that!(&panel).does_not_contain("alpha");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// AGENTS.md forbids per-view keybinding hints; the global `?` popup is the only
+    /// place controls are documented. This keeps that from being undone by accident.
+    #[test]
+    fn the_edit_page_should_not_carry_inline_control_hints() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-no-hints", vec![edit_cue(0, 1000, "a")]);
+
+        // Act
+        let screen = drawn(100, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        for hint in ["j/k", "↑↓", "Enter", "Esc", " · "] {
+            assert_that!(screen.contains(hint)).is_false();
+        }
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cue_glyphs_should_shed_brackets_before_they_shed_the_cue() {
+        // Act / Assert
+        assert_that!(cue_glyphs(0).as_str()).is_equal_to("");
+        assert_that!(cue_glyphs(1).as_str()).is_equal_to("|");
+        assert_that!(cue_glyphs(2).as_str()).is_equal_to("||");
+        assert_that!(cue_glyphs(3).as_str()).is_equal_to("|─|");
+        assert_that!(cue_glyphs(4).as_str()).is_equal_to("|<>|");
+        assert_that!(cue_glyphs(5).as_str()).is_equal_to("|<─>|");
+        assert_that!(cue_glyphs(8).as_str()).is_equal_to("|<────>|");
+    }
+
+    fn timeline_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The text of a ruler drawn for `window`, marked for `cue`.
+    fn ruler_text(window: &TimelineWindow, cue: &crate::cue::Cue) -> String {
+        timeline_ruler(window, window.span(cue), None, false)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn window_over(start: u64, end: u64, width: u16) -> TimelineWindow {
+        TimelineWindow {
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+            width,
+        }
+    }
+
+    /// The readings are the axis: one every ten seconds, each starting on the column its
+    /// moment falls on, so a cue's width can be read against them.
+    #[test]
+    fn the_axis_should_read_out_absolute_time_every_ten_seconds() {
+        // Arrange: a minute of a ten-minute file, starting somewhere untidy.
+        let window = window_over(52, 112, 76);
+        let cue = edit_cue(80_000, 84_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: absolute file time, not time relative to the window, which scrolls with
+        // the selection and would say nothing about where in the film a cue sits.
+        assert_that!(text.contains("1:00")).is_true();
+        assert_that!(text.contains("1:30")).is_true();
+        // Deliberately readings that only a ten-second interval produces: sixty and ninety
+        // seconds would still be marked by an axis ticking at fifteen.
+        assert_that!(text.contains("1:10")).is_true();
+        assert_that!(text.contains("1:40")).is_true();
+        assert_that!(text.contains("0:08")).is_false();
+
+        // Each reading begins on the column its moment maps to, using the same mapping the
+        // cue spans above it use — 1:30 must start where a cue starting at 1:30 would.
+        let column = window
+            .column(Duration::from_secs(90))
+            .expect("1:30 is inside the window");
+        let from_there: String = text.chars().skip(usize::from(column)).collect();
+        assert_that!(from_there.starts_with("1:30")).is_true();
+
+        // And nothing else is drawn: no tick glyphs under the numbers.
+        assert_that!(
+            text.chars()
+                .all(|glyph| glyph.is_ascii_digit() || matches!(glyph, ':' | '▲' | ' '))
+        )
+        .is_true();
+    }
+
+    /// An axis mixing `59:59` with `1:00:00` would carry readings of two widths, and the
+    /// gap between two readings is the only thing telling you the interval.
+    #[test]
+    fn an_axis_reaching_past_an_hour_should_carry_hours_on_every_reading() {
+        // Arrange: a window straddling the hour mark.
+        let window = window_over(3570, 3630, 90);
+        let cue = edit_cue(3_600_000, 3_602_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: the readings before the hour carry it too.
+        assert_that!(text.contains("0:59:40")).is_true();
+        assert_that!(text.contains("1:00:20")).is_true();
+        assert_that!(text.contains(" 59:40")).is_false();
+    }
+
+    /// Half a timestamp is a different, wrong time, and two run together are unreadable as
+    /// either. A reading that cannot be drawn clear of its neighbours, of the selection
+    /// marks, and of the track's end is dropped whole.
+    #[test]
+    fn a_reading_that_cannot_be_drawn_clear_should_not_be_drawn_at_all() {
+        // Arrange: the cue's ends fall right where 1:20's reading would go.
+        let window = window_over(60, 120, 76);
+        let cue = edit_cue(80_000, 84_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: that reading is gone rather than painted through, and so is the one at
+        // the right edge, which has a column but no room for its digits.
+        assert_that!(text.contains("1:20")).is_false();
+        assert_that!(text.contains("2:00")).is_false();
+
+        // Every reading that is drawn is a whole one: each run of digits is a real
+        // ten-second mark for this window, so none is the tail of a reading that was
+        // painted over or the head of one that ran off the end.
+        let printed: Vec<String> = text
+            .split(|glyph: char| !glyph.is_ascii_digit() && glyph != ':')
+            .filter(|run| !run.is_empty())
+            .map(str::to_string)
+            .collect();
+        let expected: Vec<String> = (60..=120)
+            .step_by(10)
+            .map(|second| format_clock(Duration::from_secs(second), false))
+            .collect();
+        assert_that!(printed.is_empty()).is_false();
+        for reading in &printed {
+            assert_that!(expected.contains(reading)).is_true();
+        }
+        assert_that!(printed.len() < expected.len()).is_true();
+        assert_that!(text.chars().count()).is_equal_to(76);
+    }
+
+    /// On the narrowest track an hour-long file can put two seven-character readings eight
+    /// columns apart, so they have to thin out rather than run into each other.
+    #[test]
+    fn readings_too_close_to_stand_apart_should_thin_out() {
+        // Arrange: the smallest track `render` allows, on a film past the hour mark.
+        let window = window_over(3600, 3660, 48);
+        let cue = edit_cue(3_610_000, 3_612_000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert: every unbroken run of characters is one whole reading. Two that had run
+        // together would show up here as a single run belonging to neither.
+        let expected: Vec<String> = (3600..=3660)
+            .step_by(10)
+            .map(|second| format_clock(Duration::from_secs(second), true))
+            .collect();
+        let printed: Vec<String> = text
+            .split([' ', '▲'])
+            .filter(|run| !run.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_that!(printed.is_empty()).is_false();
+        for reading in &printed {
+            assert_that!(expected.contains(reading)).is_true();
+        }
+        // And the track is too tight to hold them all, so at least one gave way.
+        assert_that!(printed.len() < expected.len()).is_true();
+    }
+
+    /// The marks have to line up with the bracket ends    /// The marks have to line up with the bracket ends drawn directly above them, which is
+    /// why they come from the same `span` the bracket does rather than being re-derived.
+    #[test]
+    fn the_axis_should_mark_the_selected_cue_under_its_bracket_ends() {
+        // Arrange
+        let window = window_over(60, 120, 76);
+        let cue = edit_cue(80_000, 84_000, "x");
+        let (first, last) = window.span(&cue).expect("the cue is inside the window");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert
+        let glyphs: Vec<char> = text.chars().collect();
+        assert_that!(glyphs[usize::from(first)]).is_equal_to('▲');
+        assert_that!(glyphs[usize::from(last)]).is_equal_to('▲');
+        assert_that!(glyphs.iter().filter(|glyph| **glyph == '▲').count()).is_equal_to(2);
+
+        // Arrange / Act: a cue longer than the window it is centred in, so both of its
+        // ends fall outside and the bracket above is drawn clamped to the track edges.
+        let overflowing = edit_cue(30_000, 150_000, "x");
+        let text = ruler_text(&window, &overflowing);
+
+        // Assert: the marks are clamped the same way, rather than disappearing with the
+        // moments they belong to.
+        let glyphs: Vec<char> = text.chars().collect();
+        assert_that!(window.column(overflowing.start)).is_none();
+        assert_that!(glyphs[0]).is_equal_to('▲');
+        assert_that!(glyphs[75]).is_equal_to('▲');
+    }
+
+    /// A track with no columns to draw on is a layout the renderer never asks for, but the
+    /// arithmetic below divides by the window's span and indexes by column, so it answers
+    /// with an empty line rather than panicking.
+    /// The window shortens on a dense track, and a ten-second interval in an eight-second
+    /// window lands one reading — or none, once the selected cue's marks take the column it
+    /// would have gone in. An axis with no numbers on it is not an axis, so the interval
+    /// follows the window down.
+    #[test]
+    fn the_axis_interval_should_follow_the_window_down() {
+        // Act / Assert: the longest round interval that still lands six readings.
+        assert_that!(axis_tick(Duration::from_secs(60))).is_equal_to(10);
+        assert_that!(axis_tick(Duration::from_secs(30))).is_equal_to(5);
+        assert_that!(axis_tick(Duration::from_secs(15))).is_equal_to(2);
+        assert_that!(axis_tick(Duration::from_secs(8))).is_equal_to(1);
+        // Nothing sub-second, however short the window gets.
+        assert_that!(axis_tick(Duration::from_secs(2))).is_equal_to(1);
+        assert_that!(axis_tick(Duration::ZERO)).is_equal_to(1);
+    }
+
+    /// A window with readings a second apart still has to place them, which is the case the
+    /// crowding rule was written against a ten-second interval for.
+    #[test]
+    fn a_short_window_should_still_carry_readings() {
+        // Arrange: eight seconds across a full-width track.
+        let window = window_over(20, 28, 150);
+
+        // Act
+        let text = ruler_text(&window, &edit_cue(24_000, 24_500, "x"));
+
+        // Assert
+        assert_that!(text.contains("0:21")).is_true();
+        assert_that!(text.contains("0:27")).is_true();
+    }
+
+    #[test]
+    fn an_axis_with_no_width_should_draw_nothing() {
+        // Arrange
+        let window = window_over(0, 60, 0);
+        let cue = edit_cue(0, 1000, "x");
+
+        // Act
+        let text = ruler_text(&window, &cue);
+
+        // Assert
+        assert_that!(text.as_str()).is_equal_to("");
+    }
+
+    #[test]
+    fn timeline_lines_should_put_overlapping_cues_on_their_own_rows() {
+        // Arrange
+        let cues = vec![edit_cue(0, 10_000, "a"), edit_cue(5000, 15_000, "b")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        );
+        let text = timeline_text(&lines);
+
+        // Assert
+        assert_that!(text.len()).is_equal_to(2);
+        // Both cues span 10 s of a 60 s window drawn 61 columns wide, so both are 11
+        // columns; the second starts five columns in. Read at their columns rather than
+        // off the front of the row, since the axis rules a gridline down every tenth
+        // second and the lead-in is no longer blank.
+        let expected = cue_glyphs(11);
+        assert_that!(text[0].starts_with(&expected)).is_true();
+        assert_that!(
+            text[1]
+                .chars()
+                .skip(5)
+                .take(11)
+                .collect::<String>()
+                .as_str()
+        )
+        .is_equal_to(expected.as_str());
+    }
+
+    /// A cue too brief to fill a column still has to mark the column it falls on, or the
+    /// view silently hides the very cues most likely to be mistimed.
+    #[test]
+    fn timeline_lines_should_keep_a_cue_shorter_than_one_column() {
+        // Arrange
+        let cues = vec![edit_cue(30_000, 30_100, "blink")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 60,
+        };
+
+        // Act
+        let text = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        ));
+
+        // Assert: the one column it falls on carries the cue, and nothing but the axis's
+        // own gridlines is drawn anywhere else.
+        assert_that!(text[0].contains('|')).is_true();
+        assert_that!(
+            text[0]
+                .chars()
+                .filter(|glyph| !matches!(glyph, ' ' | '┊'))
+                .count()
+        )
+        .is_equal_to(1);
+    }
+
+    #[test]
+    fn timeline_lines_should_skip_cues_outside_the_visible_window() {
+        // Arrange: the second cue sits an hour later, far outside a 60 s window.
+        let cues = vec![
+            edit_cue(1000, 3000, "here"),
+            edit_cue(3_600_000, 3_602_000, "later"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let text = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        ));
+
+        // Assert: one cue drawn, and nothing wrapped around from the other.
+        assert_that!(text.len()).is_equal_to(1);
+        assert_that!(text[0].matches('|').count()).is_equal_to(2);
+    }
+
+    /// The timing mode swaps two colours rather than adding a third: the selected cue takes
+    /// yellow and hands cyan to the playhead.
+    ///
+    /// **Asserted as a swap rather than as "the cue is yellow"**, because that is the whole
+    /// requirement. Painting the selection yellow and leaving the playhead alone would put a
+    /// yellow `│` inside a yellow span, which draws as no playhead at all — and the two are
+    /// on screen together exactly when a reader nudges a cue with a span still playing,
+    /// which is what the mode is for.
+    #[test]
+    fn the_timing_mode_should_swap_the_selected_cues_colour_with_the_playheads() {
+        // Arrange: one cue with the playhead inside it, so both colours are on one lane.
+        let cues = vec![edit_cue(10_000, 20_000, "line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+        let at = Some(std::time::Duration::from_secs(15));
+        let colours = |timing: TimingScope| {
+            let lines = timeline_lines(&cues, &layout, &window, Some(0), at, None, timing);
+            let cells: Vec<(char, Option<Color>)> = lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| {
+                    span.content
+                        .chars()
+                        .map(move |glyph| (glyph, span.style.fg))
+                })
+                .collect();
+            let of = |glyph: char| {
+                cells
+                    .iter()
+                    .find(|(candidate, _)| *candidate == glyph)
+                    .and_then(|(_, colour)| *colour)
+            };
+            (of('|'), of('│'))
+        };
+
+        // Act
+        let (cue_normally, playhead_normally) = colours(TimingScope::Off);
+        let (cue_retiming, playhead_retiming) = colours(TimingScope::Cue(CueGrip::Whole));
+
+        // Assert: cyan cue, yellow playhead — and in the mode, the other way round.
+        assert_that!(cue_normally).is_equal_to(Some(Color::Cyan));
+        assert_that!(playhead_normally).is_equal_to(Some(Color::Yellow));
+        assert_that!(cue_retiming).is_equal_to(Some(Color::Yellow));
+        assert_that!(playhead_retiming).is_equal_to(Some(Color::Cyan));
+
+        // Assert: and whichever way round they are, they are never the same colour — which
+        // is the property the swap exists to keep.
+        assert_that!(cue_normally != playhead_normally).is_true();
+        assert_that!(cue_retiming != playhead_retiming).is_true();
+    }
+
+    /// Every end the next `h`/`l` moves is drawn as a solid handle — reversed — and nothing
+    /// else is: the start alone, the end alone, both for the whole cue, and never an end the
+    /// window has clamped the cue onto, which would point at a moment the end is not at.
+    ///
+    /// The whole cue getting handles is the regression this pins: marking only an edge left the
+    /// default selection looking like no selection at all.
+    #[test]
+    fn timeline_lines_should_draw_handles_on_every_end_that_moves() {
+        // Arrange: a cue at 10s → 20s, one lane.
+        let cues = vec![edit_cue(10_000, 20_000, "line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let handles = |window: &crate::cue::TimelineWindow, timing: TimingScope| {
+            timeline_lines(&cues, &layout, window, Some(0), None, None, timing)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| span.content.chars().map(move |glyph| (glyph, span.style)))
+                .enumerate()
+                .filter(|(_, (_, style))| style.add_modifier.contains(Modifier::REVERSED))
+                .map(|(column, (glyph, _))| (column, glyph))
+                .collect::<Vec<_>>()
+        };
+        // One column per second.
+        let whole = window_over(0, 60, 61);
+
+        // Act / Assert: the start's column, then the end's.
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::Start)))
+            .is_equal_to(vec![(10, '|')]);
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::End))).is_equal_to(vec![(20, '|')]);
+
+        // Act / Assert: both for the whole cue, since both ends move together.
+        assert_that!(handles(&whole, TimingScope::Cue(CueGrip::Whole)))
+            .is_equal_to(vec![(10, '|'), (20, '|')]);
+
+        // Act / Assert: nothing with the mode off, or at track scale.
+        assert_that!(handles(&whole, TimingScope::Off).len()).is_equal_to(0);
+        assert_that!(handles(&whole, TimingScope::Track).len()).is_equal_to(0);
+
+        // Act / Assert: a window inside the cue clamps both ends onto its edges, and no
+        // selection gets a handle there.
+        let inside = window_over(12, 18, 61);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::Start)).len()).is_equal_to(0);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::End)).len()).is_equal_to(0);
+        assert_that!(handles(&inside, TimingScope::Cue(CueGrip::Whole)).len()).is_equal_to(0);
+
+        // Act / Assert: with only the start clamped, the whole cue keeps its end's handle.
+        let later = window_over(12, 30, 61);
+        assert_that!(handles(&later, TimingScope::Cue(CueGrip::Whole)))
+            .is_equal_to(vec![(27, '|')]);
+    }
+
+    /// At the wider scale every cue takes the retiming yellow, because every cue is what the
+    /// keys are about to move.
+    ///
+    /// The selection is not lost in the crowd: it keeps the bold the others do not have. And
+    /// the playhead still holds the colour the swap hands it, so the one mark that has to
+    /// stay readable over a span is readable over all of them.
+    #[test]
+    fn retiming_globally_should_paint_every_cue_yellow_rather_than_only_the_selected_one() {
+        // Arrange: three cues, only one of which the cursor is on.
+        let cues = vec![
+            edit_cue(1000, 3000, "one"),
+            edit_cue(5000, 7000, "two"),
+            edit_cue(9000, 11_000, "three"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, 4);
+        let window = window_over(0, 20, 61);
+
+        // Act: the style of every cue's end mark, `|`, as the lanes are drawn at each scale.
+        // Counted per mark rather than per span: the selected cue's ends carry handles in the
+        // mode, which splits its bar into several spans without making it more than one cue.
+        let styles = |timing: TimingScope| {
+            timeline_lines(&cues, &layout, &window, Some(0), None, None, timing)
+                .iter()
+                .flat_map(|line| line.spans.clone())
+                .flat_map(|span| {
+                    let style = (span.style.fg, span.style.add_modifier);
+                    span.content
+                        .chars()
+                        .filter(|glyph| *glyph == '|')
+                        .map(move |_| style)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Assert: at cue scale only the selection's two ends are yellow, and its neighbours
+        // stay dim.
+        let narrow = styles(TimingScope::Cue(CueGrip::Whole));
+        assert_that!(
+            narrow
+                .iter()
+                .filter(|(fg, _)| *fg == Some(Color::Yellow))
+                .count()
+        )
+        .is_equal_to(2);
+        assert_that!(narrow.iter().any(|(fg, _)| *fg == Some(Color::DarkGray))).is_true();
+
+        // Assert: at track scale every cue is yellow, and exactly one of them — its two ends —
+        // is bold, so the reader can still see which one the other keys are about.
+        let wide = styles(TimingScope::Track);
+        assert_that!(wide.len()).is_equal_to(6);
+        assert_that!(wide.iter().all(|(fg, _)| *fg == Some(Color::Yellow))).is_true();
+        assert_that!(
+            wide.iter()
+                .filter(|(_, modifier)| modifier.contains(Modifier::BOLD))
+                .count()
+        )
+        .is_equal_to(2);
+    }
+
+    /// The ruler's `▲` marks are the selected cue's two ends, so they follow it to yellow —
+    /// otherwise "which cue am I on" is answered in two colours at once.
+    #[test]
+    fn the_axis_marks_should_follow_the_selected_cue_into_the_timing_mode() {
+        // Arrange
+        let window = window_over(0, 60, 61);
+        let cue = edit_cue(10_000, 20_000, "line");
+        let colour_of_marks = |retiming: bool| {
+            timeline_ruler(&window, window.span(&cue), None, retiming)
+                .spans
+                .iter()
+                .find(|span| span.content.contains('▲'))
+                .and_then(|span| span.style.fg)
+        };
+
+        // Act / Assert
+        assert_that!(colour_of_marks(false)).is_equal_to(Some(Color::Cyan));
+        assert_that!(colour_of_marks(true)).is_equal_to(Some(Color::Yellow));
+    }
+
+    /// With no selection there is no cue to paint in the selection colour and none to keep
+    /// on top of a crowded lane — every cue is drawn the same way, which is exactly what the
+    /// pane looks like while the timeline holds the cursor.
+    #[test]
+    fn timeline_lines_should_paint_no_cue_as_selected_when_nothing_is() {
+        // Arrange: two cues sharing a lane's worth of the window, drawn with and without a
+        // selection so the only difference is the one being tested.
+        let cues = vec![
+            edit_cue(10_000, 20_000, "one"),
+            edit_cue(30_000, 40_000, "two"),
+        ];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = window_over(0, 60, 61);
+        let selection_spans = |selected: Option<usize>| {
+            timeline_lines(
+                &cues,
+                &layout,
+                &window,
+                selected,
+                None,
+                None,
+                TimingScope::Off,
+            )
+            .iter()
+            .flat_map(|line| line.spans.clone())
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .count()
+        };
+
+        // Act / Assert
+        assert_that!(selection_spans(Some(0)) > 0).is_true();
+        assert_that!(selection_spans(None)).is_equal_to(0);
+
+        // Act / Assert: and the cues themselves are still all there, so standing the
+        // selection down is not standing the track down.
+        let text = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            None,
+            None,
+            None,
+            TimingScope::Off,
+        ));
+        assert_that!(text.join("").matches('|').count()).is_equal_to(4);
+    }
+
+    /// The shift is what the reader is actually reading after three presses: the two
+    /// timestamps alone cannot say whether they are a tenth of a second in or a whole one.
+    #[test]
+    fn format_shift_should_sign_and_round_a_nudge() {
+        assert_that!(format_shift(150).as_str()).is_equal_to("+0.15s");
+        assert_that!(format_shift(-50).as_str()).is_equal_to("-0.05s");
+        assert_that!(format_shift(2_500).as_str()).is_equal_to("+2.50s");
+        // Hundredths, so a fifty-millisecond step is visible on every press rather than on
+        // every other one.
+        assert_that!(format_shift(-1_005).as_str()).is_equal_to("-1.00s");
+    }
+
+    #[test]
+    fn timeline_lines_should_mark_a_crowded_cue_distinctly() {
+        // Arrange: five mutually overlapping cues against a cap of four.
+        let cues: Vec<_> = (0..5)
+            .map(|index| edit_cue(index * 100, 9000, "x"))
+            .collect();
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        );
+
+        // Assert: the overflowed cue is the only one painted magenta.
+        let magenta = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Magenta))
+            .count();
+        assert_that!(lines.len()).is_equal_to(4);
+        assert_that!(magenta > 0).is_true();
+
+        // Cleanup: none.
+    }
+
+    /// `Layer::SubtitleEdit` and `subtitle_edit: Some(..)` are two pieces of state that
+    /// have to agree and nothing in the type system makes them. If they ever drift the
+    /// page must draw nothing rather than panic mid-frame.
+    #[test]
+    fn the_page_should_draw_nothing_when_the_layer_outlives_its_state() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-orphan", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit = None;
+        app.layer = Layer::SubtitleEdit;
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: an empty frame, and specifically not the file list showing through.
+        assert_that!(screen.trim().is_empty()).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `cues` and `selected` are public, so "ready but holding nothing" is reachable
+    /// state. The track has to skip itself rather than index past the end of the list.
+    #[test]
+    fn the_timeline_should_draw_nothing_when_the_cue_list_is_emptied_underneath_it() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-emptied", vec![edit_cue(0, 1000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().cues.clear();
+
+        // Act
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the panes are still framed, with no cue drawn inside them — and the
+        // title names no span, because there is no cue to have one.
+        assert_that!(screen.contains("Timeline")).is_true();
+        assert_that!(screen.contains("Timeline (")).is_false();
+        assert_that!(screen.contains('|')).is_false();
+        assert_that!(screen.contains('▲')).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A gridline stands under every reading the axis places, on every lane, so a cue's
+    /// position can be read against the clock without the eye travelling down four rows of
+    /// blank space to the numbers.
+    #[test]
+    fn the_lanes_should_be_ruled_at_every_reading_of_the_axis() {
+        // Arrange: an empty track over a minute, which is a reading every ten seconds.
+        let layout = crate::cue::pack_lanes(&[], crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lane = timeline_text(&timeline_lines(
+            &[],
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        ))
+        .remove(0);
+
+        // Assert: one every ten columns, at the same columns the ruler puts its readings on.
+        let ruled: Vec<usize> = lane
+            .chars()
+            .enumerate()
+            .filter(|(_, glyph)| *glyph == '┊')
+            .map(|(column, _)| column)
+            .collect();
+        assert_that!(ruled.as_slice()).contains_exactly_in_given_order([0, 10, 20, 30, 40, 50, 60]);
+        assert_that!(
+            axis_columns(&window)
+                .into_iter()
+                .map(|(_, column)| usize::from(column))
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order(ruled);
+    }
+
+    /// The gridlines are scenery: anything that marks a moment or a cue is painted over
+    /// them, or the pane would be ruled through the very thing it is being read for.
+    #[test]
+    fn anything_with_something_to_say_should_win_a_ruled_column() {
+        // Arrange: a cue starting exactly on the twenty-second reading, with the playhead
+        // on the thirty-second one and the timeline cursor on the fortieth.
+        let cues = vec![edit_cue(20_000, 25_000, "on the line")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act
+        let lane = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(40)),
+            TimingScope::Off,
+        ))
+        .remove(0);
+
+        // Assert: the cue, the playhead and the cursor each took their column back.
+        let at = |column: usize| lane.chars().nth(column);
+        assert_that!(at(20)).is_equal_to(Some('|'));
+        assert_that!(at(30)).is_equal_to(Some('│'));
+        assert_that!(at(40)).is_equal_to(Some('│'));
+        // And the readings nothing landed on are still ruled.
+        assert_that!(at(0)).is_equal_to(Some('┊'));
+        assert_that!(at(10)).is_equal_to(Some('┊'));
+        assert_that!(at(50)).is_equal_to(Some('┊'));
+    }
+
+    /// The selected index is walked unconditionally so it can be painted last, so a
+    /// selection pointing past the end of the list must be skipped rather than indexed.
+    #[test]
+    fn timeline_lines_should_skip_a_selection_that_is_not_in_the_cue_list() {
+        // Arrange
+        let layout = crate::cue::pack_lanes(&[], crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 20,
+        };
+
+        // Act: an empty track, with the cursor still sitting on cue zero.
+        let lines = timeline_lines(&[], &layout, &window, Some(0), None, None, TimingScope::Off);
+
+        // Assert: one lane carrying nothing but the axis's gridlines, rather than an index
+        // panic or a cue drawn for a selection that does not exist.
+        assert_that!(lines.len()).is_equal_to(1);
+        assert_that!(
+            timeline_text(&lines)[0]
+                .chars()
+                .all(|glyph| matches!(glyph, ' ' | '┊'))
+        )
+        .is_true();
+    }
+
+    /// The count is the only sign the background pass is running, and it goes away when
+    /// there is nothing left to report — a border reading "done" forever is furniture. It
+    /// sits on the cue panel's border, next to the rows whose frames it is counting, rather
+    /// than occupying the one status row for the whole of a long pass.
+    #[test]
+    fn the_page_should_count_the_frames_being_generated_while_the_pass_runs() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-warming",
+            vec![
+                edit_cue(1000, 3000, "first"),
+                edit_cue(5000, 7000, "second"),
+            ],
+        );
+
+        // Act / Assert: nothing to say before the pass starts.
+        assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("/2]")).is_false();
+
+        // Act / Assert: counting while it runs, and saying nothing about frames it did not
+        // have to draw — a fully cached track is the ordinary case and reads as the short
+        // form.
+        app.subtitle_edit.as_mut().unwrap().apply_warming(3, 42, 0);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("[3/42]")).is_true();
+
+        // Frames it did have to draw are said out loud, because that is the only thing on
+        // screen that tells a working cache from one being rebuilt.
+        app.subtitle_edit.as_mut().unwrap().apply_warming(4, 42, 4);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("[4/42 · 4 new]")).is_true();
+
+        // ...and silent again once it is over.
+        app.subtitle_edit.as_mut().unwrap().apply_warming(42, 42, 4);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("[42/42]")).is_false();
+        assert_that!(screen.contains("4 new")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Frames are missing on a network mount for a reason the user did not choose, so the
+    /// page says so rather than leaving them wondering why this directory feels different.
+    #[test]
+    fn the_page_should_say_when_a_network_mount_is_why_there_are_no_frames() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-network", vec![edit_cue(1000, 3000, "one")]);
+
+        // Act
+        app.subtitle_edit.as_mut().unwrap().warm = WarmState::OffForNetwork;
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("not generated on network mounts")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The status row is charged to the same budget the time axis is: at a size where
+    /// both fit, both are drawn, and where they cannot, the axis gives way for as long as
+    /// the pass runs — the cue under the cursor is never what goes.
+    #[test]
+    fn the_status_row_should_take_its_row_from_the_axis_rather_than_from_the_cue_list() {
+        // Arrange: four lanes, which is the deepest track the timeline draws.
+        let (mut app, directory) = edit_page_app(
+            "edit-status-room",
+            vec![
+                edit_cue(0, 9000, "a"),
+                edit_cue(1000, 9000, "b"),
+                edit_cue(2000, 9000, "c"),
+                edit_cue(3000, 9000, "d"),
+            ],
+        );
+        // A message that stands for the whole status row: what is being tested is the row's
+        // cost, and the running pass's count is on the cue panel's border rather than here.
+        app.subtitle_edit.as_mut().unwrap().warm = WarmState::OffForNetwork;
+
+        // Act / Assert: twelve rows fit the axis without the status line, and the status
+        // line costs it — the cue block stays either way.
+        let screen = drawn(50, 12, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("network mounts")).is_true();
+        assert_that!(screen.contains('▲')).is_false();
+        // Four overlapping cues are one group, so the block carries the compact timing.
+        assert_that!(screen.contains("┌ 0:00.0 ")).is_true();
+
+        // Act / Assert: one more row and both fit.
+        let screen = drawn(50, 13, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("network mounts")).is_true();
+        assert_that!(screen.contains('▲')).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The editor covers the list it was opened from, so it has to carry the cue's own
+    /// timing — "which cue is this" is the one thing opening it costs the reader. The
+    /// buffer is drawn as it stands, line breaks and all, because where the line breaks is
+    /// part of what is being judged.
+    #[test]
+    fn the_cue_editor_should_draw_the_cue_it_is_editing() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-editor",
+            vec![
+                edit_cue(5000, 7000, "Hello there"),
+                edit_cue(9000, 11_000, "Later"),
+            ],
+        );
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.cue_editor_newline();
+        app.cue_editor_insert('a');
+
+        // Act
+        let screen = draw(&mut app, 100, 30).join("\n");
+
+        // Assert: the timing on the border, the buffer inside it, and the mark saying the
+        // typing will be kept.
+        assert_that!(screen.contains("Cue 1 · 00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(screen.contains("Hello there!")).is_true();
+        assert_that!(screen.contains("edited")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A staged cue edit is invisible the moment the editor closes, and invisible unsaved
+    /// work is work the reader believes is saved. The cue panel's border carries the count,
+    /// in the corner the background pass uses while it is running.
+    #[test]
+    fn the_cue_panel_should_count_the_edits_waiting_to_be_written() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-edited-count", vec![edit_cue(5000, 7000, "Hello")]);
+
+        // Act / Assert: nothing staged, nothing said.
+        assert_that!(draw(&mut app, 100, 30).join("\n").contains("edited")).is_false();
+
+        // Act / Assert: one edit staged, and the panel says so.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        assert_that!(draw(&mut app, 100, 30).join("\n").contains("1 edited")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rewrites and deletions are counted apart and each dropped at zero, because they are
+    /// different work with different consequences: one number would make the reader open the
+    /// panel to find out which of the two they had staged.
+    #[test]
+    fn the_cue_panel_should_count_deletions_apart_from_rewrites() {
+        // Arrange: three cues, so two can go and one is left.
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-count",
+            vec![
+                edit_cue(1000, 2000, "One"),
+                edit_cue(3000, 4000, "Two"),
+                edit_cue(5000, 6000, "Three"),
+            ],
+        );
+
+        // Act / Assert: a deletion alone reads on its own, with no separator to hang off.
+        app.toggle_delete_selected_cue();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 deleted")).is_true();
+        assert_that!(screen.contains("edited")).is_false();
+        assert_that!(screen.contains("·")).is_false();
+
+        // Act / Assert: a rewrite as well — of the second cue, which marking the first moved
+        // the cursor onto — and both counts stand side by side.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited · 1 deleted")).is_true();
+
+        // Act / Assert: and unmarking the first takes the deletion's half away again.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_delete_selected_cue();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited")).is_true();
+        assert_that!(screen.contains("deleted")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timeline's title is the readout a reader nudges against: the cue's live times,
+    /// and how far it has been moved.
+    ///
+    /// Both halves matter and neither is enough alone. Without the times the reader cannot
+    /// see where the cue now is; without the shift they cannot tell three presses from six,
+    /// which is the question a burst of them is asking.
+    #[test]
+    fn the_timeline_title_should_read_out_the_shift_while_a_cue_is_being_retimed() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-timing-title", vec![edit_cue(5000, 7000, "Hello")]);
+
+        // Act / Assert: unmoved, the title names the cue's times and no shift — "+0.00s" on
+        // every cue the reader walks past would be a number that never changes.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("0.00s")).is_false();
+
+        // Act: into the mode and three steps later.
+        app.toggle_cue_timing_mode();
+        for _ in 0..3 {
+            app.nudge_selected_cue(1);
+        }
+
+        // Assert: the times moved with the cue, and the shift says how far.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline ([00:00:05.1 → 00:00:07.1] · +0.15s)")).is_true();
+
+        // Act / Assert: and back at the file's timing the shift goes rather than reading
+        // zero, so the title is only ever carrying a number worth reading.
+        app.reset_selected_cue_timing();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline ([00:00:05.0 → 00:00:07.0])")).is_true();
+        assert_that!(screen.contains("0.00s")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The title brackets whatever part of the cue `h`/`l` are moving, so the reader can see
+    /// which half their next press changes — and brackets nothing where `h`/`l` move no part
+    /// of this cue.
+    #[test]
+    fn the_timeline_title_should_bracket_the_part_of_the_cue_that_moves() {
+        // Arrange: a cue at 5.0s → 7.0s.
+        let (mut app, directory) =
+            edit_page_app("edit-grip-title", vec![edit_cue(5000, 7000, "Hello")]);
+        let screen = |app: &mut App| draw(app, 100, 30).join("\n");
+
+        // Act / Assert: outside the mode, no brackets.
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+
+        // Act / Assert: the whole cue, then its start, then its end.
+        app.toggle_cue_timing_mode();
+        assert_that!(screen(&mut app).contains("Timeline ([00:00:05.0 → 00:00:07.0])")).is_true();
+        app.move_cue_grip(false);
+        assert_that!(screen(&mut app).contains("Timeline ([00:00:05.0] → 00:00:07.0)")).is_true();
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → [00:00:07.0])")).is_true();
+
+        // Act / Assert: at track scale every cue moves, so no part of this one is bracketed.
+        app.toggle_global_retiming();
+        assert_that!(screen(&mut app).contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A resized cue puts a second figure on the title, and the word is what tells the two
+    /// apart: one says the line moved, the other says how long it is now on screen.
+    ///
+    /// Both can be true at once — a cue can be shifted *and* stretched — which is exactly why
+    /// neither may be a bare number standing next to the other.
+    #[test]
+    fn the_timeline_title_should_read_out_a_changed_cue_length() {
+        // Arrange: a cue the file has running 5.0s → 7.0s.
+        let (mut app, directory) =
+            edit_page_app("edit-length-title", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_cue_timing_mode();
+
+        // Act: the end selected and moved out by ten steps, so the line is on screen half a
+        // second longer.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(10);
+
+        // Assert: the times moved with the end, and the length says what it now is.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → [00:00:07.5] · 2.50s long)"))
+            .is_true();
+
+        // Act / Assert: shifted as well, with the whole cue selected, both figures stand, each
+        // saying which it is.
+        app.move_cue_grip(false);
+        app.nudge_selected_cue(3);
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("· +0.15s · 2.50s long)")).is_true();
+
+        // Act / Assert: back at the file's length the figure goes rather than reading the
+        // same number on every cue the reader walks past — even though the cue is still
+        // shifted, so the two are dropped independently.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(-10);
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("· +0.15s)")).is_true();
+        assert_that!(screen.contains("long")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// While the whole track is being retimed the title says so in words, so the figure
+    /// cannot be read as the selected cue's own shift.
+    ///
+    /// The two are otherwise the same shape, and they answer different questions: one says
+    /// how far this line has moved, the other how far the file has. A reader who has just
+    /// pressed `T` must not have to work out which they are looking at.
+    #[test]
+    fn the_timeline_title_should_label_the_figure_while_the_whole_track_is_retimed() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-global-title",
+            vec![edit_cue(5000, 7000, "Hello"), edit_cue(9000, 11000, "Bye")],
+        );
+
+        // Act: into the wide scale and three steps on.
+        app.toggle_global_retiming();
+        for _ in 0..3 {
+            app.shift_whole_track(1);
+        }
+
+        // Assert: the cue's live times, and the track's figure named as the track's.
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.1 → 00:00:07.1 · global +0.15s)"))
+            .is_true();
+
+        // Act / Assert: back at the file's timings the figure goes rather than reading zero.
+        app.reset_track_timing();
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("Timeline (00:00:05.0 → 00:00:07.0)")).is_true();
+        assert_that!(screen.contains("global")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The length dialog names the cue it is about and shows the value being typed, so the
+    /// number can be judged against where the line actually sits without closing it.
+    #[test]
+    fn the_cue_length_dialog_should_name_the_cue_and_show_the_value() {
+        // Arrange: the page on a cue running 5.0s → 7.0s, in the mode.
+        let (mut app, directory) =
+            edit_page_app("edit-length-dialog", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_cue_timing_mode();
+
+        // Act
+        app.open_cue_length_dialog();
+        let screen = draw(&mut app, 100, 30).join("\n");
+
+        // Assert: the cue's number and span in the title, the field and its value inside.
+        assert_that!(screen.contains("Cue 1 · 00:00:05.0 → 00:00:07.0")).is_true();
+        assert_that!(screen.contains("On screen for")).is_true();
+        assert_that!(screen.contains("00:02.000")).is_true();
+
+        // Act / Assert: a character the field refuses says why, rather than looking like a
+        // dead key.
+        app.input_text_char('x');
+        let screen = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("digits, : and . only")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// On a pane too narrow for both, the cue's times go and the figure stays.
+    ///
+    /// Ratatui clips a title from the right, so left alone the reader would lose the one
+    /// number they are pressing a key to change and keep the two they are not. Nothing is
+    /// lost by dropping the times — they are on the cue's own row in the panel throughout.
+    #[test]
+    fn a_narrow_timeline_title_should_drop_the_cues_times_before_the_track_figure() {
+        // Arrange: the page at its narrowest, with the whole track moved.
+        let (mut app, directory) =
+            edit_page_app("edit-global-narrow", vec![edit_cue(5000, 7000, "Hello")]);
+        app.toggle_global_retiming();
+        for _ in 0..3 {
+            app.shift_whole_track(1);
+        }
+
+        // Act / Assert: with room for both, both are there.
+        let wide = draw(&mut app, 100, 30).join("\n");
+        assert_that!(wide.contains("00:00:05.1 → 00:00:07.1 · global +0.15s")).is_true();
+
+        // Act: the narrowest page `render` allows, where the two do not fit together.
+        let narrow = draw(&mut app, 50, 30).join("\n");
+
+        // Assert: the figure survives whole, and the times are what gave way. Asserted on
+        // the title rather than the screen — the cue's times are still on its own row in the
+        // panel, which is exactly why the title can afford to drop them.
+        assert_that!(narrow.contains("Timeline (global +0.15s)")).is_true();
+        assert_that!(narrow.contains("Timeline (00:00:05.1")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A retimed cue is a staged-but-unwritten edit like any other, so it counts on the
+    /// border and wears the mark on its row — the reader must not have to remember which
+    /// lines they moved.
+    #[test]
+    fn a_retimed_cue_should_be_counted_and_marked_like_a_rewritten_one() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = edit_page_app(
+            "edit-retimed-mark",
+            vec![
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Retimed"),
+            ],
+        );
+
+        // Act: move the second cue, and put the cursor back on the first so the retimed row
+        // is drawn unselected — where the cyan fill does not own its colours.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+
+        // Assert: counted on the border.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = draw(&mut app, 100, 30).join("\n");
+        assert_that!(screen.contains("1 edited")).is_true();
+
+        // Assert: and said on the row itself, in the pair every staged edit wears.
+        // Matched over the row's *symbols* rather than over its bytes: the panel's borders
+        // are multi-byte box-drawing characters, so a byte offset from `str::find` is not
+        // the column the word starts in and would read the style of some other cell.
+        let cell_of = |word: &str| {
+            (0..buffer.area.height).find_map(|y| {
+                let symbols: Vec<&str> = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                (0..symbols.len())
+                    .find(|start| symbols[*start..].concat().starts_with(word))
+                    .map(|x| buffer[(x as u16, y)].clone())
+            })
+        };
+        let retimed = cell_of("Retimed").expect("the retimed row should be on screen");
+        let untouched = cell_of("Untouched").expect("the other row should be on screen");
+        assert_that!(retimed.fg).is_equal_to(Color::Yellow);
+        assert!(retimed.modifier.contains(Modifier::ITALIC));
+        // The untouched row is the one under the cursor, so it wears the selection's fill
+        // rather than the plain grey — and, not being edited, no italic.
+        assert_that!(untouched.fg).is_equal_to(Color::White);
+        assert_that!(untouched.bg).is_equal_to(Color::Cyan);
+        assert!(!untouched.modifier.contains(Modifier::ITALIC));
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A count on the panel's border says *how many* cues were rewritten but not *which*,
+    /// and on a track of a thousand cues that is no answer at all. The rewritten row says
+    /// so itself, in the words that changed — yellow and italic, the same pair every other
+    /// staged-but-unwritten thing in the application wears.
+    #[test]
+    fn a_rewritten_cue_should_say_so_in_its_own_words() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = edit_page_app(
+            "edit-edited-mark",
+            vec![
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Rewritten"),
+            ],
+        );
+
+        // The words of the row at `y`, with the style of its first character.
+        let row = |app: &mut App, y: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = column_of(&line, "Untouched").or_else(|| column_of(&line, "Rewritten"));
+            (line.clone(), text.map(|x| buffer[(x, y)].clone()))
+        };
+
+        // The two cue rows, found by the words on them.
+        let mut rows = (0..30).filter(|y| {
+            let line = row(&mut app, *y).0;
+            line.contains("Untouched") || line.contains("Rewritten")
+        });
+        let untouched = rows.next().expect("the first cue should be drawn");
+        let rewritten = rows.next().expect("the second cue should be drawn");
+        drop(rows);
+
+        // Act: rewrite the second one.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Assert: the rewritten row's words are yellow and italic; the other row's are not.
+        let (_, edited_cell) = row(&mut app, rewritten);
+        let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
+        assert!(
+            edited_cell.modifier.contains(Modifier::ITALIC),
+            "a rewritten cue's words should be italic"
+        );
+        let (_, plain_cell) = row(&mut app, untouched);
+        let plain_cell = plain_cell.expect("the untouched cue should still be drawn");
+        assert_that!(plain_cell.fg).is_equal_to(Color::Gray);
+        assert!(
+            !plain_cell.modifier.contains(Modifier::ITALIC),
+            "an untouched cue's words should be left alone"
+        );
+
+        // And with the cursor off it, the colour carries the same thing the italic does.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        let (_, edited_cell) = row(&mut app, rewritten);
+        let edited_cell = edited_cell.expect("the rewritten cue should still be drawn");
+        assert_that!(edited_cell.fg).is_equal_to(Color::Yellow);
+        assert!(edited_cell.modifier.contains(Modifier::ITALIC));
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue marked to go says so in red, with a line through the words it will not get to
+    /// say — the same colour a track marked for deletion wears one layer up. The
+    /// strikethrough is what carries the mark onto the selected row, where the cyan fill owns
+    /// the colours, exactly as the italic carries a rewrite onto it.
+    #[test]
+    fn a_cue_marked_for_deletion_should_say_so_in_red_and_struck_through() {
+        // Arrange: two cues, so an untouched row is there to compare against.
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-mark",
+            vec![
+                edit_cue(1000, 3000, "Untouched"),
+                edit_cue(5000, 7000, "Doomed"),
+            ],
+        );
+
+        // The words of the row at `y`, with the style of its first character.
+        let row = |app: &mut App, y: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = column_of(&line, "Untouched").or_else(|| column_of(&line, "Doomed"));
+            (line.clone(), text.map(|x| buffer[(x, y)].clone()))
+        };
+
+        // The two cue rows, found by the words on them.
+        let mut rows = (0..30).filter(|y| {
+            let line = row(&mut app, *y).0;
+            line.contains("Untouched") || line.contains("Doomed")
+        });
+        let untouched = rows.next().expect("the first cue should be drawn");
+        let doomed = rows.next().expect("the second cue should be drawn");
+        drop(rows);
+
+        // Act: mark the second one, which leaves the cursor on it — there is nowhere further
+        // down the list for it to go.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.toggle_delete_selected_cue();
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([1]);
+
+        // Assert: struck through under the cursor, where the fill owns the colours.
+        let (_, marked_cell) = row(&mut app, doomed);
+        let marked_cell = marked_cell.expect("the marked cue should still be drawn");
+        assert!(
+            marked_cell.modifier.contains(Modifier::CROSSED_OUT),
+            "a cue marked for deletion should be struck through"
+        );
+        let (_, plain_cell) = row(&mut app, untouched);
+        let plain_cell = plain_cell.expect("the untouched cue should still be drawn");
+        assert_that!(plain_cell.fg).is_equal_to(Color::Gray);
+        assert!(
+            !plain_cell.modifier.contains(Modifier::CROSSED_OUT),
+            "an untouched cue's words should be left alone"
+        );
+
+        // Act / Assert: and with the cursor off it, red carries the same thing the line does.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        let (_, marked_cell) = row(&mut app, doomed);
+        let marked_cell = marked_cell.expect("the marked cue should still be drawn");
+        assert_that!(marked_cell.fg).is_equal_to(Color::Red);
+        assert!(marked_cell.modifier.contains(Modifier::CROSSED_OUT));
+        // The row reads as one red thing rather than struck-through words under an ordinary
+        // timestamp, so the timing on its border goes red too.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let border: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, doomed - 1)].symbol())
+            .collect();
+        let timing =
+            column_of(&border, "00:00:05.0").expect("the marked cue's timing should be drawn");
+        assert_that!(buffer[(timing, doomed - 1)].fg).is_equal_to(Color::Red);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Going *is* the edit: a row marked to go is not also a rewritten row, which is the
+    /// ranking the track list's rows already follow. Without it a cue rewritten and then
+    /// marked would be drawn yellow and italic — saying it will read differently, about a
+    /// line that will not be read at all.
+    #[test]
+    fn a_cue_both_rewritten_and_marked_should_read_as_deleted() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-deleted-over-edited",
+            vec![
+                edit_cue(1000, 3000, "Rewritten"),
+                edit_cue(5000, 7000, "Spare"),
+            ],
+        );
+
+        // Act: rewrite the first cue, then mark it.
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.toggle_delete_selected_cue();
+        // The cursor moved on, so the marked row is drawn unselected and shows its colour.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Assert
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let found = (0..buffer.area.height).find_map(|y| {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            column_of(&line, "Rewritten").map(|x| buffer[(x, y)].clone())
+        });
+        let cell = found.expect("the rewritten and marked cue should be drawn");
+        assert_that!(cell.fg).is_equal_to(Color::Red);
+        assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+        assert!(
+            !cell.modifier.contains(Modifier::ITALIC),
+            "a cue marked to go must not also read as one about to say something else"
+        );
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span takes a second or two to decode, during which the page looks exactly as it
+    /// did before the key was pressed. Without a word about it, `p` reads as a key that
+    /// does nothing — and ahead of the background pass's count, because this is the one
+    /// the user is actually waiting on.
+    #[test]
+    fn the_page_should_say_that_a_playback_is_being_prepared() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("edit-preparing", vec![edit_cue(1000, 3000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4, 0);
+
+        // Act
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .prepare_playback(crate::preview::PlaybackAnchor::Cue(0));
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Preparing playback")).is_true();
+        assert_that!(screen.contains("Generating preview frames")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A playback that could not be decoded says why, against the cue it was asked for —
+    /// and ahead of everything else, since it is the only line here explaining something
+    /// the user just did.
+    #[test]
+    fn the_page_should_explain_a_playback_it_could_not_start() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-playback-failed", vec![edit_cue(1000, 3000, "a")]);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4, 0);
+
+        // Act
+        app.subtitle_edit.as_mut().unwrap().fail_playback(
+            crate::preview::PlaybackAnchor::Cue(0),
+            "Could not play this cue: no video".to_string(),
+        );
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(screen.contains("Could not play this cue: no video")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup is the only place the five values are visible, so it has to show all of
+    /// them — and mark the ones that differ from the config file, which is what answers
+    /// "did I leave the speed at half?" without reading every row.
+    #[test]
+    fn the_preview_settings_dialog_should_show_every_value_and_mark_the_changed_ones() {
+        // Arrange: a config that asked for a lower rate than the built-in default, so the
+        // *file's* answer is what an unchanged row has to show.
+        let (mut app, directory) = edit_page_app("preview-settings", vec![edit_cue(0, 2000, "a")]);
+        app.set_preview_settings(crate::app::PreviewSettings {
+            playback_fps: 24,
+            ..crate::app::PreviewSettings::default()
+        });
+        app.open_preview_settings();
+
+        // Act
+        let screen = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: every row, with the values in force.
+        assert_that!(screen.contains("Preview settings")).is_true();
+        for row in [
+            "Speed",
+            "Loop",
+            "Sound",
+            "Padding",
+            "Frame rate",
+            "Video track",
+            "Audio track",
+            "Subtitle track",
+        ] {
+            assert_that!(screen.contains(row)).is_true();
+        }
+        assert_that!(screen.contains("[ 1x ]")).is_true();
+        assert_that!(screen.contains("[ 1.00 s ]")).is_true();
+        // The file's rate, not the built-in thirty.
+        assert_that!(screen.contains("[ 24 fps ]")).is_true();
+        // The two switches are button pairs rather than a value in brackets, so both answers
+        // are on the row and the lit one is the state in force. The third `No` is the audio
+        // row reading `None` — this fixture is a video with no sound, which is the one
+        // dropdown in this popup that can be empty.
+        assert_that!(screen.matches("Yes").count()).is_equal_to(2);
+        assert_that!(screen.matches("No").count()).is_equal_to(3);
+        assert_that!(screen.contains("[ None ]")).is_true();
+
+        // Assert: the three tracks come first and run together, and one blank row separates
+        // them from the speed.
+        let rows = draw(&mut app, 140, 40);
+        let row_of = |label: &str| {
+            rows.iter()
+                .position(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("the {label} row should be drawn"))
+        };
+        let subtitle_row = row_of("Subtitle track");
+        assert_that!(row_of("Video track")).is_equal_to(subtitle_row - 2);
+        assert_that!(row_of("Audio track")).is_equal_to(subtitle_row - 1);
+        assert_that!(row_of("Speed")).is_equal_to(subtitle_row + 2);
+
+        // Act: open the speed dropdown, the row after the three tracks.
+        for _ in 0..3 {
+            app.move_preview_settings_cursor(1);
+        }
+        app.activate_preview_setting();
+        let open = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: the field marker turns, and every speed is listed under it with the one in
+        // force marked — the same tree-guide children every other dropdown draws.
+        assert_that!(open.contains("▿")).is_true();
+        for speed in ["0.25x", "0.5x", "0.75x", "1.25x", "1.5x", "2x"] {
+            assert_that!(open.contains(speed)).is_true();
+        }
+        assert_that!(open.contains("> 1x")).is_true();
+        assert_that!(open.contains("└──")).is_true();
+
+        // Act: choose a different speed, then a different rate. The lists run fastest and
+        // highest first, so one step *down* from the value in force is the slower answer.
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        let changed = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: the new values are shown, and the rate row moved off the file's answer.
+        assert_that!(changed.contains("[ 0.75x ]")).is_true();
+        assert_that!(changed.contains("[ 5 fps ]")).is_true();
+
+        // Act / Assert: the dialog raised without its popup state draws the page rather than
+        // panicking on an unwrap — the guard every settings renderer opens with.
+        app.preview_settings_popup = None;
+        let bare = draw(&mut app, 140, 40).join(" ");
+        assert_that!(bare.contains("Preview settings")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track row is *changed* when the reader has pointed it somewhere else in this visit,
+    /// which is the honest thing to say: nothing has happened yet, and closing the popup is
+    /// what will make it happen. A track the page would refuse is greyed rather than hidden,
+    /// so a reader who can see it is there has been answered.
+    #[test]
+    fn the_track_rows_should_mark_a_pending_choice_and_grey_a_refused_one() {
+        // Arrange: a second subtitle track the page cannot read, beside the one it is on.
+        let (mut app, directory) = edit_page_app("preview-tracks", vec![edit_cue(0, 2000, "a")]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.open_preview_settings();
+
+        // Act: open the subtitle list.
+        app.preview_settings_popup =
+            app.preview_settings_popup
+                .map(|popup| crate::app::PreviewSettingsPopup {
+                    field: crate::app::PreviewSettingsField::SubtitleTrack,
+                    ..popup
+                });
+        app.activate_preview_setting();
+        let open = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: both tracks are on the list, and the one that cannot be previewed says so.
+        assert_that!(open.contains("Subtitle track")).is_true();
+        assert_that!(open.contains("#1 · SRT")).is_true();
+        assert_that!(open.contains("#2 · PGS")).is_true();
+        assert_that!(open.contains("cannot be previewed")).is_true();
+        // The refused row is drawn inert, which is the one thing that tells it apart.
+        assert_that!(
+            app.preview_choice_enabled(crate::app::PreviewSettingsField::SubtitleTrack, 1)
+        )
+        .is_false();
+
+        // Act / Assert: an untouched row is not marked as changed — the reader opening a
+        // list and picking what was already there has not asked for a switch.
+        app.activate_preview_setting();
+        assert_that!(app.preview_track_pending(crate::app::PreviewSettingsField::SubtitleTrack))
+            .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same question is raised by two departures, and the second half of it names which:
+    /// switching tracks leaves this track's page as surely as `Esc` does, so saying "leaving"
+    /// there would describe something the reader did not press.
+    #[test]
+    fn the_unsaved_cue_edits_prompt_should_name_the_departure_it_is_about() {
+        // Arrange: two SubRip tracks and a cue rewritten but not written out.
+        let (mut app, directory) =
+            edit_page_app("leave-cues-wording", vec![edit_cue(0, 2000, "a")]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act / Assert: `Esc` on the page raises it about leaving.
+        app.request_leave_subtitle_edit();
+        let leaving = draw(&mut app, 100, 30).join(" ");
+        assert_that!(leaving.contains("leaving discards them")).is_true();
+        app.resolve_leave_subtitle_edit(false);
+
+        // Act / Assert: and the popup naming another track raises it about switching.
+        app.open_preview_settings();
+        app.preview_settings_popup =
+            app.preview_settings_popup
+                .map(|popup| crate::app::PreviewSettingsPopup {
+                    field: crate::app::PreviewSettingsField::SubtitleTrack,
+                    ..popup
+                });
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        let switching = draw(&mut app, 100, 30).join(" ");
+        assert_that!(switching.contains("switching tracks discards them")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `K` explains the row under the cursor, and keeps explaining as the cursor moves — it
+    /// is a panel you leave up while reading down the rows, not a per-field prompt.
+    #[test]
+    fn the_preview_help_panel_should_explain_whichever_row_the_cursor_is_on() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("preview-help", vec![edit_cue(0, 2000, "a")]);
+        app.open_preview_settings();
+
+        // Act / Assert: nothing until asked for.
+        assert_that!(
+            draw(&mut app, 160, 40)
+                .join(" ")
+                .contains("Information about")
+        )
+        .is_false();
+
+        // Act
+        app.toggle_preview_help();
+        let screen = draw(&mut app, 160, 40).join(" ");
+
+        // Assert: titled for the focused row, and explaining that row rather than the popup.
+        assert_that!(screen.contains("Information about Video track")).is_true();
+        assert_that!(screen.contains("Which of the file's video streams")).is_true();
+
+        // Act / Assert: it follows the cursor rather than staying on the row it opened over.
+        app.move_preview_settings_cursor(1);
+        let moved = draw(&mut app, 160, 40).join(" ");
+        assert_that!(moved.contains("Information about Audio track")).is_true();
+        assert_that!(moved.contains("Information about Video track")).is_false();
+
+        // Act / Assert: and every row has something to say, with its own title.
+        for field in PreviewSettingsField::ORDER {
+            let title = preview_field_help_title(field);
+            assert_that!(title.contains(field.label())).is_true();
+            let text = preview_field_help_text(field);
+            assert_that!(text.lines.len() > 1).is_true();
+        }
+
+        // Act / Assert: `K` again puts it away.
+        app.toggle_preview_help();
+        assert_that!(
+            draw(&mut app, 160, 40)
+                .join(" ")
+                .contains("Information about")
+        )
+        .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The lit button carries the row's own style, so which answer is true and which row the
+    /// cursor is on both read at a glance. Asserted on the styled spans rather than on the
+    /// text, because every state of this row draws the same two words.
+    #[test]
+    fn a_toggle_row_should_light_the_answer_in_force_and_dim_the_other() {
+        // Act / Assert: unselected and unchanged — the lit button is plain white, the other
+        // dimmed.
+        let plain = toggle_line("Loop", true, false, false);
+        assert_that!(style_of(&plain, " Yes ").fg).is_equal_to(Some(Color::White));
+        assert_that!(style_of(&plain, " No ").fg).is_equal_to(Some(Color::DarkGray));
+
+        // Act / Assert: the answer flips with the value, not with the cursor.
+        let no = toggle_line("Loop", false, false, false);
+        assert_that!(style_of(&no, " Yes ").fg).is_equal_to(Some(Color::DarkGray));
+        assert_that!(style_of(&no, " No ").fg).is_equal_to(Some(Color::White));
+
+        // Act / Assert: focused, and focused-and-changed, take the shared field styles the
+        // dropdown rows use — so a toggle does not read as a different kind of row.
+        let focused = toggle_line("Loop", true, true, false);
+        assert_that!(style_of(&focused, " Yes ")).is_equal_to(focused_style(false));
+        let focused_changed = toggle_line("Loop", true, true, true);
+        assert_that!(style_of(&focused_changed, " Yes ")).is_equal_to(focused_style(true));
+
+        // Act / Assert: changed but not focused is the changed style, which is what makes a
+        // setting left on stand out from the rows around it.
+        let changed = toggle_line("Loop", true, false, true);
+        assert_that!(style_of(&changed, " Yes ")).is_equal_to(changed_style());
+        assert_that!(style_of(&changed, " No ").fg).is_equal_to(Some(Color::DarkGray));
+    }
+
+    /// The style of the span holding `text`, for asserting on a row whose every state draws
+    /// the same words.
+    fn style_of(line: &Line<'static>, text: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content == text)
+            .unwrap_or_else(|| panic!("the row should hold a {text} span"))
+            .style
+    }
+
+    /// A playback that will run at half speed, silently, is not something the user should
+    /// have to open a popup to find out about — but nor should an untouched page grow
+    /// furniture. The badge appears only because the user made it appear.
+    #[test]
+    fn the_preview_pane_should_name_only_the_settings_that_differ_from_the_config_file() {
+        // Arrange
+        let (mut app, directory) = edit_page_app("preview-badge", vec![edit_cue(0, 2000, "a")]);
+
+        // Act / Assert: nothing added to an untouched page.
+        let plain = draw(&mut app, 140, 40).join(" ");
+        assert_that!(plain.contains("Preview")).is_true();
+        assert_that!(plain.contains("Preview ·")).is_false();
+
+        // Act: half speed, looping, muted. The speed list runs fastest first, so half is the
+        // second row from the *end*. The speed is the row after the three tracks.
+        app.open_preview_settings();
+        for _ in 0..3 {
+            app.move_preview_settings_cursor(1);
+        }
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(true);
+        app.move_preview_settings_cursor(-1);
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        let badged = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: all three named, and the padding and rate left out — they change what a
+        // playback costs rather than what it looks like.
+        assert_that!(badged.contains("0.5x")).is_true();
+        assert_that!(badged.contains("loop")).is_true();
+        assert_that!(badged.contains("muted")).is_true();
+
+        // Act / Assert: and turning them back off takes the badge away again.
+        app.open_preview_settings();
+        app.reset_preview_settings();
+        app.escape_preview_settings();
+        assert_that!(draw(&mut app, 140, 40).join(" ").contains("Preview ·")).is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A config file that turned something *on* makes that the unchanged state, so the badge
+    /// has to name the setting when the user turns it back off — a badge keyed on "is this
+    /// the built-in default" would stay silent exactly when it mattered.
+    #[test]
+    fn the_badge_should_name_a_setting_turned_off_against_a_config_that_turned_it_on() {
+        // Arrange: defaults that already loop and already mute.
+        let settings = crate::app::PreviewSettings {
+            playback_loop: true,
+            playback_muted: true,
+            ..crate::app::PreviewSettings::default()
+        };
+
+        // Act / Assert: matching the defaults says nothing.
+        assert_that!(playback_settings_badge(settings, settings, None)).is_none();
+
+        // Act / Assert: and going against them names both, in the words of what is now true.
+        let changed = crate::app::PreviewSettings {
+            playback_loop: false,
+            playback_muted: false,
+            ..settings
+        };
+        assert_that!(playback_settings_badge(changed, settings, None))
+            .is_equal_to(Some("once · sound".to_string()));
+
+        // Act / Assert: and a chosen audio track leads, because a preview playing the
+        // commentary sounds like the wrong film and nothing else on screen would say why.
+        assert_that!(playback_settings_badge(settings, settings, Some(4)))
+            .is_equal_to(Some("audio #4".to_string()));
+        assert_that!(playback_settings_badge(changed, settings, Some(4)))
+            .is_equal_to(Some("audio #4 · once · sound".to_string()));
+    }
+
+    /// The playback takes the pane while it runs, and the still frame is what is left when
+    /// it stops. Before its first frame — while the span decodes, and for the moment
+    /// between the sound starting and the device's first callback — the still one stays,
+    /// so pressing `p` never blanks the pane.
+    #[test]
+    fn the_preview_pane_should_show_the_playback_while_one_is_running() {
+        // Arrange: a still frame on screen, painted a colour nothing else here draws.
+        let (mut app, directory) =
+            edit_page_app("edit-playback-pane", vec![edit_cue(1000, 3000, "a")]);
+        drawn(80, 24, |frame| render(frame, &mut app));
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_frame(0, still_frame(cells, [255, 0, 0]));
+        let still = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Act: a span whose picture differs in *shape*, not just colour. A flat frame
+        // encodes to spaces under halfblocks whatever colour it is — the two halves of
+        // every cell match — so striping the rows is what makes the difference land in the
+        // characters a `TestBackend` records.
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let playback_cells =
+            crate::preview::playback_cells(cells, (1920, 1080), picker.font_size());
+        let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
+        let striped: Vec<u8> = (0..pixels.1)
+            .flat_map(|row| {
+                let shade = if row % 2 == 0 { 0u8 } else { 255 };
+                std::iter::repeat_n(shade, pixels.0 as usize * 3)
+            })
+            .collect();
+        app.subtitle_edit.as_mut().unwrap().begin_playback(
+            crate::preview::PlaybackAnchor::Cue(0),
+            crate::preview::PlaybackFrames::new(
+                striped,
+                crate::preview::SpanShape {
+                    pixels,
+
+                    cells: playback_cells,
+                    picker,
+                },
+                10,
+                crate::preview::PlaybackSpeed::NORMAL,
+                std::time::Duration::from_secs(1),
+                Vec::new(),
+            ),
+            Box::new(crate::audio::DeviceSource::new(
+                crate::audio::OutputFormat::FALLBACK,
+                std::sync::Arc::new(Vec::new()),
+            )),
+            false,
+        );
+        app.advance_playback();
+        let playing = drawn(80, 24, |frame| render(frame, &mut app));
+
+        // Assert: the pane changed, so it is the playback being drawn and not the still.
+        assert_that!(playing == still).is_false();
+
+        // Act / Assert: and when the playback ends, the still frame is back.
+        app.subtitle_edit.as_mut().unwrap().stop_playback();
+        assert_that!(drawn(80, 24, |frame| render(frame, &mut app))).is_equal_to(still);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The playhead is the only thing on the timeline that says *where in the span* the
+    /// sound has got to, which is the whole judgement the page exists for: is the bracket
+    /// where the speech is. So it has to be readable over the cue it is being read against
+    /// rather than hidden underneath it.
+    #[test]
+    fn the_playhead_should_mark_where_the_sound_is_across_every_lane() {
+        // Arrange: two overlapping cues, so the track has two lanes to cross.
+        let cues = [edit_cue(10_000, 20_000, "a"), edit_cue(15_000, 25_000, "b")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::ZERO,
+            end: std::time::Duration::from_secs(60),
+            width: 61,
+        };
+
+        // Act: eighteen seconds in, which is inside both cues.
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            Some(std::time::Duration::from_secs(18)),
+            None,
+            TimingScope::Off,
+        );
+
+        // Assert: on both lanes, at the column that moment maps to — over the cue rather
+        // than under it.
+        let text = timeline_text(&lines);
+        assert_that!(text.len()).is_equal_to(2);
+        for lane in &text {
+            assert_that!(lane.chars().nth(18)).is_equal_to(Some('│'));
+        }
+
+        // Act / Assert: and no playback means no mark, rather than one parked at zero.
+        let text = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        ));
+        for lane in &text {
+            assert_that!(lane.contains('│')).is_false();
+        }
+    }
+
+    /// The playhead's moment comes from the audio device, not from the cue list the track
+    /// was laid out against — so a span reaching past the visible window must leave the
+    /// timeline unmarked rather than painting its edge.
+    #[test]
+    fn a_playhead_outside_the_visible_window_should_not_be_drawn() {
+        // Arrange
+        let cues = [edit_cue(10_000, 20_000, "a")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = crate::cue::TimelineWindow {
+            start: std::time::Duration::from_secs(10),
+            end: std::time::Duration::from_secs(70),
+            width: 61,
+        };
+
+        // Act / Assert: before the window, and after it.
+        for at in [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(90),
+        ] {
+            let text = timeline_text(&timeline_lines(
+                &cues,
+                &layout,
+                &window,
+                Some(0),
+                Some(at),
+                None,
+                TimingScope::Off,
+            ));
+            for lane in &text {
+                assert_that!(lane.contains('│')).is_false();
+            }
+        }
+    }
+
+    /// End to end through the real page: a playback running puts the mark on the timeline,
+    /// and stopping it takes the mark away.
+    #[test]
+    fn the_page_should_draw_a_playhead_while_a_span_is_playing() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-playhead", vec![edit_cue(10_000, 20_000, "a")]);
+        // Counted rather than searched for: `│` is also ratatui's vertical border glyph, so
+        // the page is full of them before anything plays. The layout does not change here —
+        // a playing page shows no status row, the same as an idle one — so any increase is
+        // the playhead.
+        let before = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+
+        // Act: a span starting where the cue does, stepped onto its first frame.
+        let cells = app.subtitle_edit.as_ref().unwrap().preview_cells;
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let playback_cells =
+            crate::preview::playback_cells(cells, (1920, 1080), picker.font_size());
+        let pixels = crate::preview::playback_pixels(playback_cells, picker.font_size());
+        let stride = (pixels.0 as usize) * (pixels.1 as usize) * 3;
+        app.subtitle_edit.as_mut().unwrap().begin_playback(
+            crate::preview::PlaybackAnchor::Cue(0),
+            crate::preview::PlaybackFrames::new(
+                vec![40; stride * 20],
+                crate::preview::SpanShape {
+                    pixels,
+
+                    cells: playback_cells,
+                    picker,
+                },
+                10,
+                crate::preview::PlaybackSpeed::NORMAL,
+                std::time::Duration::from_secs(8),
+                Vec::new(),
+            ),
+            Box::new(crate::audio::DeviceSource::new(
+                crate::audio::OutputFormat::FALLBACK,
+                std::sync::Arc::new(Vec::new()),
+            )),
+            false,
+        );
+        app.advance_playback();
+        let playing = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+
+        // Assert: one mark per lane, and this track has one lane.
+        assert_that!(playing).is_equal_to(before + 1);
+
+        // Act / Assert: and it goes when the playback does.
+        app.subtitle_edit.as_mut().unwrap().stop_playback();
+        let stopped = drawn(80, 24, |frame| render(frame, &mut app))
+            .matches('│')
+            .count();
+        assert_that!(stopped).is_equal_to(before);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A protocol filling `cells` exactly, in one flat colour, for asserting which picture
+    /// the pane is drawing.
+    fn still_frame(
+        cells: ratatui::layout::Size,
+        colour: [u8; 3],
+    ) -> Box<ratatui_image::protocol::Protocol> {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let font = picker.font_size();
+        let mut image = image::RgbImage::new(
+            u32::from(cells.width) * u32::from(font.width),
+            u32::from(cells.height) * u32::from(font.height),
+        );
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgb(colour);
+        }
+        Box::new(
+            picker
+                .new_protocol(
+                    image::DynamicImage::ImageRgb8(image),
+                    cells,
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks should encode any image"),
+        )
+    }
+
+    /// The one mark on this pane the reader is actively moving, so it goes on top of
+    /// everything — including the playhead, which is the other `│` that can share a column
+    /// with it. Green, because both the other colours here already mean something and swap
+    /// meanings between them in the timing mode.
+    #[test]
+    fn the_timeline_cursor_should_be_drawn_through_every_lane_over_the_playhead() {
+        // Arrange: one cue, a window a minute wide over sixty-one columns, so a column is a
+        // second and the arithmetic is readable.
+        let cues = vec![edit_cue(0, 60_000, "sign")];
+        let layout = crate::cue::pack_lanes(&cues, crate::cue::MAX_LANES);
+        let window = window_over(0, 60, 61);
+        let at = Duration::from_secs(20);
+
+        // Act: the playhead and the cursor on the same column.
+        let lines = timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            Some(at),
+            Some(at),
+            TimingScope::Off,
+        );
+
+        // Assert: the cursor wins the column, and it is green.
+        let text = timeline_text(&lines);
+        assert_that!(text[0].chars().nth(20)).is_equal_to(Some('│'));
+        let painted = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('│'))
+            .expect("the cursor should be drawn");
+        assert_that!(painted.style.fg).is_equal_to(Some(CURSOR_COLOUR));
+
+        // Act / Assert: and with the cue panel holding the cursor there is no mark at all.
+        let text = timeline_text(&timeline_lines(
+            &cues,
+            &layout,
+            &window,
+            Some(0),
+            None,
+            None,
+            TimingScope::Off,
+        ));
+        assert_that!(text[0].contains('│')).is_false();
+    }
+
+    /// The ruler marks the column too, with the `▼` that mirrors the selection's `▲`. Its
+    /// column is reserved before any reading is placed, for the reason the selection's ends
+    /// are: a reading with a mark painted through it is a plausible but wrong time.
+    #[test]
+    fn the_ruler_should_mark_the_cursors_column_without_defacing_a_reading() {
+        // Arrange: a minute over sixty-one columns puts 00:00:20 at column twenty.
+        let cue = edit_cue(0, 2_000, "line");
+        let window = window_over(0, 60, 61);
+
+        // Act
+        let marked: String = timeline_ruler(
+            &window,
+            window.span(&cue),
+            Some(Duration::from_secs(20)),
+            false,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+
+        // Assert: the mark is there, the reading that would have started in that column is
+        // gone whole rather than defaced, and the readings either side survive.
+        assert_that!(marked.chars().nth(20)).is_equal_to(Some('▼'));
+        assert_that!(marked.as_str()).does_not_contain("0:20");
+        assert_that!(marked.as_str()).contains("0:10");
+        assert_that!(marked.as_str()).contains("0:30");
+
+        // Act / Assert: and no cursor means no `▼`.
+        assert_that!(ruler_text(&window, &cue)).does_not_contain("▼");
+    }
+
+    /// Two panes take keys now, so the border has to say which of them `h` is about to talk
+    /// to — the same answer the file list and the track list already give.
+    #[test]
+    fn the_focused_border_should_move_between_the_cue_panel_and_the_timeline() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-focus",
+            vec![edit_cue(0, 2_000, "one"), edit_cue(4_000, 6_000, "two")],
+        );
+
+        // Act: drawn with the cue panel holding the cursor.
+        let cues_focused = draw(&mut app, 90, 24);
+
+        // Act: and again with the timeline holding it.
+        app.focus_timeline();
+        let timeline_focused = draw(&mut app, 90, 24);
+
+        // Assert: the title says where the cursor is, the ruler marks its column, and the
+        // two draws differ.
+        assert_that!(cues_focused.join("\n").as_str()).does_not_contain("▼");
+        assert_that!(timeline_focused.join("\n").as_str()).contains("Timeline (00:00:00.00)");
+        assert_that!(timeline_focused.join("\n").as_str()).contains("▼");
+        assert_that!(cues_focused != timeline_focused).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// **No cue is marked anywhere while the timeline holds the cursor.** The selection is
+    /// where the *other* pane's cursor is parked, and leaving it drawn puts two things on
+    /// screen that both look like "here" — one of which no key being pressed is moving.
+    /// Both panes have to stand it down together, or the filled block in the list and the
+    /// cyan bracket on the track disagree about whether there is a selection at all.
+    #[test]
+    fn no_cue_should_be_marked_in_either_pane_while_the_timeline_holds_the_cursor() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-no-selection",
+            vec![edit_cue(1_000, 3_000, "one"), edit_cue(5_000, 7_000, "two")],
+        );
+        // The selected block is the one thing on this page drawn on a cyan *background*, so
+        // counting those cells answers "is a cue marked" without reading the glyphs.
+        let filled_cells = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buffer[(*x, *y)].style().bg == Some(Color::Cyan))
+                .count()
+        };
+
+        // Act / Assert: with the cue panel holding the cursor, the selection is drawn and
+        // its two ends are marked on the ruler.
+        assert_that!(filled_cells(&mut app) > 0).is_true();
+        assert_that!(draw(&mut app, 90, 24).join("\n").as_str()).contains("▲");
+
+        // Act
+        app.focus_timeline();
+
+        // Assert: nothing filled in the cue panel, and no `▲` under a cue on the ruler —
+        // the only mark left is the cursor's own `▼`.
+        assert_that!(filled_cells(&mut app)).is_equal_to(0);
+        let drawn = draw(&mut app, 90, 24).join("\n");
+        assert_that!(drawn.as_str()).does_not_contain("▲");
+        assert_that!(drawn.as_str()).contains("▼");
+
+        // Act / Assert: and `Ctrl+K` brings both back, so nothing was lost by looking away.
+        app.focus_cues();
+        assert_that!(filled_cells(&mut app) > 0).is_true();
+        assert_that!(draw(&mut app, 90, 24).join("\n").as_str()).contains("▲");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The title answers for whichever pane holds the cursor and never for both at once.
+    /// Three timestamps in a row that changed shape with the focus made the reader work out
+    /// which two belonged together before they could read either, and the cue's own times
+    /// are on its row in the panel the whole time.
+    #[test]
+    fn the_timelines_title_should_read_for_one_pane_at_a_time() {
+        // Arrange
+        let (mut app, directory) = edit_page_app(
+            "edit-title",
+            vec![
+                edit_cue(5_000, 7_000, "one"),
+                edit_cue(20_000, 22_000, "two"),
+            ],
+        );
+
+        // The cue's times are on its row in the panel throughout, so the title is what has
+        // to be read on its own — a whole-screen assertion would find them either way.
+        let title = |app: &mut App| {
+            draw(app, 100, 24)
+                .into_iter()
+                .find(|line| line.contains("Timeline ("))
+                .expect("the timeline draws a title")
+        };
+
+        // Act: nudge the cue, with the cue panel still holding the cursor.
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(3);
+
+        // Assert: the cue's live times and how far it has moved, and no cursor reading.
+        let cues = title(&mut app);
+        assert_that!(cues.as_str()).contains("00:00:05.1 → 00:00:07.1");
+        assert_that!(cues.as_str()).contains("+0.15s");
+
+        // Act: the cursor into the timeline, four coarse steps on from the nudged cue's own
+        // moment of 5.15.
+        app.focus_timeline();
+        app.move_timeline_cursor(4, crate::subtitle_edit::TIMELINE_STEP);
+
+        // Assert: the moment alone, to a hundredth — and the cue's readings stood down.
+        let timeline = title(&mut app);
+        assert_that!(timeline.as_str()).contains("Timeline (00:00:07.15)");
+        assert_that!(timeline.as_str()).does_not_contain("→");
+        assert_that!(timeline.as_str()).does_not_contain("+0.15s");
+        // No `▼` in front of it: with one reading at a time there is nothing for a glyph to
+        // tell it apart from, and the ruler below is where the mark belongs.
+        assert_that!(timeline.as_str()).does_not_contain("▼");
+
+        // Act / Assert: one fine step, which a tenths readout could not have shown at all.
+        app.move_timeline_cursor(1, crate::subtitle_edit::TIMELINE_FINE_STEP);
+        assert_that!(title(&mut app).as_str()).contains("Timeline (00:00:07.20)");
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor is free to walk out of the window the selected cue chose, and a cursor
+    /// drawn nowhere is one the reader cannot follow — so the window slides to hold it.
+    #[test]
+    fn the_timeline_should_follow_a_cursor_that_walks_out_of_its_window() {
+        // Arrange: a cue at the very start of a two-minute file, so the window opens on it.
+        let (mut app, directory) = edit_page_app("edit-follow", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+
+        // Act: ninety seconds on, which is well past a sixty-second window opened at zero.
+        for _ in 0..18 {
+            app.move_timeline_cursor(
+                crate::subtitle_edit::TIMELINE_LEAP,
+                crate::subtitle_edit::TIMELINE_STEP,
+            );
+        }
+        let screen = draw(&mut app, 100, 24).join("\n");
+
+        // Assert: the cursor is on screen, and the axis has moved with it — the title says
+        // the moment and the ruler carries a mark for it, which it could not if the window
+        // had stayed where it was.
+        assert_that!(screen.as_str()).contains("Timeline (00:01:30.00)");
+        assert_that!(screen.matches('▼').count()).is_equal_to(1);
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Coming back the other way, the cursor has to travel *through* the window before
+    /// anything scrolls.
+    ///
+    /// `fitted` anchors a window on the selected cue and is rebuilt from it on every draw, so
+    /// sliding that the minimum needed to hold the cursor parked the cursor against the edge
+    /// it had left by — every frame. Moving back then dragged the whole track underneath a
+    /// cursor stuck to the right-hand edge, which is the opposite of scrolling. The scroll
+    /// position is the reader's while they hold the cursor, not the selection's.
+    #[test]
+    fn a_cursor_coming_back_should_cross_the_window_before_it_scrolls() {
+        // Arrange: a cue at the very start of a two-minute file, so the window opens on it —
+        // and stays anchored there if the selection is what decides.
+        let (mut app, directory) =
+            edit_page_app("edit-scroll-back", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+        // The ruler's readings, and where the cursor's mark sits along them. The marks are
+        // blanked out of the first half: they are what is expected to move, and leaving them
+        // in would make every comparison below differ for that reason alone.
+        let axis = |app: &mut App| -> (String, usize) {
+            let row = draw(app, 100, 24)
+                .into_iter()
+                .find(|line| line.contains('▼'))
+                .expect("the focused timeline marks its cursor");
+            let column = row
+                .chars()
+                .position(|glyph| glyph == '▼')
+                .expect("the row was found by that mark");
+            let readings = row
+                .chars()
+                .map(|glyph| {
+                    if matches!(glyph, '▲' | '▼') {
+                        ' '
+                    } else {
+                        glyph
+                    }
+                })
+                .collect();
+            (readings, column)
+        };
+        let leap = |app: &mut App, steps: i32| {
+            app.move_timeline_cursor(steps, crate::subtitle_edit::TIMELINE_STEP)
+        };
+
+        // Act: ninety seconds on, well past the sixty-second window, which drags it right.
+        for _ in 0..18 {
+            leap(&mut app, crate::subtitle_edit::TIMELINE_LEAP);
+        }
+        let (scrolled, at_edge) = axis(&mut app);
+
+        // Act: five seconds back the other way.
+        leap(&mut app, -crate::subtitle_edit::TIMELINE_LEAP);
+        let (unmoved, stepped_back) = axis(&mut app);
+
+        // Assert: the axis held still and the cursor moved along it — the whole defect was
+        // this pair coming out the other way round.
+        assert_that!(unmoved.as_str()).is_equal_to(scrolled.as_str());
+        assert_that!(stepped_back < at_edge).is_true();
+
+        // Act: back past the window's left edge, which is where scrolling starts again.
+        for _ in 0..14 {
+            leap(&mut app, -crate::subtitle_edit::TIMELINE_LEAP);
+        }
+        let (dragged, at_left_edge) = axis(&mut app);
+
+        // Assert: this time the axis moved, and the cursor is pinned to the left of it.
+        assert_that!(dragged.as_str() != unmoved.as_str()).is_true();
+        assert_that!(at_left_edge < stepped_back).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the pane forgets the scroll, so a later visit opens on the selected cue again
+    /// rather than wherever the reader last stopped — the rule the cursor's own seed follows.
+    #[test]
+    fn re_entering_the_timeline_should_open_on_the_selected_cue_again() {
+        // Arrange
+        let (mut app, directory) =
+            edit_page_app("edit-scroll-reset", vec![edit_cue(0, 2_000, "one")]);
+        app.focus_timeline();
+        let opened = draw(&mut app, 100, 24).join("\n");
+
+        // Act: scroll well away, leave, and come back.
+        for _ in 0..18 {
+            app.move_timeline_cursor(
+                crate::subtitle_edit::TIMELINE_LEAP,
+                crate::subtitle_edit::TIMELINE_STEP,
+            );
+        }
+        let scrolled = draw(&mut app, 100, 24).join("\n");
+        app.focus_cues();
+        app.focus_timeline();
+        let returned = draw(&mut app, 100, 24).join("\n");
+
+        // Assert
+        assert_that!(scrolled.as_str() != opened.as_str()).is_true();
+        assert_that!(returned.as_str()).is_equal_to(opened.as_str());
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pixel format is the fallback answer to "how many bits per sample", used whenever the
+    /// stream does not state `bits_per_raw_sample`. The high-depth formats are found by
+    /// substring and the ordinary ones by an exact list, and it is that list — the common
+    /// case, every 8-bit video ever probed — that had only one of its entries exercised.
+    #[test]
+    fn video_bit_depth_should_read_every_ordinary_pixel_format_as_eight_bits() {
+        for format in [
+            "yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "nv12", "nv21",
+            "rgb24", "bgr24", "rgba", "bgra", "gray",
+        ] {
+            let stream = stream_of(serde_json::json!({"pix_fmt": format}));
+            assert_eq!(
+                video_bit_depth(&stream),
+                Some(8),
+                "{format} should read as 8-bit"
+            );
+        }
+
+        // And the two answers that are not eight: a stated depth wins outright, a marker in
+        // the name is read when nothing is stated, and an unrecognised format answers with
+        // nothing rather than guessing.
+        assert_eq!(
+            video_bit_depth(&stream_of(
+                serde_json::json!({"pix_fmt": "yuv420p", "bits_per_raw_sample": "10"})
+            )),
+            Some(10),
+        );
+        assert_eq!(
+            video_bit_depth(&stream_of(serde_json::json!({"pix_fmt": "yuv420p12le"}))),
+            Some(12),
+        );
+        assert_eq!(
+            video_bit_depth(&stream_of(serde_json::json!({"pix_fmt": "xyz"}))),
+            None,
+        );
+        assert_eq!(video_bit_depth(&stream_of(serde_json::json!({}))), None);
+    }
+
+    /// Every rejected keystroke has to say why in the field's own words, since the character
+    /// the reader typed is already gone from the screen and silence there is indistinguishable
+    /// from a field that is broken.
+    #[test]
+    fn reject_message_should_name_the_rule_the_keystroke_broke() {
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Digits)),
+            "digits only"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Word)),
+            "no spaces"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Text)),
+            "unsupported character"
+        );
+        assert_eq!(
+            reject_message(InputReject::Character(CharClass::Timecode)),
+            "digits, : and . only"
+        );
+        assert_eq!(reject_message(InputReject::Full(32)), "32 character limit");
+    }
+
+    /// A subtitle track whose codec no `SubtitleFormat` covers still has to be named on the
+    /// details pane. Closed captions get their standard's own name, an unnamed codec says so,
+    /// and anything else is shown as the codec — upper-cased, since a bare `dvb_teletext` in
+    /// a column of proper names reads as a bug.
+    #[test]
+    fn subtitle_information_format_should_name_a_codec_no_format_covers() {
+        assert_eq!(
+            subtitle_information_format(Some(SubtitleFormat::SubRip), "subrip"),
+            "SubRip (SRT)"
+        );
+        assert_eq!(
+            subtitle_information_format(None, "eia_608"),
+            "CEA-608 Closed Captions"
+        );
+        assert_eq!(
+            subtitle_information_format(None, "eia_708"),
+            "CEA-708 Closed Captions"
+        );
+        assert_eq!(subtitle_information_format(None, "unknown"), "Unknown");
+        assert_eq!(
+            subtitle_information_format(None, "dvb_teletext"),
+            "DVB_TELETEXT"
+        );
+    }
+
+    /// The container is named from the file's extension where that is recognised and from
+    /// what ffprobe called it otherwise — and the two are combined only when they disagree,
+    /// so an ordinary MKV is not labelled `Matroska (matroska)`.
+    #[test]
+    fn container_format_description_should_fall_back_to_what_ffprobe_called_it() {
+        let info = |format: serde_json::Value| {
+            crate::probe::MediaInfo::from_json(serde_json::json!({
+                "format": format,
+                "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+            }))
+            .unwrap()
+        };
+
+        // A recognised extension and a probe name that says something else: both.
+        let described = container_format_description(
+            &info(serde_json::json!({"format_long_name": "Matroska / WebM"})),
+            Path::new("/tmp/clip.mkv"),
+        );
+        assert!(
+            described.contains("Matroska / WebM"),
+            "an extension and a probe name that disagree should give both: {described}",
+        );
+
+        // A recognised extension and no probe name at all: the extension's own label.
+        assert_eq!(
+            container_format_description(&info(serde_json::json!({})), Path::new("/tmp/clip.mkv")),
+            crate::edit::ContainerFormat::Matroska.label(),
+        );
+
+        // An extension nothing recognises: whatever ffprobe called it, and "Unknown" when it
+        // called it nothing — a blank in this column would read as a missing field.
+        assert_eq!(
+            container_format_description(
+                &info(serde_json::json!({"format_name": "ogg"})),
+                Path::new("/tmp/clip.weird"),
+            ),
+            "ogg",
+        );
+        assert_eq!(
+            container_format_description(
+                &info(serde_json::json!({})),
+                Path::new("/tmp/clip.weird")
+            ),
+            "Unknown",
+        );
     }
 }

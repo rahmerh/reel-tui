@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 
@@ -17,6 +17,35 @@ pub struct Config {
     pub remux_workers: usize,
     pub network_transcode_workers: usize,
     pub network_remux_workers: usize,
+    /// How many media files' preview frames the subtitle edit page's cache may hold before the
+    /// least recently used one is dropped.
+    pub preview_cache_tracks: usize,
+    /// The most disk those frames may occupy, in bytes, before the least recently used
+    /// media file's are dropped as well.
+    ///
+    /// A backstop for `preview_cache_tracks` rather than a second way of saying the same
+    /// thing: a count of tracks is the unit that matches how the cache is used, but the
+    /// tracks are not the same size as each other, and ten long, densely subtitled films
+    /// run to several gigabytes. Written in the file as `cache_megabytes`, since a byte
+    /// count at this scale is not a number anyone can read back.
+    pub preview_cache_bytes: u64,
+    /// Whether opening the subtitle edit page renders every cue's frame in the background.
+    pub preview_prefetch: bool,
+    /// The same, for media on a network mount. Off by default: a feature-length track is
+    /// a thousand-odd accurate seeks, and doing that across NFS or SMB unasked is not a
+    /// trade the user made.
+    pub network_preview_prefetch: bool,
+    /// How many frames a second the subtitle edit page's scrub playback aims for.
+    ///
+    /// The escape hatch for a terminal that cannot keep up with the picture: over ssh, or
+    /// inside tmux, the bytes for a halfblocks frame have further to travel than they do
+    /// locally, and lowering this is what turns a playback that stutters into one that is
+    /// merely chunky. A ceiling rather than a promise — a span too large to hold in memory
+    /// at this rate is decoded at a lower one, and so is one whose source holds fewer frames
+    /// a second than this (see `preview::source_capped_fps`).
+    pub playback_fps: u32,
+    /// How much of the media either side of the cue that playback covers.
+    pub playback_pad: Duration,
 }
 
 impl Default for Config {
@@ -27,18 +56,94 @@ impl Default for Config {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
+            preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
+            preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
+            preview_prefetch: true,
+            network_preview_prefetch: false,
+            playback_fps: DEFAULT_PLAYBACK_FPS,
+            playback_pad: DEFAULT_PLAYBACK_PAD,
         }
     }
 }
+
+/// Frames a second a scrub playback aims for.
+///
+/// Thirty rather than something cheaper because the point of the playback is judging
+/// whether a line lands with the speech, and below about twenty the gaps between frames
+/// become the thing you are measuring against instead of the picture.
+const DEFAULT_PLAYBACK_FPS: u32 = 30;
+
+/// The floor and ceiling a mistyped rate is held between. Five is where consecutive frames
+/// stop reading as motion at all; sixty is past what any terminal keeps up with, and
+/// nothing above it would be drawn anyway.
+///
+/// Public because the subtitle edit page's preview-settings popup adjusts the same value for the
+/// session, and it must stop at exactly the limits a config file is held to rather than at
+/// a second copy of them that can drift.
+pub const MIN_PLAYBACK_FPS: u32 = 5;
+pub const MAX_PLAYBACK_FPS: u32 = 60;
+
+/// How much of the media either side of the cue a scrub playback covers.
+///
+/// A second is long enough to hear the speech start before the line is due and to hear it
+/// finish after, which is the judgement being made; much more and the span takes longer to
+/// decode and longer to sit through for the same answer.
+///
+/// Lowered from two when playbacks started being decoded at the terminal's own pixel
+/// resolution. The span's length multiplies its cost — see `preview::affordable_fps` — so
+/// two seconds either side was buying run-up nobody watches at the price of the frame rate
+/// during the part they do.
+const DEFAULT_PLAYBACK_PAD: Duration = Duration::from_secs(1);
+
+/// A pad of zero is meaningful — play exactly the cue and nothing else — so only the top
+/// is capped. Ten seconds either side is already a twenty-second span.
+///
+/// A `Duration` rather than the seconds it is read from, so the popup and the config loader
+/// share one number instead of one holding a float and the other a conversion of it. The
+/// loader converts *to* seconds at the single point it compares against a parsed float.
+pub const MAX_PLAYBACK_PAD: Duration = Duration::from_secs(10);
 
 /// A typo'd or malicious huge value in the config file must not spawn an unreasonable
 /// number of threads.
 const MAX_WORKERS: usize = 16;
 
+/// Whole media files rather than megabytes, because a track is what gets used and half a
+/// track is nearly worthless — see `framecache`'s module docs for why the unit of eviction
+/// has to be the unit of use.
+///
+/// Ten is the last ten films you opened the subtitle edit page on. Disk follows from the content
+/// rather than from a number: a feature-length track is a thousand or two cues at under a
+/// hundred kilobytes a frame, so ten of them is on the order of a gigabyte, and a set of
+/// unusually long and densely subtitled ones perhaps three.
+const DEFAULT_PREVIEW_CACHE_TRACKS: usize = 10;
+
+/// A ceiling a mistyped value cannot cross. Zero is allowed and means the cache keeps
+/// nothing beyond the page that is open, which is a real answer for a machine short on
+/// disk — the open track is never evicted, since the pass is about to render into it.
+const MAX_PREVIEW_CACHE_TRACKS: usize = 1024;
+
+/// The disk backstop, in megabytes, for when [`DEFAULT_PREVIEW_CACHE_TRACKS`] tracks turn
+/// out to be much larger than the estimate above.
+///
+/// Two gigabytes is deliberately above what ten ordinary films come to, so the track count
+/// stays the bound that normally bites and this only catches the case it was added for: a
+/// cache that had grown unbounded and eventually failed a save with `No space left on
+/// device`. Measured at roughly a hundred kilobytes a frame and one or two thousand frames
+/// a track, this is a couple of dozen tracks' worth.
+const DEFAULT_PREVIEW_CACHE_MEGABYTES: u64 = 2048;
+
+/// A ceiling a mistyped value cannot cross, in megabytes — a petabyte, which is to say
+/// nothing a real disk will reach, since the point is only to keep the multiplication below
+/// from overflowing. Zero is allowed and means the same as `cache_tracks = 0`.
+const MAX_PREVIEW_CACHE_MEGABYTES: u64 = 1024 * 1024 * 1024;
+
+const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
+
 #[derive(Deserialize, Default)]
 struct RawConfig {
     notifications: Option<RawNotifications>,
     workers: Option<RawWorkers>,
+    preview: Option<RawPreview>,
 }
 
 #[derive(Deserialize, Default)]
@@ -51,6 +156,29 @@ struct RawWorkers {
     transcode: Option<usize>,
     remux: Option<usize>,
     network: Option<RawNetworkWorkers>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPreview {
+    cache_tracks: Option<usize>,
+    cache_megabytes: Option<u64>,
+    prefetch: Option<RawPrefetch>,
+    playback: Option<RawPlayback>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPlayback {
+    fps: Option<u32>,
+    /// Seconds, as a float, so half a second is expressible. `Duration` itself is not
+    /// deserialised directly — TOML has no duration type, and the field being plainly a
+    /// number of seconds is what makes the config file readable.
+    pad: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPrefetch {
+    enabled: Option<bool>,
+    network: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -111,6 +239,9 @@ impl Config {
         let notifications = raw.notifications.unwrap_or_default();
         let workers = raw.workers.unwrap_or_default();
         let network = workers.network.unwrap_or_default();
+        let preview = raw.preview.unwrap_or_default();
+        let prefetch = preview.prefetch.unwrap_or_default();
+        let playback = preview.playback.unwrap_or_default();
         Self {
             notifications: notifications.enabled.unwrap_or(defaults.notifications),
             transcode_workers: clamp(workers.transcode.unwrap_or(defaults.transcode_workers)),
@@ -121,6 +252,48 @@ impl Config {
                     .unwrap_or(defaults.network_transcode_workers),
             ),
             network_remux_workers: clamp(network.remux.unwrap_or(defaults.network_remux_workers)),
+            preview_cache_tracks: preview
+                .cache_tracks
+                .unwrap_or(defaults.preview_cache_tracks)
+                .min(MAX_PREVIEW_CACHE_TRACKS),
+            // Clamped before the multiplication rather than after, so a mistyped value
+            // cannot overflow its way to a budget of nearly nothing.
+            preview_cache_bytes: preview
+                .cache_megabytes
+                .map_or(defaults.preview_cache_bytes, |megabytes| {
+                    megabytes.min(MAX_PREVIEW_CACHE_MEGABYTES) * BYTES_PER_MEGABYTE
+                }),
+            preview_prefetch: prefetch.enabled.unwrap_or(defaults.preview_prefetch),
+            network_preview_prefetch: prefetch
+                .network
+                .unwrap_or(defaults.network_preview_prefetch),
+            playback_fps: playback
+                .fps
+                .unwrap_or(defaults.playback_fps)
+                .clamp(MIN_PLAYBACK_FPS, MAX_PLAYBACK_FPS),
+            playback_pad: playback
+                .pad
+                // NaN first, because `f64::min` answers with the *other* operand for it —
+                // so a `pad = nan` would clamp to the maximum and give a twenty-second
+                // playback rather than falling back to the default.
+                .filter(|pad| !pad.is_nan())
+                // `try_from_secs_f64` rather than `from_secs_f64`, which panics outright on
+                // a negative — which a hand-written config file can perfectly well hold,
+                // and which must not take the process down at launch.
+                .and_then(|pad| {
+                    Duration::try_from_secs_f64(pad.min(MAX_PLAYBACK_PAD.as_secs_f64())).ok()
+                })
+                .unwrap_or(defaults.playback_pad),
+        }
+    }
+
+    /// Whether to render a whole track's frames in the background, given whether the
+    /// target directory is on a network mount.
+    pub fn effective_prefetch(&self, is_network_mount: bool) -> bool {
+        if is_network_mount {
+            self.network_preview_prefetch
+        } else {
+            self.preview_prefetch
         }
     }
 
@@ -182,7 +355,7 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n",
+            b"[notifications]\nenabled = false\n\n[workers]\ntranscode = 2\nremux = 8\n\n[workers.network]\ntranscode = 3\nremux = 4\n\n[preview]\ncache_tracks = 4\n\n[preview.prefetch]\nenabled = false\nnetwork = true\n\n[preview.playback]\nfps = 24\npad = 1.5\n",
         )
         .unwrap();
         let config = Config::load_from(&path);
@@ -194,6 +367,12 @@ mod tests {
                 remux_workers: 8,
                 network_transcode_workers: 3,
                 network_remux_workers: 4,
+                preview_cache_tracks: 4,
+                preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
+                preview_prefetch: false,
+                network_preview_prefetch: true,
+                playback_fps: 24,
+                playback_pad: Duration::from_millis(1500),
             }
         );
         fs::remove_dir_all(directory).unwrap();
@@ -339,6 +518,64 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The rate is the escape hatch for a terminal that cannot keep up with the picture —
+    /// over ssh, or inside tmux — so a value that is missing, absurd, or nonsense has to
+    /// leave a playback that still works rather than one that divides by zero or asks for
+    /// a thousand frames a second.
+    #[test]
+    fn playback_settings_should_fall_back_and_stay_inside_their_limits() {
+        let directory = scratch("playback");
+        let load = |body: &[u8]| {
+            let path = directory.join("config.toml");
+            fs::write(&path, body).unwrap();
+            Config::load_from(&path)
+        };
+
+        // Act / Assert: an absent section keeps the defaults.
+        let defaults = load(b"[preview]\ncache_tracks = 4\n");
+        assert_eq!(defaults.playback_fps, DEFAULT_PLAYBACK_FPS);
+        assert_eq!(defaults.playback_pad, DEFAULT_PLAYBACK_PAD);
+
+        // Act / Assert: one value set leaves the other alone, down to the leaf.
+        let partial = load(b"[preview.playback]\nfps = 15\n");
+        assert_eq!(partial.playback_fps, 15);
+        assert_eq!(partial.playback_pad, DEFAULT_PLAYBACK_PAD);
+
+        // Act / Assert: a rate nothing could draw, and one nothing could watch.
+        assert_eq!(
+            load(b"[preview.playback]\nfps = 9000\n").playback_fps,
+            MAX_PLAYBACK_FPS
+        );
+        assert_eq!(
+            load(b"[preview.playback]\nfps = 0\n").playback_fps,
+            MIN_PLAYBACK_FPS
+        );
+
+        // Act / Assert: a pad of nothing is meaningful — play exactly the cue — so only
+        // the top is capped.
+        assert_eq!(
+            load(b"[preview.playback]\npad = 0\n").playback_pad,
+            Duration::ZERO
+        );
+        assert_eq!(
+            load(b"[preview.playback]\npad = 600.0\n").playback_pad,
+            MAX_PLAYBACK_PAD
+        );
+
+        // Act / Assert: and a negative or a non-finite pad, both of which `from_secs_f64`
+        // panics on outright, fall back rather than take the process down at launch.
+        assert_eq!(
+            load(b"[preview.playback]\npad = -3.0\n").playback_pad,
+            DEFAULT_PLAYBACK_PAD
+        );
+        assert_eq!(
+            load(b"[preview.playback]\npad = nan\n").playback_pad,
+            DEFAULT_PLAYBACK_PAD
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn effective_workers_should_use_the_network_limits_only_on_a_network_mount() {
         let config = Config {
@@ -347,6 +584,12 @@ mod tests {
             remux_workers: 5,
             network_transcode_workers: 1,
             network_remux_workers: 1,
+            preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
+            preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
+            preview_prefetch: true,
+            network_preview_prefetch: false,
+            playback_fps: DEFAULT_PLAYBACK_FPS,
+            playback_pad: DEFAULT_PLAYBACK_PAD,
         };
         assert_eq!(config.effective_workers(false), (1, 5));
         assert_eq!(config.effective_workers(true), (1, 1));
@@ -366,6 +609,112 @@ mod tests {
             config,
             Config {
                 notifications: false,
+                ..Config::default()
+            }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rendering a frame per cue means a thousand accurate seeks, which is fine on a
+    /// local disk and is not something to start unasked across NFS or SMB.
+    #[test]
+    fn prefetching_should_follow_the_mount_the_directory_is_on() {
+        let defaults = Config::default();
+        assert!(defaults.effective_prefetch(false));
+        assert!(!defaults.effective_prefetch(true));
+
+        // Both are settable, so a fast share can opt in and a slow laptop can opt out.
+        let configured = Config {
+            preview_prefetch: false,
+            network_preview_prefetch: true,
+            ..defaults
+        };
+        assert!(!configured.effective_prefetch(false));
+        assert!(configured.effective_prefetch(true));
+    }
+
+    /// The cache is counted in whole media files rather than megabytes, because a track
+    /// is what gets used and half a track is nearly worthless — see `framecache`.
+    #[test]
+    fn the_frame_cache_limit_should_be_counted_in_tracks() {
+        assert_eq!(
+            Config::default().preview_cache_tracks,
+            DEFAULT_PREVIEW_CACHE_TRACKS
+        );
+        // Zero is a real answer for a machine short on disk: nothing is kept beyond the
+        // page that is open, which the pass is rendering into and so never evicts.
+        let none = Config {
+            preview_cache_tracks: 0,
+            ..Config::default()
+        };
+        assert_eq!(none.preview_cache_tracks, 0);
+    }
+
+    /// A mistyped cache size must not let the frame cache eat the disk, the same way a
+    /// mistyped worker count must not spawn a hundred threads.
+    #[test]
+    fn an_absurd_cache_size_should_be_capped() {
+        let directory = scratch("cache-size");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[preview]\ncache_tracks = 99999999\n").unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(config.preview_cache_tracks, MAX_PREVIEW_CACHE_TRACKS);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The byte budget is the backstop for the track count, since ten tracks can be a few
+    /// hundred megabytes or a few gigabytes depending on how long and how densely subtitled
+    /// the films are. Written in megabytes, because a byte count at this scale is not a
+    /// number anyone can read back.
+    #[test]
+    fn the_frame_cache_should_also_have_a_disk_backstop() {
+        let directory = scratch("cache-bytes");
+        let path = directory.join("config.toml");
+
+        // The default is stated in megabytes and stored in bytes.
+        assert_eq!(
+            Config::default().preview_cache_bytes,
+            DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE
+        );
+
+        // A configured value is converted…
+        fs::write(&path, b"[preview]\ncache_megabytes = 512\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).preview_cache_bytes,
+            512 * BYTES_PER_MEGABYTE
+        );
+
+        // …zero is a real answer, the same as `cache_tracks = 0`…
+        fs::write(&path, b"[preview]\ncache_megabytes = 0\n").unwrap();
+        assert_eq!(Config::load_from(&path).preview_cache_bytes, 0);
+
+        // …and a value large enough to overflow the multiplication is clamped before it,
+        // so a mistype cannot wrap around to a budget of nearly nothing.
+        fs::write(&path, b"[preview]\ncache_megabytes = 184467440737095516\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).preview_cache_bytes,
+            MAX_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// One preview key set in isolation must not reset the others, the same as every
+    /// other leaf in this file.
+    #[test]
+    fn a_lone_preview_key_should_keep_the_other_preview_defaults() {
+        let directory = scratch("preview-partial");
+        let path = directory.join("config.toml");
+        fs::write(&path, b"[preview.prefetch]\nnetwork = true\n").unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(
+            config,
+            Config {
+                network_preview_prefetch: true,
                 ..Config::default()
             }
         );

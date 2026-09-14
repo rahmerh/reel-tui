@@ -3,16 +3,22 @@
 //! plus the event loop.
 
 pub mod app;
+pub mod audio;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod cue;
 pub mod edit;
 pub mod files;
+pub mod framecache;
 pub mod input;
 pub mod mount;
 pub mod notification;
+pub mod preview;
 pub mod probe;
 pub mod requirements;
 pub mod staging;
 pub mod subtitle;
+pub mod subtitle_edit;
+pub mod sync;
 pub mod ui;

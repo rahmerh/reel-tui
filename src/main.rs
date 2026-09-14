@@ -1,4 +1,3 @@
-use std::time::Duration;
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
@@ -7,12 +6,14 @@ use crossterm::event::{
     Event, KeyEventKind,
 };
 use crossterm::execute;
-use reel_tui::app::App;
+use ratatui_image::picker::Picker;
+use reel_tui::app::{App, PreviewSettings};
 use reel_tui::cli;
 use reel_tui::edit::spawn_edit_worker_pools;
 use reel_tui::files::spawn_directory_monitor;
 use reel_tui::input::{InputOutcome, InputState, handle_key};
 use reel_tui::notification::completion_notification_sender;
+use reel_tui::preview::spawn_preview_workers;
 use reel_tui::probe::{spawn_conflict_probe_worker, spawn_probe_worker};
 use reel_tui::{config, mount, ui};
 
@@ -40,10 +41,40 @@ fn run(target_dir: PathBuf) -> Result<()> {
     let (transcode_workers, remux_workers) = app_config.effective_workers(is_network_mount);
     let (transcode_tx, remux_tx, edit_rx) =
         spawn_edit_worker_pools(transcode_workers, remux_workers);
+    // Queried here, before `ratatui::run` enters raw mode and the alternate screen: the
+    // query writes an escape sequence to the terminal and reads its reply off stdin, which
+    // needs a cooked terminal and an stdin nothing else is draining. Inside the closure it
+    // hangs or corrupts the first frame. A terminal that answers nothing falls back to
+    // halfblocks, which every terminal can draw.
+    // `drawing_picker` then discards a halfblocks answer: two coloured half-cells cannot
+    // show a subtitle burned into a frame, and the subtitle edit page says so once rather than
+    // rendering and caching a picture nobody could read.
+    let picker = Picker::from_query_stdio()
+        .ok()
+        .and_then(reel_tui::preview::drawing_picker);
+    // Here for the same reason the picker is: enumerating audio devices makes some hosts
+    // write to stderr — ALSA especially — and on the alternate screen that lands in the
+    // middle of the UI. A machine with no device answers with the fallback, which nothing
+    // ends up playing anyway.
+    let audio_format = reel_tui::audio::device_format();
+    let (preview_handles, preview_rx) = spawn_preview_workers(picker);
     let mut app = App::new(target_dir, request_tx, conflict_tx, transcode_tx, remux_tx)?;
     app.set_completion_notification_sender(completion_notification_sender(
         app_config.notifications,
     ));
+    app.set_preview_handles(Some(preview_handles));
+    app.set_audio_format(audio_format);
+    app.set_preview_settings(PreviewSettings {
+        prefetch: app_config.effective_prefetch(is_network_mount),
+        network: is_network_mount,
+        cache_tracks: app_config.preview_cache_tracks,
+        cache_bytes: app_config.preview_cache_bytes,
+        playback_fps: app_config.playback_fps,
+        playback_pad: app_config.playback_pad,
+        // Session-only, and so not in the config file: these start where a fresh run starts
+        // and are changed from the subtitle edit page's preview-settings popup (`:`).
+        ..PreviewSettings::default()
+    });
     let mut input = InputState::default();
 
     ratatui::run(|terminal| -> Result<()> {
@@ -64,13 +95,18 @@ fn run(target_dir: PathBuf) -> Result<()> {
             dirty |= app.receive_probe_results(&result_rx);
             dirty |= app.receive_conflict_probe_results(&conflict_rx);
             dirty |= app.receive_edit_results(&edit_rx);
+            dirty |= app.receive_preview_events(&preview_rx);
             app.start_pending_probe();
+            app.start_pending_preview();
+            // After the drains, so a span that arrived this iteration is stepped in the
+            // same pass it landed in rather than sitting on its first frame until the next.
+            dirty |= app.advance_playback();
             dirty |= app.maybe_open_conflict_dialog();
             if redraw.tick(std::mem::take(&mut dirty), app.is_animating()) {
                 terminal.draw(|frame| ui::render(frame, &mut app))?;
             }
 
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(app.poll_interval())? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if handle_key(&mut app, &mut input, key) == InputOutcome::Quit {

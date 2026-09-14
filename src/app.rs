@@ -27,16 +27,520 @@ use crate::{
         video_stream_title,
     },
     files::{DirectorySnapshot, FileEntry, scan_directory},
+    framecache,
+    preview::{
+        CueStyle, FrameOutcome, FrameRequest, FrameSource, PlaybackAnchor, PlaybackOutcome,
+        PlaybackRequest, PlaybackSpeed, PrepareOutcome, PrepareRequest, PreviewEvent,
+        PreviewHandles, SyncOutcome, SyncRequest, WarmRequest,
+    },
     probe::{MediaInfo, ProbeOutcome, ProbeRequest, ProbeResponse},
     staging::{BatchItem, BatchItemStatus, BatchState, StagedEdit},
     subtitle::{
-        FormatChoice, LanguageChoice, SidecarEntry, SubtitleChange, SubtitleFlag, SubtitleFormat,
-        SubtitleMetadata, SubtitleSource, ToolCapabilities, canonical_language_code,
-        common_language_choices, language_choice, partition_sidecars, path_extension, stream_cc,
-        stream_commentary, stream_forced, stream_hearing_impaired, stream_language,
-        stream_original, stream_title,
+        CueChanges, CueEdit, CueInsert, CueSnapshot, FormatChoice, LanguageChoice, SidecarEntry,
+        SubtitleChange, SubtitleFlag, SubtitleFormat, SubtitleMetadata, SubtitleSource,
+        ToolCapabilities, canonical_language_code, common_language_choices, language_choice,
+        normalized_language, partition_sidecars, path_extension, stream_cc, stream_commentary,
+        stream_forced, stream_hearing_impaired, stream_language, stream_original, stream_title,
+    },
+    subtitle_edit::{
+        self, CueGrip, CueOrigin, PreviewSupport, PreviewWorkspace, SubtitleEditState, TimingScope,
+        WarmState,
     },
 };
+
+/// What the subtitle edit page's frame cache and background pass are allowed to do.
+///
+/// Resolved by `main` from `config.toml` and from whether the directory sits on a network
+/// mount, so `App` holds one answer rather than re-deriving the policy at each decision.
+///
+/// The playback half of it is also **adjustable for the session** from the subtitle edit page's
+/// preview-settings popup (`:`), which mutates this in place and never writes to disk —
+/// `config.toml` stays the defaults, and `App::preview_defaults` keeps a copy of them so a
+/// field can be put back. The cache half is not adjustable: a background pass is already
+/// running against the policy it was started under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreviewSettings {
+    /// Whether opening a page renders every cue's frame in the background.
+    pub prefetch: bool,
+    /// Whether the media is on a network mount. Only used to explain a *disabled* pass:
+    /// it is the one reason the page says out loud, because it is not the user's doing.
+    pub network: bool,
+    /// How many media files' frames the cache may hold before the least recently used is
+    /// dropped whole.
+    pub cache_tracks: usize,
+    /// The disk backstop for the same eviction, in bytes. See [`framecache::prune`].
+    pub cache_bytes: u64,
+    /// How many frames a second the scrub playback aims for. A ceiling, lowered by two
+    /// things that know better: a source holding fewer frames than this *at the speed in
+    /// force* (`preview::source_capped_fps`) and a span too large to hold at this rate
+    /// (`preview::affordable_fps`).
+    pub playback_fps: u32,
+    /// How much of the media either side of the cue a scrub playback covers.
+    pub playback_pad: Duration,
+    /// How fast a scrub playback runs. Session-only — there is no config key for it,
+    /// because the speed you want depends on the line you are looking at.
+    pub playback_speed: PlaybackSpeed,
+    /// Whether a span starts again when it reaches its end instead of stopping.
+    pub playback_loop: bool,
+    /// Whether the span plays without its sound.
+    ///
+    /// Muting asks for no audio output from the decode at all, which puts the playback on
+    /// exactly the path media with no audio track already takes: no samples, a
+    /// `SilentOutput`, and a slideshow at the right rate.
+    pub playback_muted: bool,
+}
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        let defaults = crate::config::Config::default();
+        Self {
+            prefetch: true,
+            network: false,
+            cache_tracks: defaults.preview_cache_tracks,
+            cache_bytes: defaults.preview_cache_bytes,
+            playback_fps: defaults.playback_fps,
+            playback_pad: defaults.playback_pad,
+            playback_speed: PlaybackSpeed::NORMAL,
+            playback_loop: false,
+            playback_muted: false,
+        }
+    }
+}
+
+/// Why the subtitle edit page will not let a cue be changed on a track that is not SubRip.
+///
+/// **The words and the timing are refused together and for one reason.** An ASS cue names a
+/// style and positions itself against the script rather than carrying its own appearance, so
+/// rewriting the stripped text the list shows would throw the styling away — and its timing
+/// is the anchor every `\move`, `\fad` and karaoke tag in it is measured from, so shifting
+/// the cue without shifting them animates the line against itself.
+const CUE_EDITS_SUBRIP_ONLY: &str =
+    "Only SubRip cues can be edited here; this track is another format.";
+
+/// Signed seconds to a hundredth, for automatic sync's completion notice
+/// (`Synced: shifted by +1.35s`). Not shared with the timeline title's own shift readout
+/// (`ui::format_shift`), which `App` must not depend on — this page's state owns nothing
+/// about rendering, and a two-line duplicate of a sign and a decimal point is cheaper than
+/// a dependency the other way round.
+fn format_offset(millis: i64) -> String {
+    let sign = if millis.is_negative() { '-' } else { '+' };
+    let millis = millis.unsigned_abs();
+    format!("{sign}{}.{:02}s", millis / 1000, (millis % 1000) / 10)
+}
+
+/// Why the cue editor and the timing mode refuse a cue that is marked to go.
+///
+/// The same refusal the track list gives for moving or re-encoding a track marked for
+/// deletion, in the same words: a reader who has said this line is leaving has not asked to
+/// rewrite it, and letting them would put a row on screen that was yellow for the words it
+/// will never say and red for the fact it will not be there to say them.
+const CUE_MARKED_FOR_DELETION: &str = "Unmark this cue for deletion before editing it.";
+
+/// Why the last cue a track has left cannot be marked to go.
+///
+/// A SubRip file with nothing in it is not a subtitle track, and remuxing one back into a
+/// container is a save that fails on something the reader did. Removing the track itself is
+/// what they are after, and the track list already does exactly that.
+const CUE_TRACK_NEEDS_A_CUE: &str =
+    "A subtitle track needs at least one cue; delete the track itself instead.";
+
+/// Why the length dialog will not take what was typed into it.
+///
+/// Stated as the shape that *is* read rather than as "invalid", because the field accepts
+/// only digits and separators — so a value that reaches here is one arranged wrongly, and
+/// showing the arrangement is the whole answer.
+const CUE_LENGTH_UNREADABLE: &str = "Type a length as mm:ss.mmm, for example 00:02.500.";
+
+/// Why the length dialog will not take a length of nothing.
+///
+/// The floor is one nudge, so the refusal can name a real value rather than a rule.
+const CUE_LENGTH_TOO_SHORT: &str = "A cue has to be on screen for at least 0.05s.";
+
+/// Why the length dialog will not take a length the media does not contain.
+///
+/// Not pedantry about a value that would merely look odd: a cue's span is what `p` decodes,
+/// so a mistyped `99:99.999` is a request to hold a hundred minutes of raw frames in memory.
+/// The edge keys cannot reach such a length — fifty milliseconds at a time — which is why
+/// this is the one place the check is needed.
+const CUE_LENGTH_LONGER_THAN_MEDIA: &str = "A cue cannot be on screen for longer than the media.";
+
+/// How far `a` will count looking for a free name before giving up.
+///
+/// A bound rather than a loop that cannot end: the names it tries are `clip.und.srt`,
+/// `clip.und.1.srt` and so on, and a directory holding a hundred of those is one where the
+/// reader wants a word rather than a hundred and first file.
+const MAX_NEW_TRACK_NUMBER: usize = 99;
+
+/// The subtitle edit page's cue editor: one cue's text, being rewritten.
+///
+/// **Its own multi-line buffer rather than the application's `TextInputState`**, which is a
+/// single line with a single cursor: a SubRip cue is routinely two lines, and how the text
+/// is broken across them is part of the cue — it is what the viewer will see. A field that
+/// could not hold a line break would quietly make every two-line cue a one-line cue.
+///
+/// The cursor is a row and a column in *characters*, not bytes, because the column is also
+/// where the caret is drawn and subtitle text is full of multi-byte characters.
+/// What the open cue editor is about.
+///
+/// The page's two panes ask two different questions of `i`, so it answers two different
+/// things: with the cursor in the cue panel there is a line under it to rewrite, and with the
+/// cursor in the timeline there is a *moment* under it and no line at all — which is exactly
+/// the case a reader hits when a subtitle is missing.
+///
+/// The two share the whole editor and differ only at the ends: what the buffer opens with,
+/// and what closing it does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CueTarget {
+    /// A cue already on the page, addressed by where it came from — see
+    /// [`crate::subtitle_edit::CueOrigin`].
+    Cue(CueOrigin),
+    /// No cue yet: a new one to be inserted at this moment, if anything is typed.
+    ///
+    /// **Nothing at all is staged until the editor closes with words in it.** Opening `i` by
+    /// mistake and pressing `Esc` must leave the track exactly as it was, and an empty cue
+    /// staged eagerly would be a line in the file that draws nothing and a row in the panel
+    /// with nothing on it. Whitespace counts as nothing for the same reason.
+    New(Duration),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueEditor {
+    /// Which subtitle track's cue this is, so an edit staged here cannot be applied to a
+    /// track the page has since moved on from.
+    pub source: SubtitleSource,
+    /// Which cue the typing is about: one already on the page, or one that does not exist
+    /// yet. See [`CueTarget`].
+    pub target: CueTarget,
+    /// What the cue said when the editor opened, which is what "has anything changed"
+    /// means here.
+    ///
+    /// Deliberately the page's text rather than the file's: a cue already carrying a staged
+    /// rewrite opens on the staged words, and leaving without touching them is not an edit.
+    /// The file's own cue is what the *writer* checks against, and
+    /// [`App::file_cue_snapshot`] is where that comes from.
+    pub original: String,
+    pub lines: Vec<String>,
+    pub row: usize,
+    pub column: usize,
+}
+
+/// The open cue length dialog: which cue it is about, and the value being typed.
+///
+/// Its own draft beside [`CueEditor`] rather than a field on the page, so a dialog that is
+/// not open is a state that does not exist — and so the cue it was opened on is remembered
+/// by *origin* rather than by position, which is the only address that survives a list the
+/// page can renumber underneath it.
+///
+/// A [`TextInputState`] rather than the cue editor's bespoke buffer: a length is one short
+/// single-line value, which is exactly what every other field in the application is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CueLengthDraft {
+    /// Which subtitle track's cue this is, so a length typed here cannot be applied to a
+    /// track the page has since moved on from.
+    pub source: SubtitleSource,
+    /// Which cue is being resized — see [`CueOrigin`].
+    pub origin: CueOrigin,
+    pub input: TextInputState,
+}
+
+impl CueEditor {
+    /// The buffer as one string, which is what a cue's text is.
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Whether the reader has actually changed anything, which is what makes leaving safe
+    /// without asking.
+    pub fn is_modified(&self) -> bool {
+        self.text() != self.original
+    }
+
+    /// The cursor clamped onto the buffer, for after any edit that can shorten it.
+    fn clamp(&mut self) {
+        self.row = self.row.min(self.lines.len().saturating_sub(1));
+        self.column = self.column.min(self.lines[self.row].chars().count());
+    }
+
+    /// The byte offset the character cursor stands at, for the row it is on.
+    fn offset(&self) -> usize {
+        self.lines[self.row]
+            .char_indices()
+            .nth(self.column)
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.lines[self.row].len())
+    }
+}
+
+/// Where the preview-settings popup's cursor is, and whether a dropdown is open under it.
+///
+/// The values themselves live in [`PreviewSettings`], not here: the popup is a view onto the
+/// session's settings, so closing and re-opening it shows what is in force rather than what
+/// was last typed into it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreviewSettingsPopup {
+    pub field: PreviewSettingsField,
+    pub mode: PreviewSettingsMode,
+    /// Whether `K` has opened the panel explaining the focused field, as it does on the
+    /// container, audio, video and subtitle popups.
+    pub help_visible: bool,
+    /// Which row of the open dropdown the cursor is on. Seeded from the value in force when
+    /// the dropdown opens, so `Enter` `Enter` is a no-op rather than a change to whatever
+    /// happens to be first in the list. Meaningless in [`PreviewSettingsMode::Summary`].
+    pub cursor: usize,
+    /// Which video track this visit has chosen, as a row of [`App::preview_video_tracks`],
+    /// or `None` for the one the page is already previewing against.
+    ///
+    /// **The three track rows are pending where the other five take effect at once**, and
+    /// the difference is what applying costs. A speed is read by the next playback; a video
+    /// or subtitle track is read when the page is *built*, so putting one into force means
+    /// tearing the page down and standing it up again — with a new workspace, a new cue
+    /// extraction and a new background pass. That must not happen once per keypress, so it
+    /// happens once, when the popup closes.
+    pub video: Option<usize>,
+    /// The same for the audio track, as a row of [`App::preview_audio_tracks`].
+    pub audio: Option<usize>,
+    /// The same for the subtitle track, as a row of [`App::preview_subtitle_tracks`].
+    pub subtitle: Option<usize>,
+}
+
+/// Whether the popup's cursor is walking its fields or the choices of one open dropdown.
+///
+/// The same two-level shape the container, audio, video and subtitle popups use, so `Enter`
+/// opens and commits and `Esc` backs out one level at a time everywhere in the application.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewSettingsMode {
+    #[default]
+    Summary,
+    Dropdown,
+}
+
+impl PreviewSettingsPopup {
+    /// The same popup with its cursor on row `row` — a field, or a choice of the open
+    /// dropdown, depending on which the cursor is currently walking.
+    ///
+    /// Returned rather than assigned in place because reading how many rows there are needs
+    /// `&App` while writing the cursor needs `&mut App`; handing back a whole `Copy` popup
+    /// keeps the two apart without a re-borrow whose failure case could never happen.
+    fn at_row(self, row: usize) -> Self {
+        match self.mode {
+            PreviewSettingsMode::Dropdown => Self {
+                cursor: row,
+                ..self
+            },
+            PreviewSettingsMode::Summary => Self {
+                field: PreviewSettingsField::ORDER[row],
+                ..self
+            },
+        }
+    }
+}
+
+/// The rows of the preview-settings popup, in the order they are drawn.
+///
+/// **The three track rows lead, and the five playback settings follow after a blank row.**
+/// They answer the prior question — *what* is being previewed, rather than how it plays —
+/// and a reader who has just opened the page is far likelier to be pointing it at the right
+/// picture and sound than to be reaching for a speed. Within each half the old rule still
+/// holds: ordered by how often a playback wants them changed rather than by what they cost,
+/// so padding and frame rate stay at the bottom.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewSettingsField {
+    #[default]
+    VideoTrack,
+    AudioTrack,
+    SubtitleTrack,
+    Speed,
+    Loop,
+    Sound,
+    Padding,
+    FrameRate,
+}
+
+impl PreviewSettingsField {
+    pub const ORDER: [Self; 8] = [
+        Self::VideoTrack,
+        Self::AudioTrack,
+        Self::SubtitleTrack,
+        Self::Speed,
+        Self::Loop,
+        Self::Sound,
+        Self::Padding,
+        Self::FrameRate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Speed => "Speed",
+            Self::Loop => "Loop",
+            Self::Sound => "Sound",
+            Self::Padding => "Padding",
+            Self::FrameRate => "Frame rate",
+            Self::VideoTrack => "Video track",
+            Self::AudioTrack => "Audio track",
+            Self::SubtitleTrack => "Subtitle track",
+        }
+    }
+
+    /// Whether this row names a track of the open file rather than a playback setting.
+    ///
+    /// The three of them share a shape the other five do not: their choices are the file's
+    /// own streams, some of which the page would refuse; they are pending until the popup
+    /// closes; and `r` puts them back to the track the page is on rather than to anything
+    /// `config.toml` said.
+    pub fn is_track(self) -> bool {
+        matches!(
+            self,
+            Self::VideoTrack | Self::AudioTrack | Self::SubtitleTrack
+        )
+    }
+
+    /// Whether this row is a yes/no button pair rather than a dropdown.
+    ///
+    /// Two states do not want a list to open over them — the answer is already on screen,
+    /// and `Enter` on a pair of buttons is one keypress where a dropdown is three.
+    pub fn is_toggle(self) -> bool {
+        matches!(self, Self::Loop | Self::Sound)
+    }
+}
+
+/// One row of one of the preview-settings popup's three track dropdowns.
+///
+/// Carries what the row *names* beside what it says, because the popup's cursor answers in
+/// row positions and the thing being chosen is a stream index or a whole subtitle source.
+/// Labels are built here rather than in `ui.rs` for the reason every other string `App`
+/// hands over is: this side of the application owns nothing about rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackChoice {
+    pub label: String,
+    /// Whether the page can actually preview against this track.
+    ///
+    /// A refused track is **listed and greyed rather than left out**: a reader who can see
+    /// the track is there and is not on offer has been answered, where one who cannot find
+    /// it at all goes looking for a bug. The label says which refusal it is.
+    pub enabled: bool,
+    pub source: TrackChoiceSource,
+}
+
+/// What choosing a track row names.
+///
+/// A video or audio row names one stream of the open file; a subtitle row names a track,
+/// which can be a file of its own sitting beside the media.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrackChoiceSource {
+    /// An **absolute** ffprobe stream index.
+    Stream(u64),
+    Subtitle(SubtitleSource),
+}
+
+/// `#0 · H264 · 1920×1080 · Director's cut`, the shortest line that tells two video streams
+/// apart.
+///
+/// The absolute index leads, because it is what the reader sees on the track list and what
+/// every refusal and every `-map` in the application names.
+fn video_track_label(stream: &BTreeMap<String, serde_json::Value>, index: u64) -> String {
+    let mut parts = vec![format!("#{index}"), stream_codec_label(stream)];
+    if let (Some(width), Some(height)) = (
+        stream_number(stream, "width"),
+        stream_number(stream, "height"),
+    ) {
+        parts.push(format!("{width}×{height}"));
+    }
+    push_stream_title(&mut parts, stream);
+    parts.join(" · ")
+}
+
+/// `#1 · AAC · 5.1 · ENG · Commentary`.
+///
+/// The language and the title are what tell a commentary track from the feature, which is
+/// the distinction this row exists to let the reader make.
+fn audio_track_label(stream: &BTreeMap<String, serde_json::Value>, index: u64) -> String {
+    let mut parts = vec![format!("#{index}"), stream_codec_label(stream)];
+    if let Some(layout) = stream
+        .get("channel_layout")
+        .and_then(serde_json::Value::as_str)
+    {
+        parts.push(layout.to_string());
+    } else if let Some(channels) = stream_number(stream, "channels") {
+        parts.push(format!("{channels} ch"));
+    }
+    parts.push(stream_language_label(stream));
+    push_stream_title(&mut parts, stream);
+    parts.join(" · ")
+}
+
+/// The codec, upper-cased the way the track list writes it.
+fn stream_codec_label(stream: &BTreeMap<String, serde_json::Value>) -> String {
+    stream
+        .get("codec_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_uppercase()
+}
+
+/// The stream's language as a bare code, upper-cased — `ENG`, or `UND` where there is none.
+///
+/// The code rather than the expanded name, matching `subtitle_overview_details` on the
+/// track list: the popup's rows are already long, and a reader picking between two audio
+/// tracks is telling them apart rather than reading about them.
+fn stream_language_label(stream: &BTreeMap<String, serde_json::Value>) -> String {
+    normalized_language(&stream_language(stream)).to_uppercase()
+}
+
+/// Appends the stream's own title, when it has one worth reading.
+fn push_stream_title(parts: &mut Vec<String>, stream: &BTreeMap<String, serde_json::Value>) {
+    if let Some(title) = stream_title(stream) {
+        parts.push(title);
+    }
+}
+
+/// Why a subtitle track is on the list but not on offer, in the fewest words that say it.
+///
+/// Short because it sits on the end of a dropdown row rather than on a status line; the
+/// track list and `i` carry the full reason for anyone who wants it.
+const TRACK_DELETED_NOTE: &str = "marked for deletion";
+const TRACK_UNPREVIEWABLE_NOTE: &str = "cannot be previewed";
+
+/// The paddings the popup offers, largest first.
+///
+/// A curated list rather than every quarter-second between the floor and the ceiling: a
+/// dropdown of forty rows is a worse way to pick a number than a dropdown of eight, and the
+/// paddings anyone actually wants are coarse — none, a beat, a second, or enough run-up to
+/// hear the line before last. A value the config file asked for that is not on this list is
+/// merged in by [`App::playback_pad_choices`] rather than being unreachable.
+///
+/// Descending, like every other list in this popup: the values that cost the most sit at the
+/// top, so walking down a list always means asking for less.
+const PLAYBACK_PAD_CHOICES: [Duration; 8] = [
+    Duration::from_secs(5),
+    Duration::from_secs(3),
+    Duration::from_secs(2),
+    Duration::from_millis(1_500),
+    Duration::from_secs(1),
+    Duration::from_millis(500),
+    Duration::from_millis(250),
+    Duration::ZERO,
+];
+
+/// The frame rates the popup offers, highest first.
+///
+/// The film and video rates plus the two ends `config` clamps to, rather than every multiple
+/// of five: the reason to lower this is a terminal that cannot keep up, and that is answered
+/// by dropping to a named rate rather than by trying 35 and then 30.
+const PLAYBACK_FPS_CHOICES: [u32; 7] = [60, 48, 30, 24, 15, 10, 5];
+
+/// How long the event loop blocks waiting for a key when nothing is playing.
+///
+/// Twenty hertz: fast enough that a keypress feels immediate, slow enough that an idle
+/// `reel` costs nothing.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long it blocks while a span is playing.
+///
+/// A playback draws at up to sixty frames a second, and a poll interval of the same order
+/// as a frame period would land the picture on whichever side of the boundary the loop
+/// happened to wake on. Small enough to be well inside one frame; not zero, because a
+/// spin would be a whole core for a slideshow.
+const PLAYBACK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Layer {
@@ -44,6 +548,10 @@ pub enum Layer {
     Files,
     Streams,
     StreamDetails,
+    /// The subtitle edit page: a full-screen view of one track's cues, opened with
+    /// `c` from [`Layer::Streams`]. Unlike the others this replaces the whole frame
+    /// rather than drawing over the file list.
+    SubtitleEdit,
 }
 
 /// Which characters a text field accepts. An enum rather than a `fn(char) -> bool`
@@ -57,6 +565,11 @@ pub enum CharClass {
     Word,
     /// ASCII digits only.
     Digits,
+    /// A time value: digits and the two separators one is written with.
+    ///
+    /// The comma is accepted beside the period because SubRip writes its timestamps with
+    /// one, so it is what a reader who has been looking at the file will reach for.
+    Timecode,
 }
 
 impl CharClass {
@@ -65,6 +578,7 @@ impl CharClass {
             Self::Text => !character.is_control(),
             Self::Word => !character.is_control() && !character.is_whitespace(),
             Self::Digits => character.is_ascii_digit(),
+            Self::Timecode => character.is_ascii_digit() || matches!(character, ':' | '.' | ','),
         }
     }
 }
@@ -111,6 +625,18 @@ impl TextInputConfig {
         width: 16,
         max_len: 20,
         accepts: CharClass::Digits,
+        exit_on_empty_backspace: false,
+    };
+    /// How long a cue is on screen, typed as `mm:ss.mmm`.
+    ///
+    /// Narrow because the value is nine characters and the popup holding it is the smallest
+    /// in the application; the cap is loose enough to retype the value from scratch without
+    /// clearing it first, which is what a field that refuses a keystroke at the cap feels
+    /// broken for.
+    pub const CUE_LENGTH: Self = Self {
+        width: 14,
+        max_len: 16,
+        accepts: CharClass::Timecode,
         exit_on_empty_backspace: false,
     };
 
@@ -163,8 +689,11 @@ pub enum TextInputSite {
     VideoLanguageSearch,
     SubtitleTitle,
     LanguageSearch,
+    CreateTrackLanguageSearch,
     CustomResolution,
+    CueLength,
     FileSearch,
+    CueSearch,
     KeybindingsSearch,
 }
 
@@ -436,6 +965,22 @@ pub enum Dialog {
     AudioSettings,
     VideoSettings,
     SubtitleSettings,
+    /// How the subtitle edit page's scrub playback is done, for this session only — speed, loop,
+    /// sound, padding and frame rate. Opened with `:` from the subtitle edit page; see
+    /// `App::open_preview_settings`.
+    PreviewSettings,
+    /// The subtitle edit page's cue editor, opened with `i` — see `App::open_cue_editor`.
+    EditCue,
+    /// "What should I make?", opened with `a` from the track list — see
+    /// `App::open_create_track`. Two steps in one dialog: what kind of track, then its format
+    /// and whether it goes in the container or beside it.
+    CreateTrack,
+    /// How long the selected cue is on screen, typed rather than nudged. Opened with `D`
+    /// from the subtitle edit page's timing mode — see `App::open_cue_length_dialog`.
+    CueLength,
+    /// "Leaving discards them" before walking off the subtitle edit page with staged cue text
+    /// that has not been written yet — see `App::request_leave_subtitle_edit`.
+    ConfirmLeaveCues,
     /// A confirm-cancel prompt over whichever processing view is showing
     /// (`Dialog::BatchProcessing`, one item or many) — see `App::request_cancel_edit`.
     ConfirmCancel,
@@ -455,6 +1000,14 @@ pub enum Dialog {
     /// its own Keep/Discard choice — opens itself automatically, no manual action
     /// needed. See `App::conflicting_paths`/`maybe_open_conflict_dialog`.
     ResolveConflicts,
+    /// Covers the subtitle edit page while automatic sync (`A`) decodes the track's
+    /// audio and measures its offset — see `App::auto_sync_track`. Deliberately takes
+    /// no key at all, not even a cancel: the decode is a background `ffmpeg` run of a
+    /// few seconds, and a cancel button here would need a running-request handle this
+    /// page has nowhere else, for a wait shorter than most of the confirm prompts
+    /// already in the application. Closes itself the moment the worker answers
+    /// (`App::apply_auto_sync_outcome`), whatever the answer was.
+    AutoSyncing,
 }
 
 /// What an in-progress `Dialog::ConfirmReset` would discard if confirmed.
@@ -493,6 +1046,66 @@ pub enum ResetChoice {
     #[default]
     KeepEdits,
     ResetEdits,
+}
+
+/// The two-option cursor for `Dialog::ConfirmLeaveCues`, defaulting to the safe half: a bare
+/// `Enter` on a question about unsaved work keeps the reader where their work is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LeaveCuesChoice {
+    #[default]
+    StayHere,
+    DiscardEdits,
+}
+
+/// A subtitle edit page to open again on the far side of a save.
+///
+/// Writing a cue edit rewrites the file the page is about, which moves its fingerprint, so
+/// the page has to close and the file has to be re-probed before anything can be drawn from
+/// it again. Ejecting the reader to the track list at that point answers "I saved" with "you
+/// are somewhere else now" — on the one page where a save is something you do repeatedly,
+/// between edits, rather than once at the end.
+///
+/// So the page is remembered rather than the layer: which track it was about, and which cue
+/// the cursor was on. `media` is what the file *became* — a container conversion renames it
+/// — and is checked before the page is opened again, so a reader who moved to another file
+/// while the save ran is not dragged back to this one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SubtitleEditReopen {
+    media: PathBuf,
+    source: SubtitleSource,
+    cue: usize,
+}
+
+/// What a [`App::close_subtitle_edit`] is for, which decides the fate of a track created
+/// this session and never typed into.
+///
+/// `a` writes a zero-byte sidecar the moment the popup is answered, and leaving the page
+/// without putting a line in it takes the file back off the disk — an `a` pressed by
+/// mistake has to cost nothing. A close that is only the first half of re-opening the page
+/// is not leaving, and deleting the file there would pull it out from under the page about
+/// to open on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageExit<'a> {
+    /// The reader is going back to the track list, or to another file.
+    Leaving,
+    /// The page is coming straight back on this subtitle track.
+    Reopening(&'a SubtitleSource),
+}
+
+impl PageExit<'_> {
+    /// Whether the empty track at `path` survives this close.
+    ///
+    /// Only when the page is about to re-open on that very track — a reader switching the
+    /// video stream under a track they have just made has not abandoned it. Re-opening on a
+    /// *different* track is leaving this one, so the empty file goes exactly as it would on
+    /// the way to the track list; skipping the check there would take `new_track` without
+    /// acting on it and orphan the file for the rest of the session.
+    fn keeps_new_track(self, path: Option<&Path>) -> bool {
+        match (self, path) {
+            (Self::Reopening(SubtitleSource::Sidecar(target)), Some(path)) => target == path,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -853,6 +1466,183 @@ impl ContainerSettingsField {
     }
 }
 
+/// What `a` on the track list can make. Subtitles is the only answer today; the list is
+/// what makes audio a row rather than a rewrite.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackKind {
+    #[default]
+    Subtitles,
+}
+
+impl NewTrackKind {
+    pub const ORDER: [Self; 1] = [Self::Subtitles];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtitles => "Subtitles",
+        }
+    }
+}
+
+/// The format a new subtitle track is written in.
+///
+/// **SubRip alone, and that is a property of the cue editor rather than of this list.**
+/// Adding, editing, retiming and deleting a cue are all SubRip-only — an ASS cue names a
+/// style and positions itself against the script rather than carrying its own appearance —
+/// so any other choice here would create a track the reader cannot put a line into. A track
+/// can still be *converted* afterwards, from the ordinary subtitle settings dialog.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackFormat {
+    #[default]
+    SubRip,
+}
+
+impl NewTrackFormat {
+    pub const ORDER: [Self; 1] = [Self::SubRip];
+
+    pub fn format(self) -> SubtitleFormat {
+        match self {
+            Self::SubRip => SubtitleFormat::SubRip,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.format().label()
+    }
+}
+
+/// Where a newly created track ends up when the reader saves.
+///
+/// Every new track begins life as a sidecar file beside the media, because that is the only
+/// thing the staging model can key a change against — see `App::create_subtitle_track`.
+/// *Internal* additionally stages the import mark `Ctrl+H` sets, so the save converts the
+/// sidecar to whatever the container takes, muxes it in and deletes the file; *external*
+/// stages nothing and the sidecar is what the save writes. The reader can change their mind
+/// afterwards with `Ctrl+H`/`Ctrl+L` on the row, so this is a default rather than a
+/// commitment.
+///
+/// Labelled `Embedded`/`External` on the popup's radio row — the same word the track list
+/// already uses for `Embedded subtitles (N)` — rather than the longer sentence this used to
+/// carry: those fit a dropdown row, not two buttons on one line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTrackPlacement {
+    /// In the media file itself. The default: a track that travels with the file is what
+    /// most readers mean by adding subtitles to it.
+    #[default]
+    Internal,
+    /// A separate file beside the media.
+    External,
+}
+
+impl NewTrackPlacement {
+    pub const ORDER: [Self; 2] = [Self::Internal, Self::External];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Internal => "Embedded",
+            Self::External => "External",
+        }
+    }
+}
+
+/// Which row of the "New track" popup holds the cursor.
+///
+/// `Format` is where the cursor starts — the first row the reader can actually answer,
+/// `Kind` having nothing left to decide. `Kind` is still reachable — the reader can walk
+/// `k`/`gg` up to it and see it lit — but `h`/`l` cannot move it off `Subtitles`, since
+/// `Video` and `Audio` are not real choices yet (`App::move_create_track_choice` answers
+/// with a "not implemented" notice instead of moving anything). Selectable without being
+/// editable, the way a disabled field elsewhere in the application is still reachable by the
+/// cursor even though it refuses every key that would change it.
+///
+/// `Language` sits beside `Format` for the reason it exists at all: a save refuses an
+/// undetermined sidecar outright, so a track created in the wrong language is a track the
+/// reader has to open the subtitle settings dialog to fix before they can even see whether
+/// their guess was right. Asking here, once, is cheaper than a detour through a second
+/// dialog for the common case of a guess that misses.
+///
+/// **Its answer starts empty**, and `Action`'s `Create` button is refused until it isn't —
+/// see `App::confirm_create_track`. It also opens with no guess at all: a new subtitle
+/// track is as often a translation as it is a transcript of the film's own audio, so the
+/// audio's language is no better a starting point than any other entry in the list — the
+/// row simply opens on the list's own first entry, alphabetically, the way a fresh dropdown
+/// with nothing "current" to seed it always does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CreateTrackField {
+    Kind,
+    #[default]
+    Format,
+    Language,
+    Placement,
+    /// The Create/Back button row at the foot of the popup.
+    Action,
+}
+
+/// The Create/Back button row `Dialog::CreateTrack` ends on.
+///
+/// A tiny enum rather than a `bool` so the two buttons read the same way every other
+/// two-state row in the popup does (`NewTrackPlacement`, and `PreviewSettingsField`'s
+/// toggles) — `ORDER`, `label` and a mnemonic letter, picked with `h`/`l` or that letter
+/// directly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CreateTrackAction {
+    #[default]
+    Create,
+    Back,
+}
+
+impl CreateTrackAction {
+    pub const ORDER: [Self; 2] = [Self::Create, Self::Back];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Create => "Create",
+            Self::Back => "Back",
+        }
+    }
+
+    /// The letter highlighted in the button and bound as its shortcut, always the label's
+    /// first character.
+    pub fn mnemonic(self) -> char {
+        self.label().chars().next().expect("label is non-empty")
+    }
+}
+
+/// The cursor for `Dialog::CreateTrack`, following the container settings popup's grammar
+/// for its two dropdowns (`Format`, `Language`): `Enter` opens the list and then commits the
+/// highlighted choice, `Esc` closes it. `Placement` and `Action` are two-state rows moved
+/// with `h`/`l`, the shape the preview-settings popup's toggles already use.
+///
+/// Not `Copy`, unlike every other field-and-cursor struct like it in the application — the
+/// searchable language list needs a typed query (`language_search`, a `SearchState`, which
+/// owns a `String`), and that is the one thing a `Copy` bundle cannot hold. Every place that
+/// used to take a bitwise copy of the whole popup now clones it instead.
+#[derive(Clone, Debug, Default)]
+pub struct CreateTrackPopup {
+    pub field: CreateTrackField,
+    /// Whether the focused dropdown's list is expanded. A closed row's `Enter` opens it; an
+    /// open row's `Enter` takes the choice under the cursor. Meaningless for
+    /// `Placement`/`Action`, which have no list to open.
+    pub open: bool,
+    /// Position within whichever list is open — `Format`'s or the filtered language list —
+    /// meaningless while `open` is false. Shared between the two rather than each keeping its
+    /// own, because only one of them can be open at a time.
+    pub cursor: usize,
+    pub kind: NewTrackKind,
+    pub format: NewTrackFormat,
+    /// The canonical language code the track will be created with, chosen here before the
+    /// track exists — see `CreateTrackField`'s doc comment for why this is asked up front
+    /// rather than left to a second visit to the subtitle settings dialog.
+    pub language: String,
+    /// The `Language` row's search bar. Its own field rather than reusing `cursor`'s list for
+    /// anything more, because a typed query is what the shared `SearchState`/`TextInputSite`
+    /// machinery every other language picker in the application goes through needs — see
+    /// `App::filtered_create_track_languages`.
+    pub language_search: SearchState,
+    pub placement: NewTrackPlacement,
+    pub action: CreateTrackAction,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContainerSettingsMode {
     #[default]
@@ -1058,6 +1848,83 @@ pub struct App {
     pub left_subtitle_order: Vec<TrackRef>,
     pub subtitle_settings_popup: Option<SubtitleSettingsPopup>,
     pub subtitle_capabilities: ToolCapabilities,
+    /// The open subtitle edit page, if any. An `Option` rather than loose fields so
+    /// that dropping it — on `back`, on a file change, on quit — is what releases the
+    /// page's scratch directory, instead of every exit path having to remember to.
+    pub subtitle_edit: Option<SubtitleEditState>,
+    /// The subtitle edit page a save was started from, to be opened again once the file it
+    /// rewrote has been re-probed. See [`Self::reopen_subtitle_edit`].
+    pending_reopen: Option<SubtitleEditReopen>,
+    /// Bumped for each page opening, so a worker result that arrives after the user has
+    /// moved on can be recognised as stale and dropped.
+    page_generation: u64,
+    /// Bumped for each scrub playback, counted apart from `page_generation`: stopping a
+    /// playback must not abandon the background frame pass, which is a different piece of
+    /// work for the same page.
+    playback_generation: u64,
+    /// Whether the worker has been asked for a span it has not been told to stop decoding.
+    ///
+    /// The page drops a playback on its own whenever what it was for changed — the cursor
+    /// moved, the pane resized — and this is what lets `advance_playback` notice that and
+    /// tell the worker, rather than each of those points having to.
+    playback_live: bool,
+    /// What the audio device wants a span's sound emitted as.
+    ///
+    /// Read once by `main` before the terminal is taken over — some hosts write to stderr
+    /// while enumerating devices, and on the alternate screen that lands in the middle of
+    /// the UI — and handed to `ffmpeg`, so the audio callback copies rather than resamples.
+    /// Tests and library consumers keep the fallback, which nothing plays anyway.
+    audio_format: crate::audio::OutputFormat,
+    /// The preview worker, when one is running. `None` in tests and for library
+    /// consumers that never open the subtitle edit page, exactly like
+    /// `completion_notification_tx` — `App::new` has a positional signature a dozen test
+    /// sites construct, so new workers arrive through a setter rather than a parameter.
+    preview: Option<PreviewHandles>,
+    /// What the subtitle edit page's background frame pass is allowed to do, from `config.toml`
+    /// and from whether the directory is on a network mount. Set by `main` beside the
+    /// worker handles; the default is what a test or a library consumer gets.
+    preview_settings: PreviewSettings,
+    /// The same, as `main` first supplied it — what `r`/`R` in the preview-settings popup
+    /// put a field back to. The *config file's* answer rather than the hard-coded one, so
+    /// resetting agrees with what the user would get by restarting.
+    preview_defaults: PreviewSettings,
+    pub preview_settings_popup: Option<PreviewSettingsPopup>,
+    /// Which video stream the subtitle edit page previews against, by **absolute** ffprobe
+    /// index, or `None` for the file's first real one — which is what a page opens on.
+    ///
+    /// On `App` rather than on the page because the switch is carried out by tearing the
+    /// page down and building it again, so a choice stored there would be destroyed by the
+    /// act of applying it. Cleared whenever the selected file changes (`queue_probe`): an
+    /// index means nothing on another file, and a page silently previewing the wrong stream
+    /// is the one thing this must never do.
+    preview_video_stream: Option<u64>,
+    /// The same for the stream a scrub playback takes its sound from, and the one automatic
+    /// sync aligns against.
+    preview_audio_stream: Option<u64>,
+    /// The subtitle track the popup has been told to re-open the page on, held only while
+    /// the "unsaved cue edits" prompt is up.
+    ///
+    /// Switching tracks *is* leaving this track's page — the cue list is rebuilt from the
+    /// file and staged rewrites are re-applied to nothing — so the same question is asked,
+    /// and this is what tells the answer apart from the one `Esc` asks.
+    pending_track_switch: Option<SubtitleSource>,
+    /// The subtitle edit page's open cue editor, if `i` has raised one.
+    pub cue_editor: Option<CueEditor>,
+    /// The open "what should I make?" popup, if `a` has raised one.
+    pub create_track_popup: Option<CreateTrackPopup>,
+    /// The subtitle file `a` wrote this session, while the page it opened is still up.
+    ///
+    /// An `a` pressed by mistake has to cost nothing, which is the rule the page already
+    /// applies to a cue editor closed with nothing typed in it — so the file is taken back
+    /// off the disk if the reader leaves without putting a line in it. Held here rather than
+    /// on the page's own state because the deletion happens as the page closes, and because
+    /// only `App` can see the staged edits the guard has to consult. See
+    /// `App::discard_empty_new_track`.
+    pub new_track: Option<PathBuf>,
+    /// The subtitle edit page's open cue length dialog, if `D` has raised one.
+    pub cue_length: Option<CueLengthDraft>,
+    /// Which answer the "discard the unwritten cue edits?" prompt is pointing at.
+    pub leave_cues_choice: LeaveCuesChoice,
     pub container_target: Option<ContainerFormat>,
     pub container_metadata: Option<ContainerMetadata>,
     pub container_settings_popup: Option<ContainerSettingsPopup>,
@@ -1136,6 +2003,9 @@ pub struct App {
     /// `CONFLICT_COUNTDOWN` first, or an Enter already in flight for something else
     /// would silently revert staged work.
     pub(crate) conflict_opened_at: Option<Instant>,
+    /// When `Dialog::AutoSyncing` opened, driving its spinner exactly as
+    /// `conflict_opened_at` drives the conflict notice's countdown.
+    pub(crate) sync_started: Option<Instant>,
     pub conflict_scroll: u16,
     pub conflict_max_scroll: u16,
     pub keybindings_search: SearchState,
@@ -1195,6 +2065,24 @@ impl App {
             left_subtitle_order: Vec::new(),
             subtitle_settings_popup: None,
             subtitle_capabilities: ToolCapabilities::detect_cached(),
+            subtitle_edit: None,
+            pending_reopen: None,
+            page_generation: 0,
+            playback_generation: 0,
+            playback_live: false,
+            audio_format: crate::audio::OutputFormat::FALLBACK,
+            preview_settings: PreviewSettings::default(),
+            preview_defaults: PreviewSettings::default(),
+            preview_settings_popup: None,
+            preview_video_stream: None,
+            preview_audio_stream: None,
+            pending_track_switch: None,
+            cue_editor: None,
+            create_track_popup: None,
+            new_track: None,
+            cue_length: None,
+            leave_cues_choice: LeaveCuesChoice::default(),
+            preview: None,
             container_target: None,
             container_metadata: None,
             container_settings_popup: None,
@@ -1227,6 +2115,7 @@ impl App {
             conflict_tx,
             pending_conflict_checks: HashMap::new(),
             conflict_opened_at: None,
+            sync_started: None,
             conflict_scroll: 0,
             conflict_max_scroll: 0,
             keybindings_search: SearchState::default(),
@@ -1244,6 +2133,42 @@ impl App {
 
     pub fn set_completion_notification_sender(&mut self, sender: Option<Sender<PathBuf>>) {
         self.completion_notification_tx = sender;
+    }
+
+    /// Supplies the worker the subtitle edit page loads its cues through. Without it
+    /// the page still opens and still closes cleanly, it just never leaves its loader.
+    pub fn set_preview_handles(&mut self, handles: Option<PreviewHandles>) {
+        self.preview = handles;
+    }
+
+    /// Supplies the subtitle edit page's caching and prefetching policy, resolved by `main` from
+    /// `config.toml` and the mount the directory is on.
+    pub fn set_preview_settings(&mut self, settings: PreviewSettings) {
+        self.preview_settings = settings;
+        // Snapshotted here rather than re-read from `Config` when a reset happens, because
+        // this is the only place the file's answer is known — `App` never learns where the
+        // settings came from, and a second read could disagree with the first if the file
+        // changed under a running session.
+        self.preview_defaults = settings;
+    }
+
+    /// What a playback would be done with right now, for the popup and the status row.
+    pub fn preview_settings(&self) -> PreviewSettings {
+        self.preview_settings
+    }
+
+    /// The settings a playback would be done with had the popup never been opened.
+    pub fn preview_defaults(&self) -> PreviewSettings {
+        self.preview_defaults
+    }
+
+    /// Records what the audio device wants, so a span's sound is emitted as exactly that.
+    ///
+    /// A setter for the same reason the preview handles are one: `App::new` has a
+    /// positional signature a dozen test sites construct, and the query has to happen in
+    /// `main` before the terminal is taken over — see [`crate::audio::device_format`].
+    pub fn set_audio_format(&mut self, format: crate::audio::OutputFormat) {
+        self.audio_format = format;
     }
 
     /// Records the terminal's last reported focus state, driven by `main`'s
@@ -1276,6 +2201,50 @@ impl App {
                 self.reconcile_files(Vec::new());
             }
         }
+    }
+
+    /// Carries the open file's staged subtitle changes across a change to its sidecar list,
+    /// dropping only the ones whose track is genuinely no longer there.
+    ///
+    /// Two things move when a sidecar appears or disappears, and both have to be followed:
+    ///
+    /// - A change is keyed by `SubtitleSource::Sidecar(path)`, so it survives when a sidecar
+    ///   with that path is still present *and still the same file* — same fingerprint, same
+    ///   format. An embedded track's change is never affected by any of this.
+    /// - `left_subtitle_order` holds `TrackRef::Sidecar(index)`, which are **positions in a
+    ///   vector a new sidecar can be inserted into the middle of** — the list is sorted by
+    ///   name. Left alone, the left column would silently re-point at another file.
+    ///
+    /// Answers whether anything was dropped, so the caller can tell a loss worth a notice
+    /// from an ordinary arrival.
+    fn remap_subtitle_changes(&mut self, old_sidecars: &[SidecarEntry]) -> bool {
+        let before = self.subtitle_changes.len();
+        let sidecars = &self.sidecars;
+        self.subtitle_changes
+            .retain(|source, _change| match source {
+                SubtitleSource::Embedded(_) => true,
+                // Path and fingerprint, and deliberately not format: a sidecar's format is read
+                // off its extension, so a change keyed to this path was necessarily made against
+                // this format. Comparing them as well would be an arm nothing can reach.
+                SubtitleSource::Sidecar(path) => sidecars.iter().any(|sidecar| {
+                    sidecar.path == *path
+                        && Some(sidecar.fingerprint)
+                            == crate::files::FileFingerprint::for_path(path).ok()
+                }),
+            });
+        self.left_subtitle_order = self
+            .left_subtitle_order
+            .iter()
+            .filter_map(|track| match track {
+                TrackRef::Sidecar(old) => {
+                    let path = &old_sidecars.get(*old)?.path;
+                    let now = sidecars.iter().position(|sidecar| sidecar.path == *path)?;
+                    Some(TrackRef::Sidecar(now))
+                }
+                other => Some(*other),
+            })
+            .collect();
+        self.subtitle_changes.len() != before
     }
 
     fn reconcile_files(&mut self, files: Vec<FileEntry>) {
@@ -1421,13 +2390,24 @@ impl App {
                 // is refreshed lazily once resolution actually completes (see
                 // `refresh_cached_outcome`).
             } else if sidecars_changed && !was_processing {
-                self.subtitle_changes.clear();
+                // **Remapped rather than cleared.** This used to throw away every staged
+                // subtitle change on the file, which is far more than the change warrants: a
+                // sidecar appearing beside the media says nothing about the *other* tracks'
+                // conversions, language tags, import marks or cue edits, and the reader has no
+                // way to get them back. It also made a file appearing a destructive event,
+                // which `a` performs deliberately.
+                let dropped = self.remap_subtitle_changes(&old_sidecars);
                 self.subtitle_settings_popup = None;
                 self.selected_stream = self
                     .selected_stream
                     .min(self.stream_count().saturating_sub(1));
-                self.notice =
-                    Some("Matching subtitle sidecars changed; reloaded them.".to_string());
+                // Only when something was actually lost. Raised unconditionally it would put a
+                // stale-sounding line on the footer every time a sidecar is created or
+                // removed, describing work that did not happen.
+                if dropped {
+                    self.notice =
+                        Some("Matching subtitle sidecars changed; reloaded them.".to_string());
+                }
             }
             return;
         }
@@ -1610,100 +2590,110 @@ impl App {
 
     pub fn select_next(&mut self) {
         self.notice = None;
-        if self.layer == Layer::Streams {
-            if self.move_within_subtitle_column(1, 1, false) {
-                return;
+        match self.layer {
+            Layer::Files => {
+                let result_count = self.file_panel_entries().len();
+                if result_count == 0 {
+                    return;
+                }
+                let next = self
+                    .list_state
+                    .selected()
+                    .map(|index| (index + 1).min(result_count - 1))
+                    .unwrap_or(0);
+                self.select(next);
             }
-            let count = self.stream_count();
-            if count > 0 {
-                self.selected_stream = (self.selected_stream + 1).min(count - 1);
+            Layer::Streams => {
+                if self.move_within_subtitle_column(1, 1, false) {
+                    return;
+                }
+                let count = self.stream_count();
+                if count > 0 {
+                    self.selected_stream = (self.selected_stream + 1).min(count - 1);
+                }
             }
-            return;
+            Layer::StreamDetails => self.scroll_details_down(1),
+            Layer::SubtitleEdit => self.move_cue(1),
         }
-        if self.layer == Layer::StreamDetails {
-            self.scroll_details_down(1);
-            return;
-        }
-        let result_count = self.file_panel_entries().len();
-        if result_count == 0 {
-            return;
-        }
-        let next = self
-            .list_state
-            .selected()
-            .map(|index| (index + 1).min(result_count - 1))
-            .unwrap_or(0);
-        self.select(next);
     }
 
     pub fn select_previous(&mut self) {
         self.notice = None;
-        if self.layer == Layer::Streams {
-            if self.move_within_subtitle_column(-1, 1, false) {
-                return;
+        match self.layer {
+            Layer::Files => {
+                let previous = self
+                    .list_state
+                    .selected()
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or(0);
+                self.select(previous);
             }
-            self.selected_stream = self.selected_stream.saturating_sub(1);
-            return;
+            Layer::Streams => {
+                if self.move_within_subtitle_column(-1, 1, false) {
+                    return;
+                }
+                self.selected_stream = self.selected_stream.saturating_sub(1);
+            }
+            Layer::StreamDetails => self.scroll_details_up(1),
+            Layer::SubtitleEdit => self.move_cue(-1),
         }
-        if self.layer == Layer::StreamDetails {
-            self.scroll_details_up(1);
-            return;
-        }
-        let previous = self
-            .list_state
-            .selected()
-            .map(|index| index.saturating_sub(1))
-            .unwrap_or(0);
-        self.select(previous);
     }
 
     pub fn select_first(&mut self) {
         self.notice = None;
-        if self.layer == Layer::StreamDetails {
-            self.details_scroll = 0;
-            return;
-        }
-        if self.layer == Layer::Streams {
-            self.selected_stream = 0;
-            return;
-        }
-        if !self.file_panel_entries().is_empty() {
-            self.select(0);
+        match self.layer {
+            Layer::Files => {
+                if !self.file_panel_entries().is_empty() {
+                    self.select(0);
+                }
+            }
+            Layer::Streams => self.selected_stream = 0,
+            Layer::StreamDetails => self.details_scroll = 0,
+            Layer::SubtitleEdit => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    state.select_first();
+                }
+            }
         }
     }
 
     pub fn select_last(&mut self) {
         self.notice = None;
-        if self.layer == Layer::StreamDetails {
-            self.details_scroll = self.details_max_scroll;
-            return;
-        }
-        if self.layer == Layer::Streams {
-            if self.subtitle_columns_side_by_side {
-                let rows = self.track_rows();
-                let column = match self.selected_track() {
-                    Some(TrackRef::Embedded(index))
-                        if self
-                            .media_info()
-                            .and_then(|info| stream_by_index(info, index))
-                            .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
-                    {
-                        self.embedded_subtitle_positions(&rows)
-                    }
-                    Some(TrackRef::Sidecar(_)) => self.sidecar_positions(&rows),
-                    _ => self.embedded_subtitle_positions(&rows),
-                };
-                if let Some(last) = column.last() {
-                    self.selected_stream = *last;
-                    return;
+        match self.layer {
+            Layer::Files => {
+                let result_count = self.file_panel_entries().len();
+                if result_count > 0 {
+                    self.select(result_count - 1);
                 }
             }
-            self.selected_stream = self.stream_count().saturating_sub(1);
-            return;
-        }
-        let result_count = self.file_panel_entries().len();
-        if result_count > 0 {
-            self.select(result_count - 1);
+            Layer::Streams => {
+                if self.subtitle_columns_side_by_side {
+                    let rows = self.track_rows();
+                    let column = match self.selected_track() {
+                        Some(TrackRef::Embedded(index))
+                            if self
+                                .media_info()
+                                .and_then(|info| stream_by_index(info, index))
+                                .is_some_and(|stream| stream_kind(stream) == Some("subtitle")) =>
+                        {
+                            self.embedded_subtitle_positions(&rows)
+                        }
+                        Some(TrackRef::Sidecar(_)) => self.sidecar_positions(&rows),
+                        _ => self.embedded_subtitle_positions(&rows),
+                    };
+                    if let Some(last) = column.last() {
+                        self.selected_stream = *last;
+                        return;
+                    }
+                }
+                self.selected_stream = self.stream_count().saturating_sub(1);
+            }
+            Layer::StreamDetails => self.details_scroll = self.details_max_scroll,
+            Layer::SubtitleEdit => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    state.select_last();
+                }
+            }
         }
     }
 
@@ -1735,6 +2725,15 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         self.details_scroll = 0;
         self.details_max_scroll = 0;
+        // The subtitle edit page belongs to one track of one file, so anything that changes
+        // which file is open has to close it — otherwise it would keep showing cues for
+        // a file the user has already navigated away from.
+        self.close_subtitle_edit(PageExit::Leaving);
+        // And the streams it was previewing against go with it: they are absolute indexes
+        // into *this* file's probe, so carrying them to the next file would preview stream
+        // three of something that has two.
+        self.preview_video_stream = None;
+        self.preview_audio_stream = None;
         self.layer = Layer::Files;
         self.selected_stream = 0;
         self.outcome = None;
@@ -1810,6 +2809,9 @@ impl App {
                 self.loading = false;
                 self.selected_stream = 0;
                 self.load_staged_or_reset();
+                // The answer a page owed after a save was waiting for. Nothing is owed in
+                // the ordinary case and this costs a `None` check.
+                self.reopen_subtitle_edit();
             }
         }
         if disk_cache_dirty {
@@ -2138,10 +3140,97 @@ impl App {
         self.notice = Some(notice);
         if !needs_rescan
             || expected_selection
-                .is_some_and(|path| self.selected_file().is_some_and(|file| file.path == path))
+                .as_ref()
+                .is_some_and(|path| self.selected_file().is_some_and(|file| file.path == *path))
         {
             self.layer = Layer::Streams;
         }
+        // The page a save was started from goes back up, once the file it rewrote has been
+        // re-probed — which for a cached outcome has already happened here, and otherwise
+        // happens when `receive_probe_results` drains the answer. Pointed at whatever the
+        // file became: a container conversion renames it, and the page has to follow.
+        if let Some(reopen) = self.pending_reopen.as_mut() {
+            match expected_selection {
+                Some(path) => reopen.media = path,
+                None => self.pending_reopen = None,
+            }
+        }
+        self.reopen_subtitle_edit();
+    }
+
+    /// Opens the subtitle edit page again after the save that closed it, if one is owed.
+    ///
+    /// Owed and *possible* are different questions, and the second is asked here: the file
+    /// has to be the one the page was about, its probe has to have landed, and the track has
+    /// to still be there. Any of those failing drops the request rather than deferring it —
+    /// a page owed forever would spring open on some unrelated file later on.
+    fn reopen_subtitle_edit(&mut self) {
+        let Some(reopen) = self.pending_reopen.as_ref() else {
+            return;
+        };
+        if self.subtitle_edit.is_some() {
+            // A page is already up — the save never closed this one, or the reader opened
+            // another. Either way there is nothing owed, and holding the request would
+            // spring a page open later on something unrelated.
+            self.pending_reopen = None;
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        if !self
+            .selected_file()
+            .is_some_and(|file| file.path == reopen.media)
+        {
+            self.pending_reopen = None;
+            return;
+        }
+        if self.loading || self.media_info().is_none() {
+            // The probe for this file is still out; try again when its answer lands.
+            return;
+        }
+        let reopen = self.pending_reopen.take().expect("checked above");
+        self.open_subtitle_edit_on(&reopen.source, Some(reopen.cue));
+    }
+
+    /// Opens the subtitle edit page on `source`, putting the cursor back on cue `cue`.
+    ///
+    /// The one way the page is opened on a track the cursor is not already parked on —
+    /// after a save, and when the preview-settings popup names another track. **Through the
+    /// ordinary opening rather than around it**: [`Self::open_subtitle_edit`] checks the
+    /// track's format and the tools it needs, and both a save and a switch can meet a track
+    /// that fails those. Refused, it leaves the reader on the track list with a notice
+    /// saying why.
+    ///
+    /// `cue` is `None` when the track itself is changing, since a position in one track's
+    /// list says nothing about another's.
+    fn open_subtitle_edit_on(&mut self, source: &SubtitleSource, cue: Option<usize>) {
+        let Some(row) = self.track_row_of(source) else {
+            return;
+        };
+        self.layer = Layer::Streams;
+        self.selected_stream = row;
+        self.open_subtitle_edit();
+        if let Some((state, cue)) = self.subtitle_edit.as_mut().zip(cue) {
+            // Where the cursor was, restored once the cues have been read back — the list
+            // is rebuilt from the file, so there is nothing to select yet.
+            state.restore_selection(cue);
+        }
+    }
+
+    /// Which row of the track list a subtitle source sits on, for putting the cursor back on
+    /// it. `None` once the track is gone, which a save can do.
+    fn track_row_of(&self, source: &SubtitleSource) -> Option<usize> {
+        self.track_rows()
+            .iter()
+            .position(|track| match (track, source) {
+                (TrackRef::Embedded(index), SubtitleSource::Embedded(wanted)) => index == wanted,
+                (TrackRef::Sidecar(index), SubtitleSource::Sidecar(path)) => self
+                    .sidecars
+                    .get(*index)
+                    .is_some_and(|sidecar| sidecar.path == *path),
+                _ => false,
+            })
     }
 
     pub fn enter(&mut self) {
@@ -2151,6 +3240,478 @@ impl App {
         if self.layer == Layer::Files && self.stream_count() > 0 {
             self.layer = Layer::Streams;
             self.selected_stream = 0;
+        }
+    }
+
+    /// `a` on the track list: asks what to make, then makes it.
+    ///
+    /// Every refusal is raised **before anything is written**. A file left behind by a press
+    /// that then declines to open the page would be the worst of both answers, and the two
+    /// most likely refusals — a format this build cannot preview, a file no sidecar can
+    /// attach to — are exactly the ones a reader would otherwise discover that way.
+    pub fn open_create_track(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        // No file, or a probe still out: there is no track list drawn to have pressed `a` on,
+        // so this is inert rather than a refusal with something to say.
+        let Some(file) = self.selected_file() else {
+            return;
+        };
+        let path = file.path.clone();
+        if self.media_info().is_none() {
+            return;
+        }
+        // A sidecar written beside a file the matcher will never look at is an orphan: it
+        // would not appear as a row, and the page would have nothing to open. `is_sidecar_host`
+        // is the matcher's own answer, so the two cannot drift apart.
+        if !crate::subtitle::is_sidecar_host(&path) {
+            self.notice =
+                Some("Reel can only add a subtitle track beside a video file.".to_string());
+            return;
+        }
+        // No `preview_blocked` check here, deliberately. It would be the natural fourth
+        // refusal, and it is unreachable: the only format this can create is SubRip, which
+        // that gate never turns away — reading SubRip cues needs no decoder and no external
+        // tool. A build with no libass still opens the page and says so in the preview pane
+        // (`PreviewSupport::NoSubtitleBurn`), which is right: the cues are editable whether or
+        // not a frame can be drawn behind them. Add the check when a second format appears.
+        self.notice = None;
+        // `language` starts empty rather than seeded with the guess — see `CreateTrackField`'s
+        // doc comment for why an unconfirmed answer must not be indistinguishable from a
+        // chosen one. The guess still steers where the `Language` list opens (see
+        // `activate_create_track`), so it costs the reader nothing to accept.
+        self.create_track_popup = Some(CreateTrackPopup::default());
+        self.dialog = Some(Dialog::CreateTrack);
+    }
+
+    /// The labels of whichever dropdown is focused — `Format`'s fixed list, or the `Language`
+    /// list filtered by what the reader has typed.
+    ///
+    /// One answer read by the renderer and by the cursor, so what is drawn and what `Enter`
+    /// takes cannot come to disagree about how long the list is. `Placement` and `Action` are
+    /// two-state rows moved with `h`/`l` rather than dropdowns, so they have no list here.
+    pub fn create_track_choices(&self) -> Vec<String> {
+        let Some(popup) = self.create_track_popup.as_ref() else {
+            return Vec::new();
+        };
+        match popup.field {
+            CreateTrackField::Format => NewTrackFormat::ORDER
+                .iter()
+                .map(|format| format.label().to_string())
+                .collect(),
+            CreateTrackField::Language => self
+                .filtered_create_track_languages()
+                .iter()
+                .map(LanguageChoice::label)
+                .collect(),
+            CreateTrackField::Kind | CreateTrackField::Placement | CreateTrackField::Action => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// The `Language` row's list, filtered by what the reader has typed — the same shape
+    /// `filtered_subtitle_languages` already gives the subtitle settings dialog. The popup's
+    /// own guessed (or last chosen) language stands in for "the track's current one", so a
+    /// guess outside the common list is still selectable rather than silently missing from
+    /// the list it was seeded from.
+    pub fn filtered_create_track_languages(&self) -> Vec<LanguageChoice> {
+        let Some(popup) = self.create_track_popup.as_ref() else {
+            return Vec::new();
+        };
+        let mut choices = common_language_choices();
+        if let Some(current) = language_choice(&popup.language)
+            && !choices.iter().any(|choice| choice.code == current.code)
+        {
+            choices.push(current);
+            choices.sort_by(|left, right| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+                    .then_with(|| left.code.cmp(&right.code))
+            });
+        }
+        choices.retain(|choice| choice.matches(&popup.language_search.value));
+        choices
+    }
+
+    /// `j`/`k` in the popup: through whichever dropdown is open, or between the popup's five
+    /// rows.
+    pub fn move_create_track_cursor(&mut self, delta: isize) {
+        let choices = self.create_track_choices().len();
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            let last = choices.saturating_sub(1);
+            popup.cursor = popup.cursor.saturating_add_signed(delta).min(last);
+            return;
+        }
+        popup.field = match (popup.field, delta < 0) {
+            (CreateTrackField::Kind, true) => CreateTrackField::Kind,
+            (CreateTrackField::Kind, false) => CreateTrackField::Format,
+            (CreateTrackField::Format, true) => CreateTrackField::Kind,
+            (CreateTrackField::Format, false) => CreateTrackField::Language,
+            (CreateTrackField::Language, true) => CreateTrackField::Format,
+            (CreateTrackField::Language, false) => CreateTrackField::Placement,
+            (CreateTrackField::Placement, true) => CreateTrackField::Language,
+            (CreateTrackField::Placement, false) => CreateTrackField::Action,
+            (CreateTrackField::Action, true) => CreateTrackField::Placement,
+            (CreateTrackField::Action, false) => CreateTrackField::Action,
+        };
+    }
+
+    /// `gg`/`G` in the popup, so it navigates like every other list in the application.
+    pub fn move_create_track_to_endpoint(&mut self, last: bool) {
+        let choices = self.create_track_choices().len();
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            popup.cursor = if last { choices.saturating_sub(1) } else { 0 };
+        } else {
+            popup.field = if last {
+                CreateTrackField::Action
+            } else {
+                CreateTrackField::Kind
+            };
+        }
+    }
+
+    /// `h`/`l` in the popup: picks an answer directly on `Placement` and `Action`, the same
+    /// grammar `App::set_preview_toggle` uses for the preview-settings popup's switches.
+    /// Inert on `Format` and `Language`, and while a list is open — a dropdown row's value is
+    /// chosen from its list, not moved left or right.
+    ///
+    /// **On `Kind` it is refused rather than inert.** The row is reachable so the reader can
+    /// see it is there, but `Video`/`Audio` are not real choices yet, so there is nowhere for
+    /// the cursor to go — a silent no-op there would read as a broken key rather than as a
+    /// feature that does not exist, which is why it raises the same kind of notice a track the
+    /// application cannot yet edit does elsewhere.
+    pub fn move_create_track_choice(&mut self, right: bool) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            return;
+        }
+        match popup.field {
+            CreateTrackField::Kind => {
+                self.notice =
+                    Some("Creating video or audio tracks is not implemented yet.".to_string());
+            }
+            CreateTrackField::Format | CreateTrackField::Language => {}
+            CreateTrackField::Placement => {
+                popup.placement = if right {
+                    NewTrackPlacement::External
+                } else {
+                    NewTrackPlacement::Internal
+                };
+            }
+            CreateTrackField::Action => {
+                popup.action = if right {
+                    CreateTrackAction::Back
+                } else {
+                    CreateTrackAction::Create
+                };
+            }
+        }
+    }
+
+    /// `Enter`: open `Format`'s or `Language`'s list, or take the choice under the cursor;
+    /// flip `Placement`; perform whichever of Create/Back `Action` is currently on.
+    pub fn activate_create_track(&mut self) {
+        let choices = self.create_track_choices().len();
+        let Some(field) = self.create_track_popup.as_ref().map(|popup| popup.field) else {
+            return;
+        };
+        match field {
+            // Nothing to open: there is no list behind `Kind`, and `Subtitles` is already
+            // the only real answer it could commit.
+            CreateTrackField::Kind => {}
+            CreateTrackField::Format => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if !popup.open {
+                    popup.open = true;
+                    popup.cursor = NewTrackFormat::ORDER
+                        .iter()
+                        .position(|format| *format == popup.format)
+                        .unwrap_or_default();
+                    return;
+                }
+                let cursor = popup.cursor.min(choices.saturating_sub(1));
+                popup.open = false;
+                popup.format = NewTrackFormat::ORDER[cursor];
+            }
+            CreateTrackField::Language => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if !popup.open {
+                    // The list opens on an empty query, so the reader sees every common
+                    // language rather than whatever was left typed from an earlier visit.
+                    popup.language_search.clear();
+                    popup.open = true;
+                    // The cursor opens on the list's own first entry rather than a guess
+                    // taken from the media's audio track — a new subtitle track is as
+                    // often a translation as it is a transcript of what is spoken, so the
+                    // audio's language is no better a starting point than any other entry
+                    // in the list. See `CreateTrackField`'s doc comment.
+                    popup.cursor = 0;
+                    return;
+                }
+                let choices = self.filtered_create_track_languages();
+                let popup = self.create_track_popup.as_mut().unwrap();
+                if let Some(choice) = choices.get(popup.cursor) {
+                    popup.language = choice.code.clone();
+                }
+                popup.open = false;
+                popup.language_search.clear();
+            }
+            CreateTrackField::Placement => {
+                let popup = self.create_track_popup.as_mut().unwrap();
+                popup.placement = match popup.placement {
+                    NewTrackPlacement::Internal => NewTrackPlacement::External,
+                    NewTrackPlacement::External => NewTrackPlacement::Internal,
+                };
+            }
+            CreateTrackField::Action => {
+                let popup = self.create_track_popup.as_ref().unwrap();
+                match popup.action {
+                    CreateTrackAction::Create => {
+                        let answers = popup.clone();
+                        self.confirm_create_track(answers);
+                    }
+                    CreateTrackAction::Back => self.close_create_track(),
+                }
+            }
+        }
+    }
+
+    /// `Esc`: close `Format`'s open list, otherwise close the whole popup.
+    ///
+    /// There is only one screen now, so there is no step left to back out to — a closed list
+    /// has nowhere further to retreat to short of the popup itself.
+    pub fn escape_create_track(&mut self) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        if popup.open {
+            popup.open = false;
+            // Harmless when `Format`'s list was the one open — the search is already empty —
+            // and what leaves a stale query behind for the reader's next visit to `Language`
+            // otherwise.
+            popup.language_search.clear();
+            return;
+        }
+        self.close_create_track();
+    }
+
+    pub fn close_create_track(&mut self) {
+        self.create_track_popup = None;
+        self.dialog = None;
+    }
+
+    /// `/` while the `Language` row's list is open: starts typing a query, the same searchable
+    /// picker `App::start_subtitle_language_search` opens for the subtitle settings dialog's
+    /// own `Language` row.
+    pub fn start_create_track_language_search(&mut self) {
+        self.clear_text_input_reject();
+        if let Some(popup) = self
+            .create_track_popup
+            .as_mut()
+            .filter(|popup| popup.field == CreateTrackField::Language && popup.open)
+        {
+            popup.language_search.activate();
+        }
+    }
+
+    /// `Esc` while typing that query: drops it and shows every common language again, without
+    /// closing the list — the reader is narrowing a search, not answering the row.
+    pub fn cancel_create_track_language_search(&mut self) {
+        if let Some(popup) = self
+            .create_track_popup
+            .as_mut()
+            .filter(|popup| popup.field == CreateTrackField::Language && popup.open)
+        {
+            popup.language_search.clear();
+            popup.cursor = 0;
+        }
+    }
+
+    /// `c`/`C`: the Create button's mnemonic, reachable from anywhere in the popup regardless
+    /// of which row holds the cursor or whether `Format`'s list is open — closing that list
+    /// silently rather than requiring it be closed first, since a mnemonic exists precisely so
+    /// the reader need not navigate to press it.
+    pub fn create_track_now(&mut self) {
+        let Some(popup) = self.create_track_popup.as_mut() else {
+            return;
+        };
+        popup.open = false;
+        let answers = popup.clone();
+        self.confirm_create_track(answers);
+    }
+
+    /// Takes the popup's answers and makes the track.
+    ///
+    /// Given the answers rather than reading them back off `self.create_track_popup`: its only
+    /// caller has them in hand, and re-reading would add a "there is no popup" arm that cannot
+    /// happen and could not be tested.
+    fn confirm_create_track(&mut self, popup: CreateTrackPopup) {
+        // Refused rather than silently falling back to a guess: a language chosen without
+        // the reader ever seeing it is the same defect an unreviewed guess would be, one
+        // step later. The popup stays open, exactly as `Ctrl+S` on an empty new track is
+        // refused rather than closing the page on a file that was never written to.
+        if popup.language.is_empty() {
+            self.notice = Some("Choose a language before creating the track.".to_string());
+            return;
+        }
+        self.close_create_track();
+        match popup.kind {
+            NewTrackKind::Subtitles => {
+                self.create_subtitle_track(popup.format.format(), popup.placement, popup.language);
+            }
+        }
+    }
+
+    /// Writes an empty subtitle file beside the media and opens the edit page on it.
+    ///
+    /// **A new track is a real file from the moment it exists, and that is the whole design.**
+    /// The application's unit of staging is a change to a track that is already there:
+    /// `SubtitleChange` is keyed by `SubtitleSource::{Embedded, Sidecar}`, `edit::
+    /// validate_subtitle_sources` resolves every staged source to a real stream or a
+    /// fingerprint-matching sidecar, and `track_rows` is built from the probe and the
+    /// directory scan. A track that does not exist has nothing to be keyed by, nothing to
+    /// fingerprint and no row to be selected on — so a staged "new track" would need a third
+    /// `SubtitleSource`, a phantom `SidecarEntry`, and a `preview::prepare` that reads cues
+    /// out of nothing. Writing zero bytes is enormously cheaper, and it is also the honest
+    /// framing: a sidecar is its own file rather than an edit to the media, so creating one
+    /// changes nothing about the media at all.
+    ///
+    /// The property that actually matters — an `a` pressed by mistake costing nothing — is
+    /// bought by `discard_empty_new_track` on the way off the page instead.
+    ///
+    /// The cues typed into it are staged and written by `Ctrl+S` exactly like every other cue
+    /// edit; only this empty container file is eager.
+    fn create_subtitle_track(
+        &mut self,
+        format: SubtitleFormat,
+        placement: NewTrackPlacement,
+        language: String,
+    ) {
+        let Some(media) = self.selected_file().map(|file| file.path.clone()) else {
+            return;
+        };
+        // `self.directory` rather than the media's own parent: they are the same directory —
+        // every file here came from scanning it — and this way there is no "a file with no
+        // parent" arm that cannot happen.
+        let directory = self.directory.clone();
+        let Some(stem) = media.file_stem().and_then(|stem| stem.to_str()) else {
+            return;
+        };
+        // **A real language rather than `und`, chosen before the file exists.** The sidecar
+        // matcher requires a language as the name's first component, and a save *refuses*
+        // `und` outright (`edit::validate_subtitle_sources`) — so a track created as
+        // undetermined could not be written at all. The popup's `Language` row is where the
+        // reader answers that, rather than through a second visit to the subtitle settings
+        // dialog afterward.
+        let Some(path) = (0..=MAX_NEW_TRACK_NUMBER).find_map(|number| {
+            let name = crate::subtitle::sidecar_filename(
+                stem,
+                &language,
+                false,
+                false,
+                (number > 0).then_some(number),
+                format,
+            );
+            let candidate = directory.join(name);
+            (!candidate.exists()).then_some(candidate)
+        }) else {
+            self.notice = Some("There are already too many subtitle files for this one.".into());
+            return;
+        };
+        // An empty SubRip file is exactly what a track with no cues is — `cue::write_srt` of
+        // nothing is the empty string — so there is no placeholder cue to explain away.
+        if let Err(error) = std::fs::write(&path, crate::cue::write_srt(&[])) {
+            self.notice = Some(format!("Could not create the subtitle file: {error}"));
+            return;
+        }
+        self.new_track = Some(path.clone());
+        // Synchronously, rather than waiting on the directory monitor: the page is about to
+        // open on this file, and it can only do that once the scan has given it a row and a
+        // `SidecarEntry` to be addressed by. The precedent is the rescan after a batch.
+        if let Ok(files) = scan_directory(&self.directory) {
+            self.reconcile_files(files);
+        }
+        let source = SubtitleSource::Sidecar(path.clone());
+        if placement == NewTrackPlacement::Internal {
+            // Byte for byte what `Ctrl+H` stages on any other sidecar, which is what makes the
+            // placement a default the reader can change their mind about rather than a
+            // commitment taken at creation.
+            let mut change = self.subtitle_change(&source, format);
+            change.import_into_media = true;
+            self.store_subtitle_change(source.clone(), change);
+        }
+        let Some(row) = self.track_row_of(&source) else {
+            return;
+        };
+        self.selected_stream = row;
+        // The reconcile above may have raised its own "sidecars changed" line, which is about
+        // a file appearing rather than about what the reader just did.
+        self.notice = None;
+        self.open_subtitle_edit();
+    }
+
+    /// Takes back the file `a` made, when the reader leaves without putting a line in it.
+    ///
+    /// An `a` pressed by mistake has to cost nothing — the rule the page already applies to a
+    /// cue editor closed with nothing typed in it. Every one of these conditions is
+    /// load-bearing:
+    ///
+    /// - **It has to be this page's own track.** Another page's, or a sidecar the session did
+    ///   not create, is somebody else's file.
+    /// - **No save may be in flight.** `confirm_process_all` closes the page while the file is
+    ///   still empty and the reader's first cue lives in `staged_edits`, so an unguarded hook
+    ///   here would delete a file out from under its own save.
+    /// - **Nothing staged against it**, in either the live map or the per-file snapshot. A
+    ///   cue typed in, or an import mark the reader kept, is work to be written rather than an
+    ///   accident to be swept up. **The import mark is deliberately not such work**: it came
+    ///   from the popup rather than from the reader's editing — a new track is internal by
+    ///   default, so it carries one from the moment it exists — and a mark on a file that is
+    ///   about to be removed means nothing. Counting it would make the *default* placement the
+    ///   one case that leaves litter behind.
+    /// - **Still empty on disk**, read from the filesystem rather than from the page's cue
+    ///   list, because the disk is what would be left behind.
+    fn discard_empty_new_track(&mut self) {
+        let Some(path) = self.new_track.take() else {
+            return;
+        };
+        let source = SubtitleSource::Sidecar(path.clone());
+        let is_this_page = self
+            .subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.source == source);
+        if !is_this_page || self.active_batch.is_some() || self.pending_reopen.is_some() {
+            return;
+        }
+        // Any cue at all — typed, or one of the file's own that a rewrite is keyed against —
+        // is the reader having worked on this track.
+        let edited = |change: &SubtitleChange| !change.cues.is_empty();
+        let worked_on = self.subtitle_changes.get(&source).is_some_and(edited)
+            || self
+                .staged_edits
+                .values()
+                .any(|edit| edit.subtitle_changes.get(&source).is_some_and(edited));
+        if worked_on {
+            return;
+        }
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+            let _ = std::fs::remove_file(&path);
+            // The mark goes with the file: an import staged against a track that no longer
+            // exists is a save that fails on something the reader cannot see.
+            self.subtitle_changes.remove(&source);
+            for edit in self.staged_edits.values_mut() {
+                edit.subtitle_changes.remove(&source);
+            }
         }
     }
 
@@ -2168,6 +3729,2855 @@ impl App {
         }
     }
 
+    /// Opens the subtitle edit page for the selected track.
+    ///
+    /// Only SubRip opens for now. Everything else — the other text formats as much as
+    /// the bitmap ones — is turned away by the same guard, since nothing here converts:
+    /// the page reads the track exactly as it is stored.
+    pub fn open_subtitle_edit(&mut self) {
+        if self.layer != Layer::Streams || self.dialog.is_some() {
+            return;
+        }
+        let Some(source) = self.selected_subtitle_source() else {
+            self.notice = Some(self.unimplemented_track_notice());
+            return;
+        };
+        if let SubtitleSource::Embedded(index) = source
+            && self.deleted_streams.contains(&index)
+        {
+            self.notice =
+                Some("Unmark this subtitle track for deletion before previewing it.".to_string());
+            return;
+        }
+        let Some(format) = self.subtitle_source_format(&source) else {
+            self.notice = Some(
+                "This subtitle format is not one reel recognises, so it cannot be previewed."
+                    .to_string(),
+            );
+            return;
+        };
+        // Asked before anything is opened, so a track needing a tool that is not installed
+        // says which tool rather than opening a page that loads and then fails.
+        if let Some(reason) = self.subtitle_capabilities.preview_blocked(format) {
+            self.notice = Some(reason);
+            return;
+        }
+        let Some(media) = self.selected_file().map(|file| file.path.clone()) else {
+            return;
+        };
+        let workspace = match PreviewWorkspace::new() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.notice = Some(format!("Could not prepare a preview workspace: {error}"));
+                return;
+            }
+        };
+        // A missing or unparseable duration leaves this zero, which the timeline window
+        // widens back out to fit the cues it is given rather than collapsing.
+        let duration = self
+            .media_info()
+            .and_then(crate::edit::media_duration)
+            .map(Duration::from_secs_f64)
+            .unwrap_or_default();
+
+        // Read once per page opening rather than per frame: it is in every cache key, so
+        // that re-encoding a file in place cannot serve the old picture under the new one's
+        // path. A file whose video stream ffprobe could not describe still previews — it
+        // just keys on the path alone, which is what an empty identity means.
+        // The reader's own choice from the preview-settings popup, or the file's first real
+        // video stream. Every one of the three below is read *from that stream*: the map
+        // the grab uses, the identity its frames are keyed by, and the size they are
+        // rendered at. Taking any of them from a different stream would file one stream's
+        // pictures under another's name.
+        let video_stream = self.preview_video_stream().unwrap_or_default();
+        let frames = FrameSource {
+            media,
+            video_stream,
+            video_identity: self
+                .media_info()
+                .map(|info| crate::preview::video_identity(info, video_stream))
+                .unwrap_or_default(),
+            // A fixed size derived from the source, not from the pane: a cached frame has
+            // to keep serving after the terminal is resized.
+            pixels: crate::preview::target_pixels(
+                self.media_info()
+                    .and_then(|info| crate::preview::video_resolution(info, video_stream)),
+            ),
+            // Replaced when the cues arrive, since an ASS script's styles are read out of
+            // the file with them. Nothing is staged before then.
+            style: std::sync::Arc::new(CueStyle::SubRip),
+            workspace: workspace.path().to_path_buf(),
+        };
+
+        self.notice = None;
+        self.page_generation = self.page_generation.wrapping_add(1);
+        // Decided here rather than per frame: neither of these changes while the page is
+        // open, and the page has to be able to say why it is empty without waiting for a
+        // request it is never going to make. `start_pending_preview` gates on the same two
+        // conditions, so a page that reports frames are coming is one that asks for them.
+        let support = if !self
+            .preview
+            .as_ref()
+            .is_some_and(PreviewHandles::draws_frames)
+        {
+            PreviewSupport::NoImageProtocol
+        } else if !self.subtitle_capabilities.can_burn_subtitles() {
+            PreviewSupport::NoSubtitleBurn
+        } else {
+            PreviewSupport::Available
+        };
+        let state = SubtitleEditState::new(
+            self.page_generation,
+            frames,
+            source,
+            duration,
+            support,
+            self.preview
+                .as_ref()
+                .map(PreviewHandles::frame_bytes_per_cell)
+                .unwrap_or_default(),
+            workspace,
+        );
+        if let Some(preview) = self.preview.as_ref() {
+            // A sidecar is its own input and needs no extraction; an embedded track is
+            // read out of the media file by its absolute stream index.
+            let (input, stream_index) = match &state.source {
+                SubtitleSource::Embedded(index) => (state.media().to_path_buf(), Some(*index)),
+                SubtitleSource::Sidecar(path) => (path.clone(), None),
+            };
+            preview.request(PrepareRequest {
+                generation: state.generation,
+                input,
+                stream_index,
+                format,
+                workspace: state.workspace().to_path_buf(),
+            });
+        }
+        self.subtitle_edit = Some(state);
+        self.layer = Layer::SubtitleEdit;
+    }
+
+    /// Closes the subtitle edit page, releasing its scratch directory and abandoning any
+    /// worker result still in flight for it.
+    ///
+    /// The single place `subtitle_edit` is cleared, so there is one answer to "what
+    /// happens to the workspace" rather than one per exit path.
+    ///
+    /// `exit` is what the close is *for*, and it decides one thing: whether a track created
+    /// this session with nothing typed into it is taken back off the disk. See
+    /// [`PageExit::keeps_new_track`].
+    fn close_subtitle_edit(&mut self, exit: PageExit<'_>) {
+        // Before the page is taken, since the guard has to ask what it was open on. The one
+        // place the page state is cleared, so there is one answer here exactly as there is
+        // for the workspace.
+        if !exit.keeps_new_track(self.new_track.as_deref()) {
+            self.discard_empty_new_track();
+        }
+        if self.subtitle_edit.take().is_some() {
+            // Before the page goes: dropping the state releases the audio device on its
+            // own, but a span still being decoded for it would otherwise run to completion
+            // with nowhere to go.
+            self.abandon_playback();
+            self.page_generation = self.page_generation.wrapping_add(1);
+            // Tell the worker the page is gone as well as marking its answers stale: an
+            // extraction that has not finished is killed rather than left demuxing a
+            // whole container — seconds locally, and far longer over a network mount —
+            // for a page nobody is looking at.
+            if let Some(preview) = self.preview.as_ref() {
+                preview.abandon(self.page_generation);
+            }
+        }
+    }
+
+    /// Applies what the preview workers produced — a track's cues, a cue's frame —
+    /// ignoring anything belonging to a page the user has already left. Returns whether
+    /// an event was drained, so the main loop can skip redrawing when none arrived.
+    pub fn receive_preview_events(&mut self, receiver: &Receiver<PreviewEvent>) -> bool {
+        let mut received = false;
+        let mut prepared = false;
+        let mut stopped_playback = false;
+        let mut sync_outcome = None;
+        while let Ok(event) = receiver.try_recv() {
+            received = true;
+            let Some(state) = self.subtitle_edit.as_mut() else {
+                continue;
+            };
+            match event {
+                PreviewEvent::Prepared {
+                    generation,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    PrepareOutcome::Ready { cues, style } => {
+                        state.apply_prepared(cues, style);
+                        prepared = true;
+                    }
+                    PrepareOutcome::Failed(message) => state.fail(message),
+                },
+                PreviewEvent::Warming {
+                    generation,
+                    done,
+                    total,
+                    rendered,
+                } if generation == state.generation => state.apply_warming(done, total, rendered),
+                PreviewEvent::Frame {
+                    generation,
+                    cue_index,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    FrameOutcome::Ready(protocol) => state.apply_frame(cue_index, protocol),
+                    FrameOutcome::Failed(message) => state.fail_frame(cue_index, message),
+                },
+                // The moment is the second gate here, the way the cue index is above: the
+                // cursor may have moved on while this was rendering, and the page drops what
+                // arrives for a moment it has left rather than drawing it under a different
+                // one. `SubtitleEditState` makes that check itself, since it owns the cursor.
+                PreviewEvent::ScrubFrame {
+                    generation,
+                    at,
+                    outcome,
+                } if generation == state.generation => match outcome {
+                    FrameOutcome::Ready(protocol) => state.apply_scrub_frame(at, protocol),
+                    FrameOutcome::Failed(message) => state.fail_scrub_frame(at, message),
+                },
+                // Two gates, not one. The generation says the span is for the playback that
+                // is still wanted; the anchor says the page has not moved off what it was
+                // asked for since — another line, or another moment — which it can have,
+                // because moving either cursor is one of the things that stops a playback.
+                PreviewEvent::Playback {
+                    generation,
+                    anchor,
+                    outcome,
+                } if generation == self.playback_generation
+                    && state.preparing_playback() == Some(anchor) =>
+                {
+                    match outcome {
+                        PlaybackOutcome::Ready(mut frames) => {
+                            // The sound leaves the span here and is owned by the device for
+                            // as long as the stream lives, which is what makes dropping the
+                            // page the one thing that stops it. Handed over as somewhere it
+                            // *can* be opened rather than as an open device, so a looping
+                            // playback can open another when it comes round.
+                            let sound = frames.take_samples();
+                            let source = crate::audio::DeviceSource::new(self.audio_format, sound);
+                            state.begin_playback(
+                                anchor,
+                                frames,
+                                Box::new(source),
+                                self.preview_settings.playback_loop,
+                            );
+                        }
+                        PlaybackOutcome::Failed(message) => {
+                            state.fail_playback(anchor, message);
+                            stopped_playback = true;
+                        }
+                    }
+                }
+                PreviewEvent::Sync {
+                    generation,
+                    outcome,
+                } if generation == state.generation => {
+                    state.syncing = false;
+                    sync_outcome = Some(outcome);
+                }
+                _ => {}
+            }
+        }
+        // After the drain, not inside it: applying an outcome needs `self` fully — staging
+        // the shift and setting the notice — which the loop's borrow of `subtitle_edit`
+        // rules out, exactly the reason `prepared` and `stopped_playback` are deferred too.
+        if let Some(outcome) = sync_outcome {
+            self.apply_auto_sync_outcome(outcome);
+        }
+        if prepared {
+            self.start_warming();
+        }
+        // A span that could not be decoded leaves nothing running, so the worker is told
+        // straight away rather than at the next `advance_playback` — which would not fire,
+        // since there is no playback left to advance.
+        if stopped_playback {
+            self.abandon_playback();
+        }
+        received
+    }
+
+    /// Renders the whole track's frames in the background, or records why it is not.
+    ///
+    /// Called once per track, the moment its cues land. The interactive worker still
+    /// answers the selection on its own thread, so this never has to race the cursor —
+    /// its job is to have the frame ready before the cursor arrives.
+    fn start_warming(&mut self) {
+        let settings = self.preview_settings;
+        // The same two gates `start_pending_preview` applies: without a terminal that can
+        // draw images or an FFmpeg that can burn subtitles in, every frame this rendered
+        // would be one the page could never show.
+        let can_draw = self
+            .preview
+            .as_ref()
+            .is_some_and(PreviewHandles::draws_frames)
+            && self.subtitle_capabilities.can_burn_subtitles();
+        let request = {
+            let Some(state) = self.subtitle_edit.as_mut() else {
+                return;
+            };
+            if !can_draw || state.cues.is_empty() {
+                state.warm = WarmState::Off;
+                None
+            } else if !settings.prefetch {
+                state.warm = if settings.network {
+                    WarmState::OffForNetwork
+                } else {
+                    WarmState::Off
+                };
+                None
+            } else {
+                state.warm = WarmState::Working {
+                    done: 0,
+                    total: state.cues.len(),
+                    rendered: 0,
+                };
+                Some(WarmRequest {
+                    generation: state.generation,
+                    source: state.frames.clone(),
+                    cues: state.cues.clone(),
+                    duration: state.duration,
+                    cache_tracks: settings.cache_tracks,
+                    cache_bytes: settings.cache_bytes,
+                })
+            }
+        };
+        if let Some(request) = request
+            && let Some(preview) = self.preview.as_ref()
+        {
+            preview.request_warm(request);
+        }
+    }
+
+    /// Asks for the frame at the selected cue, and for the ones around it.
+    ///
+    /// Called every loop iteration beside `start_pending_probe`. The debounce it used to
+    /// apply unconditionally now applies only when the selected cue would have to be
+    /// rendered: that is what a held-down `j` must not start an accurate seek per repeat
+    /// of, whereas a frame already in the cache costs a read and an encode, and making the
+    /// user wait `FRAME_DEBOUNCE` for it is a tenth of a second of empty pane for nothing.
+    pub fn start_pending_preview(&mut self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        // Asking for a frame that can only fail is worse than not asking: it is one
+        // `ffmpeg` per settled selection producing a message that goes under the cue the
+        // cursor has since left. A terminal with no image protocol and a build without
+        // libass both land here.
+        if !preview.draws_frames() || !self.subtitle_capabilities.can_burn_subtitles() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        if !state.any_frame_requested() {
+            return;
+        }
+        // A pane with no cells has nothing to scale to, and the renderer has not measured
+        // one yet on the first frame after the page opens. Not merely wasteful: encoding
+        // an image for a zero-cell area trips a `debug_assert!` inside `ratatui-image`
+        // and takes the worker thread down with it.
+        if state.preview_cells.width == 0 || state.preview_cells.height == 0 {
+            return;
+        }
+        // Only a request that named the selection asks for the selected cue. A refill
+        // triggered by the background pass asks for the neighbours alone — see
+        // `SubtitleEditState::refill_nearby`.
+        let selected = if state.frame_requested() && !state.has_frame(state.selected) {
+            state.frame_target(state.selected)
+        } else {
+            None
+        };
+        // The debounce exists to stop one `ffmpeg` per keystroke, so it only applies to a
+        // cue that would have to be rendered — one already in the cache costs a file read.
+        // Held back rather than dropped: the neighbours in the same dispatch are cache-only
+        // by construction, and returning here would strand them behind the expensive one,
+        // which is exactly the round trip the ready window exists to remove.
+        let held_back = selected.as_ref().is_some_and(|target| {
+            let (media, cue) = state.frames.key(&target.cue, &target.on_screen);
+            !framecache::is_cached(&media, &cue) && !state.frame_request_due()
+        });
+        let wanted = if held_back { None } else { selected };
+        let nearby = state.nearby_frame_targets();
+        // Debounced by the same rule as the selected cue, and for the same reason: the wait
+        // exists to stop one `ffmpeg` per keystroke, so a moment already in the frame cache
+        // goes straight through — which is what makes scrubbing back over ground the cursor
+        // has already covered draw at once. Held back rather than dropped, so a settling
+        // cursor still gets its frame.
+        let moment = state
+            .scrub_requested()
+            .then(|| state.scrub_target())
+            .flatten();
+        let scrub = moment.filter(|target| {
+            let (media, key) = state.frames.moment_key(target);
+            framecache::is_cached(&media, &key) || state.scrub_request_due()
+        });
+        let scrub_held_back = state.scrub_requested() && scrub.is_none();
+        // Everything in the window is already encoded, which is the steady state while the
+        // cursor sits still. Forgetting the request here is what stops the same window
+        // being re-examined on every one of the twenty loop iterations a second — unless
+        // the selected cue is being held back, which is a request still owed an answer.
+        if wanted.is_none() && nearby.is_empty() && scrub.is_none() {
+            if !held_back {
+                state.clear_frame_request();
+            }
+            if !scrub_held_back {
+                state.clear_scrub_request();
+            }
+            return;
+        }
+        // A dispatch that carries only the neighbours leaves the held-back request
+        // standing, so the grab still goes out once the debounce expires. Re-sending the
+        // same nearby list on the two or three iterations inside that window is harmless:
+        // the frame worker coalesces its queue down to the newest request.
+        if held_back {
+            state.clear_nearby_request();
+        } else {
+            state.clear_frame_request();
+        }
+        if !scrub_held_back {
+            state.clear_scrub_request();
+        }
+        preview.request_frame(FrameRequest {
+            generation: state.generation,
+            source: state.frames.clone(),
+            wanted,
+            nearby,
+            scrub,
+            cells: state.preview_cells,
+        });
+    }
+
+    /// The subtitle track under the cursor, if the cursor is on one at all.
+    /// What the subtitle edit page says on a row it has nothing to offer. It names the kind of
+    /// track the reader actually picked and states the absence of a feature, rather than
+    /// telling them to pick something else: `c` on a video track is a reasonable thing to
+    /// try, and "select a subtitle track" reads as a correction of the reader for a gap in
+    /// the program. Every refusal of this shape is worded the same way, so a reader who
+    /// meets one on one kind of track knows what they are being told on the next.
+    fn unimplemented_track_notice(&self) -> String {
+        // `track_rows` offers only the container, video, audio and subtitle rows, and a
+        // subtitle row never reaches here — so the kind is read off the stream rather than
+        // enumerated, and the fallback is for a selection that has gone stale rather than
+        // for a kind of track that has a row of its own.
+        let subject = match self.selected_track() {
+            Some(TrackRef::Container) => "the container".to_string(),
+            _ => self
+                .selected_stream_info()
+                .and_then(stream_kind)
+                .map_or_else(|| "this track".to_string(), |kind| format!("{kind} tracks")),
+        };
+        format!("Editing {subject} is not implemented yet.")
+    }
+
+    fn selected_subtitle_source(&self) -> Option<SubtitleSource> {
+        match self.selected_track()? {
+            TrackRef::Embedded(index) => self
+                .selected_stream_info()
+                .is_some_and(|stream| stream_kind(stream) == Some("subtitle"))
+                .then_some(SubtitleSource::Embedded(index)),
+            TrackRef::Sidecar(index) => self
+                .sidecars
+                .get(index)
+                .map(|sidecar| SubtitleSource::Sidecar(sidecar.path.clone())),
+            TrackRef::Container => None,
+        }
+    }
+
+    fn move_cue(&mut self, delta: isize) {
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.select(delta);
+        }
+    }
+
+    /// Hands the page's cursor to the timeline pane, for `Ctrl+J`.
+    ///
+    /// The cursor lands on the moment the preview pane is already showing, so arriving
+    /// changes what the keys mean and nothing else. From there `h`/`l` walk it through the
+    /// media and the pane follows — which is the only way to look at a frame the cue list
+    /// does not point at.
+    pub fn focus_timeline(&mut self) {
+        if let Some(state) = self.subtitle_edit.as_mut()
+            && state.focus_timeline()
+        {
+            self.notice = None;
+        }
+    }
+
+    /// Takes the cursor back to the cue panel, for `Ctrl+K`.
+    ///
+    /// Deliberately not what `Esc`/`q` do: the timeline is the other half of this page
+    /// rather than a level below it, so backing out of it means backing out of the page.
+    pub fn focus_cues(&mut self) -> bool {
+        self.subtitle_edit
+            .as_mut()
+            .is_some_and(SubtitleEditState::focus_cues)
+    }
+
+    /// Moves the timeline cursor by `steps` of `step`, for `Ctrl+H`/`Ctrl+L`, `h`/`l` and
+    /// `H`/`L` while the timeline holds the cursor.
+    pub fn move_timeline_cursor(&mut self, steps: i32, step: Duration) {
+        if let Some(state) = self.subtitle_edit.as_mut()
+            && state.move_cursor(steps, step)
+        {
+            self.notice = None;
+        }
+    }
+
+    /// Whether the timeline pane holds the page's cursor, so the keys belong to it.
+    pub fn timeline_focused(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.cursor().is_some())
+    }
+
+    /// Moves the cue cursor sideways, between the cues that share a moment with the one it
+    /// is on. Does nothing on a cue that overlaps nothing, which has nowhere sideways to go.
+    pub fn move_cue_within_group(&mut self, delta: isize) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.select_within_group(delta);
+        }
+    }
+
+    /// Starts or stops the scrub playback of whatever the page is pointing at.
+    ///
+    /// With the cue panel holding the cursor that is the selected cue, and the span is the
+    /// configured padding either side of it. With the timeline holding it there is no
+    /// selected cue at all, and the span is `preview::CURSOR_PLAYBACK_REACH` either side of
+    /// the moment the cursor stands on, plus that same padding on top — a moment has no
+    /// length of its own, so the second it is given is a property of the feature rather
+    /// than a preference.
+    ///
+    /// Either way it is played as a slideshow of frames the worker decodes in one pass.
+    /// Pressing the key again while one is running — or while one is still decoding — stops
+    /// it, which is what makes the same key both the way in and the way out of something
+    /// that takes a second or two to start.
+    pub fn toggle_playback(&mut self) {
+        if self.stop_playback() {
+            return;
+        }
+        // The same two gates the still frames take. A terminal that cannot draw images has
+        // nothing to show a slideshow with, and a build that cannot burn subtitles in would
+        // play a span with no line on it — which on this page is not a degraded playback,
+        // it is the wrong answer to the only question being asked.
+        //
+        // The picker is taken through the first of those rather than beside it: it is
+        // present exactly when the frame worker is, so binding it here asks the same
+        // question `draws_frames` did and leaves nothing to unwrap further down. It decides
+        // how many pixels a cell is worth, which is what makes a burned-in line readable
+        // rather than a coloured smear — see `preview::playback_pixels`.
+        let Some(picker) = self
+            .preview
+            .as_ref()
+            .and_then(PreviewHandles::picker)
+            .cloned()
+        else {
+            return;
+        };
+        if !self.subtitle_capabilities.can_burn_subtitles() {
+            return;
+        }
+        let settings = self.preview_settings;
+        // Asked of the probe rather than of `ffmpeg`: an audio `-map` on media with no audio
+        // fails the whole run, and the optional `0:a:0?` form leaves an output file with no
+        // streams in it, which fails just as hard. So the question is settled before the
+        // command is built, and a video with no sound plays as a silent slideshow.
+        // Muting is asked for here, by not asking for sound at all, rather than by turning
+        // a device down later: no audio output, no samples, and the page takes the same path
+        // media with no audio track already takes.
+        //
+        // Which stream it is is the reader's own choice from the preview-settings popup, so
+        // a film with a commentary track can be judged against either.
+        let audio = (!settings.playback_muted)
+            .then(|| self.preview_audio_stream())
+            .flatten()
+            .map(|stream| crate::preview::AudioTrack {
+                stream,
+                format: self.audio_format,
+            });
+        // Read before the page is borrowed, and applied before the memory budget sees the
+        // rate: the budget should be charged for the frames the source can actually give,
+        // not for copies the `fps` filter would manufacture to reach a rate it does not hold.
+        //
+        // Through `effective_playback_fps` rather than a second `source_capped_fps` call, so
+        // the rate the popup's Frame rate row shows and the rate the span is decoded at are
+        // provably the same answer rather than two computations that agree today.
+        let capped_fps = self.effective_playback_fps();
+        let request = {
+            let Some(state) = self.subtitle_edit.as_mut() else {
+                return;
+            };
+            let cells = crate::preview::playback_cells(
+                state.preview_cells,
+                state.frames.pixels,
+                picker.font_size(),
+            );
+            if cells.width == 0 || cells.height == 0 {
+                return;
+            }
+            let pixels = crate::preview::playback_pixels(cells, picker.font_size());
+            // **Whichever pane holds the cursor is what `p` plays.** The two answer different
+            // questions and the page can only be pointing at one of them: with the cue panel
+            // holding the cursor there is a selected line and its span is what is being
+            // judged, while with the timeline holding it there is no selection at all and the
+            // only thing the reader is pointing at is a moment. Playing the cue's span from
+            // the timeline would play a stretch of media the cursor may be nowhere near.
+            //
+            // Both arms end at the same three things — an anchor, a span, and the cues to
+            // burn into it — so everything below is one decision taken once.
+            let (anchor, span_start, span_end, on_screen) = match state.cursor() {
+                Some(at) => {
+                    let (span_start, span_end) = crate::preview::cursor_playback_span(
+                        at,
+                        settings.playback_pad,
+                        state.duration,
+                    );
+                    // Unanchored, the same way the cursor's still grab is: the reader pointed
+                    // at a stretch of media rather than at a line, so what belongs on it is
+                    // exactly what a viewer would see — which for most of a film is nothing.
+                    let on_screen = crate::cue::on_screen_during(&state.cues, span_start, span_end);
+                    (PlaybackAnchor::Cursor(at), span_start, span_end, on_screen)
+                }
+                None => {
+                    let Some(cue) = state.selected_cue().cloned() else {
+                        return;
+                    };
+                    let (span_start, span_end) =
+                        crate::preview::playback_span(&cue, settings.playback_pad, state.duration);
+                    // Every cue that appears anywhere in the span, not this one alone. A span
+                    // that burned in only the selected line would play the stretch of media
+                    // with everything else stripped out of it — and for a typeset or karaoke
+                    // line, whose cues share a moment and each draw part of one effect, the
+                    // selected line on its own is a fraction of a picture nobody will ever
+                    // see.
+                    let cue_index = state.selected;
+                    let on_screen =
+                        crate::cue::on_screen_between(&state.cues, cue_index, span_start, span_end);
+                    (
+                        PlaybackAnchor::Cue(cue_index),
+                        span_start,
+                        span_end,
+                        on_screen,
+                    )
+                }
+            };
+            state.prepare_playback(anchor);
+            PlaybackRequest {
+                generation: self.playback_generation.wrapping_add(1),
+                source: state.frames.clone(),
+                anchor,
+                on_screen,
+                span_start,
+                span_end,
+                // Lowered from what the user asked for only when the span at this size
+                // would not fit in memory — see `preview::affordable_fps`, which is charged
+                // the *stretched* span and so knows that a slow playback holds more frames.
+                fps: crate::preview::affordable_fps(
+                    capped_fps,
+                    span_end.saturating_sub(span_start),
+                    settings.playback_speed,
+                    pixels,
+                ),
+                speed: settings.playback_speed,
+                pixels,
+                cells,
+                audio,
+            }
+        };
+        self.playback_generation = request.generation;
+        self.playback_live = true;
+        if let Some(preview) = self.preview.as_ref() {
+            preview.request_playback(request);
+        }
+    }
+
+    /// Whether a dialog raised now would be drawn over a picture the terminal is repainting.
+    ///
+    /// **A popup cannot be layered over a playback, and this is not a drawing bug to be
+    /// fixed.** A playback places pixels through the terminal's own image protocol on every
+    /// step, and those pixels are not part of the cell buffer a dialog is drawn into — so a
+    /// dialog raised over a running span is painted once and wiped by the next frame,
+    /// leaving a popup that is open, taking every key, and invisible. The span being
+    /// decoded counts too: it is about to start, and a popup opened a moment before it does
+    /// is in exactly the same position a moment later.
+    ///
+    /// The answer is therefore to keep the two apart rather than to order them. A dialog the
+    /// user asked for is refused (`:` and `?` on the subtitle edit page); one that raises itself —
+    /// the conflict notice — stops the playback instead, since it cannot be refused.
+    pub fn playback_in_progress(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.playback_active() || state.preparing_playback().is_some())
+    }
+
+    /// Opens the preview-settings popup over the subtitle edit page.
+    ///
+    /// Only from that page, only when nothing else is up — the same two gates every other
+    /// settings popup applies — and only when nothing is playing, for the reason
+    /// [`Self::playback_in_progress`] gives. There is nothing to seed from: the popup reads
+    /// `preview_settings` directly, so what it shows is always what a playback would
+    /// actually be done with rather than a copy taken when it opened.
+    pub fn open_preview_settings(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        self.preview_settings_popup = Some(PreviewSettingsPopup::default());
+        self.notice = None;
+        self.dialog = Some(Dialog::PreviewSettings);
+    }
+
+    /// Opens the cue editor, for `i`: on the selected cue, or on a new one at the timeline
+    /// cursor's moment.
+    ///
+    /// **Which of the two it is follows the page's focus, because the focus is what `i` is
+    /// about.** With the cursor in the timeline no cue is marked anywhere — the panel draws
+    /// no filled block and the timeline no bracket — so "edit the selected cue" would rewrite
+    /// a line nothing on screen points at, from a pane whose whole subject is a moment. The
+    /// moment is what the reader is pointing at, so the moment is what gets a cue.
+    ///
+    /// Refused rather than queued while a playback runs, for the reason every dialog on this
+    /// page is: a span's pixels reach the terminal through its own image protocol rather than
+    /// the cell buffer, so a popup raised over one is painted once and then wiped.
+    ///
+    /// **SubRip only, and the refusal says so.** An ASS cue names a style and positions
+    /// itself against the script rather than carrying its own appearance, so editing the
+    /// stripped text the list shows would either throw the styling away or need an editor
+    /// that understands override tags. Saying that is better than an editor that quietly
+    /// ruins a typeset line.
+    pub fn open_cue_editor(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if self.subtitle_source_format(&state.source) != Some(SubtitleFormat::SubRip) {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        let (target, original) = match state.cursor() {
+            // The timeline holds the cursor: an empty buffer for a cue that does not exist.
+            Some(at) => (CueTarget::New(at), String::new()),
+            None => {
+                // A line the reader has said is leaving is not a line they asked to rewrite.
+                if self.selected_cue_is_deleted() {
+                    self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+                    return;
+                }
+                let Some(origin) = state.selected_origin() else {
+                    return;
+                };
+                let Some(cue) = state.selected_cue() else {
+                    return;
+                };
+                (CueTarget::Cue(origin), cue.text.clone())
+            }
+        };
+        let lines: Vec<String> = original.split('\n').map(str::to_string).collect();
+        // The caret starts at the end of the text, the way the application's other text
+        // fields do: the common edit is adding to a line or fixing its tail, and a caret at
+        // the start would have to be walked past the whole cue to get there.
+        let editor = CueEditor {
+            source: state.source.clone(),
+            target,
+            row: lines.len() - 1,
+            column: lines[lines.len() - 1].chars().count(),
+            lines,
+            original,
+        };
+        self.cue_editor = Some(editor);
+        self.notice = None;
+        self.dialog = Some(Dialog::EditCue);
+    }
+
+    /// Stages what the editor holds and closes it.
+    ///
+    /// **Leaving the editor keeps the typing** rather than discarding it, the way leaving
+    /// vim's insert mode does: staging costs nothing and is reversible by editing again,
+    /// where a popup that threw work away on `Esc` would have to ask before closing — a
+    /// second dialog over the one page that cannot hold two.
+    ///
+    /// **An editor opened on a new cue that closes empty stages nothing at all**, and
+    /// whitespace is empty for this purpose. `i` pressed by mistake has to cost nothing, and
+    /// a cue with no words in it is a line that draws nothing on the picture and a row with
+    /// nothing on it in the panel — neither is something a reader asked for by not typing.
+    pub fn close_cue_editor(&mut self) {
+        let Some(editor) = self.cue_editor.take() else {
+            return;
+        };
+        self.dialog = None;
+        match editor.target {
+            CueTarget::Cue(origin) => {
+                if editor.is_modified() {
+                    self.stage_cue_text(&editor, origin);
+                }
+            }
+            CueTarget::New(at) => {
+                let text = editor.text();
+                if !text.trim().is_empty() {
+                    self.insert_cue(&editor.source, at, text);
+                }
+            }
+        }
+    }
+
+    /// Puts a cue the file has no line for into the staged edits and onto the page.
+    ///
+    /// Staged like every other change to a cue, which is what makes it savable by the same
+    /// `Ctrl+S`, discardable by the same question on the way off the page, and countable on
+    /// the same panel border. Nothing here writes a file.
+    ///
+    /// The end is [`subtitle_edit::INSERT_DURATION`] past the start, held inside the media so
+    /// a cue made near the end of a film cannot run past it — the same ceiling the timeline
+    /// cursor stops at, since a cue is only worth as much as the picture under it.
+    fn insert_cue(&mut self, source: &SubtitleSource, at: Duration, text: String) {
+        let Some(format) = self.subtitle_source_format(source) else {
+            return;
+        };
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let start = at.min(state.cue_ceiling());
+        let end = start + subtitle_edit::INSERT_DURATION;
+        // Held inside the media, but against its true end rather than the cursor's ceiling:
+        // nothing is seeked to a cue's end, so it may sit on the last frame. Left alone where
+        // the duration would not parse, since clamping to zero would make every cue empty.
+        let end = if state.duration.is_zero() {
+            end
+        } else {
+            end.min(state.duration)
+        };
+        let mut change = self.subtitle_change(source, format);
+        let insert = change.cues.next_insert_id();
+        change.cues.inserts.insert(
+            insert,
+            CueInsert {
+                text: text.clone(),
+                start,
+                end,
+            },
+        );
+        self.store_subtitle_change(source.clone(), change);
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.insert_cue(insert, start, end, text);
+        }
+    }
+
+    /// Puts one cue's rewritten text into the staged edit for the open file, and onto the
+    /// page so the list and the preview show it at once.
+    ///
+    /// The edit's `original` is the *file's* text rather than what the editor opened with,
+    /// so editing the same cue twice still checks against what is on disk — see
+    /// [`crate::subtitle::CueEdit`].
+    fn stage_cue_text(&mut self, editor: &CueEditor, origin: CueOrigin) {
+        let text = editor.text();
+        let Some(position) = self
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| state.position_of(origin))
+        else {
+            return;
+        };
+        let file = self.file_cue_snapshot(&editor.source, position);
+        let staged = text.clone();
+        self.stage_cue_change(&editor.source, origin, file, move |words, _, _| {
+            *words = staged;
+        });
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.edit_cue_text(position, text);
+        }
+    }
+
+    /// The cue as the *file* has it, which is what an edit is staged against.
+    ///
+    /// Taken from an edit already staged for that cue when there is one: the page's own list
+    /// carries the staged words and timing, so a second edit built from the list would check
+    /// the file for something the file never said. Only when nothing is staged are the two
+    /// the same thing, which is what makes reading the page's cue right in that case.
+    ///
+    /// `None` for a cue the reader added, which is not a fallback but the answer: an
+    /// insertion names no line in the file, so there is nothing for it to be checked against
+    /// and nothing to go stale under it.
+    fn file_cue_snapshot(&self, source: &SubtitleSource, position: usize) -> Option<CueSnapshot> {
+        let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.origin(position)? else {
+            return None;
+        };
+        if let Some(staged) = self
+            .subtitle_changes
+            .get(source)
+            .and_then(|change| change.cues.edits.get(&cue))
+        {
+            return Some(staged.original.clone());
+        }
+        let shown = state.cues.get(position)?;
+        Some(CueSnapshot {
+            text: shown.text.clone(),
+            start: shown.start,
+            end: shown.end,
+        })
+    }
+
+    /// Folds one change to a cue into the staged edits for the open file.
+    ///
+    /// The one place a staged cue is created, amended or dropped, so the rules that make the
+    /// maps safe are stated once: the *file's* snapshot is carried forward across repeated
+    /// edits of the same cue, and an edit that no longer asks for anything is removed rather
+    /// than stored — `store_subtitle_change` then drops the whole change when nothing is
+    /// left of it, so a track edited only here stops looking modified.
+    ///
+    /// **One function for a rewrite and for an insertion**, because a reader retiming a cue
+    /// is doing one thing whether the file has a line for it or not: the [`CueOrigin`] is all
+    /// that separates them, and it separates them here rather than at each of the three keys
+    /// that can reach this. The one asymmetry is what "asks for nothing" means — a rewrite
+    /// that matches the file stops being an edit, where an inserted cue *is* the ask and is
+    /// never dropped for saying the same thing twice.
+    ///
+    /// `file` is what the cue reads on disk, needed only for a rewrite the page has not
+    /// staged anything against yet — `None` for an inserted cue, which has no line there.
+    fn stage_cue_change(
+        &mut self,
+        source: &SubtitleSource,
+        origin: CueOrigin,
+        file: Option<CueSnapshot>,
+        amend: impl FnOnce(&mut String, &mut Duration, &mut Duration),
+    ) {
+        let Some(format) = self.subtitle_source_format(source) else {
+            return;
+        };
+        let mut change = self.subtitle_change(source, format);
+        match origin {
+            CueOrigin::File(cue) => {
+                let mut edit = match change.cues.edits.get(&cue) {
+                    Some(staged) => staged.clone(),
+                    None => match file {
+                        Some(file) => CueEdit::unchanged(file),
+                        None => return,
+                    },
+                };
+                amend(&mut edit.text, &mut edit.start, &mut edit.end);
+                if edit.is_effective() {
+                    change.cues.edits.insert(cue, edit);
+                } else {
+                    change.cues.edits.remove(&cue);
+                }
+            }
+            CueOrigin::Inserted(id) => {
+                let Some(insert) = change.cues.inserts.get_mut(&id) else {
+                    return;
+                };
+                amend(&mut insert.text, &mut insert.start, &mut insert.end);
+            }
+        }
+        self.store_subtitle_change(source.clone(), change);
+    }
+
+    /// `d`: marks the selected cue to be taken out of the track, or takes the mark back off.
+    ///
+    /// The same gesture the track list gives a track, at the same key and in the same colour
+    /// — see [`Self::toggle_delete_selected_stream`]. The mark is staged like every other cue
+    /// edit, so `Ctrl+S` writes it and leaving the page asks about it.
+    ///
+    /// **The row stays in the list, marked, until a save carries it out.** That is what makes
+    /// this a toggle rather than a one-way door, and it keeps the panel's positions still
+    /// while the reader works down a track. It also keeps the cue burned into the preview,
+    /// which is the point: judging whether a line should go means seeing it, and a still
+    /// grabbed at the moment it comes in would otherwise show nothing at all.
+    ///
+    /// **A cue the reader added this session is un-added instead**, row and all. It names no
+    /// line in the file to be marked against and there is nothing to restore it from, so a
+    /// mark on one would be storing a change that cancels itself.
+    ///
+    /// **A staged rewrite of the same cue is kept.** Marking a line to go must not silently
+    /// cost the reader typing they get back by unmarking it — which is where this diverges
+    /// from the track list, whose `d` drops that track's staged settings. The writer applies
+    /// the rewrite and then drops the line, so keeping it costs nothing.
+    ///
+    /// **Not gated on a playback**, unlike every dialog this page can raise: a mark changes
+    /// neither the picture nor the timing, so a span still running still describes the cue it
+    /// claims to.
+    ///
+    /// Marking advances the cursor by one cue and unmarking does not, the same asymmetry the
+    /// track list has: a run of `d` takes out a run of cues, while a second press on one row
+    /// takes the mark back off in place.
+    pub fn toggle_delete_selected_cue(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        // With the cursor in the timeline no cue is marked anywhere, so there is nothing for
+        // `d` to be about — the same reason the vertical movement keys are inert there.
+        if state.cursor().is_some() {
+            return;
+        }
+        let (source, position) = (state.source.clone(), state.selected);
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        if format != SubtitleFormat::SubRip {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        let marked = self.staged_cue_deletions();
+        let mut change = self.subtitle_change(&source, format);
+        match origin {
+            CueOrigin::Inserted(id) => {
+                change.cues.inserts.remove(&id);
+                self.store_subtitle_change(source, change);
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    state.remove_cue(position);
+                }
+                self.notice = None;
+            }
+            CueOrigin::File(cue) if change.cues.deletes.remove(&cue).is_some() => {
+                self.store_subtitle_change(source, change);
+                self.notice = None;
+            }
+            CueOrigin::File(cue) => {
+                // Counted over the page's rows rather than the file's, because an inserted
+                // cue survives the save and a row already marked does not.
+                let rows = self
+                    .subtitle_edit
+                    .as_ref()
+                    .map_or(0, |state| state.cues.len());
+                if rows.saturating_sub(marked.len()) <= 1 {
+                    self.notice = Some(CUE_TRACK_NEEDS_A_CUE.into());
+                    return;
+                }
+                // The *file's* cue, which `file_cue_snapshot` gives even for a row the page
+                // has already rewritten — what the reader marked is the line on disk.
+                let Some(file) = self.file_cue_snapshot(&source, position) else {
+                    return;
+                };
+                change.cues.deletes.insert(cue, file);
+                self.store_subtitle_change(source, change);
+                self.notice = None;
+                // One step, across the group boundary when there is one: the two movements
+                // `l` and `j` already make, composed, so there is no new cursor bookkeeping.
+                if let Some(state) = self.subtitle_edit.as_mut()
+                    && !state.select_within_group(1)
+                {
+                    state.select(1);
+                }
+            }
+        }
+    }
+
+    /// `t`: turns the timing mode on or off at cue scale, where `h`/`l` move the selected cue.
+    ///
+    /// Always on with the whole cue selected: `Ctrl+H`/`Ctrl+L` pick an edge from there
+    /// ([`Self::move_cue_grip`]), and a visit that ended on one does not leave the next `t`
+    /// silently resizing where the reader expects it to move the line.
+    pub fn toggle_cue_timing_mode(&mut self) {
+        self.toggle_timing_scope(TimingScope::Cue(CueGrip::Whole));
+    }
+
+    /// `T`: turns the timing mode on or off at track scale — global retiming, where `h`/`l`
+    /// move every cue in the track by the same amount.
+    ///
+    /// This is the answer to the commonest defect a subtitle file has, which is not a wrong
+    /// line but the whole file being a second or two out. At cue scale that is one press per
+    /// cue, which for a feature film is a thousand presses to fix one mistake.
+    pub fn toggle_global_retiming(&mut self) {
+        self.toggle_timing_scope(TimingScope::Track);
+    }
+
+    /// Turns the timing mode on at the given scale, or off if it is already at that scale.
+    ///
+    /// "At that scale" is compared by variant, so `t` leaves the cue scale whichever part of
+    /// the cue is selected rather than switching the selection back to the whole cue.
+    ///
+    /// **The scales replace each other rather than stacking**, which is what
+    /// [`TimingScope`] being one value buys: pressing `T` while `t` is on retimes the track
+    /// rather than leaving two modes on for `h` to choose between, and one `Esc` leaves
+    /// whichever is on.
+    ///
+    /// **Not gated on a playback**, unlike every dialog this page can raise. A mode is not
+    /// drawn into the cell buffer a running span would wipe, and being usable *while* a span
+    /// plays is the reason it is a mode at all — see [`SubtitleEditState::timing`].
+    fn toggle_timing_scope(&mut self, scope: TimingScope) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(source) = self
+            .subtitle_edit
+            .as_ref()
+            .map(|state| state.source.clone())
+        else {
+            return;
+        };
+        if self.subtitle_source_format(&source) != Some(SubtitleFormat::SubRip) {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.timing =
+                if std::mem::discriminant(&state.timing) == std::mem::discriminant(&scope) {
+                    TimingScope::Off
+                } else {
+                    scope
+                };
+        }
+        self.notice = None;
+    }
+
+    /// How far the selected cue has been moved from where the file has it, in milliseconds.
+    ///
+    /// `None` for a cue nothing is staged against, and for one whose words changed but whose
+    /// timing did not: a shift of zero is not a shift, and drawing one on every cue the
+    /// reader walks past would put a number that never changes on the one line of the page
+    /// with room for a number.
+    /// `None` for an inserted cue too, and for the same reason: it was placed rather than
+    /// moved, so there is nothing it has been shifted *from*.
+    pub fn selected_cue_shift(&self) -> Option<i64> {
+        let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.selected_origin()? else {
+            return None;
+        };
+        let edit = self
+            .subtitle_changes
+            .get(&state.source)?
+            .cues
+            .edits
+            .get(&cue)?;
+        let shift = edit.start.as_millis() as i64 - edit.original.start.as_millis() as i64;
+        (shift != 0).then_some(shift)
+    }
+
+    /// How much of the track the open page's timing mode moves, which is what gives `h`/`l`
+    /// their other meanings.
+    pub fn timing_scope(&self) -> TimingScope {
+        self.subtitle_edit
+            .as_ref()
+            .map(|state| state.timing)
+            .unwrap_or_default()
+    }
+
+    /// How far global retiming has moved the open track, in milliseconds.
+    ///
+    /// `None` for a track sitting at the timings the file gives it, so the readout says
+    /// nothing rather than saying zero — the same rule [`Self::selected_cue_shift`] follows
+    /// one scale down.
+    pub fn track_shift(&self) -> Option<i64> {
+        self.subtitle_edit
+            .as_ref()
+            .map(|state| state.track_shift)
+            .filter(|shift| *shift != 0)
+    }
+
+    /// Turns the timing mode off at whichever scale it is on, for `Esc` — and reports whether
+    /// it was on.
+    ///
+    /// `Esc` peels this page one layer at a time, and the answer is what tells
+    /// [`Self::back`] to stop there rather than go on to ask about leaving. One press leaves
+    /// either scale, because the two are one mode.
+    pub fn leave_cue_timing_mode(&mut self) -> bool {
+        self.subtitle_edit
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.timing).is_on())
+    }
+
+    /// `h`/`l` and `H`/`L` in timing mode at cue scale: moves the selected part of the
+    /// selected cue — its start, the whole of it, or its end — and stages the result.
+    pub fn nudge_selected_cue(&mut self, steps: i64) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let TimingScope::Cue(grip) = state.timing else {
+            return;
+        };
+        // A cue marked to go has no timing worth arguing about, and moving one would put a
+        // readout on the title for a line that will not be in the file.
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let (source, selected) = (state.source.clone(), state.selected);
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        // Taken before the nudge, because with nothing staged yet the page's own copy of the
+        // cue is what it falls back to, and the nudge is about to move that.
+        let file = self.file_cue_snapshot(&source, selected);
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        let Some((_, start, end)) = state.move_grabbed(grip, steps) else {
+            return;
+        };
+        self.stage_cue_change(&source, origin, file, move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
+    }
+
+    /// `Ctrl+H`/`Ctrl+L` in timing mode at cue scale: moves what `h`/`l` move one step left
+    /// or right along the selected cue — its start, the whole of it, its end.
+    ///
+    /// Stops at either end rather than wrapping (see [`CueGrip`]). Stages nothing and stops no
+    /// playback, because it changes which part of the cue the next press moves rather than
+    /// the cue. Not refused on a cue marked to go either: the refusal belongs to the press
+    /// that would move it, which is where the reader learns why.
+    pub fn move_cue_grip(&mut self, right: bool) {
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        let TimingScope::Cue(grip) = state.timing else {
+            return;
+        };
+        let Some(next) = (if right { grip.right() } else { grip.left() }) else {
+            return;
+        };
+        state.timing = TimingScope::Cue(next);
+        self.notice = None;
+    }
+
+    /// `D` in timing mode at cue scale: opens the dialog for typing how long the selected cue
+    /// is on screen.
+    ///
+    /// `h`/`l` move an edge fifty milliseconds a press, which is the right size for landing a
+    /// line against a mouth and the wrong size for saying "this sign should be up for eight
+    /// seconds". This is that answer, typed once.
+    ///
+    /// **Gated on a running playback where `h`/`l` are not**, because it is a dialog: a
+    /// span's pixels reach the terminal outside the cell buffer a popup is drawn into, so one
+    /// opened over a playback is invisible and swallows every key. `h`/`l` are a mode's keys
+    /// and have no such problem — which is exactly why the timing mode is a mode.
+    pub fn open_cue_length_dialog(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if !matches!(state.timing, TimingScope::Cue(_)) {
+            return;
+        }
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let Some(origin) = state.selected_origin() else {
+            return;
+        };
+        let Some(length) = state.selected_length() else {
+            return;
+        };
+        let mut input = TextInputState::new(crate::cue::format_length(length));
+        // Opened active, because the dialog has nothing in it but this field: a value the
+        // reader has to press something to start typing into would be a step that answers no
+        // question.
+        input.activate();
+        self.cue_length = Some(CueLengthDraft {
+            source: state.source.clone(),
+            origin,
+            input,
+        });
+        self.clear_text_input_reject();
+        self.notice = None;
+        self.dialog = Some(Dialog::CueLength);
+    }
+
+    /// `Enter` in the length dialog: reads what was typed, stages it, and closes.
+    ///
+    /// **A value that cannot be used leaves the dialog open**, with the refusal on the page's
+    /// status row behind it. Closing on a bad value would throw the typing away and leave the
+    /// cue silently unchanged, which is the one outcome a reader cannot tell from success.
+    ///
+    /// A length the cue already has closes without staging anything: pressing `Enter` on an
+    /// untouched field is how a reader backs out of a dialog they opened to look at, and it
+    /// must not make the file look modified.
+    pub fn commit_cue_length(&mut self) {
+        let Some(draft) = self.cue_length.as_ref() else {
+            return;
+        };
+        let Some(length) = crate::cue::parse_length(&draft.input.value) else {
+            self.notice = Some(CUE_LENGTH_UNREADABLE.into());
+            return;
+        };
+        if length < subtitle_edit::MIN_CUE_LENGTH {
+            self.notice = Some(CUE_LENGTH_TOO_SHORT.into());
+            return;
+        }
+        // **A typo here is the one keypress on this page that can ask for an unbounded
+        // decode.** A cue's span is what `p` plays, and a playback decodes the whole of it to
+        // raw frames — so a mistyped `99:99.999` is a hundred-minute span in memory, from a
+        // page whose every other span is a line of dialogue. Nothing else the reader can
+        // press produces a length the media does not contain, and this refuses to be the
+        // first. Skipped for media whose duration is unknown rather than guessed at.
+        let media = self
+            .subtitle_edit
+            .as_ref()
+            .map(|state| state.duration)
+            .unwrap_or_default();
+        if !media.is_zero() && length > media {
+            self.notice = Some(CUE_LENGTH_LONGER_THAN_MEDIA.into());
+            return;
+        }
+        let (source, origin) = (draft.source.clone(), draft.origin);
+        self.close_cue_length_dialog();
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        // The dialog remembers the cue by origin, so a page that has moved on — another
+        // track, or the cue gone with a save — is a length with nothing to apply it to
+        // rather than one applied to whatever now stands in that slot.
+        if state.source != source {
+            return;
+        }
+        let Some(position) = state.position_of(origin) else {
+            return;
+        };
+        let file = self.file_cue_snapshot(&source, position);
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        let Some((_, start, end)) = state.set_selected_length(length) else {
+            return;
+        };
+        self.stage_cue_change(&source, origin, file, move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
+    }
+
+    /// `Esc` in the length dialog: drops what was typed and leaves the cue as it was.
+    ///
+    /// Unlike the cue editor, which keeps its buffer on the way out: that one holds words
+    /// that took typing and can be come back to, where this holds one number that is quicker
+    /// to retype than to find again — and a half-typed length kept across a visit would open
+    /// the dialog on something that is not the cue's length, which is the one thing the field
+    /// is supposed to be able to tell you.
+    pub fn cancel_cue_length(&mut self) {
+        self.close_cue_length_dialog();
+    }
+
+    fn close_cue_length_dialog(&mut self) {
+        self.cue_length = None;
+        self.clear_text_input_reject();
+        if self.dialog == Some(Dialog::CueLength) {
+            self.dialog = None;
+        }
+    }
+
+    /// How long the selected cue is on screen, when that is not the length the file gives it.
+    ///
+    /// `None` for a cue nothing is staged against, for one whose words or start moved but
+    /// whose length did not, and for an inserted cue — the rules
+    /// [`Self::selected_cue_shift`] follows one axis over, and for the same reason: a figure
+    /// that is on screen whatever the reader does is a label rather than a readout.
+    pub fn selected_cue_length_change(&self) -> Option<Duration> {
+        let state = self.subtitle_edit.as_ref()?;
+        let CueOrigin::File(cue) = state.selected_origin()? else {
+            return None;
+        };
+        let edit = self
+            .subtitle_changes
+            .get(&state.source)?
+            .cues
+            .edits
+            .get(&cue)?;
+        let length = edit.end.saturating_sub(edit.start);
+        let was = edit.original.end.saturating_sub(edit.original.start);
+        (length != was).then_some(length)
+    }
+
+    /// `0` in timing mode: puts the selected cue back to the timing the file gives it.
+    ///
+    /// The file's timing rather than the last nudge's, which is what makes this an undo of
+    /// the whole burst rather than of one press. Only a staged edit remembers what the file
+    /// said, so a cue nobody has moved has nothing to restore and this does nothing.
+    ///
+    /// **The cue's words are left alone.** This is a key of the timing mode, and a reader who
+    /// retimed *and* rewrote a cue has not asked for their typing back.
+    pub fn reset_selected_cue_timing(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if !matches!(state.timing, TimingScope::Cue(_)) {
+            return;
+        }
+        if self.selected_cue_is_deleted() {
+            self.notice = Some(CUE_MARKED_FOR_DELETION.into());
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let (source, position) = (state.source.clone(), state.selected);
+        // An inserted cue has no timing in the file to be put back to, so `r` on one does
+        // nothing rather than guessing at where it "should" have gone.
+        let Some(origin @ CueOrigin::File(cue)) = state.selected_origin() else {
+            return;
+        };
+        let Some(original) = self
+            .subtitle_changes
+            .get(&source)
+            .and_then(|change| change.cues.edits.get(&cue))
+            .map(|edit| edit.original.clone())
+        else {
+            return;
+        };
+        let (start, end) = (original.start, original.end);
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.set_cue_timing(position, start, end);
+        }
+        self.stage_cue_change(&source, origin, Some(original), move |_, from, to| {
+            *from = start;
+            *to = end;
+        });
+    }
+
+    /// `h`/`l` and `H`/`L` in timing mode at track scale: shifts **every** cue by the same
+    /// amount and stages the lot.
+    ///
+    /// **Staged in one pass rather than through [`Self::stage_cue_change`] per cue.** That
+    /// function clones the file's whole [`SubtitleChange`] and stores it back on every call,
+    /// which for a thousand-cue track would be a thousand clones of a thousand-entry map for
+    /// one press of a held key. The rules it enforces are kept here rather than skipped: the
+    /// `original` snapshot stays pinned to what the file says, an edit that no longer asks
+    /// for anything is removed rather than stored, and an inserted cue is amended in the
+    /// inserts and never dropped.
+    ///
+    /// **A cue marked for deletion shifts with the rest**, where a per-cue nudge refuses one.
+    /// The mark can be taken back off, and coming back to a line left behind by every shift
+    /// since would be a silent surprise; the writer applies a rewrite before dropping the
+    /// line, so carrying one for a cue that is about to go costs nothing.
+    pub fn shift_whole_track(&mut self, steps: i64) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Track {
+            return;
+        }
+        let source = state.source.clone();
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        let before = self.cue_timings_before_shift();
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            return;
+        };
+        if state.shift_all(steps).is_none() {
+            return;
+        }
+        self.stage_whole_track_shift(&source, format, &before);
+    }
+
+    /// Every cue's current timing, gathered right before a whole-track move — shared by
+    /// [`Self::shift_whole_track`] and [`Self::auto_sync_track`], since both need the "was"
+    /// half of [`Self::stage_whole_track_shift`]'s comparison taken before the move happens.
+    ///
+    /// With nothing staged against a cue yet the page's own copy is what its snapshot falls
+    /// back to — and that is exactly what is about to move. Timings only: a thousand-cue
+    /// track costs a thousand pairs of `Duration` per call rather than a thousand `String`s,
+    /// and the words are not what a shift changes.
+    fn cue_timings_before_shift(&self) -> Vec<(Duration, Duration)> {
+        self.subtitle_edit
+            .as_ref()
+            .map(|state| state.cues.iter().map(|cue| (cue.start, cue.end)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Stages every cue's *new* timing against its `before` snapshot, once the page's own
+    /// cues have already been moved.
+    ///
+    /// Shared by [`Self::shift_whole_track`] (a run of hand nudges, staged in one pass rather
+    /// than through [`Self::stage_cue_change`] per cue — see that function's own doc comment
+    /// for why) and [`Self::auto_sync_track`] (one computed offset, applied the same way): a
+    /// whole-track move is staged identically whether the amount came from a keypress or from
+    /// a background worker, so the two cannot come to disagree about what it costs to record.
+    fn stage_whole_track_shift(
+        &mut self,
+        source: &SubtitleSource,
+        format: SubtitleFormat,
+        before: &[(Duration, Duration)],
+    ) {
+        let mut change = self.subtitle_change(source, format);
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        for (position, (cue, &(was_start, was_end))) in state.cues.iter().zip(before).enumerate() {
+            match state.origin(position) {
+                Some(CueOrigin::File(at)) => {
+                    // Built only for a cue nothing is staged against, which after the first
+                    // press of a held key is none of them — the entry already there carries
+                    // the file's snapshot forward, which is what pins it to disk.
+                    let edit = change.cues.edits.entry(at).or_insert_with(|| {
+                        CueEdit::unchanged(CueSnapshot {
+                            text: cue.text.clone(),
+                            start: was_start,
+                            end: was_end,
+                        })
+                    });
+                    edit.start = cue.start;
+                    edit.end = cue.end;
+                }
+                Some(CueOrigin::Inserted(id)) => {
+                    if let Some(insert) = change.cues.inserts.get_mut(&id) {
+                        insert.start = cue.start;
+                        insert.end = cue.end;
+                    }
+                }
+                None => continue,
+            }
+        }
+        // A track shifted back to where the file has it stops being an edit, the same way one
+        // cue does. Only a rewrite can stop asking for anything: an insertion *is* the ask.
+        change.cues.edits.retain(|_, edit| edit.is_effective());
+        self.store_subtitle_change(source.clone(), change);
+    }
+
+    /// `A`: measures how far this track is out of sync with its own audio and dispatches
+    /// the work to the background — see [`crate::sync`] for the algorithm. Applying the
+    /// answer, once it comes back, is [`Self::apply_auto_sync_outcome`].
+    ///
+    /// Refused in the same words `t`/`T` are (`CUE_EDITS_SUBRIP_ONLY`) for the reason they
+    /// are: an ASS cue's timing anchors its override tags, so shifting it without shifting
+    /// them animates the line against itself.
+    ///
+    /// **Raises `Dialog::AutoSyncing` and blocks on it until the worker answers**, unlike
+    /// every mode and one-shot action this page otherwise has. The offset it computes is
+    /// measured against the cues as they stand the instant this dispatches; nothing on this
+    /// page stops the reader from hand-nudging the same track while a few seconds of decode
+    /// run in the background, and a computed offset applied on top of a shift the reader
+    /// made in the meantime would silently stack the two rather than replace either — the
+    /// reader would have no way to tell that happened. A blocking dialog is what rules that
+    /// out, by ruling out every key that could move a cue while it waits, rather than by
+    /// re-checking the cues on the way back the way a cue edit's own snapshot does; there is
+    /// no key here worth keeping live for a wait this short. **Gated on a playback for
+    /// exactly that reason** — it is a dialog, so it is refused while one is running or
+    /// decoding, the same as every other dialog this page can raise (`playback_in_progress`).
+    pub fn auto_sync_track(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() || self.playback_in_progress()
+        {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.syncing {
+            return;
+        }
+        let source = state.source.clone();
+        let generation = state.generation;
+        let media = state.media().to_path_buf();
+        let cues = state.cues.clone();
+        let duration = state.duration;
+        if self.subtitle_source_format(&source) != Some(SubtitleFormat::SubRip) {
+            self.notice = Some(CUE_EDITS_SUBRIP_ONLY.into());
+            return;
+        }
+        // The stream the reader is listening to, so an offset is measured against the speech
+        // they are hearing rather than against whichever track happens to be first.
+        let audio_stream = self.preview_audio_stream();
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        preview.request_sync(SyncRequest {
+            generation,
+            media,
+            audio_stream,
+            cues,
+            duration,
+        });
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.syncing = true;
+        }
+        self.notice = None;
+        self.sync_started = Some(Instant::now());
+        self.dialog = Some(Dialog::AutoSyncing);
+    }
+
+    /// Applies automatic sync's answer once the worker reports it, from
+    /// [`Self::receive_preview_events`]. Reports the outcome on the page's one status slot
+    /// exactly as every other one-shot action on this page does.
+    ///
+    /// **Applying a found offset reuses [`Self::stage_whole_track_shift`] wholesale** — the
+    /// same staging a hand-nudged `T` produces, so a reader who does not like the computed
+    /// answer corrects it with the same keys they would use on their own retiming, and a
+    /// save writes either the same way.
+    ///
+    /// **Closes `Dialog::AutoSyncing` before anything else here, whichever outcome came
+    /// back.** That dialog takes no key of its own to dismiss it, so every path through this
+    /// function has to be the one that lets the reader back in — an early return inside the
+    /// `Applied` arm below must not leave it standing forever.
+    fn apply_auto_sync_outcome(&mut self, outcome: SyncOutcome) {
+        self.sync_started = None;
+        if self.dialog == Some(Dialog::AutoSyncing) {
+            self.dialog = None;
+        }
+        match outcome {
+            SyncOutcome::Applied(offset_ms) => {
+                let Some(state) = self.subtitle_edit.as_ref() else {
+                    return;
+                };
+                let source = state.source.clone();
+                let Some(format) = self.subtitle_source_format(&source) else {
+                    return;
+                };
+                let before = self.cue_timings_before_shift();
+                let negative = offset_ms.is_negative();
+                let shift = Duration::from_millis(offset_ms.unsigned_abs());
+                let Some(state) = self.subtitle_edit.as_mut() else {
+                    return;
+                };
+                let Some(moved) = state.shift_track_by(shift, negative) else {
+                    self.notice = Some("Already in sync.".into());
+                    return;
+                };
+                self.stage_whole_track_shift(&source, format, &before);
+                self.notice = Some(format!("Synced: shifted by {}", format_offset(moved)));
+            }
+            SyncOutcome::NotConfident => {
+                self.notice = Some("Couldn't confidently align this track to the audio.".into());
+            }
+            SyncOutcome::Failed(message) => {
+                self.notice = Some(message);
+            }
+        }
+    }
+
+    /// `r` in timing mode at track scale: puts **every** cue back to the timing the file
+    /// gives it.
+    ///
+    /// The wide version of [`Self::reset_selected_cue_timing`], and it undoes hand nudges
+    /// along with the shift — `r` means "the timings the file has", at either scale, rather
+    /// than meaning something different depending on which one is on.
+    ///
+    /// **Every cue's words are left alone**, exactly as they are one scale down: this is a
+    /// key of the timing mode, and a reader who retimed *and* rewrote has not asked for their
+    /// typing back. An inserted cue has no timing in the file to be put back to, so it stays
+    /// where it was placed.
+    ///
+    /// This is the one key on the page that can discard a lot of work in a single press, and
+    /// there is no undo to recover it with.
+    pub fn reset_track_timing(&mut self) {
+        if self.layer != Layer::SubtitleEdit || self.dialog.is_some() {
+            return;
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        if state.timing != TimingScope::Track {
+            return;
+        }
+        let source = state.source.clone();
+        let Some(format) = self.subtitle_source_format(&source) else {
+            return;
+        };
+        let Some(change) = self.subtitle_changes.get(&source) else {
+            // Nothing staged is nothing to put back, and the cues are already the file's.
+            return;
+        };
+        // Only a staged edit remembers what the file said, so this is every cue there is
+        // anything to restore for; the rest are untouched and need no moving.
+        let restored: Vec<(usize, Duration, Duration)> = (0..state.cues.len())
+            .filter_map(|position| match state.origin(position)? {
+                CueOrigin::File(cue) => {
+                    let edit = change.cues.edits.get(&cue)?;
+                    Some((position, edit.original.start, edit.original.end))
+                }
+                CueOrigin::Inserted(_) => None,
+            })
+            .collect();
+        if restored.is_empty() {
+            // Nothing staged against a line the file holds is nothing to put back. A track
+            // whose cues are all the reader's own reaches here too, and keeps its figure:
+            // an inserted cue has no timing in the file, so none of them moved.
+            return;
+        }
+        let mut change = self.subtitle_change(&source, format);
+        for edit in change.cues.edits.values_mut() {
+            edit.start = edit.original.start;
+            edit.end = edit.original.end;
+        }
+        // A cue whose timing was the only thing changed stops being an edit; one that was
+        // also rewritten keeps its words and so stays.
+        change.cues.edits.retain(|_, edit| edit.is_effective());
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.restore_timings(&restored);
+        }
+        self.store_subtitle_change(source, change);
+    }
+
+    /// Whether the open file is carrying cue edits that have not been written to disk yet,
+    /// which is what makes leaving the subtitle edit page worth asking about.
+    ///
+    /// A cue marked to go is work like any other: it is visible on this page and nowhere
+    /// else, so leaving without asking would throw it away silently.
+    pub fn has_unsaved_cue_edits(&self) -> bool {
+        !self.staged_cue_edits().is_empty() || !self.staged_cue_deletions().is_empty()
+    }
+
+    /// Which rows of the *open subtitle edit page's* cue list carry work that has not been
+    /// written out, for the count on the cue panel's border and the mark on each edited row.
+    ///
+    /// Positions rather than a count, because the panel needs both and a count cannot be
+    /// recovered from a number. Gathered for that one track rather than the whole file: the
+    /// panel is that track's cue list, and a mark on it that included another track's edits
+    /// would be about something not on screen. With the page closed there is no track to
+    /// gather for, which is the empty set every caller outside it sees.
+    ///
+    /// **Positions in the page's list, not in the file.** The two stop agreeing the moment a
+    /// cue is inserted, and it is rows the panel draws. An inserted cue is always one of
+    /// them: it exists nowhere but here until a save writes it.
+    pub fn staged_cue_edits(&self) -> BTreeSet<usize> {
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return BTreeSet::new();
+        };
+        let Some(change) = self.subtitle_changes.get(&state.source) else {
+            return BTreeSet::new();
+        };
+        (0..state.cues.len())
+            .filter(|position| match state.origin(*position) {
+                Some(CueOrigin::File(cue)) => change.cues.edits.contains_key(&cue),
+                Some(CueOrigin::Inserted(id)) => change.cues.inserts.contains_key(&id),
+                None => false,
+            })
+            .collect()
+    }
+
+    /// Which rows of the open page's cue list are marked to be taken out of the track, for
+    /// the count on the cue panel's border and the mark on each row.
+    ///
+    /// The twin of [`Self::staged_cue_edits`] and positions in the *page's* list for the same
+    /// reason: it is rows the panel draws, and the page's list stops agreeing with the file's
+    /// the moment a cue is inserted.
+    ///
+    /// An inserted cue is never one of them — un-adding one takes its row out of the list
+    /// rather than marking it, so there is no row left to be counted here.
+    pub fn staged_cue_deletions(&self) -> BTreeSet<usize> {
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return BTreeSet::new();
+        };
+        let Some(change) = self.subtitle_changes.get(&state.source) else {
+            return BTreeSet::new();
+        };
+        (0..state.cues.len())
+            .filter(|position| match state.origin(*position) {
+                Some(CueOrigin::File(cue)) => change.cues.deletes.contains_key(&cue),
+                Some(CueOrigin::Inserted(_)) | None => false,
+            })
+            .collect()
+    }
+
+    /// Whether the selected cue is marked to go, which is what `i`, the timing mode's keys —
+    /// `h`/`l`, the modified `h`/`l` edge keys, `D` — and `r` all refuse on.
+    fn selected_cue_is_deleted(&self) -> bool {
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return false;
+        };
+        let Some(CueOrigin::File(cue)) = state.selected_origin() else {
+            return false;
+        };
+        self.subtitle_changes
+            .get(&state.source)
+            .is_some_and(|change| change.cues.deletes.contains_key(&cue))
+    }
+
+    /// `Esc` on the subtitle edit page: leave, or ask first when cue edits would be thrown away.
+    ///
+    /// This page is where cue edits are made and the only place they are visible, so
+    /// leaving it is where they end. The question is asked because the answer is
+    /// destructive, not to offer a way of carrying unwritten cues around the application:
+    /// a reader who left with edits still staged would have no way of seeing them again
+    /// short of coming back here, and every Ctrl+S from anywhere else would write words
+    /// they had stopped thinking about.
+    pub fn request_leave_subtitle_edit(&mut self) {
+        if self.has_unsaved_cue_edits() {
+            self.dialog = Some(Dialog::ConfirmLeaveCues);
+            return;
+        }
+        self.leave_subtitle_edit();
+    }
+
+    /// Closes the page and puts the cursor back on the track list.
+    fn leave_subtitle_edit(&mut self) {
+        let created = self.new_track.clone();
+        self.close_subtitle_edit(PageExit::Leaving);
+        // A switch the reader asked for and then answered by leaving the page instead. Held
+        // any longer it would fire on whatever page opened next.
+        self.pending_track_switch = None;
+        // A file `discard_empty_new_track` has just removed still has a row on the list the
+        // reader is about to land on, so the scan happens here rather than inside the close —
+        // `queue_probe` calls that one mid-reselection, and a reconcile there would clobber
+        // the selection it is in the middle of setting. On every other path the directory
+        // monitor picks the deletion up within a second.
+        if created.is_some_and(|path| !path.exists())
+            && let Ok(files) = scan_directory(&self.directory)
+        {
+            self.reconcile_files(files);
+        }
+        // A refusal raised on this page was about a key pressed on this page. Carried out of
+        // it, the footer on the track list would paint it over a view it says nothing about
+        // — the reader having asked a question here and been answered there.
+        self.notice = None;
+        self.layer = Layer::Streams;
+    }
+
+    /// Answers the "discard the unwritten cue edits?" prompt.
+    ///
+    /// The prompt is raised by two things and answered here for both: `Esc`, which leaves
+    /// the page, and the preview-settings popup naming another subtitle track, which leaves
+    /// this track's page for another one. `pending_track_switch` is which of the two it was;
+    /// staying clears it either way, since a refused switch is not one to carry forward.
+    pub fn resolve_leave_subtitle_edit(&mut self, leave: bool) {
+        if self.dialog != Some(Dialog::ConfirmLeaveCues) {
+            return;
+        }
+        self.dialog = None;
+        self.leave_cues_choice = LeaveCuesChoice::default();
+        let switch = self.pending_track_switch.take();
+        if !leave {
+            return;
+        }
+        self.discard_cue_edits();
+        match switch {
+            Some(source) => self.switch_subtitle_edit_track(&source, None),
+            None => self.leave_subtitle_edit(),
+        }
+    }
+
+    /// Throws away the open track's staged cue text, leaving every other staged edit on the
+    /// file alone.
+    ///
+    /// Only the cue text goes: a track can be carrying a format conversion, a language tag
+    /// or an export at the same time, and those were staged from the track list rather than
+    /// here. `store_subtitle_change` drops the change outright when nothing is left of it,
+    /// so a track edited only on this page comes out of `staged_edits` entirely rather than
+    /// lingering as an empty entry that makes the file look modified.
+    fn discard_cue_edits(&mut self) {
+        let Some(source) = self
+            .subtitle_edit
+            .as_ref()
+            .map(|state| state.source.clone())
+        else {
+            return;
+        };
+        let Some(mut change) = self.subtitle_changes.get(&source).cloned() else {
+            return;
+        };
+        change.cues = CueChanges::default();
+        self.store_subtitle_change(source, change);
+    }
+
+    /// Moves the prompt's cursor between keeping the edits and discarding them.
+    pub fn choose_leave_subtitle_edit(&mut self, direction: isize) {
+        if self.dialog != Some(Dialog::ConfirmLeaveCues) || direction == 0 {
+            return;
+        }
+        self.leave_cues_choice = if direction.is_positive() {
+            LeaveCuesChoice::DiscardEdits
+        } else {
+            LeaveCuesChoice::StayHere
+        };
+    }
+
+    /// Takes whichever answer the cursor is on.
+    pub fn activate_leave_subtitle_edit(&mut self) {
+        self.resolve_leave_subtitle_edit(self.leave_cues_choice == LeaveCuesChoice::DiscardEdits);
+    }
+
+    /// Types a character into the open cue editor.
+    pub fn cue_editor_insert(&mut self, character: char) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        editor.lines[editor.row].insert(offset, character);
+        editor.column += 1;
+    }
+
+    /// Breaks the line at the cursor, which is how a cue becomes two lines.
+    pub fn cue_editor_newline(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        let tail = editor.lines[editor.row].split_off(offset);
+        editor.lines.insert(editor.row + 1, tail);
+        editor.row += 1;
+        editor.column = 0;
+    }
+
+    /// Deletes the character before the cursor, joining two lines when it is at the start.
+    pub fn cue_editor_backspace(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        if editor.column > 0 {
+            let offset = editor.offset();
+            let previous = editor.lines[editor.row][..offset]
+                .chars()
+                .next_back()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+            editor.lines[editor.row].replace_range(offset - previous..offset, "");
+            editor.column -= 1;
+            return;
+        }
+        if editor.row == 0 {
+            return;
+        }
+        let line = editor.lines.remove(editor.row);
+        editor.row -= 1;
+        editor.column = editor.lines[editor.row].chars().count();
+        editor.lines[editor.row].push_str(&line);
+    }
+
+    /// Deletes the character under the cursor, pulling the next line up at the line's end.
+    pub fn cue_editor_delete(&mut self) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        let offset = editor.offset();
+        if offset < editor.lines[editor.row].len() {
+            let width = editor.lines[editor.row][offset..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+            editor.lines[editor.row].replace_range(offset..offset + width, "");
+            return;
+        }
+        if editor.row + 1 >= editor.lines.len() {
+            return;
+        }
+        let next = editor.lines.remove(editor.row + 1);
+        editor.lines[editor.row].push_str(&next);
+    }
+
+    /// Moves the caret by a column and a row, wrapping between lines at their ends.
+    ///
+    /// Wrapping rather than stopping: the buffer is one cue's text and the reader thinks of
+    /// it as one string that happens to be broken, so `Left` at the start of the second line
+    /// belongs at the end of the first.
+    pub fn move_cue_editor_cursor(&mut self, columns: isize, rows: isize) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        if rows != 0 {
+            editor.row = editor
+                .row
+                .saturating_add_signed(rows)
+                .min(editor.lines.len() - 1);
+            editor.clamp();
+            return;
+        }
+        let width = editor.lines[editor.row].chars().count();
+        // A step of nothing falls through both arms and leaves the caret where it is.
+        match columns {
+            ..=-1 if editor.column > 0 => editor.column -= 1,
+            ..=-1 if editor.row > 0 => {
+                editor.row -= 1;
+                editor.column = editor.lines[editor.row].chars().count();
+            }
+            1.. if editor.column < width => editor.column += 1,
+            1.. if editor.row + 1 < editor.lines.len() => {
+                editor.row += 1;
+                editor.column = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Jumps the caret to the start or the end of its line, for `Home`/`End`.
+    pub fn move_cue_editor_home(&mut self, end: bool) {
+        let Some(editor) = self.cue_editor.as_mut() else {
+            return;
+        };
+        editor.column = if end {
+            editor.lines[editor.row].chars().count()
+        } else {
+            0
+        };
+    }
+
+    /// Backs out one level: an open dropdown first, then the popup itself.
+    ///
+    /// One level at a time, like every other settings dialog — `Esc` out of a list the user
+    /// opened by mistake should not also take the popup away. Closing the popup discards
+    /// nothing: the five playback settings took effect the moment they were made, and the
+    /// three track rows take effect here, which is the only thing this close does beyond
+    /// closing.
+    pub fn escape_preview_settings(&mut self) {
+        let Some(popup) = self.preview_settings_popup.as_mut() else {
+            return;
+        };
+        if popup.mode == PreviewSettingsMode::Dropdown {
+            popup.mode = PreviewSettingsMode::Summary;
+            return;
+        }
+        let popup = *popup;
+        self.preview_settings_popup = None;
+        self.dialog = None;
+        self.apply_preview_tracks(popup);
+    }
+
+    /// Puts the popup's three track rows into force, re-opening the page when it has to.
+    ///
+    /// **The audio track needs no re-opening and the other two do**, which is the whole
+    /// shape of this. A span takes its sound from whatever stream the request names, so an
+    /// audio change lands on the next `p` for free. The video stream and the subtitle track
+    /// are read when the page is *built* — the first is in `FrameSource` and therefore in
+    /// every cache key, the second is the extraction the cue list comes from — so putting
+    /// either into force means standing the page up again.
+    ///
+    /// The selected cue survives a video-only switch and deliberately does not survive a
+    /// subtitle one: a position in one track's list says nothing about another's.
+    fn apply_preview_tracks(&mut self, popup: PreviewSettingsPopup) {
+        let video = self.chosen_stream(PreviewSettingsField::VideoTrack, popup.video);
+        let audio = self.chosen_stream(PreviewSettingsField::AudioTrack, popup.audio);
+        let subtitle = popup.subtitle.and_then(|row| {
+            match self
+                .preview_track_choices(PreviewSettingsField::SubtitleTrack)
+                .get(row)
+                .map(|choice| choice.source.clone())
+            {
+                Some(TrackChoiceSource::Subtitle(source)) => Some(source),
+                _ => None,
+            }
+        });
+        if let Some(audio) = audio {
+            self.preview_audio_stream = Some(audio);
+        }
+        let moved_video = video.is_some_and(|video| Some(video) != self.preview_video_stream());
+        if let Some(video) = video {
+            self.preview_video_stream = Some(video);
+        }
+        let Some(state) = self.subtitle_edit.as_ref() else {
+            return;
+        };
+        let moved_subtitle = subtitle
+            .as_ref()
+            .is_some_and(|source| *source != state.source);
+        if !moved_video && !moved_subtitle {
+            return;
+        }
+        let target = subtitle.unwrap_or_else(|| state.source.clone());
+        // The cursor comes back only when the track it points into is the same one.
+        let cue = (!moved_subtitle).then_some(state.selected);
+        if moved_subtitle && self.has_unsaved_cue_edits() {
+            // Switching tracks is leaving this track's page: the cue list is rebuilt from
+            // the file and staged rewrites are re-applied to nothing, so carrying them
+            // across would leave the reader with words they can no longer see and a
+            // `Ctrl+S` that still writes them.
+            self.pending_track_switch = Some(target);
+            self.dialog = Some(Dialog::ConfirmLeaveCues);
+            return;
+        }
+        self.switch_subtitle_edit_track(&target, cue);
+    }
+
+    /// Takes the page down and stands it up again on `source`.
+    ///
+    /// The close is [`PageExit::Reopening`] so that a track created this session and not yet
+    /// typed into survives a switch that lands back on it — see
+    /// [`PageExit::keeps_new_track`].
+    fn switch_subtitle_edit_track(&mut self, source: &SubtitleSource, cue: Option<usize>) {
+        self.close_subtitle_edit(PageExit::Reopening(source));
+        self.open_subtitle_edit_on(source, cue);
+    }
+
+    /// The stream a track row's pending choice names, or `None` when it has not been
+    /// touched or names something that is no longer there.
+    fn chosen_stream(&self, field: PreviewSettingsField, row: Option<usize>) -> Option<u64> {
+        match self.preview_track_choices(field).get(row?)?.source {
+            TrackChoiceSource::Stream(index) => Some(index),
+            TrackChoiceSource::Subtitle(_) => None,
+        }
+    }
+
+    /// The values the focused field can take, as the dropdown lists them.
+    ///
+    /// A value in force that is not one of the offered ones is merged in rather than being
+    /// unreachable — a config file holding `fps = 25` must be able to get back to 25 after
+    /// the user tries 30, and a list that silently dropped it would make `r` the only way
+    /// back. The value the config file asked for is merged for the same reason.
+    /// The video streams a page can be previewed against: every one that is not cover art.
+    ///
+    /// An attached picture is a still, so a page previewing against one would draw the same
+    /// frame for every cue — which is why it is the one kind of stream left out rather than
+    /// listed and refused. Never empty for a file that opened at all, since the probe
+    /// declines anything with no real video stream in it.
+    pub fn preview_video_tracks(&self) -> Vec<TrackChoice> {
+        let Some(info) = self.media_info() else {
+            return Vec::new();
+        };
+        info.streams
+            .iter()
+            .filter(|stream| {
+                stream_kind(stream) == Some("video") && !crate::probe::is_attached_picture(stream)
+            })
+            .filter_map(|stream| {
+                let index = stream_index(stream)?;
+                Some(TrackChoice {
+                    label: video_track_label(stream, index),
+                    enabled: true,
+                    source: TrackChoiceSource::Stream(index),
+                })
+            })
+            .collect()
+    }
+
+    /// The audio streams a scrub playback can take its sound from.
+    ///
+    /// **Empty for media with no sound at all**, which is the one dropdown in this popup
+    /// that can be — see [`Self::activate_preview_setting`], which refuses to open it
+    /// rather than putting a cursor into a list with no rows.
+    pub fn preview_audio_tracks(&self) -> Vec<TrackChoice> {
+        let Some(info) = self.media_info() else {
+            return Vec::new();
+        };
+        info.streams
+            .iter()
+            .filter(|stream| stream_kind(stream) == Some("audio"))
+            .filter_map(|stream| {
+                let index = stream_index(stream)?;
+                Some(TrackChoice {
+                    label: audio_track_label(stream, index),
+                    enabled: true,
+                    source: TrackChoiceSource::Stream(index),
+                })
+            })
+            .collect()
+    }
+
+    /// The file's subtitle tracks, embedded and sidecar alike, in the order the track list
+    /// puts them in.
+    ///
+    /// The track list's order rather than the probe's, because that is the list the reader
+    /// arrived from and a second ordering of the same tracks would be one more thing to
+    /// reconcile. A track the page would refuse is listed and disabled, with the reason on
+    /// the end of its label: the two refusals `open_subtitle_edit` raises are a track marked
+    /// for deletion and a format there is no road to cues through.
+    pub fn preview_subtitle_tracks(&self) -> Vec<TrackChoice> {
+        let Some(info) = self.media_info() else {
+            return Vec::new();
+        };
+        self.track_rows()
+            .iter()
+            .filter_map(|track| match track {
+                TrackRef::Embedded(index) => {
+                    let stream = stream_by_index(info, *index)?;
+                    (stream_kind(stream) == Some("subtitle")).then(|| {
+                        let source = SubtitleSource::Embedded(*index);
+                        let mut parts = vec![
+                            format!("#{index}"),
+                            self.subtitle_choice_format(&source),
+                            stream_language_label(stream),
+                        ];
+                        push_stream_title(&mut parts, stream);
+                        self.subtitle_choice(parts, source)
+                    })
+                }
+                TrackRef::Sidecar(position) => {
+                    let sidecar = self.sidecars.get(*position)?;
+                    let source = SubtitleSource::Sidecar(sidecar.path.clone());
+                    let mut parts = vec![
+                        sidecar.display_name.clone(),
+                        self.subtitle_choice_format(&source),
+                        normalized_language(&sidecar.language).to_uppercase(),
+                    ];
+                    if let Some(title) = self
+                        .subtitle_metadata_for(&source)
+                        .and_then(|metadata| metadata.title.clone())
+                    {
+                        parts.push(title);
+                    }
+                    Some(self.subtitle_choice(parts, source))
+                }
+                TrackRef::Container => None,
+            })
+            .collect()
+    }
+
+    /// How a subtitle track's format is written on its dropdown row, or `?` for one this
+    /// application does not recognise — which is also one of the two reasons a row is
+    /// refused, so the mark and the refusal agree by construction.
+    fn subtitle_choice_format(&self, source: &SubtitleSource) -> String {
+        self.subtitle_source_format(source)
+            .map_or_else(|| "?".to_string(), |format| format.overview_label().into())
+    }
+
+    /// One subtitle row, with the page's own two refusals applied to it.
+    ///
+    /// Exactly the gates [`Self::open_subtitle_edit`] raises after the source is resolved,
+    /// asked here so that a row the popup offers is a row the page will actually open —
+    /// otherwise closing the popup would take the page down and refuse to build it again,
+    /// leaving the reader on the track list wondering what they had pressed.
+    fn subtitle_choice(&self, mut parts: Vec<String>, source: SubtitleSource) -> TrackChoice {
+        let deleted = matches!(&source, SubtitleSource::Embedded(index)
+            if self.deleted_streams.contains(index));
+        let previewable = self
+            .subtitle_source_format(&source)
+            .is_some_and(|format| self.subtitle_capabilities.preview_blocked(format).is_none());
+        if deleted {
+            parts.push(TRACK_DELETED_NOTE.to_string());
+        } else if !previewable {
+            parts.push(TRACK_UNPREVIEWABLE_NOTE.to_string());
+        }
+        TrackChoice {
+            label: parts.join(" · "),
+            enabled: !deleted && previewable,
+            source: TrackChoiceSource::Subtitle(source),
+        }
+    }
+
+    /// The rows of one of the three track dropdowns, or nothing for the five settings rows.
+    ///
+    /// One entry point rather than three call sites choosing between the builders, because
+    /// every caller — the labels, the cursor, the commit, the enabled test — has to make the
+    /// same choice and a disagreement between any two of them is a cursor pointing at a
+    /// different track from the one being drawn.
+    pub fn preview_track_choices(&self, field: PreviewSettingsField) -> Vec<TrackChoice> {
+        match field {
+            PreviewSettingsField::VideoTrack => self.preview_video_tracks(),
+            PreviewSettingsField::AudioTrack => self.preview_audio_tracks(),
+            PreviewSettingsField::SubtitleTrack => self.preview_subtitle_tracks(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether row `index` of the focused field can be chosen.
+    ///
+    /// Only a track row is ever refused: a settings dropdown offers nothing the page cannot
+    /// do, which is why a field with no track rows at all answers `true` rather than `false`
+    /// — the movement keys ask this of every open dropdown, not only of the three.
+    pub fn preview_choice_enabled(&self, field: PreviewSettingsField, index: usize) -> bool {
+        match self.preview_track_choices(field).get(index) {
+            Some(choice) => choice.enabled,
+            None => !field.is_track(),
+        }
+    }
+
+    pub fn preview_choices(&self, field: PreviewSettingsField) -> Vec<String> {
+        match field {
+            PreviewSettingsField::Speed => PlaybackSpeed::STEPS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            PreviewSettingsField::Loop | PreviewSettingsField::Sound => {
+                vec!["Yes".to_string(), "No".to_string()]
+            }
+            PreviewSettingsField::Padding => self
+                .playback_pad_choices()
+                .iter()
+                .map(|pad| format!("{:.2} s", pad.as_secs_f64()))
+                .collect(),
+            PreviewSettingsField::FrameRate => self
+                .playback_fps_choices()
+                .iter()
+                .map(|fps| format!("{fps} fps"))
+                .collect(),
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => self
+                .preview_track_choices(field)
+                .into_iter()
+                .map(|choice| choice.label)
+                .collect(),
+        }
+    }
+
+    fn playback_pad_choices(&self) -> Vec<Duration> {
+        merged_choices(
+            &PLAYBACK_PAD_CHOICES,
+            [
+                self.preview_settings.playback_pad,
+                self.preview_defaults.playback_pad,
+            ],
+        )
+    }
+
+    /// The frame rate a playback of the open track would actually be decoded at.
+    ///
+    /// The setting is one ceiling and the source at the speed in force is the other, so this
+    /// is the lower of the two — and it is what the popup shows, because a row reading
+    /// `60 fps` over a 23.976 fps track states a rate that cannot happen.
+    ///
+    /// **The speed belongs in here, not only in the request.** A second of playback covers
+    /// `speed` seconds of media, so half speed leaves a 24 fps source twelve distinct frames
+    /// to give each second of it and everything above that is the `fps` filter duplicating
+    /// pictures. Showing 30 there would name a rate the user cannot have and give them no
+    /// way to tell — the same defect as offering 60 on a 24 fps film, one level down.
+    ///
+    /// The *setting* is left alone: it survives both a slower speed and a track that cannot
+    /// meet it, so going to quarter speed shows 6 and coming back shows the 30 again.
+    pub fn effective_playback_fps(&self) -> u32 {
+        crate::preview::source_capped_fps(
+            self.preview_settings.playback_fps,
+            self.source_frame_rate(),
+            self.preview_settings.playback_speed,
+        )
+    }
+
+    /// The rates the popup offers for the open track: the curated list, plus whatever is in
+    /// force, minus anything this source at this speed cannot deliver.
+    ///
+    /// The list shortens as the speed drops — a 24 fps film offers 24/15/10/5 at normal
+    /// speed and 6/5 at a quarter of it — which is the honest signal rather than a side
+    /// effect. Leaving the rows there would offer four choices that all play identically.
+    ///
+    /// [`Self::effective_playback_fps`] is merged in rather than only filled in for an empty
+    /// list, because the ceiling is rarely one of the curated values (quarter speed on a
+    /// 24 fps film tops out at 6) and it is what the row will play at, so it has to be
+    /// selectable — and [`Self::preview_choice_cursor`] has to be able to find it.
+    fn playback_fps_choices(&self) -> Vec<u32> {
+        let ceiling = crate::preview::source_frame_ceiling(
+            self.source_frame_rate(),
+            self.preview_settings.playback_speed,
+        );
+        let mut choices = self.offered_fps_choices();
+        if let Some(ceiling) = ceiling {
+            choices.retain(|fps| *fps <= ceiling);
+            let effective = self.effective_playback_fps();
+            if !choices.contains(&effective) {
+                choices.push(effective);
+                // Descending, matching `merged_choices` and every other list in this popup.
+                choices.sort_unstable_by(|left, right| right.cmp(left));
+            }
+        }
+        choices
+    }
+
+    fn offered_fps_choices(&self) -> Vec<u32> {
+        merged_choices(
+            &PLAYBACK_FPS_CHOICES,
+            [
+                self.preview_settings.playback_fps,
+                self.preview_defaults.playback_fps,
+            ],
+        )
+    }
+
+    /// Which row of the focused field's dropdown holds the value in force.
+    ///
+    /// Always found, because [`Self::preview_choices`] merges the value in force into the
+    /// list it offers — so this seeds the cursor rather than guessing at it, and `Enter`
+    /// `Enter` changes nothing.
+    pub fn preview_choice_cursor(&self, field: PreviewSettingsField) -> usize {
+        let settings = self.preview_settings;
+        match field {
+            PreviewSettingsField::Speed => PlaybackSpeed::STEPS
+                .iter()
+                .position(|speed| *speed == settings.playback_speed),
+            PreviewSettingsField::Loop => Some(usize::from(!settings.playback_loop)),
+            PreviewSettingsField::Sound => Some(usize::from(settings.playback_muted)),
+            PreviewSettingsField::Padding => self
+                .playback_pad_choices()
+                .iter()
+                .position(|pad| *pad == settings.playback_pad),
+            // The *effective* rate, not the setting: on a source too slow to meet it the
+            // setting is not one of the rows, and the cursor would open on the fastest
+            // instead of on the rate this track will actually play at.
+            PreviewSettingsField::FrameRate => self
+                .playback_fps_choices()
+                .iter()
+                .position(|fps| *fps == self.effective_playback_fps()),
+            // The row this visit has chosen, or the one the track in force sits on. Not a
+            // setting, so there is nothing in `PreviewSettings` to read.
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => self
+                .pending_track_row(field)
+                .or_else(|| self.track_row_in_force(field)),
+        }
+        .unwrap_or_default()
+    }
+
+    /// Whether the open "unsaved cue edits" prompt was raised by a track switch rather than
+    /// by leaving the page, which is the only thing its wording differs on.
+    pub fn switching_subtitle_track(&self) -> bool {
+        self.pending_track_switch.is_some()
+    }
+
+    /// The audio stream a playback would use, when it is not the file's first.
+    ///
+    /// What the preview pane's title says out loud: a span playing the commentary track
+    /// sounds like the wrong film, and nothing else on screen would explain it. `None` for
+    /// the ordinary case, so the ordinary page carries no badge at all.
+    pub fn non_default_audio_stream(&self) -> Option<u64> {
+        let chosen = self.preview_audio_stream()?;
+        let first = self
+            .preview_audio_tracks()
+            .first()
+            .map(|choice| choice.source.clone());
+        (first != Some(TrackChoiceSource::Stream(chosen))).then_some(chosen)
+    }
+
+    /// Whether a track row is pointing somewhere other than the track in force.
+    ///
+    /// What the popup draws as *changed*. A pending row that happens to name the track
+    /// already in force is not a change — the reader opened the list and picked what was
+    /// there — and marking it would make the popup claim a switch is coming when closing it
+    /// will do nothing.
+    pub fn preview_track_pending(&self, field: PreviewSettingsField) -> bool {
+        self.pending_track_row(field)
+            .is_some_and(|row| Some(row) != self.track_row_in_force(field))
+    }
+
+    /// The row a track field's dropdown has been pointed at this visit, if any.
+    fn pending_track_row(&self, field: PreviewSettingsField) -> Option<usize> {
+        let popup = self.preview_settings_popup?;
+        match field {
+            PreviewSettingsField::VideoTrack => popup.video,
+            PreviewSettingsField::AudioTrack => popup.audio,
+            PreviewSettingsField::SubtitleTrack => popup.subtitle,
+            _ => None,
+        }
+    }
+
+    /// Which row of a track field's dropdown names the track actually in force.
+    ///
+    /// The page is where a subtitle track in force is recorded and `App` is where the other
+    /// two are, which is why this is not one lookup — but it is one *answer*, read by the
+    /// cursor and by the changed marker alike, so the two cannot come to disagree about
+    /// which row is the current one.
+    fn track_row_in_force(&self, field: PreviewSettingsField) -> Option<usize> {
+        let source = match field {
+            PreviewSettingsField::VideoTrack => {
+                TrackChoiceSource::Stream(self.preview_video_stream()?)
+            }
+            PreviewSettingsField::AudioTrack => {
+                TrackChoiceSource::Stream(self.preview_audio_stream()?)
+            }
+            PreviewSettingsField::SubtitleTrack => {
+                TrackChoiceSource::Subtitle(self.subtitle_edit.as_ref()?.source.clone())
+            }
+            _ => return None,
+        };
+        self.track_choice_row(field, &source)
+    }
+
+    /// Which row of a track dropdown names `source`.
+    ///
+    /// `None` for a track that is not on the list at all, which leaves the cursor on the
+    /// first row — the same answer every other field's cursor falls back to.
+    fn track_choice_row(
+        &self,
+        field: PreviewSettingsField,
+        source: &TrackChoiceSource,
+    ) -> Option<usize> {
+        self.preview_track_choices(field)
+            .iter()
+            .position(|choice| choice.source == *source)
+    }
+
+    /// `Enter`: opens the focused dropdown, commits the open one, or flips a toggle.
+    ///
+    /// A toggle has no list to open — the two states are both on screen as buttons — so one
+    /// keypress does what three would in a dropdown.
+    pub fn activate_preview_setting(&mut self) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        match popup.mode {
+            // `Yes` is row 0 and `No` is row 1, so flipping means choosing the row the
+            // answer is *not* on: currently yes picks 1, currently no picks 0.
+            PreviewSettingsMode::Summary if popup.field.is_toggle() => {
+                self.set_preview_choice(popup.field, usize::from(self.toggle_is_yes(popup.field)));
+            }
+            PreviewSettingsMode::Summary => {
+                // A dropdown with no rows is not opened. Only the audio one can be empty —
+                // media with no sound — and a cursor put into a list with nothing in it
+                // would swallow every key until `Esc`, on a popup whose other rows still
+                // have work to do.
+                if self.preview_choices(popup.field).is_empty() {
+                    return;
+                }
+                let cursor = self.preview_choice_cursor(popup.field);
+                if let Some(popup) = self.preview_settings_popup.as_mut() {
+                    popup.mode = PreviewSettingsMode::Dropdown;
+                    popup.cursor = cursor;
+                }
+            }
+            PreviewSettingsMode::Dropdown => {
+                self.set_preview_choice(popup.field, popup.cursor);
+                if let Some(popup) = self.preview_settings_popup.as_mut() {
+                    popup.mode = PreviewSettingsMode::Summary;
+                }
+            }
+        }
+    }
+
+    /// `K`: opens or closes the panel explaining the focused field.
+    ///
+    /// Stays open across moves and changes, like every other settings popup's — it is a
+    /// panel you leave up while you read down the rows, not a per-field prompt.
+    pub fn toggle_preview_help(&mut self) {
+        if let Some(popup) = self.preview_settings_popup.as_mut() {
+            popup.help_visible = !popup.help_visible;
+        }
+    }
+
+    /// `h`/`l` on a toggle row: pick the left button or the right one.
+    ///
+    /// Bound only for the two switches. On a dropdown row a value is chosen from a list, the
+    /// way it is in every other settings popup — but a pair of buttons sits on one row with
+    /// the left one left and the right one right, so moving between them sideways is the
+    /// obvious gesture and nothing else on the row wants those keys.
+    ///
+    /// Sets rather than flips, so holding `l` lands on `No` and stays there instead of
+    /// oscillating at the key-repeat rate.
+    pub fn set_preview_toggle(&mut self, yes: bool) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        if popup.mode != PreviewSettingsMode::Summary || !popup.field.is_toggle() {
+            return;
+        }
+        self.set_preview_choice(popup.field, usize::from(!yes));
+    }
+
+    /// Whether a toggle row's `Yes` button is the lit one.
+    fn toggle_is_yes(&self, field: PreviewSettingsField) -> bool {
+        match field {
+            // Phrased as sound rather than as muting, so `Yes` is the ordinary state on this
+            // row the way it is on the one above it.
+            PreviewSettingsField::Sound => !self.preview_settings.playback_muted,
+            _ => self.preview_settings.playback_loop,
+        }
+    }
+
+    /// Puts the `index`th of a field's offered values into force.
+    ///
+    /// Out-of-range indexes leave the setting alone rather than clamping into a neighbouring
+    /// value: the only way to reach one is a list that changed under a cursor, and silently
+    /// applying the wrong speed is worse than applying none.
+    fn set_preview_choice(&mut self, field: PreviewSettingsField, index: usize) {
+        match field {
+            PreviewSettingsField::Speed => {
+                if let Some(speed) = PlaybackSpeed::STEPS.get(index) {
+                    self.preview_settings.playback_speed = *speed;
+                }
+            }
+            PreviewSettingsField::Loop => self.preview_settings.playback_loop = index == 0,
+            PreviewSettingsField::Sound => self.preview_settings.playback_muted = index != 0,
+            PreviewSettingsField::Padding => {
+                if let Some(pad) = self.playback_pad_choices().get(index) {
+                    self.preview_settings.playback_pad = *pad;
+                }
+            }
+            PreviewSettingsField::FrameRate => {
+                if let Some(fps) = self.playback_fps_choices().get(index) {
+                    self.preview_settings.playback_fps = *fps;
+                }
+            }
+            // Pending rather than in force — see [`PreviewSettingsPopup::video`]. A row the
+            // page would refuse is not taken, for the reason an out-of-range index is not:
+            // committing it would close the popup onto a page that cannot be built.
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => {
+                if !self.preview_choice_enabled(field, index) {
+                    return;
+                }
+                if let Some(popup) = self.preview_settings_popup.as_mut() {
+                    match field {
+                        PreviewSettingsField::VideoTrack => popup.video = Some(index),
+                        PreviewSettingsField::AudioTrack => popup.audio = Some(index),
+                        _ => popup.subtitle = Some(index),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn move_preview_settings_cursor(&mut self, direction: isize) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        let moved = move_cursor(
+            self.preview_row(popup),
+            self.preview_row_count(popup),
+            direction,
+            |row| self.preview_row_enabled(popup, row),
+        );
+        self.preview_settings_popup = Some(popup.at_row(moved));
+    }
+
+    pub fn move_preview_settings_to_endpoint(&mut self, end: bool) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        // Through `cursor_endpoint` rather than arithmetic, because a track dropdown can end
+        // on a row the page would refuse — a subtitle track marked for deletion is commonly
+        // the last of them — and `G` must land somewhere it can then commit from. `None` is
+        // a list with nothing choosable in it, which leaves the cursor where it is.
+        let Some(position) = cursor_endpoint(self.preview_row_count(popup), end, |row| {
+            self.preview_row_enabled(popup, row)
+        }) else {
+            return;
+        };
+        self.preview_settings_popup = Some(popup.at_row(position));
+    }
+
+    /// Whether the cursor may rest on row `row` of whatever list the popup is walking.
+    ///
+    /// Every *field* is reachable — including a track row whose own list is empty, since the
+    /// row still shows what is in force and `r` still works on it. Only the choices inside
+    /// an open track dropdown are ever refused.
+    fn preview_row_enabled(&self, popup: PreviewSettingsPopup, row: usize) -> bool {
+        match popup.mode {
+            PreviewSettingsMode::Summary => true,
+            PreviewSettingsMode::Dropdown => self.preview_choice_enabled(popup.field, row),
+        }
+    }
+
+    /// How many rows the popup's cursor can be on: its fields, or one dropdown's choices.
+    fn preview_row_count(&self, popup: PreviewSettingsPopup) -> usize {
+        match popup.mode {
+            PreviewSettingsMode::Dropdown => self.preview_choices(popup.field).len(),
+            PreviewSettingsMode::Summary => PreviewSettingsField::ORDER.len(),
+        }
+    }
+
+    /// Which of those rows it is on now.
+    fn preview_row(&self, popup: PreviewSettingsPopup) -> usize {
+        match popup.mode {
+            PreviewSettingsMode::Dropdown => popup.cursor,
+            PreviewSettingsMode::Summary => PreviewSettingsField::ORDER
+                .iter()
+                .position(|field| *field == popup.field)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Puts the focused setting back to what the config file asked for — or, on a track
+    /// row, back to the track the page is already on.
+    ///
+    /// `config.toml` has nothing to say about tracks, so the only thing a track row can be
+    /// put back to is the choice this visit has not made: dropping the pending row leaves
+    /// the page exactly as the reader found it.
+    pub fn reset_preview_setting(&mut self) {
+        let Some(popup) = self.preview_settings_popup else {
+            return;
+        };
+        let defaults = self.preview_defaults;
+        let settings = &mut self.preview_settings;
+        match popup.field {
+            PreviewSettingsField::Speed => settings.playback_speed = defaults.playback_speed,
+            PreviewSettingsField::Loop => settings.playback_loop = defaults.playback_loop,
+            PreviewSettingsField::Sound => settings.playback_muted = defaults.playback_muted,
+            PreviewSettingsField::Padding => settings.playback_pad = defaults.playback_pad,
+            PreviewSettingsField::FrameRate => settings.playback_fps = defaults.playback_fps,
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => {
+                self.clear_pending_track(popup.field);
+            }
+        }
+        self.reseed_preview_cursor();
+    }
+
+    /// Drops one track row's pending choice, leaving it naming the track in force.
+    fn clear_pending_track(&mut self, field: PreviewSettingsField) {
+        if let Some(popup) = self.preview_settings_popup.as_mut() {
+            match field {
+                PreviewSettingsField::VideoTrack => popup.video = None,
+                PreviewSettingsField::AudioTrack => popup.audio = None,
+                _ => popup.subtitle = None,
+            }
+        }
+    }
+
+    /// Puts every playback setting back to what the config file asked for.
+    ///
+    /// Only the playback half: the cache policy the rest of `PreviewSettings` holds is not
+    /// something the popup ever changed, and a background pass is already running under it.
+    pub fn reset_preview_settings(&mut self) {
+        if self.preview_settings_popup.is_none() {
+            return;
+        }
+        let defaults = self.preview_defaults;
+        let settings = &mut self.preview_settings;
+        settings.playback_speed = defaults.playback_speed;
+        settings.playback_loop = defaults.playback_loop;
+        settings.playback_muted = defaults.playback_muted;
+        settings.playback_pad = defaults.playback_pad;
+        settings.playback_fps = defaults.playback_fps;
+        // And every track row back to the track the page is on, which is what `r` does one
+        // row at a time. Nothing has been applied yet, so this really is "leave the page as
+        // I found it" rather than a switch back.
+        for field in PreviewSettingsField::ORDER
+            .into_iter()
+            .filter(|field| field.is_track())
+        {
+            self.clear_pending_track(field);
+        }
+        self.reseed_preview_cursor();
+    }
+
+    /// Moves an open dropdown's cursor back onto the value now in force.
+    ///
+    /// Only a reset needs this: everything else that changes a value does so *from* the
+    /// cursor. Without it, `r` inside an open dropdown would restore the setting and leave
+    /// the highlight on the value it just discarded, so `Enter` would put it straight back.
+    fn reseed_preview_cursor(&mut self) {
+        // Filtered rather than checked in two steps, so a reset in `Summary` — the ordinary
+        // case, where there is no cursor to move — leaves through the same door as a reset
+        // with no popup at all.
+        let Some(popup) = self
+            .preview_settings_popup
+            .filter(|popup| popup.mode == PreviewSettingsMode::Dropdown)
+        else {
+            return;
+        };
+        let cursor = self.preview_choice_cursor(popup.field);
+        if let Some(popup) = self.preview_settings_popup.as_mut() {
+            popup.cursor = cursor;
+        }
+    }
+
+    /// How many frames a second the media the page is previewing against actually holds.
+    ///
+    /// From the probe that opened the file, and from the video stream a frame is actually
+    /// grabbed from — the reader's own choice, since two streams of one file need not run
+    /// at the same rate. For a sidecar track that is the companion video, which is the file
+    /// the page was opened on either way.
+    ///
+    /// `None` when ffprobe would not say, which leaves the user's own ceiling uncapped.
+    fn source_frame_rate(&self) -> Option<f64> {
+        let info = self.media_info()?;
+        let chosen = self.preview_video_stream();
+        info.streams
+            .iter()
+            .find(|stream| {
+                stream_kind(stream) == Some("video") && crate::edit::stream_index(stream) == chosen
+            })
+            .or_else(|| {
+                info.streams
+                    .iter()
+                    .find(|stream| stream_kind(stream) == Some("video"))
+            })
+            .and_then(crate::probe::stream_frame_rate)
+    }
+
+    /// Which video stream the page previews against: the reader's choice, or the file's
+    /// first real one.
+    ///
+    /// Resolved through [`crate::preview::default_video_stream`] rather than read straight
+    /// off the field, so "unchosen" and "chosen the first one" are the same answer and the
+    /// frames of the two cannot be cached apart. `None` only for a file with no video
+    /// stream at all, which the probe already refuses to open.
+    fn preview_video_stream(&self) -> Option<u64> {
+        crate::preview::video_stream_index(self.media_info()?, self.preview_video_stream)
+    }
+
+    /// Which audio stream a scrub playback takes its sound from, and automatic sync aligns
+    /// against: the reader's choice, or the file's first.
+    ///
+    /// `None` is media with no sound in it, which plays as a silent slideshow at the right
+    /// rate — the same path a machine with no output device takes.
+    fn preview_audio_stream(&self) -> Option<u64> {
+        let info = self.media_info()?;
+        let audio = |index: Option<u64>| {
+            info.streams.iter().find(|stream| {
+                stream_kind(stream) == Some("audio")
+                    && index.is_none_or(|index| crate::edit::stream_index(stream) == Some(index))
+            })
+        };
+        // A chosen index that names nothing falls back to the first, rather than to silence:
+        // the choice is cleared when the file changes, but a probe refreshed under an open
+        // page can drop a stream, and playing the first track beats playing none.
+        audio(self.preview_audio_stream)
+            .or_else(|| audio(None))
+            .and_then(crate::edit::stream_index)
+    }
+
+    /// Stops any playback and tells the worker to stop decoding for it.
+    ///
+    /// Reports whether there was one, which is what makes the keybinding a toggle.
+    fn stop_playback(&mut self) -> bool {
+        let stopped = self
+            .subtitle_edit
+            .as_mut()
+            .is_some_and(SubtitleEditState::stop_playback);
+        if stopped {
+            self.abandon_playback();
+        }
+        stopped
+    }
+
+    /// Tells the worker that whatever span it is decoding is no longer wanted.
+    fn abandon_playback(&mut self) {
+        self.playback_live = false;
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        if let Some(preview) = self.preview.as_ref() {
+            preview.abandon_playback(self.playback_generation);
+        }
+    }
+
+    /// Moves the playhead to wherever the sound has got to, reporting whether the page
+    /// needs repainting.
+    ///
+    /// Called once per loop iteration, beside the other pumps. Also the single point that
+    /// reconciles the worker with the page: `SubtitleEditState` drops a playback on its own
+    /// whenever the cursor moves or the pane resizes, and this is where that becomes a
+    /// running `ffmpeg` being killed rather than left decoding a span nobody will watch.
+    pub fn advance_playback(&mut self) -> bool {
+        let Some(state) = self.subtitle_edit.as_mut() else {
+            // The page itself is gone, which `close_subtitle_edit` has already reported.
+            return false;
+        };
+        let dirty = state.advance_playback();
+        if self.playback_live && !self.playback_active() {
+            self.abandon_playback();
+        }
+        dirty
+    }
+
+    /// Whether a span is playing or being decoded, for the loop's poll interval and for
+    /// the status row.
+    pub fn playback_active(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(SubtitleEditState::playback_active)
+    }
+
+    /// How long the event loop may block waiting for a key.
+    ///
+    /// Fifty milliseconds is a twenty-hertz ceiling, which is fine for everything else this
+    /// application draws and would turn a thirty-frame-a-second playback into a judder. A
+    /// playback is the one thing here whose picture is timed rather than merely animated,
+    /// so it — and only it — is worth waking up for at a rate above what it draws at.
+    pub fn poll_interval(&self) -> Duration {
+        if self.playback_active() {
+            PLAYBACK_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        }
+    }
+
     pub fn back(&mut self) -> bool {
         match self.layer {
             Layer::StreamDetails => {
@@ -2178,6 +6588,44 @@ impl App {
             }
             Layer::Streams => {
                 self.layer = Layer::Files;
+                true
+            }
+            Layer::SubtitleEdit => {
+                // Peeled one layer at a time, the same way Esc backs out of a file search
+                // before leaving the file list: a playback is something on screen the user
+                // may want gone without also losing the page they spent a second opening.
+                if self.stop_playback() {
+                    return true;
+                }
+                // A filter is the next layer down, for the reason a playback is the first:
+                // it is something on screen the reader may want gone without also losing
+                // the page. Ahead of the timing mode because it changes what is *drawn*,
+                // where the mode changes what the keys mean — and the mode is meant to
+                // survive everything else, since nudging a cue and looking at the result
+                // are the same piece of work.
+                if self.cue_search_has_query() {
+                    self.clear_cue_search();
+                    return true;
+                }
+                // The timeline cursor is deliberately *not* peeled here. The two panes are
+                // one page rather than a page and a page inside it, so a reader who moved
+                // the cursor down into the timeline is no deeper in than one who never did —
+                // and answering their `q` with "back to the cue panel" makes them press it
+                // twice to leave a page they only ever entered once. `Ctrl+K` is how the
+                // cursor comes home; leaving the page takes it home too.
+                //
+                // The timing mode is the next layer down, and it is peeled *after* the
+                // playback rather than before: the two are meant to be used together, so an
+                // `Esc` aimed at a span that is playing must not also cost the reader the
+                // mode they were nudging in.
+                if self.leave_cue_timing_mode() {
+                    return true;
+                }
+                // Asks before leaving cue edits behind, which is a third peeled layer: the
+                // edits are not lost by going, but this page is the only place they are
+                // visible, so walking out silently is how a reader comes to believe they
+                // were written.
+                self.request_leave_subtitle_edit();
                 true
             }
             Layer::Files => false,
@@ -3315,14 +7763,35 @@ impl App {
         }) {
             return Some(TextInputSite::LanguageSearch);
         }
+        if self.create_track_popup.as_ref().is_some_and(|popup| {
+            popup.field == CreateTrackField::Language
+                && popup.open
+                && popup.language_search.is_active
+        }) {
+            return Some(TextInputSite::CreateTrackLanguageSearch);
+        }
         if self.custom_resolution_input_active() {
             return Some(TextInputSite::CustomResolution);
+        }
+        // The field is the whole dialog, so it is active for as long as the dialog is: there
+        // is nothing else here for a keystroke to be meant for.
+        if self.dialog == Some(Dialog::CueLength) && self.cue_length.is_some() {
+            return Some(TextInputSite::CueLength);
         }
         if self.dialog == Some(Dialog::Keybindings) && self.keybindings_search.is_active {
             return Some(TextInputSite::KeybindingsSearch);
         }
         if self.dialog.is_none() && self.layer == Layer::Files && self.file_search.is_active {
             return Some(TextInputSite::FileSearch);
+        }
+        if self.dialog.is_none()
+            && self.layer == Layer::SubtitleEdit
+            && self
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(|state| state.cue_search().is_active)
+        {
+            return Some(TextInputSite::CueSearch);
         }
         None
     }
@@ -3362,6 +7831,10 @@ impl App {
                 &mut self.subtitle_settings_popup.as_mut()?.language_search.input,
                 TextInputConfig::LANGUAGE_SEARCH,
             )),
+            TextInputSite::CreateTrackLanguageSearch => Some((
+                &mut self.create_track_popup.as_mut()?.language_search.input,
+                TextInputConfig::LANGUAGE_SEARCH,
+            )),
             TextInputSite::CustomResolution => {
                 let draft = self
                     .video_settings_popup
@@ -3376,9 +7849,18 @@ impl App {
                 };
                 Some((input, TextInputConfig::RESOLUTION))
             }
+            TextInputSite::CueLength => Some((
+                &mut self.cue_length.as_mut()?.input,
+                TextInputConfig::CUE_LENGTH,
+            )),
             TextInputSite::FileSearch => {
                 let config = self.file_search.config();
                 Some((&mut self.file_search.input, config))
+            }
+            TextInputSite::CueSearch => {
+                let search = self.subtitle_edit.as_mut()?.cue_search_mut();
+                let config = search.config();
+                Some((&mut search.input, config))
             }
             TextInputSite::KeybindingsSearch => {
                 let config = self.keybindings_search.config();
@@ -3439,7 +7921,24 @@ impl App {
                     popup.language_cursor = 0;
                 }
             }
+            TextInputSite::CreateTrackLanguageSearch => {
+                if let Some(popup) = self.create_track_popup.as_mut() {
+                    popup.cursor = 0;
+                }
+            }
             TextInputSite::KeybindingsSearch => self.keybindings_scroll = 0,
+            // Rebuilding the projection is what makes the list narrow as the reader types,
+            // and it is what puts the cursor back on a row that is still drawn.
+            TextInputSite::CueSearch => {
+                if let Some(state) = self.subtitle_edit.as_mut() {
+                    if outcome == InputEdit::Exited {
+                        // Backspace off an empty query left the bar rather than abandoning
+                        // the search, so there is nothing to come back to any more.
+                        state.finish_cue_search();
+                    }
+                    state.refilter();
+                }
+            }
             TextInputSite::FileSearch => {
                 if outcome == InputEdit::Exited {
                     self.file_search_origin = None;
@@ -3450,7 +7949,8 @@ impl App {
             | TextInputSite::AudioTitle
             | TextInputSite::VideoTitle
             | TextInputSite::SubtitleTitle
-            | TextInputSite::CustomResolution => {}
+            | TextInputSite::CustomResolution
+            | TextInputSite::CueLength => {}
         }
     }
 
@@ -3973,6 +8473,7 @@ impl App {
             .get(&source)
             .cloned()
             .unwrap_or(SubtitleChange {
+                cues: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -4102,6 +8603,7 @@ impl App {
             .get(source)
             .cloned()
             .unwrap_or(SubtitleChange {
+                cues: Default::default(),
                 source: source.clone(),
                 source_format,
                 embedded_target: None,
@@ -4255,28 +8757,6 @@ impl App {
             .collect()
     }
 
-    pub fn subtitle_field_reason(&self, field: SubtitleSettingsField) -> Option<String> {
-        let popup = self.subtitle_settings_popup.as_ref()?;
-        if !self.subtitle_field_visible(field) {
-            return None;
-        }
-        let external = self.subtitle_source_external(&popup.source);
-        let flag = field.subtitle_flag()?;
-        if external
-            && matches!(
-                flag,
-                SubtitleFlag::Forced | SubtitleFlag::Cc | SubtitleFlag::HearingImpaired
-            )
-        {
-            return None;
-        }
-        let Some(container) = self.effective_container() else {
-            return Some("Choose a known container to set this flag.".to_string());
-        };
-        (!container.supports_subtitle_flag(flag))
-            .then(|| format!("{} does not support this subtitle flag.", container.label()))
-    }
-
     pub fn subtitle_popup_default(&self) -> bool {
         let Some(popup) = self.subtitle_settings_popup.as_ref() else {
             return false;
@@ -4315,10 +8795,6 @@ impl App {
         let source_format = popup.source_format;
         let external = self.subtitle_source_external(&source);
         if field == SubtitleSettingsField::Default {
-            if let Some(reason) = self.subtitle_field_reason(field) {
-                self.notice = Some(reason);
-                return;
-            }
             self.toggle_subtitle_default(&source);
             return;
         }
@@ -4336,10 +8812,6 @@ impl App {
             SubtitleSettingsField::Commentary => metadata.commentary,
             _ => return,
         };
-        if !current && let Some(reason) = self.subtitle_field_reason(field) {
-            self.notice = Some(reason);
-            return;
-        }
         match field {
             SubtitleSettingsField::Forced => metadata.forced = !metadata.forced,
             SubtitleSettingsField::Cc => metadata.cc = !metadata.cc,
@@ -4388,10 +8860,6 @@ impl App {
         if popup.mode != SubtitleSettingsMode::Summary
             || popup.field != SubtitleSettingsField::Title
         {
-            return;
-        }
-        if let Some(reason) = self.subtitle_field_reason(SubtitleSettingsField::Title) {
-            self.notice = Some(reason);
             return;
         }
         let popup = self.subtitle_settings_popup.as_mut().unwrap();
@@ -4605,11 +9073,9 @@ impl App {
                     popup.language_search.clear();
                     popup.language_cursor = cursor;
                 }
-                SubtitleSettingsField::Title => {
-                    if let Some(reason) = self.subtitle_field_reason(SubtitleSettingsField::Title) {
-                        self.notice = Some(reason);
-                    }
-                }
+                // Typing into the Title row is `start_subtitle_title_input`'s, which the
+                // key handler reaches for that row instead of coming here.
+                SubtitleSettingsField::Title => {}
                 field => self.toggle_subtitle_checkbox(field),
             },
             SubtitleSettingsMode::CodecDropdown => {
@@ -5851,6 +10317,15 @@ impl App {
             return;
         }
         let paths: Vec<PathBuf> = self.staged_edits.keys().cloned().collect();
+        // Noted before anything is dispatched, because the page is about to be closed by
+        // the rescan the save's own output triggers. `media` is filled in by
+        // `finish_batch_if_done`, which is the first point that knows what the file
+        // became. See `SubtitleEditReopen`.
+        self.pending_reopen = self.subtitle_edit.as_ref().map(|state| SubtitleEditReopen {
+            media: state.media().to_path_buf(),
+            source: state.source.clone(),
+            cue: state.selected,
+        });
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut items = Vec::new();
         for path in paths {
@@ -5893,6 +10368,12 @@ impl App {
                 &staged.audio_settings,
                 &staged.video_settings,
             );
+            // Nothing is recorded here about this file's rendered preview frames, and that
+            // is the point: a remux leaves the video stream byte for byte as it was, so
+            // `framecache::media_key` does not move across one and the frames stay where
+            // they are. This used to note the old key so the directory could be renamed
+            // afterwards, which meant deciding in advance which edits preserve the picture.
+            // See `preview::video_identity`.
             let request = EditRequest {
                 path: path.clone(),
                 destination: SaveDestination::ReplaceOriginal,
@@ -6165,6 +10646,10 @@ impl App {
         if self.dialog.is_some() || self.conflicting_paths().is_empty() {
             return false;
         }
+        // This notice raises itself, so unlike `:` and `?` it cannot be refused while a span
+        // is playing — the playback gives way instead, or the notice would be drawn once and
+        // wiped by the next frame. See `playback_in_progress`.
+        self.stop_playback();
         self.conflict_scroll = 0;
         self.conflict_opened_at = Some(Instant::now());
         self.dialog = Some(Dialog::ResolveConflicts);
@@ -6193,7 +10678,17 @@ impl App {
     /// stops*, since the frame that shows the finished state (a settled gauge, an
     /// armed button) is by definition the first frame where this is false.
     pub fn is_animating(&self) -> bool {
-        matches!(self.dialog, Some(Dialog::BatchProcessing)) || self.conflict_countdown().is_some()
+        matches!(self.dialog, Some(Dialog::BatchProcessing) | Some(Dialog::AutoSyncing))
+            || self.conflict_countdown().is_some()
+            || self
+                .subtitle_edit
+                .as_ref()
+                .is_some_and(SubtitleEditState::is_busy)
+            // A playback repaints because the picture moved, which `advance_playback`
+            // already reports — but the frames *between* those, and the wait while a span
+            // decodes, need the loop drawing too, or the page freezes on whatever was on
+            // screen when `p` was pressed.
+            || self.playback_active()
     }
 
     pub fn scroll_conflicts(&mut self, direction: isize) {
@@ -6409,7 +10904,7 @@ impl App {
     }
 
     pub fn show_keybindings(&mut self) {
-        if self.dialog.is_none() {
+        if self.dialog.is_none() && !self.playback_in_progress() {
             self.keybindings_scroll = 0;
             self.keybindings_max_scroll = 0;
             self.keybindings_search.clear();
@@ -6445,6 +10940,67 @@ impl App {
     pub fn finish_file_search(&mut self) {
         self.file_search.deactivate();
         self.file_search_origin = None;
+    }
+
+    /// Opens the cue panel's filter bar.
+    ///
+    /// Re-checks the layer for the reason [`Self::start_file_search`] does: a search that
+    /// opened somewhere with no cue list would leave the reader typing into a bar whose
+    /// results they cannot see.
+    ///
+    /// **From the timeline it brings the cursor home first.** A search picks a cue, and the
+    /// cue panel is the only pane that marks one — while the timeline holds the cursor no
+    /// cue is marked anywhere, so a match found from there would be a line nothing on
+    /// screen points at.
+    pub fn start_cue_search(&mut self) {
+        self.clear_text_input_reject();
+        if self.layer != Layer::SubtitleEdit {
+            return;
+        }
+        self.focus_cues();
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.start_cue_search();
+        }
+    }
+
+    /// Leaves the bar with the filter still in force, handing the keys back to the list.
+    pub fn finish_cue_search(&mut self) {
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.finish_cue_search();
+        }
+    }
+
+    /// Drops the filter and puts the cursor back where the search was opened.
+    pub fn cancel_cue_search(&mut self) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.cancel_cue_search();
+        }
+    }
+
+    /// Drops a filter left in force with the bar already closed, leaving the cursor alone.
+    pub fn clear_cue_search(&mut self) {
+        self.notice = None;
+        if let Some(state) = self.subtitle_edit.as_mut() {
+            state.clear_cue_search();
+        }
+    }
+
+    /// Whether the cue panel's filter bar is taking keys, which is what routes typing into
+    /// it rather than into the page's movement keys.
+    pub fn cue_search_active(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.cue_search().is_active)
+    }
+
+    /// Whether the cue panel is filtered — which is what makes a back key clear the filter
+    /// rather than leave the page.
+    pub fn cue_search_has_query(&self) -> bool {
+        self.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.cue_query().is_empty())
     }
 
     pub fn cancel_file_search(&mut self) {
@@ -6546,6 +11102,7 @@ impl App {
                 }
             }
             Layer::StreamDetails => self.scroll_details_down(10),
+            Layer::SubtitleEdit => self.move_cue(10),
         }
     }
 
@@ -6565,6 +11122,7 @@ impl App {
                 self.selected_stream = self.selected_stream.saturating_sub(10);
             }
             Layer::StreamDetails => self.scroll_details_up(10),
+            Layer::SubtitleEdit => self.move_cue(-10),
         }
     }
 
@@ -7145,6 +11703,24 @@ fn move_cursor(
     }
 }
 
+/// The values a dropdown offers, with any that are in force but not on the list merged in.
+///
+/// A config file can hold a value the popup does not offer — `fps = 25`, say — and a list
+/// that quietly dropped it would make the value unreachable the moment the user tried
+/// another, leaving `r` as the only way back. Sorted, so a merged value sits where a reader
+/// expects it rather than at the end.
+fn merged_choices<T: Copy + Ord>(offered: &[T], in_force: [T; 2]) -> Vec<T> {
+    let mut choices = offered.to_vec();
+    for value in in_force {
+        if !choices.contains(&value) {
+            choices.push(value);
+        }
+    }
+    // Descending, matching the order every list in this popup is offered in.
+    choices.sort_unstable_by(|left, right| right.cmp(left));
+    choices
+}
+
 fn cursor_endpoint(length: usize, end: bool, enabled: impl Fn(usize) -> bool) -> Option<usize> {
     if end {
         (0..length).rev().find(|position| enabled(*position))
@@ -7316,6 +11892,44 @@ fn summarize_batch_outcome(
             detail.join(", ")
         )
     }
+}
+
+/// Refuses a save that would put a subtitle track holding nothing into the container.
+///
+/// ffmpeg is handed a subtitle stream with no cues and most muxers turn it down, so without
+/// this the save fails in the worker with a message about a file the reader cannot act on.
+/// It is stated *here*, in the pre-flight, so `Ctrl+S` answers before dispatching anything —
+/// the same shape the undetermined-language refusal beside it has.
+///
+/// This is on the common path rather than in a corner: a track created with `a` is internal by
+/// default, so it carries the import mark from the moment it exists, while its file is still
+/// the empty one `a` wrote. `edit::validate_subtitle_sources` states it again in the worker,
+/// which is the layer that must not be bypassed — a staged edit can reach it from a batch this
+/// pre-flight never saw.
+fn empty_import_error_for(
+    subtitle_changes: &BTreeMap<SubtitleSource, SubtitleChange>,
+    sidecars: &[SidecarEntry],
+) -> Option<String> {
+    for sidecar in sidecars {
+        let source = SubtitleSource::Sidecar(sidecar.path.clone());
+        let Some(change) = subtitle_changes.get(&source) else {
+            continue;
+        };
+        // Exactly zero bytes, which is the state `a` leaves a new track in — a file with
+        // something in it is the reader's own content. Staged insertions are the cues a save
+        // is about to write, so they count even though the file has not changed yet.
+        if change.import_into_media
+            && change.cues.inserts.is_empty()
+            && std::fs::metadata(&sidecar.path).is_ok_and(|metadata| metadata.len() == 0)
+        {
+            return Some(format!(
+                "{} has no cues yet, so it cannot go into the file. Add a cue, or move the \
+                 track back out.",
+                sidecar.display_name
+            ));
+        }
+    }
+    None
 }
 
 /// Free-function core of `App::subtitle_language_error` — see
@@ -7581,6 +12195,9 @@ fn validate_staged_edit(
         subtitle_changes,
         sidecars,
     ) {
+        return Err(error);
+    }
+    if let Some(error) = empty_import_error_for(subtitle_changes, sidecars) {
         return Err(error);
     }
     // `ContainerFormat::detect` cross-checks the extension against ffprobe's own
@@ -7967,6 +12584,106 @@ pub(crate) fn describe_track_groups(groups: &BTreeSet<&'static str>) -> String {
     format!("{joined} tracks")
 }
 
+/// A verb for the save summary's cue lines, as it reads leading a line and as it reads after
+/// another verb.
+type CueVerb = (&'static str, &'static str);
+
+const MOVING: CueVerb = ("Moving", "moving");
+const LENGTHENING: CueVerb = ("Lengthening", "lengthening");
+const SHORTENING: CueVerb = ("Shortening", "shortening");
+const REWORDING: CueVerb = ("Rewording", "rewording");
+
+/// The cue work staged against one track, as the save confirmation lists it: one line per kind
+/// of change with a count — `Moving 100 cues in movie.eng.srt`, `Moving and lengthening 5 cues
+/// in …`, `Shortening 1 cue in …` — then `Adding …` and `Deleting …`.
+///
+/// **Counts rather than a line per cue**, because a whole-track retime is a thousand cues and
+/// the question the dialog answers is what kind of work the save is about to do, not which
+/// line. Kinds are listed in the order the track first shows them, so the lines read in the
+/// order the reader did the work on a track they worked through top to bottom.
+///
+/// **A cue both rewritten and marked to go is counted only as deleted**, which is what the
+/// save does to it: the rewrite lands on a line the writer then drops.
+fn cue_change_summary(cues: &crate::subtitle::CueChanges, source: &str) -> Vec<String> {
+    let mut kinds: Vec<(Vec<CueVerb>, usize)> = Vec::new();
+    for (position, edit) in &cues.edits {
+        if cues.deletes.contains_key(position) {
+            continue;
+        }
+        let verbs = cue_edit_verbs(edit);
+        match kinds.iter_mut().find(|(kind, _)| *kind == verbs) {
+            Some((_, count)) => *count += 1,
+            None => kinds.push((verbs, 1)),
+        }
+    }
+    let mut lines: Vec<String> = kinds
+        .into_iter()
+        .map(|(verbs, count)| {
+            format!(
+                "{} {count} {} in {source}",
+                join_cue_verbs(&verbs),
+                cue_noun(count)
+            )
+        })
+        .collect();
+    let added = cues.inserts.len();
+    if added > 0 {
+        lines.push(format!("Adding {added} {} to {source}", cue_noun(added)));
+    }
+    let deleted = cues.deletes.len();
+    if deleted > 0 {
+        lines.push(format!(
+            "Deleting {deleted} {} from {source}",
+            cue_noun(deleted)
+        ));
+    }
+    lines
+}
+
+/// What one rewrite does to its cue, in the order the summary names it.
+///
+/// **"Moving" means both ends changed.** One end alone is lengthening or shortening, because
+/// that is how dragging an edge reads to the reader who did it — a cue whose start was pulled
+/// in is a shorter line, not a line somewhere else. Both ends by different amounts is both.
+fn cue_edit_verbs(edit: &crate::subtitle::CueEdit) -> Vec<CueVerb> {
+    let mut verbs = Vec::new();
+    if edit.start != edit.original.start && edit.end != edit.original.end {
+        verbs.push(MOVING);
+    }
+    let before = edit.original.end.saturating_sub(edit.original.start);
+    let after = edit.end.saturating_sub(edit.start);
+    if after > before {
+        verbs.push(LENGTHENING);
+    } else if after < before {
+        verbs.push(SHORTENING);
+    }
+    if edit.text != edit.original.text {
+        verbs.push(REWORDING);
+    }
+    verbs
+}
+
+/// "Moving", "Moving and shortening", "Moving, shortening and rewording".
+fn join_cue_verbs(verbs: &[CueVerb]) -> String {
+    verbs
+        .iter()
+        .enumerate()
+        .map(|(index, (leading, following))| {
+            if index == 0 {
+                (*leading).to_string()
+            } else if index + 1 == verbs.len() {
+                format!(" and {following}")
+            } else {
+                format!(", {following}")
+            }
+        })
+        .collect()
+}
+
+fn cue_noun(count: usize) -> &'static str {
+    if count == 1 { "cue" } else { "cues" }
+}
+
 /// Builds the human-readable list of changes staged for one file — container
 /// conversion/metadata, video re-encodes, subtitle import/export/metadata edits, and
 /// track moves/deletes/default changes — shown in the `ConfirmProcessAll` dialog
@@ -8132,6 +12849,11 @@ fn staged_edit_summary_entries(
                 .unwrap_or("subtitle sidecar")
                 .to_string(),
         };
+        // First, because cue edits are applied to the file before it is converted, imported
+        // or exported — a cue line after `Importing` would read as the import being edited.
+        for line in cue_change_summary(&change.cues, &source) {
+            lines.push(("subtitle", line));
+        }
         if change.import_into_media {
             let target = change.embedded_target.unwrap_or(change.source_format);
             lines.push((
@@ -8212,19 +12934,27 @@ mod tests {
     use kernal::prelude::*;
 
     use super::*;
+    use crate::cue::Cue;
 
     fn media(streams: serde_json::Value) -> MediaInfo {
         MediaInfo::from_json(serde_json::json!({"streams": streams})).unwrap()
     }
 
     fn test_app(info: MediaInfo) -> App {
+        // The counter matters: the test runner is threaded and two tests reaching here in
+        // the same nanosecond read the same clock, so they would share a directory — and
+        // whichever finished second would panic removing one that was already gone. It
+        // showed up as a rare failure in an unrelated test, which is the worst way for a
+        // suite to tell you something.
+        static DIRECTORIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "reel-tui-app-test-{}-{}",
+            "reel-tui-app-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            DIRECTORIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let (probe_tx, _) = std::sync::mpsc::channel::<ProbeRequest>();
@@ -8692,6 +13422,13 @@ mod tests {
                 "mov_text".to_string(),
             ]),
             ffmpeg_muxers: BTreeSet::from(["matroska".to_string()]),
+            ffmpeg_filters: BTreeSet::from(["subtitles".to_string(), "scale".to_string()]),
+            ffmpeg_decoders: BTreeSet::from([
+                "subrip".to_string(),
+                "ass".to_string(),
+                "webvtt".to_string(),
+                "mov_text".to_string(),
+            ]),
             seconv: true,
             tesseract_languages: vec!["eng".to_string()],
         }
@@ -9641,14 +14378,126 @@ mod tests {
         std::fs::write(directory.join("movie.nld.srt"), b"1\n").unwrap();
         app.reconcile_files(scan_directory(&directory).unwrap());
 
-        // Assert: the sidecar list is rebuilt and the subtitle work that referred to
-        // the old one is dropped, while the container change stays staged.
+        // Assert: the sidecar list is rebuilt, and every staged edit survives it. A file
+        // appearing beside the media says nothing about an *embedded* track's export, and
+        // this used to throw it away along with every other subtitle change on the file —
+        // which the reader had no way of getting back. Nor is there a notice, because
+        // nothing was lost to tell them about.
         assert_that!(app.sidecars.len()).is_equal_to(2);
-        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_changes.is_empty()).is_false();
         assert_that!(app.subtitle_settings_popup.is_none()).is_true();
         assert_that!(app.container_target).contains(ContainerFormat::Mp4);
+        assert_that!(app.notice.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The other half of the remap: a change whose sidecar is genuinely gone *is* dropped,
+    /// and the reader is told, since that is work they can no longer save.
+    #[test]
+    fn reconcile_files_should_drop_only_the_changes_whose_sidecar_has_gone() {
+        // Arrange: two sidecars, each carrying a staged import.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let english = directory.join("movie.eng.srt");
+        let dutch = directory.join("movie.nld.srt");
+        std::fs::write(&english, b"1\n").unwrap();
+        std::fs::write(&dutch, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        for index in 0..2 {
+            focus_track(&mut app, TrackRef::Sidecar(index));
+            app.transfer_subtitle(-1);
+        }
+        assert_that!(app.subtitle_changes.len()).is_equal_to(2);
+
+        // Act: one of them is deleted from under the staged work.
+        std::fs::remove_file(&english).unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert: the survivor keeps its import, addressed by path rather than by the
+        // position it used to hold — the vector it indexes into has just shrunk.
+        assert_that!(app.sidecars.len()).is_equal_to(1);
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Sidecar(dutch))
+        )
+        .is_true();
+        assert_that!(app.subtitle_changes.len()).is_equal_to(1);
         assert_that!(app.notice.clone())
             .contains("Matching subtitle sidecars changed; reloaded them.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `left_subtitle_order` holds *positions* in the sidecar vector, and the list is sorted
+    /// A sidecar swapped for one of another format is a *different file* — the format lives in
+    /// the extension — so the staged change names a path that is no longer there and goes,
+    /// rather than being carried onto the stranger that replaced it.
+    #[test]
+    fn reconcile_files_should_drop_a_change_whose_sidecar_was_swapped_for_another_format() {
+        // Arrange: a staged import on a SubRip sidecar.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let subrip = directory.join("movie.eng.srt");
+        std::fs::write(&subrip, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.transfer_subtitle(-1);
+        assert_that!(app.subtitle_changes.len()).is_equal_to(1);
+
+        // Act: the SubRip file goes and an ASS one takes its place, so the list changes and
+        // the surviving entry is a different format at a different path.
+        std::fs::remove_file(&subrip).unwrap();
+        std::fs::write(directory.join("movie.eng.ass"), b"[Script Info]\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert
+        assert_that!(app.sidecars.len()).is_equal_to(1);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Matching subtitle sidecars changed; reloaded them.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// by name — so a sidecar inserted ahead of an imported one moves it. Left unremapped the
+    /// left column silently re-points at another file, which was masked only by the blanket
+    /// clear this replaced.
+    #[test]
+    fn reconcile_files_should_keep_the_left_column_on_the_same_sidecar_when_one_is_inserted() {
+        // Arrange: one imported sidecar, sitting at index 0.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        let dutch = directory.join("movie.nld.srt");
+        std::fs::write(&dutch, b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.transfer_subtitle(-1);
+        app.left_subtitle_order = vec![TrackRef::Sidecar(0)];
+
+        // Act: a sidecar that sorts *before* it arrives, pushing it to index 1.
+        std::fs::write(directory.join("movie.eng.srt"), b"1\n").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+
+        // Assert: the left column follows the file rather than the index.
+        assert_that!(app.sidecars.len()).is_equal_to(2);
+        assert_that!(app.sidecars[1].path.clone()).is_equal_to(dutch);
+        assert_that!(app.left_subtitle_order.clone()).is_equal_to(vec![TrackRef::Sidecar(1)]);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -9806,6 +14655,7 @@ mod tests {
         subtitles.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -9838,6 +14688,7 @@ mod tests {
         staged.original_stream_order = vec![0, 1, 2];
         let change = |source: SubtitleSource, embedded_target, export_target, import_into_media| {
             SubtitleChange {
+                cues: Default::default(),
                 source,
                 source_format: SubtitleFormat::SubRip,
                 embedded_target,
@@ -9906,6 +14757,124 @@ mod tests {
         );
     }
 
+    /// Ctrl+S has to say what the cue work is before it does it, in counts rather than cue by
+    /// cue: one line per kind of change per track. A save that retimed a thousand cues was
+    /// confirmed by a dialog naming the file and nothing else.
+    #[test]
+    fn the_summary_should_count_cue_changes_by_what_happened_to_them() {
+        // Arrange: every cue the file has runs 1.0s → 2.0s and reads "line".
+        use crate::subtitle::{CueEdit, CueInsert, CueSnapshot};
+        let at = Duration::from_millis;
+        let file_cue = || CueSnapshot {
+            text: "line".to_string(),
+            start: at(1000),
+            end: at(2000),
+        };
+        let edit = |start: u64, end: u64, text: &str| CueEdit {
+            original: file_cue(),
+            text: text.to_string(),
+            start: at(start),
+            end: at(end),
+        };
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 3, "codec_type": "subtitle", "codec_name": "subrip"}
+        ]));
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let mut staged = staged_edit(fingerprint, vec![0, 3]);
+        staged.original_stream_order = vec![0, 3];
+        let change = |source: SubtitleSource,
+                      cues: crate::subtitle::CueChanges,
+                      import_into_media: bool| SubtitleChange {
+            cues,
+            source,
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media,
+            ocr_language: None,
+            metadata: None,
+        };
+        let sidecar = PathBuf::from("/videos/movie.eng.srt");
+        let worked = crate::subtitle::CueChanges {
+            edits: BTreeMap::from([
+                // Both ends by the same amount, twice: one line counting two.
+                (0, edit(1500, 2500, "line")),
+                (1, edit(1500, 2500, "line")),
+                // The start pulled in: a shorter line, not a moved one.
+                (2, edit(1200, 2000, "line")),
+                // The end pushed out.
+                (3, edit(1000, 2600, "line")),
+                // Both ends, by different amounts.
+                (4, edit(900, 2400, "line")),
+                // The words alone.
+                (5, edit(1000, 2000, "reworded")),
+                // All three at once.
+                (6, edit(1100, 1700, "reworded")),
+                // Moved, but also marked to go — so it is only deleted.
+                (7, edit(1500, 2500, "line")),
+            ]),
+            inserts: BTreeMap::from([(
+                0,
+                CueInsert {
+                    text: "new".to_string(),
+                    start: at(5000),
+                    end: at(6000),
+                },
+            )]),
+            deletes: BTreeMap::from([(7, file_cue()), (8, file_cue())]),
+        };
+        // A whole-track retime on an embedded track: only moves, nothing added or deleted.
+        let retimed = crate::subtitle::CueChanges {
+            edits: (0..3).map(|cue| (cue, edit(500, 1500, "line"))).collect(),
+            ..Default::default()
+        };
+        staged.subtitle_changes = BTreeMap::from([
+            (
+                SubtitleSource::Sidecar(sidecar.clone()),
+                change(SubtitleSource::Sidecar(sidecar), worked, true),
+            ),
+            (
+                SubtitleSource::Embedded(3),
+                change(SubtitleSource::Embedded(3), retimed, false),
+            ),
+        ]);
+
+        // Act
+        let lines = staged_edit_summary(Path::new("/videos/movie.mkv"), &info, &staged);
+
+        // Assert: the sidecar's cue work, one line per kind, in the order the track shows
+        // them — and the import after it, since the cue edits land on the file first.
+        let sidecar_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains("movie.eng.srt"))
+            .collect();
+        assert_that!(sidecar_lines[..8].to_vec()).is_equal_to(vec![
+            "Moving 2 cues in movie.eng.srt",
+            "Shortening 1 cue in movie.eng.srt",
+            "Lengthening 1 cue in movie.eng.srt",
+            "Moving and lengthening 1 cue in movie.eng.srt",
+            "Rewording 1 cue in movie.eng.srt",
+            "Moving, shortening and rewording 1 cue in movie.eng.srt",
+            "Adding 1 cue to movie.eng.srt",
+            "Deleting 2 cues from movie.eng.srt",
+        ]);
+        assert_that!(sidecar_lines.len()).is_equal_to(9);
+        assert_that!(sidecar_lines[8]).starts_with("Importing movie.eng.srt");
+
+        // Assert: the embedded track says only what happened to it.
+        let embedded_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains("subtitle track #3"))
+            .collect();
+        assert_that!(embedded_lines).is_equal_to(vec!["Moving 3 cues in subtitle track #3"]);
+    }
+
     #[test]
     fn the_summary_should_spell_out_a_subtitles_metadata_including_what_was_cleared() {
         // Arrange: metadata edits are the easiest to stage by accident and the hardest to
@@ -9925,6 +14894,7 @@ mod tests {
         staged.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -9979,6 +14949,7 @@ mod tests {
         edit.subtitle_changes = BTreeMap::from([(
             SubtitleSource::Embedded(1),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(1),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::SubRip),
@@ -10851,6 +15822,7 @@ mod tests {
         edit.subtitle_changes.insert(
             SubtitleSource::Sidecar(sidecar_path.clone()),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Sidecar(sidecar_path),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -11200,7 +16172,7 @@ mod tests {
             CacheKey::for_file(&movie),
             ProbeOutcome::Video(media(serde_json::json!([
                 {"index": 0, "codec_type": "video", "codec_name": "h264",
-                 "width": 1920, "height": 1080},
+                 "width": 640, "height": 360},
                 {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
                  "tags": {"language": "eng"}}
             ]))),
@@ -12212,6 +17184,7 @@ mod tests {
             BTreeMap::from([(
                 source.clone(),
                 SubtitleChange {
+                    cues: Default::default(),
                     source,
                     source_format: SubtitleFormat::SubRip,
                     embedded_target: None,
@@ -12266,6 +17239,100 @@ mod tests {
             .contains("Choose a language for movie.und.srt; Undetermined is not allowed.");
         assert_that!(relabelled_sidecar).is_none();
         assert_that!(nothing_open).is_none();
+    }
+
+    /// A subtitle track holding nothing cannot go into a container: ffmpeg is handed a stream
+    /// with no cues and most muxers refuse it. Answered in the pre-flight so `Ctrl+S` says so
+    /// before dispatching, rather than failing in a worker with a message about a file the
+    /// reader can no longer act on.
+    ///
+    /// This is the state internal-by-default makes reachable — a track created with `a`
+    /// carries the import mark from the moment it exists, while its file is still empty — so
+    /// it is the reader's likeliest first mistake rather than a corner case.
+    #[test]
+    fn an_empty_sidecar_marked_for_import_should_be_refused_before_anything_is_dispatched() {
+        // Arrange
+        let directory = std::env::temp_dir().join(format!(
+            "reel-tui-empty-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let empty = directory.join("movie.eng.srt");
+        std::fs::write(&empty, "").unwrap();
+        let filled = directory.join("movie.nld.srt");
+        std::fs::write(&filled, "1\n00:00:01,000 --> 00:00:02,000\nx\n\n").unwrap();
+        let sidecar = |path: &std::path::Path| SidecarEntry {
+            path: path.to_path_buf(),
+            companion: None,
+            display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            format: SubtitleFormat::SubRip,
+            language: "eng".to_string(),
+            forced: false,
+            hearing_impaired: false,
+            number: None,
+            fingerprint: crate::files::FileFingerprint::for_path(path).unwrap(),
+            companion_fingerprint: None,
+        };
+        let importing = |path: &std::path::Path| SubtitleChange {
+            cues: Default::default(),
+            source: SubtitleSource::Sidecar(path.to_path_buf()),
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media: true,
+            ocr_language: None,
+            metadata: None,
+        };
+
+        // Act / Assert: the empty one is refused, naming itself.
+        let refused = empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), importing(&empty))]),
+            &[sidecar(&empty)],
+        );
+        assert_that!(refused.clone().unwrap_or_default().as_str()).contains("has no cues yet");
+        assert_that!(refused.unwrap_or_default().as_str()).contains("movie.eng.srt");
+
+        // Act / Assert: one with cues in it goes through, and so does an empty one that is
+        // staying put — writing an empty sidecar back out unchanged fails nothing.
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(filled.clone()), importing(&filled))]),
+            &[sidecar(&filled)],
+        ))
+        .is_none();
+        let mut staying = importing(&empty);
+        staying.import_into_media = false;
+        staying.export_target = Some(SubtitleFormat::Ass);
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), staying)]),
+            &[sidecar(&empty)],
+        ))
+        .is_none();
+
+        // Act / Assert: a staged insertion is the cue the save is about to write, so it counts
+        // even though the file on disk is still empty — the ordinary workflow.
+        let mut with_a_cue = importing(&empty);
+        with_a_cue.cues.inserts.insert(
+            0,
+            crate::subtitle::CueInsert {
+                text: "First line".to_string(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+            },
+        );
+        assert_that!(empty_import_error_for(
+            &BTreeMap::from([(SubtitleSource::Sidecar(empty.clone()), with_a_cue)]),
+            &[sidecar(&empty)],
+        ))
+        .is_none();
+
+        // And a sidecar nothing is staged against is nobody's business.
+        assert_that!(empty_import_error_for(&BTreeMap::new(), &[sidecar(&empty)])).is_none();
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -14279,6 +19346,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::Ass),
@@ -14367,9 +19435,12 @@ mod tests {
             .unwrap();
         assert_that!(change.export_target).contains(SubtitleFormat::VobSub);
         assert_that!(change.embedded_target).is_none();
+        // An exported subtitle carries its flags in its own file name, so the container
+        // has no say in them: Forced stays on the popup with no container chosen at all,
+        // while CC is off it either way — a sidecar spells that one SDH instead.
         app.container_target = None;
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Forced)).is_none();
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Cc)).is_none();
+        assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Forced)).is_true();
+        assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Cc)).is_false();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -14683,6 +19754,7 @@ mod tests {
         app.subtitle_changes.insert(
             source.clone(),
             SubtitleChange {
+                cues: Default::default(),
                 source: source.clone(),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: None,
@@ -15805,6 +20877,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -15847,6 +20920,7 @@ mod tests {
         app.subtitle_changes.insert(
             SubtitleSource::Embedded(2),
             SubtitleChange {
+                cues: Default::default(),
                 source: SubtitleSource::Embedded(2),
                 source_format: SubtitleFormat::SubRip,
                 embedded_target: Some(SubtitleFormat::MovText),
@@ -15980,6 +21054,391 @@ mod tests {
 
         // Assert
         assert_that!(language.as_deref()).contains("nld");
+    }
+
+    /// The tag on a track and the name Tesseract knows a language by are not the same
+    /// string: a container routinely says `en-GB` or `de` where Tesseract wants `eng` or
+    /// `deu`. Picking the wrong one is not a failure the user sees — the OCR simply reads
+    /// the subtitle against another language's model and produces plausible nonsense —
+    /// so every step of the walk down to a usable name is asserted here.
+    #[test]
+    fn the_ocr_language_should_translate_a_two_letter_tag_and_fall_back_in_order() {
+        // Arrange: a track tagged with a regional two-letter code, and a Tesseract that
+        // has only the three-letter names installed.
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+             "tags": {"language": "de-AT"}}
+        ])));
+        app.subtitle_capabilities.tesseract_languages = vec!["eng".to_string(), "deu".to_string()];
+
+        // Act / Assert: the region is dropped and the two-letter code translated.
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("deu");
+
+        // Act / Assert: a language nothing is installed for falls back to English, which
+        // is the one most subtitles this tool meets are actually in.
+        app.subtitle_capabilities.tesseract_languages = vec!["eng".to_string(), "jpn".to_string()];
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("eng");
+
+        // Act / Assert: and with no English either, the first installed language is used
+        // rather than nothing — an OCR run in the wrong language is still recoverable,
+        // where a refusal leaves the user with no way to start one at all.
+        app.subtitle_capabilities.tesseract_languages = vec!["kor".to_string()];
+        assert_that!(
+            app.automatic_ocr_language(&SubtitleSource::Embedded(1))
+                .as_deref()
+        )
+        .contains("kor");
+
+        // Act / Assert: with nothing installed there is nothing to choose.
+        app.subtitle_capabilities.tesseract_languages.clear();
+        assert_that!(app.automatic_ocr_language(&SubtitleSource::Embedded(1))).is_none();
+    }
+
+    /// `gg` and `G` mean "the ends of whatever list I am in", and the video popup is five
+    /// lists wearing one dialog: the summary's rows, three dropdowns and the custom
+    /// resolution draft. Each keeps its own cursor, so an end key that moved the wrong one
+    /// would jump a list the reader cannot see and leave the one in front of them still.
+    /// `Ctrl+L` moves a subtitle out of the container and into a sidecar. A VobSub track
+    /// on a build with no seconv has nowhere to go — it cannot be written out as itself,
+    /// read into text, or turned into the other picture format — so every choice is
+    /// refused. The refusal has to say so: without it the key simply does nothing, which
+    /// reads as the export being broken rather than as this machine being unable to do it.
+    #[test]
+    fn exporting_a_vobsub_track_with_no_seconv_should_say_why_it_cannot() {
+        // Arrange: a VobSub track, and a build with neither seconv nor tesseract.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "dvd_subtitle",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.subtitle_capabilities = ToolCapabilities::default();
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+
+        // Act
+        let moved = app.transfer_subtitle(1);
+
+        // Assert: nothing is staged, and the notice names the obstacle.
+        assert_that!(moved).is_false();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(1))
+        )
+        .is_false();
+        let notice = app.notice.clone().expect("the refusal should say why");
+        assert_that!(notice.as_str()).contains("Cannot export");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The reset confirm is the one dialog in the application whose answer cannot be
+    /// undone, and `r` and `R` reach it at three different scales. Its title is the only
+    /// thing on screen saying which of the three the reader is about to take, so the file
+    /// scale names the file rather than saying "this file" like the other two.
+    #[test]
+    fn the_reset_confirm_should_name_the_scale_it_is_about_to_discard() {
+        // Act / Assert
+        assert_that!(ResetScope::File(PathBuf::from("/media/movie.mkv")).label())
+            .is_equal_to("Reset movie.mkv?".to_string());
+        assert_that!(ResetScope::CurrentFile.label())
+            .is_equal_to("Reset this file's edits?".to_string());
+        assert_that!(ResetScope::AllFiles.label())
+            .is_equal_to("Reset every staged file?".to_string());
+
+        // Assert: a path with no file name at all still asks a question, rather than
+        // asking the reader to confirm an empty one.
+        assert_that!(ResetScope::File(PathBuf::from("/")).label())
+            .is_equal_to("Reset this file?".to_string());
+    }
+
+    /// A conflict warning names the codec that will not fit the chosen container, and the
+    /// name FFmpeg uses for it is not the name it is known by — `hdmv_pgs_subtitle` and
+    /// `dvd_subtitle` in particular tell the reader nothing. Anything unrecognised is
+    /// upper-cased rather than dropped, so a codec this table has not met still names
+    /// itself in the warning.
+    #[test]
+    fn a_conflict_warning_should_use_the_codecs_common_name() {
+        // Act / Assert
+        for (codec, expected) in [
+            ("subrip", "SubRip/SRT"),
+            ("ass", "ASS"),
+            ("webvtt", "WebVTT"),
+            ("mov_text", "MOV Text"),
+            ("hdmv_pgs_subtitle", "PGS"),
+            ("dvd_subtitle", "VobSub"),
+            ("h264", "H.264"),
+            ("hevc", "HEVC/H.265"),
+            ("av1", "AV1"),
+            ("vp8", "VP8"),
+            ("vp9", "VP9"),
+            ("theora", "THEORA"),
+        ] {
+            assert_that!(warning_codec_label(codec)).is_equal_to(expected.to_string());
+        }
+
+        // Assert: ffprobe's casing is not guaranteed, so the lookup folds it first.
+        assert_that!(warning_codec_label("HDMV_PGS_SUBTITLE")).is_equal_to("PGS".to_string());
+    }
+
+    /// `r` on a settings popup puts *one* row back to what the file says, and the whole
+    /// point of it being one row is that the rest of the reader's work survives. A reset
+    /// that dropped the neighbouring fields would be indistinguishable from `r` on the
+    /// track list, which is a different key with a confirm in front of it.
+    #[test]
+    fn resetting_one_subtitle_row_should_leave_the_others_staged() {
+        // Arrange: a track with a language, a title and two flags all staged away from
+        // what the file says.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng", "title": "Stored title"}}
+            ]),
+        );
+        app.container_target = Some(ContainerFormat::Matroska);
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+        let source = SubtitleSource::Embedded(1);
+        let mut staged = app.subtitle_metadata_for(&source).unwrap();
+        staged.language = "nld".to_string();
+        staged.title = Some("Typed title".to_string());
+        staged.forced = true;
+        staged.commentary = true;
+        app.store_subtitle_metadata(source.clone(), SubtitleFormat::SubRip, staged);
+
+        // Act: put the language row back, one row at a time.
+        app.subtitle_settings_popup.as_mut().unwrap().field = SubtitleSettingsField::Language;
+        app.reset_focused_field();
+
+        // Assert: that row is the file's again and the other three are still the reader's.
+        let metadata = app.subtitle_metadata_for(&source).unwrap();
+        assert_that!(metadata.language.as_str()).is_equal_to("eng");
+        assert_that!(metadata.title.as_deref()).contains("Typed title");
+        assert_that!(metadata.forced).is_true();
+        assert_that!(metadata.commentary).is_true();
+
+        // Act / Assert: and each of the remaining rows answers for itself.
+        for (field, check) in [
+            (SubtitleSettingsField::Title, "title"),
+            (SubtitleSettingsField::Forced, "forced"),
+            (SubtitleSettingsField::Commentary, "commentary"),
+        ] {
+            app.subtitle_settings_popup.as_mut().unwrap().field = field;
+            app.reset_focused_field();
+            let metadata = app.subtitle_metadata_for(&source).unwrap();
+            match check {
+                "title" => {
+                    assert_that!(metadata.title.as_deref()).contains("Stored title");
+                }
+                "forced" => {
+                    assert_that!(metadata.forced).is_false();
+                }
+                _ => {
+                    assert_that!(metadata.commentary).is_false();
+                }
+            }
+        }
+
+        // Assert: with every row back to the file's answer, nothing is staged at all.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg` and `G` mean "the ends of whatever list I am in", and the video popup is five
+    /// lists wearing one dialog: the summary's rows, three dropdowns and the custom
+    /// resolution draft. Each keeps its own cursor, so an end key that moved the wrong one
+    /// would jump a list the reader cannot see and leave the one in front of them still.
+    #[test]
+    fn the_end_keys_should_move_whichever_of_the_video_popups_lists_is_open() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "width": 1920, "height": 1080}
+        ])));
+        let directory = app.directory.clone();
+        app.selected_stream = 1;
+        app.open_video_settings();
+
+        // Act / Assert: the summary walks its own rows.
+        app.move_video_settings_to_endpoint(true);
+        let last = *app.visible_video_fields().last().unwrap();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field).is_equal_to(last);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().field)
+            .is_equal_to(VideoSettingsField::Codec);
+
+        // Act / Assert: the rotation list is a fixed set, so its ends are its ends.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.field = VideoSettingsField::Rotation;
+        popup.mode = VideoSettingsMode::Dropdown;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().rotation_cursor)
+            .is_equal_to(VideoRotation::ALL.len() - 1);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().rotation_cursor).is_equal_to(0);
+
+        // Act / Assert: the resolution list skips the presets bigger than the source, so
+        // its far end is the last *enabled* row rather than the last row.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.field = VideoSettingsField::Resolution;
+        app.move_video_settings_to_endpoint(true);
+        let cursor = app.video_settings_popup.as_ref().unwrap().resolution_cursor;
+        assert!(
+            app.resolution_choices(0)[cursor].enabled,
+            "G should land on a choice that can be chosen"
+        );
+
+        // Act / Assert: the language list is long and filtered, so its end is counted from
+        // what is on screen rather than from every language there is.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.mode = VideoSettingsMode::LanguageDropdown;
+        app.move_video_settings_to_endpoint(true);
+        let languages = app.filtered_video_languages().len();
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor)
+            .is_equal_to(languages - 1);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(app.video_settings_popup.as_ref().unwrap().language_cursor).is_equal_to(0);
+
+        // Act / Assert: the custom resolution draft moves between its three rows, and its
+        // scaling list when that is open.
+        let popup = app.video_settings_popup.as_mut().unwrap();
+        popup.mode = VideoSettingsMode::CustomResolution;
+        popup.custom_resolution = Some(CustomResolutionDraft {
+            width: TextInputState::new("1920".to_string()),
+            height: TextInputState::new("1080".to_string()),
+            scaling: crate::edit::CustomScaling::FitPad,
+            field: CustomResolutionField::Width,
+            scaling_cursor: 0,
+            scaling_dropdown_open: false,
+        });
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .field
+        )
+        .is_equal_to(CustomResolutionField::Scaling);
+        app.move_video_settings_to_endpoint(false);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .field
+        )
+        .is_equal_to(CustomResolutionField::Width);
+
+        let draft = app
+            .video_settings_popup
+            .as_mut()
+            .unwrap()
+            .custom_resolution
+            .as_mut()
+            .unwrap();
+        draft.scaling_dropdown_open = true;
+        app.move_video_settings_to_endpoint(true);
+        assert_that!(
+            app.video_settings_popup
+                .as_ref()
+                .unwrap()
+                .custom_resolution
+                .as_ref()
+                .unwrap()
+                .scaling_cursor
+        )
+        .is_equal_to(CustomScaling::OPTIONS.len() - 1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The subtitle popup's two dropdowns are the same question one level down, and the
+    /// codec list is the one with disabled rows in it — a format this build has no tool
+    /// for cannot be landed on, or `G` would leave the cursor on a choice `Enter` refuses.
+    #[test]
+    fn the_end_keys_should_move_the_subtitle_popups_dropdowns_to_a_usable_row() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]),
+        );
+        app.selected_stream = app
+            .track_rows()
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(1))
+            .unwrap();
+        app.open_subtitle_settings(SubtitleSource::Embedded(1));
+        let source = app.subtitle_settings_popup.as_ref().unwrap().source.clone();
+        let source_format = app.subtitle_settings_popup.as_ref().unwrap().source_format;
+
+        // Act / Assert: the codec list lands on an enabled row at either end.
+        app.subtitle_settings_popup.as_mut().unwrap().mode = SubtitleSettingsMode::CodecDropdown;
+        for end in [true, false] {
+            app.move_subtitle_settings_to_endpoint(end);
+            let cursor = app.subtitle_settings_popup.as_ref().unwrap().codec_cursor;
+            assert!(
+                app.subtitle_choices(&source, source_format)[cursor].enabled,
+                "the {} of the codec list should be a choice that can be chosen",
+                if end { "far end" } else { "start" },
+            );
+        }
+
+        // Act / Assert: the language list has no disabled rows, so its ends are its ends.
+        app.subtitle_settings_popup.as_mut().unwrap().mode = SubtitleSettingsMode::LanguageDropdown;
+        app.move_subtitle_settings_to_endpoint(true);
+        let languages = app.filtered_subtitle_languages().len();
+        assert_that!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_cursor
+        )
+        .is_equal_to(languages - 1);
+        app.move_subtitle_settings_to_endpoint(false);
+        assert_that!(
+            app.subtitle_settings_popup
+                .as_ref()
+                .unwrap()
+                .language_cursor
+        )
+        .is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -16827,6 +22286,20 @@ mod tests {
                     title_input: active,
                 });
             }
+            TextInputSite::CreateTrackLanguageSearch => {
+                let language_search = SearchState {
+                    input: active,
+                    match_count: 0,
+                    field_width: 0,
+                };
+                app.create_track_popup = Some(CreateTrackPopup {
+                    field: CreateTrackField::Language,
+                    open: true,
+                    language: "eng".to_string(),
+                    language_search,
+                    ..CreateTrackPopup::default()
+                });
+            }
             TextInputSite::CustomResolution => {
                 app.video_settings_popup = Some(VideoSettingsPopup {
                     stream_index: 0,
@@ -16849,10 +22322,24 @@ mod tests {
                     }),
                 });
             }
+            TextInputSite::CueLength => {
+                app.cue_length = Some(CueLengthDraft {
+                    source: SubtitleSource::Embedded(2),
+                    origin: CueOrigin::File(0),
+                    input: active,
+                });
+                app.dialog = Some(Dialog::CueLength);
+            }
             TextInputSite::FileSearch => {
                 app.layer = Layer::Files;
                 app.dialog = None;
                 app.start_file_search();
+            }
+            TextInputSite::CueSearch => {
+                app.subtitle_edit = Some(ready_edit_page(vec![test_cue(0, 1000, "first line")]));
+                app.layer = Layer::SubtitleEdit;
+                app.dialog = None;
+                app.start_cue_search();
             }
             TextInputSite::KeybindingsSearch => {
                 app.dialog = Some(Dialog::Keybindings);
@@ -16861,7 +22348,7 @@ mod tests {
         }
     }
 
-    const ALL_TEXT_INPUT_SITES: [TextInputSite; 10] = [
+    const ALL_TEXT_INPUT_SITES: [TextInputSite; 13] = [
         TextInputSite::ContainerMetadata,
         TextInputSite::AudioTitle,
         TextInputSite::AudioLanguageSearch,
@@ -16869,10 +22356,49 @@ mod tests {
         TextInputSite::VideoLanguageSearch,
         TextInputSite::SubtitleTitle,
         TextInputSite::LanguageSearch,
+        TextInputSite::CreateTrackLanguageSearch,
         TextInputSite::CustomResolution,
+        TextInputSite::CueLength,
         TextInputSite::FileSearch,
+        TextInputSite::CueSearch,
         TextInputSite::KeybindingsSearch,
     ];
+
+    /// One cue, for the fixtures below.
+    fn test_cue(start: u64, end: u64, text: &str) -> Cue {
+        Cue {
+            index: 0,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            text: text.to_string(),
+            dialogue: Vec::new(),
+            events: 1,
+        }
+    }
+
+    /// A subtitle edit page with its cues already read, as a worker would have delivered
+    /// them — the state every test about the cue panel needs and the only one `App` cannot
+    /// reach without a real probe.
+    fn ready_edit_page(cues: Vec<Cue>) -> SubtitleEditState {
+        let mut state = SubtitleEditState::new(
+            1,
+            crate::preview::FrameSource {
+                media: PathBuf::from("/media/show.mkv"),
+                video_stream: 0,
+                video_identity: "h264\u{1f}960\u{1f}540".to_string(),
+                pixels: (960, 540),
+                style: std::sync::Arc::new(crate::preview::CueStyle::SubRip),
+                workspace: PathBuf::from("/tmp/reel-tui-preview/cue-search"),
+            },
+            SubtitleSource::Embedded(2),
+            Duration::from_secs(600),
+            crate::subtitle_edit::PreviewSupport::Available,
+            12,
+            crate::subtitle_edit::PreviewWorkspace::new().unwrap(),
+        );
+        state.apply_prepared(cues, crate::preview::CueStyle::SubRip);
+        state
+    }
 
     #[test]
     fn every_text_input_site_should_resolve_to_its_own_config() {
@@ -16894,8 +22420,16 @@ mod tests {
                 TextInputSite::VideoLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::SubtitleTitle => TextInputConfig::SUBTITLE_TITLE,
                 TextInputSite::LanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
+                TextInputSite::CreateTrackLanguageSearch => TextInputConfig::LANGUAGE_SEARCH,
                 TextInputSite::CustomResolution => TextInputConfig::RESOLUTION,
+                TextInputSite::CueLength => TextInputConfig::CUE_LENGTH,
                 TextInputSite::FileSearch => app.file_search.config(),
+                TextInputSite::CueSearch => app
+                    .subtitle_edit
+                    .as_ref()
+                    .expect("the page is open")
+                    .cue_search()
+                    .config(),
                 TextInputSite::KeybindingsSearch => app.keybindings_search.config(),
             };
             let (_, config) = app.text_input_mut(site).expect("site should resolve");
@@ -17068,8 +22602,10 @@ mod tests {
             let (typed, after_word) = match site {
                 TextInputSite::LanguageSearch
                 | TextInputSite::AudioLanguageSearch
-                | TextInputSite::VideoLanguageSearch => ("onetwo", ""),
+                | TextInputSite::VideoLanguageSearch
+                | TextInputSite::CreateTrackLanguageSearch => ("onetwo", ""),
                 TextInputSite::CustomResolution => ("1234", ""),
+                TextInputSite::CueLength => ("00:02.500", ""),
                 _ => ("one two", "one "),
             };
             for character in typed.chars() {
@@ -18125,7 +23661,6 @@ mod tests {
 
         assert_that!(app.subtitle_popup_metadata().unwrap().forced).is_false();
         assert_that!(app.subtitle_field_visible(SubtitleSettingsField::Forced)).is_false();
-        assert_that!(app.subtitle_field_reason(SubtitleSettingsField::Forced)).is_none();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -18676,6 +24211,6386 @@ mod tests {
         assert_that!(app.container_settings_popup.as_ref().unwrap().help_visible)
             .is_equal_to(!before);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Puts the track cursor on an embedded stream by its container index, rather than
+    /// hard-coding a row number that `track_rows`' ordering could shift underneath.
+    fn select_embedded_row(app: &mut App, index: u64) {
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| *row == TrackRef::Embedded(index))
+            .expect("stream should have a track row");
+    }
+
+    fn app_with_subtitle_codec(codec: &str) -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": codec},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app
+    }
+
+    #[test]
+    fn open_subtitle_edit_should_open_the_page_for_an_embedded_subrip_track() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        let state = app.subtitle_edit.as_ref().expect("page should be open");
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
+        assert_that!(state.status.clone()).is_equal_to(crate::subtitle_edit::LoadStatus::Preparing);
+        assert_that!(state.workspace().exists()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_edit_should_open_the_page_for_a_subrip_sidecar() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let sidecar = test_sidecar(&app, "movie.en.srt", "eng");
+        let path = sidecar.path.clone();
+        app.sidecars.push(sidecar);
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| matches!(row, TrackRef::Sidecar(_)))
+            .expect("sidecar should have a track row");
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Sidecar(path));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A format with no road to a cue list is turned away before the page opens, naming
+    /// itself so the message is about the track the user actually picked rather than about
+    /// subtitles in general.
+    #[test]
+    fn open_subtitle_edit_should_refuse_a_format_it_cannot_reach_cues_through() {
+        for (codec, expected) in [
+            ("ttml", "TTML"),
+            ("hdmv_pgs_subtitle", "PGS"),
+            ("dvd_subtitle", "VobSub"),
+        ] {
+            // Arrange
+            let mut app = app_with_subtitle_codec(codec);
+            let directory = app.directory.clone();
+            app.subtitle_capabilities = full_subtitle_capabilities();
+
+            // Act
+            app.open_subtitle_edit();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_edit.is_none()).is_true();
+            let notice = app.notice.clone().expect("a refusal should say why");
+            assert_that!(notice.contains(expected)).is_true();
+            assert_that!(notice.contains("not implemented yet")).is_true();
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// A codec string this program has no `SubtitleFormat` for cannot be routed at all, so
+    /// it is refused separately — and without naming a format, since there is not one to
+    /// name.
+    #[test]
+    fn open_subtitle_edit_should_refuse_a_codec_it_does_not_recognise() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("nonsense_codec");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().as_str()).contains("not one reel recognises");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// WebVTT and MOV Text reach the cue list by being transcoded to SubRip, so the page
+    /// opens on them — but only on a build that can decode them, which is a different
+    /// question from the encoder list the rest of the program asks about.
+    #[test]
+    fn open_subtitle_edit_should_open_a_transcodable_track_only_when_ffmpeg_can_decode_it() {
+        for (codec, expected) in [("webvtt", "VTT"), ("mov_text", "MOVTXT")] {
+            // Arrange: a build that can encode the format but not read it, which is the
+            // case a check against `ffmpeg_encoders` would wave straight through.
+            let mut app = app_with_subtitle_codec(codec);
+            let directory = app.directory.clone();
+            app.subtitle_capabilities = ToolCapabilities {
+                ffmpeg_decoders: BTreeSet::from(["subrip".to_string()]),
+                ..full_subtitle_capabilities()
+            };
+
+            // Act
+            app.open_subtitle_edit();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_edit.is_none()).is_true();
+            let notice = app.notice.clone().expect("a refusal should say why");
+            assert_that!(notice.contains(expected)).is_true();
+            assert_that!(notice.as_str()).contains("decode it");
+
+            // Act / Assert: and a build that can read it opens the page.
+            app.notice = None;
+            app.subtitle_capabilities = full_subtitle_capabilities();
+            app.open_subtitle_edit();
+            assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+            assert_that!(app.notice.clone()).is_none();
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// A track the page cannot open is turned away by naming its own kind, so the reader is
+    /// told which feature is missing rather than told to pick a different row.
+    #[test]
+    fn open_subtitle_edit_should_refuse_a_track_that_is_not_a_subtitle() {
+        for (index, expected) in [(0, "video tracks"), (1, "audio tracks")] {
+            // Arrange
+            let mut app = app_with_subtitle_codec("subrip");
+            let directory = app.directory.clone();
+            select_embedded_row(&mut app, index);
+
+            // Act
+            app.open_subtitle_edit();
+
+            // Assert
+            assert_that!(app.layer).is_equal_to(Layer::Streams);
+            assert_that!(app.subtitle_edit.is_none()).is_true();
+            assert_that!(app.notice.clone().unwrap().as_str())
+                .is_equal_to(format!("Editing {expected} is not implemented yet.").as_str());
+
+            // Cleanup
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// A selection left pointing past the rows has no kind to name, so the refusal keeps
+    /// its shape and falls back to the row itself rather than to a message about
+    /// subtitles.
+    #[test]
+    fn open_subtitle_edit_should_refuse_a_selection_that_names_no_track() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.selected_stream = app.track_rows().len();
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().as_str())
+            .is_equal_to("Editing this track is not implemented yet.");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_edit_should_refuse_the_container_row() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| *row == TrackRef::Container)
+            .expect("container should have a track row");
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().as_str())
+            .is_equal_to("Editing the container is not implemented yet.");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_edit_should_refuse_a_track_marked_for_deletion() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(2);
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone().unwrap().contains("deletion")).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_subtitle_edit_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act / Assert: wrong layer.
+        app.layer = Layer::Files;
+        app.open_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Act / Assert: right layer, but a dialog owns the keyboard.
+        app.layer = Layer::Streams;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.notice.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The scratch directory lives exactly as long as the page. Leaving it behind would
+    /// accumulate a copy of every previewed subtitle for the session's life.
+    #[test]
+    fn back_should_leave_the_edit_page_and_delete_its_workspace() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let workspace = app
+            .subtitle_edit
+            .as_ref()
+            .unwrap()
+            .workspace()
+            .to_path_buf();
+        assert_that!(workspace.exists()).is_true();
+
+        // Act
+        let handled = app.back();
+
+        // Assert
+        assert_that!(handled).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(workspace.exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An app on a real media file with a working subtitle toolchain, ready for `a`.
+    fn app_ready_to_create_a_track() -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+        app
+    }
+
+    /// Walks the popup through the real key sequence, choosing the given placement and
+    /// English as the language — the tests using this helper assert on `movie.eng.srt` by
+    /// name, so the language is searched for explicitly rather than left on the list's own
+    /// first (alphabetical) entry.
+    ///
+    /// `Enter` opens the format list, `Enter` takes its only entry, `j` to the language row,
+    /// `Enter` opens its list, `/`+typing narrows it to English, `Enter` takes it, `j` to the
+    /// placement row, `h`/`l` picks the answer directly, `j` moves to the action row, and
+    /// `Enter` performs `Create` (the row's default).
+    fn create_track_with(app: &mut App, placement: NewTrackPlacement) {
+        app.open_create_track();
+        app.activate_create_track();
+        app.activate_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "english".chars() {
+            app.input_text_char(character);
+        }
+        app.activate_create_track();
+        app.move_create_track_cursor(1);
+        app.move_create_track_choice(placement == NewTrackPlacement::External);
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+    }
+
+    #[test]
+    fn a_should_open_the_create_track_dialog_on_the_format_row() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_create_track();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CreateTrack));
+        let popup = app.create_track_popup.expect("the popup should be open");
+        assert_that!(popup.field).is_equal_to(CreateTrackField::Format);
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.placement).is_equal_to(NewTrackPlacement::Internal);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `h`/`l` on the fixed kind row cannot move anything — there is nowhere for the cursor
+    /// to go — so it answers with the same "not implemented yet" wording the rest of the
+    /// application uses for a feature missing on the type the reader tried it on.
+    #[test]
+    fn moving_the_kind_choice_should_say_video_and_audio_are_not_implemented() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(-1);
+
+        // Act
+        app.move_create_track_choice(true);
+
+        // Assert
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not implemented yet")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.as_ref().unwrap().kind)
+            .is_equal_to(NewTrackKind::Subtitles);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `Language` row starts on the same guess `create_subtitle_track` used to make
+    /// silently — the file's audio, or English where nothing says otherwise — so the reader
+    /// is correcting a guess already on screen rather than answering a blank field.
+    #[test]
+    fn opening_the_create_track_popup_should_leave_the_language_unchosen() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_create_track();
+
+        // Assert: empty, not a silent guess standing in for an answer — see
+        // `CreateTrackField`'s doc comment.
+        assert_that!(app.create_track_popup.as_ref().unwrap().language.as_str()).is_equal_to("");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The row's own answer starts empty, and the list it opens on takes no guess from the
+    /// media's audio either — a new subtitle track is as often a translation as it is a
+    /// transcript of what is spoken, so the cursor simply opens on the list's own first
+    /// entry regardless of what the file's audio is tagged.
+    #[test]
+    fn opening_the_create_track_language_list_should_start_on_the_list_s_first_entry() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "tags": {"language": "fre"},
+                },
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: the answer is still unchosen, and the cursor is on the top of the list
+        // rather than on the file's own (French) audio language.
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.language.as_str()).is_equal_to("");
+        assert_that!(popup.cursor).is_equal_to(0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `/` filters the language list, and choosing an entry from it changes `popup.language`
+    /// — the same searchable picker the subtitle settings dialog already offers, reached here
+    /// before the track exists rather than through a second visit to fix a wrong guess.
+    #[test]
+    fn choosing_a_language_in_the_create_track_popup_should_change_it() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+
+        // Act: open the list, narrow it to French, and take the only match.
+        app.activate_create_track();
+        assert_that!(app.create_track_popup.as_ref().unwrap().open).is_true();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages().len()).is_equal_to(1);
+        app.activate_create_track();
+
+        // Assert
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.language.as_str()).is_equal_to("fra");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The file created carries whichever language the reader chose in the popup — proving
+    /// the popup's answer actually reaches the sidecar rather than something derived from
+    /// the media a second time when the track is written.
+    #[test]
+    fn creating_a_track_should_use_the_language_chosen_in_the_popup() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1); // Format -> Language
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        app.activate_create_track();
+        app.move_create_track_cursor(1); // Language -> Placement
+        app.move_create_track_choice(true); // External
+        app.move_create_track_cursor(1); // Placement -> Action
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: the sidecar's name carries the chosen language, not the guessed one.
+        assert_that!(directory.join("movie.fra.srt").exists()).is_true();
+        assert_that!(directory.join("movie.eng.srt").exists()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Typing a query that matches nothing leaves the row's own answer untouched — `Enter`
+    /// on an empty list has nothing to commit, so it closes the list without changing
+    /// `language`, the same as `Esc` would.
+    #[test]
+    fn the_create_track_language_search_should_report_no_matches_without_changing_the_answer() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+
+        // Act
+        for character in "zzzzz".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages()).is_empty();
+        app.activate_create_track();
+
+        // Assert: the list closed — there was nothing under the cursor to take — and the
+        // row is still unanswered.
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.language.as_str()).is_equal_to("");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` while typing drops the query and shows every common language again, without
+    /// closing the list — narrowing a search is not the same as answering the row.
+    #[test]
+    fn cancelling_the_create_track_language_search_should_restore_the_full_list() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.start_create_track_language_search();
+        for character in "french".chars() {
+            app.input_text_char(character);
+        }
+        assert_that!(app.filtered_create_track_languages().len()).is_equal_to(1);
+
+        // Act
+        app.cancel_create_track_language_search();
+
+        // Assert
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor).is_equal_to(0);
+        assert_that!(app.filtered_create_track_languages().len()).is_greater_than(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Enter` on `Create` (or its mnemonic) before a language is chosen writes nothing and
+    /// keeps the popup up, with a notice naming what is missing — the same shape every other
+    /// refusal in this popup already takes, rather than silently falling back to a guess the
+    /// reader never saw.
+    #[test]
+    fn creating_a_track_should_be_refused_until_a_language_is_chosen() {
+        // Arrange: the cursor reaches Action without ever answering Language.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Action);
+
+        // Act
+        app.activate_create_track();
+
+        // Assert: refused, in words, with the popup still up and nothing written.
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Choose a language")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.is_some()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `c`/`C` mnemonic answers the same refusal as `Enter` on `Create` — it reaches the
+    /// same guard, since both go through `App::confirm_create_track`.
+    #[test]
+    fn the_create_track_mnemonic_should_also_refuse_without_a_language() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act
+        app.create_track_now();
+
+        // Assert
+        assert_that!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Choose a language")
+        )
+        .is_true();
+        assert_that!(app.create_track_popup.is_some()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar written beside a file the matcher will never look at is an orphan: it gets no
+    /// row, so the page would have nothing to open. Refused with a sentence rather than
+    /// silently, since the reader pressed a key and is owed an answer.
+    #[test]
+    fn a_should_refuse_a_file_no_sidecar_can_attach_to() {
+        // Arrange: a video in a container the sidecar matcher does not scan. It reaches the
+        // track list perfectly well — the refusal is on the file's extension, because that is
+        // what decides whether a sidecar beside it would ever be found again.
+        let mut app = test_file_app(&["movie.mpg"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+
+        // Act
+        app.open_create_track();
+
+        // Assert
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.clone())
+            .contains("Reel can only add a subtitle track beside a video file.".to_string());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every refusal is raised before anything is written — a file left behind by a press that
+    /// then declines to open the page would be the worst of both answers.
+    #[test]
+    fn a_should_write_nothing_until_the_popup_is_answered() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let before = std::fs::read_dir(&directory).unwrap().count();
+
+        // Act: open it, walk it, and back out again.
+        app.open_create_track();
+        app.activate_create_track();
+        app.activate_create_track();
+        app.escape_create_track();
+        app.escape_create_track();
+
+        // Assert
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(before);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A build with no libass still gets the page: the cues are editable whether or not a
+    /// frame can be drawn behind them, and the pane says why it is blank. Reading SubRip needs
+    /// no external tool at all, so there is nothing here for a capability check to refuse.
+    #[test]
+    fn a_should_make_a_track_on_a_build_that_cannot_draw_frames() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = crate::subtitle::ToolCapabilities::default();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.eng.srt").exists()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_should_be_inert_outside_the_streams_layer_or_behind_a_dialog() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act / Assert: wrong layer.
+        app.layer = Layer::Files;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+
+        // Act / Assert: a dialog already up.
+        app.layer = Layer::Streams;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_create_track();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc` peels one level at a time — the open list, then the dialog — so changing your
+    /// mind about one choice does not cost the whole popup.
+    #[test]
+    fn escape_should_back_out_of_the_create_track_dialog_one_level_at_a_time() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+        app.activate_create_track();
+        assert_that!(app.create_track_popup.as_ref().unwrap().open).is_true();
+
+        // Act / Assert: the open list closes first.
+        app.escape_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.field).is_equal_to(CreateTrackField::Format);
+
+        // And only then does the dialog go — there is no step left to peel.
+        app.escape_create_track();
+        assert_that!(app.create_track_popup.is_none()).is_true();
+        assert_that!(app.dialog.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `gg`/`G` move between the popup's four rows when no list is open, and through the
+    /// open list when one is — the same two axes every other settings popup has.
+    #[test]
+    fn the_create_track_dialog_should_navigate_like_every_other_list() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act / Assert: between the rows.
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Action);
+        app.move_create_track_to_endpoint(false);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Kind);
+
+        // Act / Assert: and through the open list, which cannot run off its end.
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+        app.move_create_track_to_endpoint(true);
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor)
+            .is_equal_to(NewTrackFormat::ORDER.len() - 1);
+        app.move_create_track_cursor(5);
+        assert_that!(app.create_track_popup.as_ref().unwrap().cursor)
+            .is_equal_to(NewTrackFormat::ORDER.len() - 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The file is named for the media, with `und` for a language the reader has not been
+    /// asked for — the sidecar matcher requires one as the name's first component.
+    #[test]
+    fn creating_a_track_should_write_an_empty_sidecar_named_for_the_media() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert: written, empty, and the page is open on it with the cursor where `i` works.
+        let path = directory.join("movie.eng.srt");
+        assert_that!(path.exists()).is_true();
+        assert_that!(std::fs::read_to_string(&path).unwrap()).is_equal_to(String::new());
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Sidecar(path));
+        // External stages nothing at all: the sidecar is what the save writes.
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Internal is the default, and it is the import mark `Ctrl+H` sets rather than a second
+    /// mechanism — so the save converts the sidecar, muxes it in and deletes the file.
+    #[test]
+    fn creating_an_internal_track_should_stage_the_import() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::Internal);
+
+        // Assert
+        let source = SubtitleSource::Sidecar(directory.join("movie.eng.srt"));
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the import should be staged");
+        assert_that!(change.import_into_media).is_true();
+        // Which is what puts the row among the container's own subtitles rather than in the
+        // sidecar column beside them.
+        assert_that!(
+            app.active_left_subtitle_tracks()
+                .contains(&TrackRef::Sidecar(0))
+        )
+        .is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The track's language never comes from the media's own audio — a subtitle track is as
+    /// often a translation as a transcript of what is spoken, so an audio tag naming a
+    /// language nothing else in the popup asks about must not silently steer what gets
+    /// written. Whatever the audio says, the language actually written is whichever one the
+    /// reader picked in the popup (`create_track_with` searches for English), never the
+    /// audio's own tag.
+    #[test]
+    fn a_new_track_s_language_should_never_come_from_the_media_s_audio() {
+        // Arrange: audio tagged Dutch.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "tags": {"language": "nld"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.layer = Layer::Streams;
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.nld.srt").exists()).is_false();
+        assert_that!(directory.join("movie.eng.srt").exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A second track beside the first takes the next free number, the convention the rest of
+    /// the application's sidecar naming already uses.
+    #[test]
+    fn creating_a_track_should_number_past_a_name_that_is_taken() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        // Something in it, so leaving does not take it back off the disk.
+        std::fs::write(
+            directory.join("movie.eng.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nx\n\n",
+        )
+        .unwrap();
+        app.back();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(directory.join("movie.eng.1.srt").exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An `a` pressed by mistake has to cost nothing, which is the rule the page already
+    /// applies to a cue editor closed with nothing typed in it.
+    #[test]
+    fn leaving_an_untouched_new_track_should_take_the_file_back_off_the_disk() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::Internal);
+        let path = directory.join("movie.eng.srt");
+        assert_that!(path.exists()).is_true();
+
+        // Act
+        app.back();
+
+        // Assert: the file goes, and the import mark it was carrying goes with it — leaving
+        // that behind would stage an edit against a track that no longer exists.
+        assert_that!(path.exists()).is_false();
+        assert_that!(app.new_track.is_none()).is_true();
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.sidecars.is_empty()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue typed into it is work to be written rather than an accident to be swept up.
+    #[test]
+    fn leaving_a_new_track_with_a_cue_in_it_should_keep_the_file() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+
+        // Act: the question is raised rather than the page simply closing, since leaving would
+        // discard the cue — and answering "stay" must not delete the file either.
+        app.request_leave_subtitle_edit();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Discarding the cue edits takes the file with them: the reader has said they want none
+    /// of it, and what is left is the empty file `a` wrote.
+    #[test]
+    fn discarding_the_cue_edits_on_a_new_track_should_take_the_file_too() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+        app.request_leave_subtitle_edit();
+
+        // Act
+        app.resolve_leave_subtitle_edit(true);
+
+        // Assert
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(path.exists()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar the session did not create is somebody else's file, however empty it is.
+    #[test]
+    fn leaving_a_page_should_never_delete_a_sidecar_it_did_not_make() {
+        // Arrange: an empty sidecar already on disk, opened the ordinary way with `c`.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let path = directory.join("movie.eng.srt");
+        std::fs::write(&path, "").unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        focus_track(&mut app, TrackRef::Sidecar(0));
+        app.open_subtitle_edit();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every popup entry point is reachable from a key `main` still delivers, so each has to
+    /// be inert on its own when there is no popup — the guard the rest of the dialogs keep.
+    #[test]
+    fn the_create_track_entry_points_should_be_inert_with_no_popup() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+
+        // Act / Assert
+        assert_that!(app.create_track_choices().is_empty()).is_true();
+        app.move_create_track_cursor(1);
+        app.move_create_track_to_endpoint(true);
+        app.activate_create_track();
+        app.escape_create_track();
+        assert_that!(app.create_track_popup.is_none()).is_true();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// There is no track list drawn to have pressed `a` on when no file is selected or the
+    /// probe is still out, so it is inert rather than a refusal with something to say.
+    #[test]
+    fn a_should_be_inert_before_there_is_a_file_to_add_a_track_to() {
+        // Act / Assert: no file selected at all.
+        let mut app = test_file_app(&[]);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.is_none()).is_true();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        // Act / Assert: a file, but its metadata has not arrived.
+        let mut app = test_file_app(&["movie.mkv"]);
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.outcome = None;
+        app.open_create_track();
+        assert_that!(app.dialog.is_none()).is_true();
+        assert_that!(app.notice.is_none()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Format and Language are reachable in both directions, and Format opens its own list —
+    /// even though it holds one entry today.
+    #[test]
+    fn the_create_track_dialog_should_open_either_row_of_its_second_step() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act / Assert: down to language and back up to format.
+        app.move_create_track_cursor(1);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Language);
+        app.move_create_track_cursor(-1);
+        assert_that!(app.create_track_popup.as_ref().unwrap().field)
+            .is_equal_to(CreateTrackField::Format);
+
+        // Act / Assert: the format row opens and commits like any other, leaving the reader on
+        // the row — there is still a placement to answer.
+        app.activate_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_true();
+        assert_that!(app.create_track_choices())
+            .is_equal_to(vec![NewTrackFormat::SubRip.label().to_string()]);
+        app.activate_create_track();
+        let popup = app.create_track_popup.as_ref().expect("still open");
+        assert_that!(popup.open).is_false();
+        assert_that!(popup.format).is_equal_to(NewTrackFormat::SubRip);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup outlives the state that allowed it — a background reconcile can take the file
+    /// away while the reader is still choosing — so the answers are re-checked before a file is
+    /// written rather than trusted.
+    #[test]
+    fn creating_a_track_should_do_nothing_once_the_file_it_was_for_has_gone() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        app.open_create_track();
+
+        // Act: the file vanishes from under the open dialog.
+        std::fs::remove_file(directory.join("movie.mkv")).unwrap();
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        app.move_create_track_cursor(1);
+        app.move_create_track_cursor(1);
+        app.activate_create_track();
+
+        // Assert: nothing written, and no page opened on a file that is not there.
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(0);
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The three things that must stop the cleanup, each of which would otherwise delete a file
+    /// somebody is still using.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_work_still_in_flight() {
+        // Arrange / Act / Assert: a save in flight. `confirm_process_all` closes the page while
+        // the file is still empty and the reader's cue lives in `staged_edits`, so an unguarded
+        // hook here would delete a file out from under its own save.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.active_batch = Some(crate::staging::BatchState {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            items: Vec::new(),
+            started: std::time::Instant::now(),
+        });
+        app.back();
+        assert_that!(path.exists()).is_true();
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        // Arrange / Act / Assert: a page waiting to be reopened after a save.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media: directory.join("movie.mkv"),
+            source: SubtitleSource::Sidecar(path.clone()),
+            cue: 0,
+        });
+        app.back();
+        assert_that!(path.exists()).is_true();
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        // Arrange / Act / Assert: the page has moved to another track. Only the page's own
+        // file is ever swept up.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        app.subtitle_edit = None;
+        app.back();
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue snapshotted into `staged_edits` is work waiting to be written, even though the
+    /// live map has been cleared — so it holds the file just as a live one does.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_a_cue_snapshotted_into_the_staged_edits() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+        app.snapshot_current_edits();
+        app.subtitle_changes.clear();
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory already holding a hundred subtitle files for one video is one where the
+    /// reader wants a word rather than a hundred and first file.
+    #[test]
+    fn creating_a_track_should_give_up_rather_than_number_for_ever() {
+        // Arrange: every name the numbering would try is taken.
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        for number in 0..=MAX_NEW_TRACK_NUMBER {
+            let name = crate::subtitle::sidecar_filename(
+                "movie",
+                "eng",
+                false,
+                false,
+                (number > 0).then_some(number),
+                SubtitleFormat::SubRip,
+            );
+            std::fs::write(directory.join(name), "").unwrap();
+        }
+        let before = std::fs::read_dir(&directory).unwrap().count();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(app.notice.clone())
+            .contains("There are already too many subtitle files for this one.".to_string());
+        assert_that!(std::fs::read_dir(&directory).unwrap().count()).is_equal_to(before);
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory that cannot be written to is reported rather than left looking like a key
+    /// that did nothing.
+    #[test]
+    fn creating_a_track_should_report_a_directory_it_cannot_write_to() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        let mut permissions = std::fs::metadata(&directory).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&directory, permissions).unwrap();
+
+        // Act
+        create_track_with(&mut app, NewTrackPlacement::External);
+
+        // Assert
+        assert_that!(app.notice.clone().unwrap_or_default().as_str())
+            .contains("Could not create the subtitle file");
+        assert_that!(app.layer).is_not_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        let mut permissions = std::fs::metadata(&directory).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&directory, permissions).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page can close without the reader leaving it — selecting another file does exactly
+    /// that — and a cue typed into the new track is work to be written either way.
+    #[test]
+    fn the_new_track_cleanup_should_stand_down_for_a_cue_still_staged_live() {
+        // Arrange
+        let mut app = app_ready_to_create_a_track();
+        let directory = app.directory.clone();
+        create_track_with(&mut app, NewTrackPlacement::External);
+        let path = directory.join("movie.eng.srt");
+        let source = SubtitleSource::Sidecar(path.clone());
+        app.insert_cue(&source, Duration::from_secs(1), "First line".to_string());
+
+        // Act: the page closes without the reader having answered a leave prompt.
+        app.close_subtitle_edit(PageExit::Leaving);
+
+        // Assert
+        assert_that!(path.exists()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page shows one track of one file. Selecting a different file has to close it,
+    /// or it keeps showing cues belonging to a file that is no longer open.
+    #[test]
+    fn selecting_another_file_should_close_the_edit_page() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app.open_subtitle_edit();
+        let workspace = app
+            .subtitle_edit
+            .as_ref()
+            .unwrap()
+            .workspace()
+            .to_path_buf();
+
+        // Act
+        app.layer = Layer::Files;
+        app.select_next();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(workspace.exists()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `j`/`k` reach `App` with no layer guard of their own, so without an arm of its
+    /// own the subtitle edit page would silently scroll the file list behind it instead.
+    #[test]
+    fn select_next_should_move_the_cue_cursor_rather_than_the_file_list_on_the_edit_page() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv", "other.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(2),
+                    text: "one".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+                crate::cue::Cue {
+                    index: 1,
+                    start: Duration::from_secs(3),
+                    end: Duration::from_secs(4),
+                    text: "two".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+            ],
+            CueStyle::SubRip,
+        );
+        let file_before = app.list_state.selected();
+
+        // Act
+        app.select_next();
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.list_state.selected()).is_equal_to(file_before);
+
+        // Act / Assert: and back up again.
+        app.select_previous();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.list_state.selected()).is_equal_to(file_before);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn paging_and_jumping_should_move_the_cue_cursor_on_the_edit_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let cues = (0..30)
+            .map(|index| crate::cue::Cue {
+                index,
+                start: Duration::from_secs(index as u64),
+                end: Duration::from_secs(index as u64 + 1),
+                text: format!("line {index}"),
+                dialogue: Vec::new(),
+                events: 1,
+            })
+            .collect();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(cues, CueStyle::SubRip);
+
+        // Act / Assert
+        app.scroll_down();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(10);
+        app.scroll_up();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+        app.select_last();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(29);
+        app.select_first();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A subtitle edit page with two cues on it, for the cue editor's tests.
+    fn edit_cue_at(start: u64, end: u64, text: &str) -> crate::cue::Cue {
+        crate::cue::Cue {
+            index: 0,
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+            text: text.into(),
+            dialogue: Vec::new(),
+            events: 1,
+        }
+    }
+
+    fn cue_editing_app() -> (App, PathBuf) {
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line"),
+            ],
+            CueStyle::SubRip,
+        );
+        (app, directory)
+    }
+
+    /// The editor is a text buffer, so every key that reaches it has to do the obvious
+    /// thing to a two-line cue — including the two that only a multi-line buffer has:
+    /// `Enter` splitting a line and `Backspace` joining one back.
+    #[test]
+    fn the_cue_editor_should_edit_text_across_lines() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+
+        // Act: type at the end, break the line, and type on the new one.
+        app.cue_editor_insert('>');
+        app.cue_editor_newline();
+        app.cue_editor_insert('t');
+        app.cue_editor_insert('w');
+        app.cue_editor_insert('o');
+
+        // Assert
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!(editor.text().as_str()).is_equal_to("First line>\ntwo");
+        assert_that!(editor.is_modified()).is_true();
+
+        // Act / Assert: backspace at the start of a line joins it to the one above.
+        app.move_cue_editor_home(false);
+        app.cue_editor_backspace();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str())
+            .is_equal_to("First line>two");
+
+        // Act / Assert: and delete takes the character under the caret.
+        app.move_cue_editor_home(false);
+        app.cue_editor_delete();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("irst line>two");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The caret walks the buffer as one string that happens to be broken, so `Left` at the
+    /// start of the second line belongs at the end of the first — and every move stays
+    /// inside the text however far it is pushed.
+    #[test]
+    fn the_cue_editor_caret_should_wrap_between_lines_and_stay_inside_the_text() {
+        // Arrange: a two-line cue.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.move_cue_editor_home(true);
+        app.cue_editor_newline();
+        app.cue_editor_insert('a');
+
+        // Act / Assert: left off the start of the second line lands at the end of the first.
+        app.move_cue_editor_home(false);
+        app.move_cue_editor_cursor(-1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((0, "First line".len()));
+
+        // Act / Assert: right off the end goes back down.
+        app.move_cue_editor_cursor(1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((1, 0));
+
+        // Act / Assert: neither end runs off the buffer, and a step of nothing moves
+        // nothing.
+        app.move_cue_editor_cursor(0, -1);
+        app.move_cue_editor_home(false);
+        app.move_cue_editor_cursor(-1, 0);
+        app.move_cue_editor_cursor(0, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((0, 0));
+        app.move_cue_editor_cursor(0, 5);
+        app.move_cue_editor_cursor(1, 0);
+        app.move_cue_editor_cursor(1, 0);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!((editor.row, editor.column)).is_equal_to((1, 1));
+
+        // Act / Assert: and moving up onto a longer line keeps the caret on it.
+        app.move_cue_editor_cursor(0, -1);
+        let editor = app.cue_editor.as_ref().unwrap();
+        assert_that!(editor.row).is_equal_to(0);
+        assert_that!(editor.column <= "First line".chars().count()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Closing the editor stages the edit rather than discarding it, and the page shows the
+    /// new words at once — the list, and the frame, which was drawn with the old ones
+    /// burned into it.
+    #[test]
+    fn closing_the_cue_editor_should_stage_the_edit_and_show_it_on_the_page() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+
+        // Act
+        app.close_cue_editor();
+
+        // Assert: staged against the track, and on the page.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the edit should be staged against the track");
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
+        assert_that!(edit.original.text.as_str()).is_equal_to("First line");
+        assert_that!(edit.text.as_str()).is_equal_to("First line!");
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].text.as_str())
+            .is_equal_to("First line!");
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(
+            app.staged_cue_edits()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.has_track_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Editing a cue back to what it said is not an edit, and must leave nothing staged —
+    /// otherwise the file would be rewritten, and the page would ask about unsaved work,
+    /// over a change the reader undid. The *original* stays the file's text across a second
+    /// visit, so the writer still checks against what is on disk.
+    #[test]
+    fn editing_a_cue_back_to_its_own_text_should_stage_nothing() {
+        // Arrange: one edit staged.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act: open it again and take the character back off.
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.as_ref().unwrap().original.as_str()).is_equal_to("First line!");
+        app.cue_editor_backspace();
+        app.close_cue_editor();
+
+        // Assert: nothing staged at all, since the text is the file's again.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].text.as_str())
+            .is_equal_to("First line");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An ASS cue names a style and positions itself against the script rather than
+    /// carrying its own appearance, so editing the stripped text the list shows would throw
+    /// the styling away. The refusal says so instead.
+    #[test]
+    fn the_cue_editor_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "A sign".into(),
+                dialogue: vec!["Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,A sign".into()],
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        app.open_cue_editor();
+
+        // Assert
+        assert_that!(app.cue_editor.is_none()).is_true();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A nudge stages the cue's new timing against the *file's*, and a burst of them stays
+    /// one edit measured from where the file has it rather than from the last press.
+    #[test]
+    fn nudging_a_cue_should_stage_it_against_the_timing_the_file_gives_it() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_true();
+
+        // Act: three steps later, in two bursts.
+        app.nudge_selected_cue(2);
+        app.nudge_selected_cue(1);
+
+        // Assert: one entry, holding the file's timing and the new one.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the nudge should be staged against the track");
+        assert_that!(change.cues.edits.len()).is_equal_to(1);
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
+        assert_that!(edit.original.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
+        assert_that!(edit.start).is_equal_to(Duration::from_millis(1150));
+        assert_that!(edit.end).is_equal_to(Duration::from_millis(2150));
+
+        // Assert: the words came along untouched, so a save cannot rewrite them.
+        assert_that!(edit.text.as_str()).is_equal_to("First line");
+        assert_that!(edit.original.text.as_str()).is_equal_to("First line");
+
+        // Assert: and the page, the count and the shift readout all agree.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_millis(1150));
+        assert_that!(app.selected_cue_shift()).is_equal_to(Some(150));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With an edge selected, `h`/`l` move that end and leave the other, so what changes is
+    /// how long the line is on screen rather than when it is.
+    #[test]
+    fn resizing_a_cue_should_stage_it_against_the_length_the_file_gives_it() {
+        // Arrange: a cue the file has running 1s → 2s.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+
+        // Act: the end selected and moved out by two steps, then the start selected and moved
+        // back by one.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(2);
+        app.move_cue_grip(false);
+        app.move_cue_grip(false);
+        app.nudge_selected_cue(-1);
+
+        // Assert: one entry, holding the file's timing and the new one.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the resize should be staged against the track");
+        assert_that!(change.cues.edits.len()).is_equal_to(1);
+        let edit = change
+            .cues
+            .edits
+            .get(&0)
+            .expect("cue zero should be staged");
+        assert_that!(edit.original.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
+        assert_that!(edit.start).is_equal_to(Duration::from_millis(950));
+        assert_that!(edit.end).is_equal_to(Duration::from_millis(2100));
+
+        // Assert: the words came along untouched, so a save cannot rewrite them.
+        assert_that!(edit.text.as_str()).is_equal_to("First line");
+
+        // Assert: the page agrees, and both readouts say what happened — the start moved,
+        // and the line is now on screen for longer than the file says.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_millis(2100));
+        assert_that!(app.selected_cue_shift()).is_equal_to(Some(-50));
+        assert_that!(app.selected_cue_length_change())
+            .is_equal_to(Some(Duration::from_millis(1150)));
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: back to the length the file gives it and the readout stands down,
+        // even though the cue is still shifted.
+        app.nudge_selected_cue(1);
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(-2);
+        assert_that!(app.selected_cue_length_change()).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A press that moves nothing — an edge already against the floor — stages nothing new,
+    /// so a held key there neither rewrites the staged timing nor re-renders a frame per
+    /// repeat.
+    #[test]
+    fn an_edge_press_against_the_floor_should_leave_the_staged_timing_alone() {
+        // Arrange: a cue the file has running 1s → 2s, with its end selected.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        app.move_cue_grip(true);
+        let staged = |app: &App| {
+            app.subtitle_changes
+                .get(&SubtitleSource::Embedded(2))
+                .and_then(|change| change.cues.edits.get(&0))
+                .map(|edit| (edit.start, edit.end))
+        };
+
+        // Act: the end pulled in by far more than the cue has, which stops on the floor.
+        app.nudge_selected_cue(-100);
+        let floor = Duration::from_secs(1) + subtitle_edit::MIN_CUE_LENGTH;
+        assert_that!(staged(&app)).is_equal_to(Some((Duration::from_secs(1), floor)));
+
+        // Act: pressed again, and held, against the floor.
+        app.nudge_selected_cue(-1);
+        app.nudge_selected_cue(-10);
+
+        // Assert: the page's cue and the staged edit are both exactly where the floor left them.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end).is_equal_to(floor);
+        assert_that!(staged(&app)).is_equal_to(Some((Duration::from_secs(1), floor)));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Ctrl+H`/`Ctrl+L` walk the selection along the cue — start, whole cue, end — and stop
+    /// at both ends. `t` always turns the mode on with the whole cue selected, turns it off
+    /// from any selection, and the selection follows the cursor to another cue.
+    #[test]
+    fn the_cue_grip_should_walk_along_the_cue_and_start_on_the_whole_cue_each_time() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: left to the start, and no further.
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Start));
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Start));
+
+        // Act / Assert: right through the whole cue to the end, and no further — a real step
+        // clears a stale refusal the way every other movement on the page does.
+        app.notice = Some(CUE_MARKED_FOR_DELETION.into());
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+        assert_that!(app.notice.is_none()).is_true();
+        app.move_cue_grip(true);
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::End));
+
+        // Assert: choosing what moves moved nothing.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: the selection follows the cursor to the next cue.
+        app.select_next();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::End));
+
+        // Act / Assert: `t` leaves from the end, and the next `t` starts on the whole cue.
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: `T` replaces an edge selection, and `t` from there starts whole again.
+        app.move_cue_grip(true);
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        app.toggle_cue_timing_mode();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Cue(CueGrip::Whole));
+
+        // Act / Assert: with no page open there is nothing to select.
+        app.subtitle_edit = None;
+        app.move_cue_grip(false);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Selecting an edge is the timing mode's, so it is inert with the mode off and at the
+    /// scale where `h`/`l` move the whole file — and moving one is refused outright on a cue
+    /// the reader has said is leaving, exactly as a nudge is.
+    #[test]
+    fn resizing_should_be_refused_outside_the_cue_scale_and_on_a_deleted_cue() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+
+        // Act / Assert: with the mode off, no edge to select and nothing moved.
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(1);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+
+        // Act / Assert: at track scale, nothing either — `T` is aimed at the file, and one
+        // cue's length is not something a whole-file key changes.
+        app.toggle_global_retiming();
+        app.move_cue_grip(true);
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        app.open_cue_length_dialog();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: at cue scale on a cue marked to go, refused in the same words the
+        // editor and the nudge use.
+        app.toggle_cue_timing_mode();
+        app.toggle_delete_selected_cue();
+        // Marking advances the cursor, so the cursor has to come back to the marked row for
+        // the refusal to be the one under test.
+        app.select_previous();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+        app.notice = None;
+        app.move_cue_grip(true);
+        app.nudge_selected_cue(1);
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_MARKED_FOR_DELETION));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+        app.notice = None;
+        app.open_cue_length_dialog();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_MARKED_FOR_DELETION));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The dialog opens holding the cue's real length, takes a typed one, and stages it the
+    /// same way a nudge does.
+    #[test]
+    fn the_length_dialog_should_open_on_the_cues_length_and_stage_what_is_typed() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+
+        // Act
+        app.open_cue_length_dialog();
+
+        // Assert: the field opens active, holding the second the file gives this cue.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        let draft = app.cue_length.as_ref().expect("the draft should be there");
+        assert_that!(draft.input.value.as_str()).is_equal_to("00:01.000");
+        assert_that!(draft.input.is_active).is_true();
+        assert_that!(app.active_text_input()).is_equal_to(Some(TextInputSite::CueLength));
+
+        // Act: retype it as three and a half seconds.
+        for _ in 0..9 {
+            app.backspace_text();
+        }
+        for character in "00:03.500".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+
+        // Assert: closed, and staged with the start kept and the end moved.
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.cue_length.is_none()).is_true();
+        let cue = &app.subtitle_edit.as_ref().unwrap().cues[0];
+        assert_that!(cue.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(cue.end).is_equal_to(Duration::from_millis(4500));
+        let edit = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .and_then(|change| change.cues.edits.get(&0))
+            .expect("the typed length should be staged");
+        assert_that!(edit.original.end).is_equal_to(Duration::from_secs(2));
+        assert_that!(edit.end).is_equal_to(Duration::from_millis(4500));
+        assert_that!(app.selected_cue_length_change())
+            .is_equal_to(Some(Duration::from_millis(3500)));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A value the dialog cannot use keeps it open and says why. Closing on one would throw
+    /// the typing away and leave the cue unchanged, which is the one outcome a reader cannot
+    /// tell apart from success.
+    #[test]
+    fn a_length_that_cannot_be_used_should_keep_the_dialog_open() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        app.open_cue_length_dialog();
+        for _ in 0..9 {
+            app.backspace_text();
+        }
+
+        // Act / Assert: an arrangement of digits that is not a time.
+        for character in "1:2:3:4".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_LENGTH_UNREADABLE));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: and a length no cue can have.
+        for _ in 0..7 {
+            app.backspace_text();
+        }
+        for character in "00:00.010".chars() {
+            app.input_text_char(character);
+        }
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::CueLength));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some(CUE_LENGTH_TOO_SHORT));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: the field refuses a letter outright, so nothing else can reach here.
+        app.input_text_char('x');
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:00.010");
+
+        // Act / Assert: `Esc` drops the typing and leaves the cue exactly as it was.
+        app.cancel_cue_length();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.cue_length.is_none()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].end)
+            .is_equal_to(Duration::from_secs(2));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Act / Assert: reopening shows the cue's length again rather than what was typed.
+        app.open_cue_length_dialog();
+        assert_that!(app.cue_length.as_ref().unwrap().input.value.as_str())
+            .is_equal_to("00:01.000");
+
+        // Act / Assert: committing the length it already has stages nothing at all.
+        app.commit_cue_length();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue nudged back to where the file has it stops being an edit, whether it is walked
+    /// back a step at a time or put back with `0`.
+    #[test]
+    fn a_cue_returned_to_its_own_timing_should_stage_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+
+        // Act / Assert: out and back by hand.
+        app.nudge_selected_cue(1);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        app.nudge_selected_cue(-1);
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.has_track_edits()).is_false();
+
+        // Act / Assert: and `0` after a longer burst does the same in one press.
+        app.nudge_selected_cue(4);
+        app.nudge_selected_cue(3);
+        app.reset_selected_cue_timing();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.selected_cue_shift()).is_none();
+
+        // Act / Assert: with nothing staged there is nothing for `0` to restore, and it
+        // must not invent a timing of its own.
+        app.reset_selected_cue_timing();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `0` restores the cue's timing and leaves its words where the reader put them: it is a
+    /// key of the timing mode, and someone who retimed *and* rewrote a line has not asked
+    /// for their typing back.
+    #[test]
+    fn resetting_a_cues_timing_should_keep_a_rewrite_staged_against_it() {
+        // Arrange: one cue carrying both kinds of edit.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+
+        // Act
+        app.reset_selected_cue_timing();
+
+        // Assert: the timing is the file's again and the words are still the reader's.
+        let edit = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .and_then(|change| change.cues.edits.get(&0))
+            .expect("the rewrite should still be staged");
+        assert_that!(edit.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edit.text.as_str()).is_equal_to("First line!");
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A global shift stages an edit for every cue in the track, each carrying the file's own
+    /// words and the timing it has been moved to.
+    ///
+    /// The staging is the half that fails invisibly: the page's list can be moved correctly
+    /// while the edits are keyed against the wrong cues or never created at all, and every
+    /// assertion short of the map still passes.
+    #[test]
+    fn global_retiming_should_stage_every_cue_in_the_track() {
+        // Arrange: two cues, at 1s → 2s and 3s → 4s.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act: three steps on, so the whole track moves 150ms.
+        app.shift_whole_track(3);
+
+        // Assert: the page's cues moved together.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(1150));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_millis(3150));
+        assert_that!(app.track_shift()).is_equal_to(Some(150));
+
+        // Assert: and so did the staged edits, each still pinned to what the file says.
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged")
+            .cues
+            .edits;
+        assert_that!(edits.len()).is_equal_to(2);
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_millis(1150));
+        assert_that!(edits[&0].original.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(edits[&0].text.as_str()).is_equal_to("First line");
+        assert_that!(edits[&1].start).is_equal_to(Duration::from_millis(3150));
+        assert_that!(edits[&1].original.start).is_equal_to(Duration::from_secs(3));
+
+        // Assert: every row of the panel says so, which is what the border counts.
+        assert_that!(app.staged_cue_edits().len()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track shifted back to where the file has it stops being an edit, the same way one
+    /// cue does — otherwise a reader who changed their mind leaves the file looking modified
+    /// and is asked about discarding work that amounts to nothing.
+    #[test]
+    fn a_track_shifted_back_to_its_own_timing_should_stage_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act: out and back again.
+        app.shift_whole_track(4);
+        app.shift_whole_track(-4);
+
+        // Assert: nothing staged, and the track is not left looking modified.
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.track_shift()).is_none();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue the reader added this session moves with the track, and moves in the *inserts*
+    /// rather than being given an edit keyed against a line the file does not have.
+    #[test]
+    fn global_retiming_should_carry_an_inserted_cue_with_the_rest() {
+        // Arrange: a cue added from the timeline, between the file's two.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(5, Duration::from_secs(1));
+        app.open_cue_editor();
+        app.cue_editor_insert('N');
+        app.close_cue_editor();
+        let inserted = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .and_then(|change| change.cues.inserts.get(&0))
+            .map(|insert| insert.start)
+            .expect("the cue should be staged as an insertion");
+
+        // Act
+        app.toggle_global_retiming();
+        app.shift_whole_track(2);
+
+        // Assert: the insertion moved by the same 100ms as the file's cues.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged");
+        assert_that!(change.cues.inserts[&0].start)
+            .is_equal_to(inserted + Duration::from_millis(100));
+        assert_that!(change.cues.edits[&0].start).is_equal_to(Duration::from_millis(1100));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue marked to go shifts with the track, where a per-cue nudge refuses one.
+    ///
+    /// The mark can be taken back off, and a line left behind by every shift since would be a
+    /// silent surprise. The row still reads as deleted rather than as edited.
+    #[test]
+    fn global_retiming_should_move_a_cue_marked_for_deletion_too() {
+        // Arrange: the first cue marked to go.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_delete_selected_cue();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+
+        // Act
+        app.toggle_global_retiming();
+        app.shift_whole_track(2);
+
+        // Assert: it moved with the rest, and is still marked to go.
+        let change = app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged");
+        assert_that!(change.cues.edits[&0].start).is_equal_to(Duration::from_millis(1100));
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_millis(1100));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `r` at track scale puts every cue back to the file's timing and keeps every word the
+    /// reader typed — the wide version of what `r` already does to one cue.
+    #[test]
+    fn resetting_at_track_scale_should_restore_every_timing_and_keep_the_words() {
+        // Arrange: one cue rewritten, then the whole track shifted, then one cue nudged on
+        // top of that — so the reset has all three kinds of work to answer for.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.toggle_global_retiming();
+        app.shift_whole_track(3);
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+        app.toggle_global_retiming();
+
+        // Act
+        app.reset_track_timing();
+
+        // Assert: every cue is back at the file's timing, hand nudges included.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_secs(1));
+        assert_that!(state.cues[1].start).is_equal_to(Duration::from_secs(3));
+        assert_that!(app.track_shift()).is_none();
+
+        // Assert: the rewritten cue kept its words, and the cue that was only moved is no
+        // longer an edit at all.
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the rewrite should still be staged")
+            .cues
+            .edits;
+        assert_that!(edits.len()).is_equal_to(1);
+        assert_that!(edits[&0].text.as_str()).is_equal_to("First line!");
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track nobody has moved has nothing to put back, and `r` on one changes nothing
+    /// rather than storing an empty change that makes the file look modified.
+    #[test]
+    fn resetting_a_track_nobody_moved_should_do_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+
+        // Act
+        app.reset_track_timing();
+
+        // Assert
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The two scales are one mode, so turning either on turns the other off and one `Esc`
+    /// leaves whichever is on. Two flags could disagree; one value cannot.
+    #[test]
+    fn the_two_timing_scales_should_replace_each_other() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+
+        // Act / Assert: `t` then `T` leaves the wide scale on, not both.
+        app.toggle_cue_timing_mode();
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+
+        // Act / Assert: and the narrow keys are inert while it is.
+        app.nudge_selected_cue(2);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Act / Assert: `T` again turns it off rather than cycling to the other scale.
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+
+        // Act / Assert: and the wide keys are inert once it is off.
+        app.shift_whole_track(2);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Act / Assert: one `Esc` leaves the wide scale, exactly as it leaves the narrow one.
+        app.toggle_global_retiming();
+        app.back();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every wide-scale key is inert off the page and under a dialog, the guard every other
+    /// key on this page carries — a dialog swallows the page's keys, and off the page there
+    /// is no track to retime.
+    #[test]
+    fn global_retiming_should_be_inert_off_the_page_and_under_a_dialog() {
+        // Arrange: retiming on, then a dialog raised over the page.
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_global_retiming();
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act / Assert: nothing moves and the scale cannot be changed under it.
+        app.shift_whole_track(2);
+        app.reset_track_timing();
+        app.toggle_global_retiming();
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Track);
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Arrange: back on the track list, where there is no page.
+        app.dialog = None;
+        app.layer = Layer::Streams;
+
+        // Act / Assert
+        app.shift_whole_track(2);
+        app.reset_track_timing();
+        app.toggle_global_retiming();
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Global retiming is refused on the same tracks the cue editor is, and the refusal names
+    /// the reason rather than leaving the key looking broken.
+    #[test]
+    fn global_retiming_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+
+        // Act
+        app.toggle_global_retiming();
+
+        // Assert: not in the mode, and told why.
+        assert_that!(app.timing_scope()).is_equal_to(TimingScope::Off);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Act / Assert: and the keys the mode would have given meaning to stay inert.
+        app.shift_whole_track(1);
+        app.reset_track_timing();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `A` dispatches one request carrying this page's media and cues, raises the blocking
+    /// `Dialog::AutoSyncing`, and marks the page syncing so a second press does nothing while
+    /// the first is still running.
+    #[test]
+    fn auto_sync_track_should_dispatch_a_request_for_the_pages_media_and_cues() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        let (generation, media) = {
+            let state = app.subtitle_edit.as_ref().unwrap();
+            (state.generation, state.media().to_path_buf())
+        };
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.auto_sync_track();
+
+        // Assert: one request, for this page's generation, media and cues.
+        let request = preview
+            .sync_rx
+            .try_recv()
+            .expect("a sync request should be sent");
+        assert_that!(request.generation).is_equal_to(generation);
+        assert_that!(request.media).is_equal_to(media);
+        assert_that!(request.cues.len()).is_equal_to(2);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().syncing).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::AutoSyncing));
+        assert_that!(app.sync_started.is_some()).is_true();
+
+        // Act / Assert: a second press while the first is still running sends nothing more.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The dialog's spinner is what makes `is_animating` true while `A` is decoding — with
+    /// no measured progress to show, `main`'s redraw loop has nothing else telling it to
+    /// keep painting frames while the worker runs.
+    #[test]
+    fn is_animating_should_hold_while_auto_sync_is_decoding() {
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        assert_that!(app.is_animating()).is_false();
+
+        app.auto_sync_track();
+        assert_that!(app.is_animating()).is_true();
+
+        app.apply_auto_sync_outcome(SyncOutcome::NotConfident);
+        assert_that!(app.is_animating()).is_false();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Automatic sync is refused on the same tracks the cue editor is, and for the same
+    /// reason: an ASS cue's timing is the anchor its own animation is measured from.
+    #[test]
+    fn auto_sync_track_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.auto_sync_track();
+
+        // Assert: nothing dispatched, told why, and no dialog raised over a refusal.
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `A` is inert off the page and under a dialog, the guard every other key on this page
+    /// carries.
+    #[test]
+    fn auto_sync_track_should_be_inert_off_the_page_and_under_a_dialog() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app.dialog = Some(Dialog::Keybindings);
+
+        // Act / Assert: swallowed under a dialog.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Arrange: back on the track list, where there is no page.
+        app.dialog = None;
+        app.layer = Layer::Streams;
+
+        // Act / Assert: swallowed off the page too.
+        app.auto_sync_track();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A found offset is staged exactly as a hand-nudged `T` would stage it, and reported.
+    #[test]
+    fn apply_auto_sync_outcome_should_stage_a_found_offset_and_report_it() {
+        // Arrange: cues at 1s and 3s.
+        let (mut app, directory) = cue_editing_app();
+
+        // Act: the worker found the track should move 1.35s later.
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(1_350));
+
+        // Assert: staged the same way `shift_whole_track` stages a hand nudge.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(2_350));
+        let edits = &app
+            .subtitle_changes
+            .get(&SubtitleSource::Embedded(2))
+            .expect("the shift should be staged")
+            .cues
+            .edits;
+        assert_that!(edits[&0].start).is_equal_to(Duration::from_millis(2_350));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by +1.35s"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A negative offset moves the track earlier and is reported with its sign.
+    #[test]
+    fn apply_auto_sync_outcome_should_stage_a_negative_offset() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(-500));
+
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.cues[0].start).is_equal_to(Duration::from_millis(500));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by -0.50s"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An offset of exactly zero moves nothing, and says so rather than claiming a shift
+    /// that did not happen.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_an_already_synced_track_rather_than_stage_nothing() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Applied(0));
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Already in sync."));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A low-confidence alignment stages nothing and says why, rather than moving the track
+    /// on a guess nobody asked for.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_low_confidence_without_staging_anything() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::NotConfident);
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref())
+            .is_equal_to(Some("Couldn't confidently align this track to the audio."));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A failed extraction (commonly, no audio track) reports `ffmpeg`'s own complaint
+    /// rather than a generic failure.
+    #[test]
+    fn apply_auto_sync_outcome_should_report_a_failed_extraction() {
+        let (mut app, directory) = cue_editing_app();
+
+        app.apply_auto_sync_outcome(SyncOutcome::Failed("no audio stream".into()));
+
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("no audio stream"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker's answer is applied only once it comes back for this page's own
+    /// generation, and it clears [`SubtitleEditState::syncing`] whether or not the answer
+    /// was one it could use — a stuck flag would refuse every future press silently. It also
+    /// closes `Dialog::AutoSyncing`, which took no key of its own to dismiss — a stuck dialog
+    /// would lock the reader out of the page entirely rather than just out of `A`.
+    #[test]
+    fn receive_preview_events_should_apply_a_sync_result_and_clear_the_syncing_flag() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        app.set_preview_handles(Some(preview.handles));
+        app.auto_sync_track();
+        preview
+            .sync_rx
+            .try_recv()
+            .expect("the dispatch should have sent a request");
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::AutoSyncing));
+
+        // Act
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx
+            .send(PreviewEvent::Sync {
+                generation,
+                outcome: SyncOutcome::Applied(150),
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&event_rx);
+
+        // Assert
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().syncing).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_millis(1_150));
+        assert_that!(app.notice.as_deref()).is_equal_to(Some("Synced: shifted by +0.15s"));
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.sync_started.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A result for a page the reader has since left is dropped, the same rule every other
+    /// preview event follows.
+    #[test]
+    fn receive_preview_events_should_drop_a_sync_result_for_a_superseded_generation() {
+        let (mut app, directory) = cue_editing_app();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app.auto_sync_track();
+        let stale_generation = app.subtitle_edit.as_ref().unwrap().generation;
+        // The page moved on, which bumps its generation.
+        app.subtitle_edit.as_mut().unwrap().generation += 1;
+
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx
+            .send(PreviewEvent::Sync {
+                generation: stale_generation,
+                outcome: SyncOutcome::Applied(150),
+            })
+            .unwrap();
+        app.receive_preview_events(&event_rx);
+
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The timing mode is refused on the same tracks the editor is, and for the same reason:
+    /// an ASS cue's timing is the anchor its own animation is measured from.
+    #[test]
+    fn the_timing_mode_should_refuse_a_track_it_would_ruin() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(vec![edit_cue_at(1, 2, "A sign")], CueStyle::SubRip);
+
+        // Act
+        app.toggle_cue_timing_mode();
+
+        // Assert: not in the mode, and told why.
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Act / Assert: and the keys the mode would have given meaning to stay inert.
+        app.nudge_selected_cue(1);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues[0].start)
+            .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page discards a staged *timing* exactly as it discards staged words —
+    /// this page is the only place either is visible.
+    #[test]
+    fn discarding_cue_edits_should_take_a_staged_timing_with_it() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(3);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act: `Esc` off the page, and answer "discard".
+        app.back();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
+        assert_that!(app.dialog).is_equal_to(None);
+        app.back();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        app.resolve_leave_subtitle_edit(true);
+
+        // Assert: gone, and the track is not left looking modified by an empty change.
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.has_track_edits()).is_false();
+        assert_that!(app.subtitle_changes.is_empty()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page is where cue edits end, so the question is asked because the answer
+    /// throws work away — and the answer that says "discard" has to actually discard, or the
+    /// reader carries invisible words to the next Ctrl+S.
+    #[test]
+    fn leaving_the_edit_page_should_ask_about_unsaved_cue_edits() {
+        // Arrange: an edit staged.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act
+        app.back();
+
+        // Assert: still on the page, with the question up and the safe answer under the
+        // cursor.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.leave_cues_choice).is_equal_to(LeaveCuesChoice::StayHere);
+
+        // Act / Assert: saying no puts the reader back on the page with their edits.
+        app.activate_leave_subtitle_edit();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act / Assert: and discarding leaves with the words gone — nothing staged against
+        // the track, so the file is not carrying an edit nowhere shows.
+        app.back();
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_track_edits()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Discarding is about the words typed on this page, not about the track. A conversion
+    /// or a language tag staged from the track list was never visible here and has nothing
+    /// to do with the question being asked, so throwing it away with the cue text would
+    /// silently undo an edit the reader made somewhere else.
+    #[test]
+    fn discarding_cue_edits_should_leave_the_tracks_other_edits_alone() {
+        // Arrange: a language tag staged from the track list, and a cue edit staged here.
+        let (mut app, directory) = cue_editing_app();
+        let source = SubtitleSource::Embedded(2);
+        let mut staged = app.subtitle_change(&source, SubtitleFormat::SubRip);
+        staged.metadata = Some(SubtitleMetadata {
+            language: "fra".to_string(),
+            title: None,
+            forced: false,
+            cc: false,
+            hearing_impaired: false,
+            original: false,
+            commentary: false,
+        });
+        app.store_subtitle_change(source.clone(), staged);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act: leave, discarding.
+        app.back();
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+
+        // Assert: the words are gone, the tag is not.
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the track should still be carrying its language tag");
+        assert_that!(change.cues.is_empty()).is_true();
+        assert_that!(change.metadata.as_ref().map(|data| data.language.as_str()))
+            .is_equal_to(Some("fra"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Nothing staged, nothing to ask about: the page closes on the first `Esc` the way it
+    /// did before it could be edited at all.
+    #[test]
+    fn leaving_the_edit_page_should_not_ask_when_nothing_was_edited() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.close_cue_editor();
+
+        // Act
+        app.back();
+
+        // Assert
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the timeline holding the cursor there is no cue marked anywhere, so `i` cannot
+    /// mean "rewrite the selection": it opens an empty editor for a cue at the moment the
+    /// cursor stands on, and typing into it stages one.
+    #[test]
+    fn i_from_the_timeline_should_add_a_cue_at_the_cursor_rather_than_edit_the_selection() {
+        // Arrange: the cursor in the timeline, walked off the selected cue's own moment.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        let at = app
+            .subtitle_edit
+            .as_ref()
+            .and_then(|state| state.cursor())
+            .expect("the timeline should hold the cursor");
+
+        // Act
+        app.open_cue_editor();
+        // The editor opens empty, rather than on the selected cue's words.
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("");
+        for character in "New line".chars() {
+            app.cue_editor_insert(character);
+        }
+        app.close_cue_editor();
+
+        // Assert: staged as an insertion, at the cursor's moment and no other.
+        let source = SubtitleSource::Embedded(2);
+        let change = app
+            .subtitle_changes
+            .get(&source)
+            .expect("the insertion should be staged against the track");
+        assert_that!(change.cues.edits.is_empty()).is_true();
+        let inserted = change
+            .cues
+            .inserts
+            .values()
+            .next()
+            .expect("one cue should have been added");
+        assert_that!(inserted.text.as_str()).is_equal_to("New line");
+        assert_that!(inserted.start).is_equal_to(at);
+        assert_that!(inserted.end).is_equal_to(at + subtitle_edit::INSERT_DURATION);
+
+        // Assert: and it is on the page, selected, with the cursor back in the cue panel.
+        let state = app.subtitle_edit.as_ref().expect("the page should be open");
+        assert_that!(state.cursor()).is_none();
+        assert_that!(state.selected_cue().map(|cue| cue.text.clone()))
+            .is_equal_to(Some("New line".to_string()));
+        // The file's own cues were left exactly as they were.
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts.contains(&"First line")).is_true();
+        assert_that!(texts.contains(&"Second line")).is_true();
+        // The panel marks it, the way it marks every other staged-but-unwritten cue.
+        assert_that!(app.staged_cue_edits().contains(&state.selected)).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `i` pressed from the timeline by mistake has to cost nothing at all — and typing only
+    /// spaces is the same as typing nothing.
+    #[test]
+    fn an_empty_editor_opened_on_a_new_cue_should_stage_nothing() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+
+        // Act: opened and closed without typing.
+        app.open_cue_editor();
+        app.close_cue_editor();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(2);
+
+        // Act: and again with nothing but whitespace in it.
+        app.focus_timeline();
+        app.open_cue_editor();
+        app.cue_editor_insert(' ');
+        app.cue_editor_newline();
+        app.cue_editor_insert('\t');
+        app.close_cue_editor();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An added cue is a staged cue like any other: it retimes with `t` and `h`/`l`, it
+    /// re-opens in the editor, and neither amends the file's own cues.
+    #[test]
+    fn an_added_cue_should_be_retimeable_and_editable_the_moment_it_exists() {
+        // Arrange: a cue added at the timeline cursor.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        for character in "Added".chars() {
+            app.cue_editor_insert(character);
+        }
+        app.close_cue_editor();
+        let source = SubtitleSource::Embedded(2);
+        let (start, end) = {
+            let inserted = app.subtitle_changes[&source].cues.inserts[&0].clone();
+            (inserted.start, inserted.end)
+        };
+
+        // Act: nudge it two steps later.
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(2);
+
+        // Assert: the staged insertion moved, keeping its length, and so did the page's cue.
+        let moved = app.subtitle_changes[&source].cues.inserts[&0].clone();
+        assert_that!(moved.start).is_equal_to(start + 2 * subtitle_edit::TIMING_STEP);
+        assert_that!(moved.end).is_equal_to(end + 2 * subtitle_edit::TIMING_STEP);
+        assert_that!(app.subtitle_changes[&source].cues.edits.is_empty()).is_true();
+        let shown = app
+            .subtitle_edit
+            .as_ref()
+            .unwrap()
+            .selected_cue()
+            .expect("the added cue should still be selected");
+        assert_that!(shown.start).is_equal_to(moved.start);
+
+        // Act: re-open the editor on it and rewrite the words.
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.as_ref().unwrap().text().as_str()).is_equal_to("Added");
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Assert: the same insertion was amended rather than a second one made, and its
+        // timing survived the rewrite.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.inserts.len()).is_equal_to(1);
+        assert_that!(change.cues.inserts[&0].text.as_str()).is_equal_to("Added!");
+        assert_that!(change.cues.inserts[&0].start).is_equal_to(moved.start);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An added cue was placed rather than moved, so the two readouts that describe a *move*
+    /// have nothing to say about it: the timeline's shift, and the `r` that puts a cue back
+    /// to the timing the file gives it. Both must answer with nothing rather than guessing at
+    /// a timing the file never held.
+    #[test]
+    fn an_added_cue_should_have_no_shift_to_report_and_nothing_to_be_reset_to() {
+        // Arrange: a cue added at the timeline cursor, then nudged.
+        let (mut app, directory) = cue_editing_app();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        app.toggle_cue_timing_mode();
+        app.nudge_selected_cue(3);
+        let source = SubtitleSource::Embedded(2);
+        let moved = app.subtitle_changes[&source].cues.inserts[&0].start;
+
+        // Act / Assert: no shift, because there is nothing it has been shifted from.
+        assert_that!(app.selected_cue_shift()).is_none();
+
+        // Act / Assert: and `r` leaves it exactly where the reader put it.
+        app.reset_selected_cue_timing();
+        assert_that!(app.subtitle_changes[&source].cues.inserts[&0].start).is_equal_to(moved);
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .selected_cue()
+                .unwrap()
+                .start
+        )
+        .is_equal_to(moved);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page is where staged cue work ends, and an added cue is staged cue work:
+    /// discarding has to take it with the rewrites rather than leave the track looking
+    /// modified over a cue nobody can see any more.
+    #[test]
+    fn discarding_on_the_way_off_the_page_should_take_the_added_cues_too() {
+        // Arrange: one cue rewritten and one added.
+        let (mut app, directory) = cue_editing_app();
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.focus_timeline();
+        app.move_timeline_cursor(4, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        let source = SubtitleSource::Embedded(2);
+        assert_that!(app.subtitle_changes[&source].cues.edits.len()).is_equal_to(1);
+        assert_that!(app.subtitle_changes[&source].cues.inserts.len()).is_equal_to(1);
+
+        // Act: leave, discarding.
+        app.back();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+
+        // Assert: the track carries nothing at all any more.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A subtitle edit page with three cues on it, for the deletion tests: two is enough to
+    /// stage one deletion but not enough to see the cursor move on to a third row, or to see
+    /// the last cue refused while another is already marked.
+    fn cue_deleting_app() -> (App, PathBuf) {
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line"),
+                edit_cue_at(5, 6, "Third line"),
+            ],
+            CueStyle::SubRip,
+        );
+        (app, directory)
+    }
+
+    /// `d` stages the deletion against the file's cue, carrying what the file says so the
+    /// writer can refuse if the line has moved — and moves the cursor on, so a run of `d`
+    /// takes out a run of cues.
+    #[test]
+    fn marking_a_cue_for_deletion_should_stage_it_and_move_the_cursor_on() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: staged against the track, with the file's own words and timing.
+        let deleted = app.subtitle_changes[&source]
+            .cues
+            .deletes
+            .get(&0)
+            .expect("cue zero should be marked");
+        assert_that!(deleted.text.as_str()).is_equal_to("First line");
+        assert_that!(deleted.start).is_equal_to(Duration::from_secs(1));
+        assert_that!(deleted.end).is_equal_to(Duration::from_secs(2));
+        // The row is still there to be unmarked, and the panel knows which one it is.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(3);
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+        // A deletion is not a rewrite: the two counts on the border answer separately.
+        assert_that!(app.staged_cue_edits().is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(app.has_track_edits()).is_true();
+        // And the cursor moved on, ready for the next `d`.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A second press on the same row takes the mark back off and leaves the cursor where it
+    /// is — the same asymmetry the track list has, which is what lets `d` mean both "this one
+    /// too" and "no, not that one".
+    #[test]
+    fn unmarking_a_cue_should_leave_the_cursor_where_it_is_and_stage_nothing() {
+        // Arrange: the second cue marked, cursor moved back onto it.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(2);
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: nothing staged at all, so the track stops looking modified.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+        assert_that!(app.staged_cue_deletions().is_empty()).is_true();
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Marking a cue that has already been rewritten keeps the rewrite, so unmarking gives it
+    /// back. The deletion still carries the *file's* words rather than the staged ones, or
+    /// the save would check the file for something it never said.
+    #[test]
+    fn marking_a_rewritten_cue_should_keep_the_rewrite_and_snapshot_the_file() {
+        // Arrange: the first cue rewritten.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: both staged, and the deletion describes the file rather than the page.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+        assert_that!(change.cues.deletes[&0].text.as_str()).is_equal_to("First line");
+        // The row reads as deleted rather than as edited — going is the edit.
+        assert_that!(
+            app.staged_cue_deletions()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+        .contains_exactly_in_given_order([0]);
+
+        // Act: unmark.
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_delete_selected_cue();
+
+        // Assert: the typing came back.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.deletes.is_empty()).is_true();
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A line the reader has said is leaving is not a line they asked to rewrite or retime,
+    /// so the three cue mutations refuse it and say why — the same refusal the track list
+    /// gives for moving or re-encoding a track marked for deletion.
+    #[test]
+    fn editing_a_cue_marked_for_deletion_should_be_refused() {
+        // Arrange: the first cue marked, cursor back on it, timing mode on.
+        let (mut app, directory) = cue_deleting_app();
+        app.toggle_delete_selected_cue();
+        app.subtitle_edit.as_mut().unwrap().select(-1);
+        app.toggle_cue_timing_mode();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act / Assert: the editor does not open.
+        app.notice = None;
+        app.open_cue_editor();
+        assert_that!(app.cue_editor.is_none()).is_true();
+        assert_that!(app.dialog).is_equal_to(None);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Act / Assert: a nudge moves nothing.
+        app.notice = None;
+        app.nudge_selected_cue(2);
+        assert_that!(app.subtitle_changes[&source].cues.edits.is_empty()).is_true();
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .selected_cue()
+                .unwrap()
+                .start
+        )
+        .is_equal_to(Duration::from_secs(1));
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Act / Assert: and `r` has nothing to put back.
+        app.notice = None;
+        app.reset_selected_cue_timing();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("Unmark this cue");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cue the reader added exists nowhere but the page, so `d` un-adds it: there is no
+    /// line in the file to be marked against and nothing to restore it from. The row goes
+    /// with it, and the file's own cues keep the positions their rewrites are keyed by.
+    #[test]
+    fn deleting_an_added_cue_should_un_add_it_and_take_its_row_with_it() {
+        // Arrange: a cue added between the second and the third, and the first rewritten.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        app.focus_timeline();
+        app.move_timeline_cursor(9, subtitle_edit::TIMELINE_STEP);
+        app.open_cue_editor();
+        app.cue_editor_insert('x');
+        app.close_cue_editor();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cues.len()).is_equal_to(4);
+        // The cursor came home to the added cue, which sits last: the timeline cursor starts
+        // on the selected cue's own moment, so nine steps from 0:01 is 0:05.5.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(3);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert: the insertion and its row are both gone, and nothing was marked instead.
+        let change = &app.subtitle_changes[&source];
+        assert_that!(change.cues.inserts.is_empty()).is_true();
+        assert_that!(change.cues.deletes.is_empty()).is_true();
+        assert_that!(change.cues.edits[&0].text.as_str()).is_equal_to("First line!");
+        let state = app.subtitle_edit.as_ref().unwrap();
+        let texts: Vec<&str> = state.cues.iter().map(|cue| cue.text.as_str()).collect();
+        assert_that!(texts).contains_exactly_in_given_order([
+            "First line!",
+            "Second line",
+            "Third line",
+        ]);
+        assert_that!(state.position_of(CueOrigin::File(2))).is_equal_to(Some(2));
+        assert_that!(state.selected).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A SubRip file with nothing in it is not a subtitle track, and remuxing one back into a
+    /// container is a save that fails on something the reader did. The last cue is refused,
+    /// with the notice pointing at the thing they are actually after.
+    #[test]
+    fn marking_the_last_cue_a_track_has_left_should_be_refused() {
+        // Arrange: two of the three cues marked already.
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.toggle_delete_selected_cue();
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes[&source].cues.deletes.len()).is_equal_to(2);
+
+        // Act
+        app.notice = None;
+        app.toggle_delete_selected_cue();
+
+        // Assert: still two, and the refusal names the way out.
+        assert_that!(app.subtitle_changes[&source].cues.deletes.len()).is_equal_to(2);
+        assert_that!(app.notice.clone().unwrap_or_default().as_str())
+            .contains("delete the track itself");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An ASS cue's timing is the anchor every animation tag in it is measured from, and the
+    /// rewrite path this stages through is SubRip's. Refused for the reason the editor is,
+    /// in the same words.
+    #[test]
+    fn deleting_a_cue_should_refuse_a_track_it_cannot_rewrite() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("ass");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "A sign"),
+                edit_cue_at(3, 4, "Another sign"),
+            ],
+            CueStyle::SubRip,
+        );
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.clone().unwrap_or_default().as_str()).contains("SubRip");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the cursor in the timeline no cue is marked anywhere, so `d` has nothing to be
+    /// about — marking the cue the panel is parked on would take out a line nothing on screen
+    /// points at.
+    #[test]
+    fn deleting_a_cue_should_be_inert_while_the_timeline_holds_the_cursor() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        app.focus_timeline();
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `d` means "delete the track" one layer up and "delete the cue" here, so the guard on
+    /// the page is what keeps the two apart — and a dialog swallows it entirely, the way it
+    /// swallows every other action behind it.
+    #[test]
+    fn deleting_a_cue_should_only_answer_from_the_page_with_nothing_over_it() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+
+        // Act / Assert: nothing from the track list, which has its own meaning for `d`.
+        app.layer = Layer::Streams;
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Act / Assert: and nothing from behind a dialog.
+        app.layer = Layer::SubtitleEdit;
+        app.dialog = Some(Dialog::Keybindings);
+        app.toggle_delete_selected_cue();
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+
+        // Act / Assert: with the dialog gone it answers.
+        app.dialog = None;
+        app.toggle_delete_selected_cue();
+        assert_that!(app.staged_cue_deletions().len()).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track with no cues on it has no row for `d` to be about, and answering by staging
+    /// something keyed against a cue that is not there would be worse than answering nothing.
+    #[test]
+    fn deleting_a_cue_should_do_nothing_on_a_track_with_no_cues() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new(), CueStyle::SubRip);
+
+        // Act
+        app.toggle_delete_selected_cue();
+
+        // Assert
+        assert_that!(
+            app.subtitle_changes
+                .contains_key(&SubtitleSource::Embedded(2))
+        )
+        .is_false();
+        assert_that!(app.notice.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A deletion is visible on this page and nowhere else, so leaving without asking would
+    /// throw it away silently — and discarding has to take it with the rewrites.
+    #[test]
+    fn leaving_the_page_should_ask_about_a_deletion_and_then_discard_it() {
+        // Arrange
+        let (mut app, directory) = cue_deleting_app();
+        let source = SubtitleSource::Embedded(2);
+        app.toggle_delete_selected_cue();
+
+        // Act
+        app.back();
+
+        // Assert: asked rather than left.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act: discard.
+        app.choose_leave_subtitle_edit(1);
+        app.activate_leave_subtitle_edit();
+
+        // Assert: the track carries nothing at all any more.
+        assert_that!(app.subtitle_changes.contains_key(&source)).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Writing a cue edit rewrites the file the subtitle edit page is reading, so the page is
+    /// closed and the file re-probed — but the reader asked to save a cue, not to leave.
+    /// The page comes back on the same track, and the cursor lands on the cue it was on.
+    #[test]
+    fn saving_from_the_edit_page_should_come_back_to_it() {
+        // Arrange: the page open on the second cue, then a save closing it the way the
+        // rescan of its own output does.
+        let (mut app, directory) = cue_editing_app();
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        let media = app.selected_file().unwrap().path.clone();
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media,
+            source: SubtitleSource::Embedded(2),
+            cue: 1,
+        });
+        app.close_subtitle_edit(PageExit::Leaving);
+        app.layer = Layer::Files;
+
+        // Act
+        app.reopen_subtitle_edit();
+
+        // Assert: the page is up again, on the track it was about.
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        let state = app.subtitle_edit.as_ref().expect("the page should be open");
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(2));
+        assert_that!(app.pending_reopen.clone()).is_none();
+
+        // And the cursor goes back where it was, once the rewritten file has been read.
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![
+                edit_cue_at(1, 2, "First line"),
+                edit_cue_at(3, 4, "Second line!"),
+            ],
+            CueStyle::SubRip,
+        );
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A save runs in the background, and the reader is free to walk away while it does.
+    /// Coming back to the page then means dragging them off whatever they moved to, so the
+    /// request is dropped rather than honoured.
+    #[test]
+    fn saving_should_not_drag_the_reader_back_from_another_file() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        app.close_subtitle_edit(PageExit::Leaving);
+        app.layer = Layer::Files;
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media: directory.join("something-else.mkv"),
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+
+        // Act
+        app.reopen_subtitle_edit();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Files);
+        assert_that!(app.pending_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A save that removes the very track the page was about has nothing to come back to,
+    /// and must not open the page on whatever track happens to sit at that row now.
+    #[test]
+    fn saving_should_not_reopen_the_page_on_a_track_that_is_gone() {
+        // Arrange
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        app.close_subtitle_edit(PageExit::Leaving);
+        app.layer = Layer::Files;
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media,
+            source: SubtitleSource::Embedded(7),
+            cue: 0,
+        });
+
+        // Act
+        app.reopen_subtitle_edit();
+
+        // Assert
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.pending_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The request waits for the re-probe rather than being dropped by it: there is nothing
+    /// to open a page against until the rewritten file has been read, and a request dropped
+    /// there would leave the reader on the track list with no way to tell why.
+    #[test]
+    fn saving_should_wait_for_the_rewritten_file_to_be_read_before_coming_back() {
+        // Arrange: the file selected, its probe still out.
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        app.close_subtitle_edit(PageExit::Leaving);
+        app.layer = Layer::Files;
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media,
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+        let outcome = app.outcome.take();
+        app.loading = true;
+
+        // Act / Assert: nothing yet, and the request is still owed.
+        app.reopen_subtitle_edit();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.pending_reopen.is_some()).is_true();
+
+        // Act / Assert: and it is honoured the moment the answer lands.
+        app.loading = false;
+        app.outcome = outcome;
+        app.reopen_subtitle_edit();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // A page already open owes nothing, and holding the request would spring one open
+        // later on something else entirely.
+        app.pending_reopen = Some(SubtitleEditReopen {
+            media: directory.join("movie.mkv"),
+            source: SubtitleSource::Embedded(2),
+            cue: 0,
+        });
+        app.reopen_subtitle_edit();
+        assert_that!(app.pending_reopen.clone()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A save rewrites the container, which moves the media file's length and mtime. The
+    /// page's frames must stay exactly where they were filed, because the picture did not
+    /// change — this is the regression that used to be repaired by renaming the directory
+    /// afterwards, and the repair is what kept coming undone.
+    #[test]
+    fn a_rewritten_container_should_leave_the_pages_frames_where_they_are() {
+        // Arrange: a page open on a file, and the key its frames are filed under.
+        let (mut app, directory) = cue_editing_app();
+        let media = app.selected_file().unwrap().path.clone();
+        let before = app.subtitle_edit.as_ref().unwrap().frames.media_key();
+
+        // Act: rewrite the file the way a remux does — different bytes, different length,
+        // a later mtime — while the probe still describes the same video stream.
+        std::fs::write(&media, vec![7u8; 8192]).unwrap();
+        let rewritten = crate::files::FileFingerprint::for_path(&media).unwrap();
+        app.open_subtitle_edit();
+
+        // Assert: the file really did move underneath the page, and the key did not.
+        assert_that!(rewritten.length).is_equal_to(8192);
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .frames
+                .media_key()
+                .as_str()
+        )
+        .is_equal_to(before.as_str());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page draws a loader while its cues are being read, and `main` only repaints
+    /// while something reports itself as animating.
+    #[test]
+    fn is_animating_should_hold_while_the_edit_page_is_preparing() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+
+        // Act / Assert
+        assert_that!(app.is_animating()).is_false();
+        app.open_subtitle_edit();
+        assert_that!(app.is_animating()).is_true();
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .apply_prepared(Vec::new(), CueStyle::SubRip);
+        assert_that!(app.is_animating()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker knows nothing about selections or `SubtitleSource`, so the request has
+    /// to carry the media file, the **absolute** stream index, and the page's workspace.
+    /// A per-type `0:s:N` index here would extract whichever track happens to be Nth
+    /// among the subtitles, which is a different track on most real files.
+    #[test]
+    fn opening_the_edit_page_should_ask_the_worker_for_the_embedded_track() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let preview = crate::preview::test_handles();
+        let requests = preview.prepare_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        let state = app.subtitle_edit.as_ref().expect("page should be open");
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(request.generation).is_equal_to(state.generation);
+        assert_that!(request.input.clone()).is_equal_to(state.media().to_path_buf());
+        assert_that!(request.stream_index).is_equal_to(Some(2));
+        assert_that!(request.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A sidecar is read straight off disk: the request has to point at the `.srt`
+    /// itself, not at the media, and ask for no extraction at all.
+    #[test]
+    fn opening_the_edit_page_should_ask_the_worker_for_a_sidecar_by_its_own_path() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let sidecar = test_sidecar(&app, "movie.en.srt", "eng");
+        let path = sidecar.path.clone();
+        app.sidecars.push(sidecar);
+        let rows = app.track_rows();
+        app.selected_stream = rows
+            .iter()
+            .position(|row| matches!(row, TrackRef::Sidecar(_)))
+            .expect("sidecar should have a track row");
+        let preview = crate::preview::test_handles();
+        let requests = preview.prepare_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(request.input.clone()).is_equal_to(path);
+        assert_that!(request.stream_index).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Leaving the page has to reach the worker, not just mark its answer stale: an
+    /// extraction demuxes the whole container, which over a network mount runs long
+    /// after the page it was for is gone.
+    #[test]
+    fn leaving_the_edit_page_should_tell_the_worker_to_stop() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        let preview = crate::preview::test_handles();
+        let (requests, live) = (preview.prepare_rx, preview.live_generation);
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        let request = requests.try_recv().expect("the worker should be asked");
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Act
+        app.back();
+
+        // Assert: the generation the worker works for is no longer the one it was given.
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_fill_the_page_with_the_cues_the_worker_parsed() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act / Assert: an empty drain is not a redraw.
+        assert_that!(app.receive_preview_events(&receiver)).is_false();
+
+        // Act
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready {
+                    style: CueStyle::SubRip,
+                    cues: vec![crate::cue::Cue {
+                        index: 0,
+                        start: Duration::from_secs(1),
+                        end: Duration::from_secs(2),
+                        text: "one".into(),
+                        dialogue: Vec::new(),
+                        events: 1,
+                    }],
+                },
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(drained).is_true();
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.status.clone()).is_equal_to(crate::subtitle_edit::LoadStatus::Ready);
+        assert_that!(state.cues.len()).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_show_a_failure_on_the_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Failed("ffmpeg said no".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().status.clone()).is_equal_to(
+            crate::subtitle_edit::LoadStatus::Failed("ffmpeg said no".to_string()),
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Cues extracted for a page the user has already left must never land on the page
+    /// they opened next — different track, possibly different file.
+    #[test]
+    fn receive_preview_events_should_drop_results_belonging_to_another_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let stale = app.subtitle_edit.as_ref().unwrap().generation;
+        app.back();
+        app.open_subtitle_edit();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cues = || PrepareOutcome::Ready {
+            style: CueStyle::SubRip,
+            cues: vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "stale".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+        };
+
+        // Act
+        sender
+            .send(PreviewEvent::Prepared {
+                generation: stale,
+                outcome: cues(),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert: the newly opened page is still waiting on its own extraction.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().status.clone())
+            .is_equal_to(crate::subtitle_edit::LoadStatus::Preparing);
+
+        // Act / Assert: and an answer arriving after the page is closed entirely is
+        // drained rather than panicking or reopening anything.
+        app.back();
+        sender
+            .send(PreviewEvent::Prepared {
+                generation: stale,
+                outcome: cues(),
+            })
+            .unwrap();
+        assert_that!(app.receive_preview_events(&receiver)).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A page whose cues have loaded, with the pane measured and the debounce waited out,
+    /// which is the state every frame request is made from.
+    fn app_ready_for_a_frame(app: &mut App) {
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        state.apply_prepared(
+            vec![
+                crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(3),
+                    text: "one".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+                crate::cue::Cue {
+                    index: 1,
+                    start: Duration::from_secs(5),
+                    end: Duration::from_secs(7),
+                    text: "two".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+            ],
+            CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+    }
+
+    /// The worker cannot see the page, so everything it needs has to be in the request:
+    /// which file, where to stage the cue, what the cue says, where to seek, and how big
+    /// the pane the renderer measured is.
+    #[test]
+    fn start_pending_preview_should_ask_for_the_frame_at_the_selected_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        let state = app.subtitle_edit.as_ref().unwrap();
+        let request = frames.try_recv().expect("a frame should be asked for");
+        assert_that!(request.generation).is_equal_to(state.generation);
+        assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
+        assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+        let wanted = request
+            .wanted
+            .clone()
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.cue_index).is_equal_to(0);
+        assert_that!(wanted.cue.text.as_str()).is_equal_to("one");
+        // The moment the cue comes in, which is what the reader is judging. This file's
+        // duration would not parse, so there is nothing to hold the seek back from —
+        // clamping against the resulting zero would preview the first frame of the media
+        // for every cue in the track.
+        assert_that!(wanted.seek).is_equal_to(Duration::from_secs(1));
+        assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 20));
+
+        // Act / Assert: and one settled selection asks exactly once.
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Seeking to the last instant of a file lands past the final frame, and
+    /// `-frames:v 1` then writes nothing at all — a cue running to the end of the media
+    /// is the ordinary case, not an edge one.
+    #[test]
+    fn a_frame_request_should_be_held_back_from_the_very_end_of_the_media() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        state.duration = Duration::from_secs(10);
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(11),
+                end: Duration::from_secs(12),
+                text: "past the end".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert: the cue comes in at 11s, past the end of a 10s file.
+        let request = frames.try_recv().expect("a frame should be asked for");
+        let wanted = request
+            .wanted
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.seek).is_equal_to(Duration::from_millis(9800));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The debounce is there to stop a held-down `j` starting an accurate seek per key
+    /// repeat. A frame already in the frame cache starts no seek at all — it costs a file
+    /// read and an encode — so waiting `FRAME_DEBOUNCE` out for it is a tenth of a second
+    /// of empty pane bought for nothing, on every single cursor move through a track that
+    /// has already been rendered.
+    #[test]
+    fn a_cached_frame_should_be_asked_for_without_waiting_out_the_debounce() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+        // The second cue's picture is on disk, as it would be once the background pass
+        // had walked past it.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        let target = state.frame_target(1).expect("the second cue has a target");
+        let key = state.frames.key(&target.cue, &target.on_screen);
+        crate::framecache::store(&key.0, &key.1, b"stand-in for a rendered frame");
+
+        // Act: the selection moves and the dispatch runs immediately, with none of the
+        // debounce waited out.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.start_pending_preview();
+
+        // Assert
+        let request = frames
+            .try_recv()
+            .expect("a cached frame should be asked for straight away");
+        let wanted = request
+            .wanted
+            .expect("the selected cue should be asked for");
+        assert_that!(wanted.cue_index).is_equal_to(1);
+
+        // Cleanup
+        if let Some(path) = crate::framecache::path(&key.0, &key.1) {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The other half of the same decision: a cue the cache has never seen is an accurate
+    /// seek into the container, which is exactly what the debounce exists to keep a held
+    /// key from starting one of per repeat.
+    #[test]
+    fn an_uncached_frame_should_still_wait_out_the_debounce() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+
+        // Act
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.start_pending_preview();
+
+        // Assert: the selected cue is held back, but the neighbours ride out anyway —
+        // they come from the cache, so there is no `ffmpeg` for the debounce to protect
+        // against and nothing gained by stranding them behind one.
+        let refill = frames
+            .try_recv()
+            .expect("the neighbours should not wait on the debounce");
+        assert_that!(refill.wanted.is_none()).is_true();
+        assert_that!(
+            refill
+                .nearby
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![0]);
+
+        // Act / Assert: and the held-back request is still owed, so the grab goes out
+        // once the movement settles rather than being forgotten with the refill.
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        let request = frames
+            .try_recv()
+            .expect("a settled selection should be asked for");
+        assert_that!(
+            request
+                .wanted
+                .map(|target| target.cue_index)
+                .unwrap_or_default()
+        )
+        .is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Holding the selected cue back has to leave the request standing even when there is
+    /// nothing else to send with it. A track of one cue has no neighbours at all, so the
+    /// dispatch is empty and the "nothing to ask for" branch runs — and forgetting the
+    /// request there would strand the cursor on a permanently blank pane, since nothing
+    /// asks again until the selection moves.
+    #[test]
+    fn a_held_back_frame_should_survive_a_dispatch_with_nothing_to_carry() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        state.apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "alone".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+
+        // Act: inside the debounce, with an uncached cue and no neighbours.
+        app.start_pending_preview();
+
+        // Assert: nothing was sent, and the request was not thrown away with it.
+        assert_that!(frames.try_recv().is_err()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame_requested()).is_true();
+
+        // Act / Assert: so the grab still goes out when the debounce expires.
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        let request = frames
+            .try_recv()
+            .expect("the held-back cue should be asked for once the debounce expires");
+        assert_that!(request.wanted.map(|target| target.cue_index)).is_equal_to(Some(0));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cues either side of the cursor are asked for alongside it, so that moving onto
+    /// one draws it in the same pass that handled the keypress rather than after a round
+    /// trip to the worker — which is the gap the pane used to fill with the cue's text.
+    #[test]
+    fn a_frame_request_should_carry_the_cues_around_the_selection() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert: the page holds two cues, so the one after the selection is the only
+        // neighbour there is.
+        let request = frames.try_recv().expect("a frame should be asked for");
+        assert_that!(
+            request
+                .nearby
+                .iter()
+                .map(|target| target.cue_index)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![1]);
+        assert_that!(request.nearby[0].cue.text.as_str()).is_equal_to("two");
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The steady state while the cursor sits still. Re-examining the window on every one
+    /// of the twenty loop iterations a second would be a `stat` per cue per tick for a
+    /// page that is not going to change until a key is pressed.
+    #[test]
+    fn a_window_that_is_already_encoded_should_ask_for_nothing_further() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act: both cues answered, which is the whole window for this two-cue track.
+        for cue_index in 0..2 {
+            app.subtitle_edit
+                .as_mut()
+                .unwrap()
+                .apply_frame(cue_index, test_protocol());
+        }
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame_requested()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An FFmpeg without libass cannot burn a cue in, so asking would be one doomed
+    /// subprocess per settled selection, producing a reason nothing is drawn under a cue
+    /// the cursor has since left.
+    #[test]
+    fn start_pending_preview_should_ask_for_nothing_without_the_tools_to_draw_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The renderer measures the pane, so the first loop iteration after the page opens
+    /// has nothing to scale to — asking then would request a zero-sized image.
+    #[test]
+    fn start_pending_preview_should_wait_for_the_renderer_to_measure_the_pane() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "one".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+
+        // Act
+        app.start_pending_preview();
+
+        // Assert
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Act / Assert: and the request survives until the pane has been measured.
+        app.subtitle_edit
+            .as_mut()
+            .unwrap()
+            .set_preview_cells(ratatui::layout::Size::new(40, 20));
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_ok()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Without a page open, or without workers, there is nothing to ask for and nobody to
+    /// ask — both are ordinary states, not errors.
+    #[test]
+    fn start_pending_preview_should_be_inert_without_a_page_or_workers() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+
+        // Act / Assert: no workers at all.
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+
+        // Act / Assert: workers, but no page.
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.back();
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn receive_preview_events_should_show_the_frame_the_worker_drew() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Frame {
+                generation,
+                cue_index: 0,
+                outcome: FrameOutcome::Ready(test_protocol()),
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame().is_some()).is_true();
+
+        // Act / Assert: a frame that could not be drawn replaces it with its reason.
+        sender
+            .send(PreviewEvent::Frame {
+                generation,
+                cue_index: 0,
+                outcome: FrameOutcome::Failed("no libass".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.frame().is_some()).is_false();
+        assert_that!(state.frame_error()).is_equal_to(Some("no libass"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame drawn for a page the user has already left must not appear on the page
+    /// they opened next — different track, possibly different file.
+    #[test]
+    fn receive_preview_events_should_drop_a_frame_belonging_to_another_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let stale = app.subtitle_edit.as_ref().unwrap().generation;
+        app.back();
+        app_ready_for_a_frame(&mut app);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Frame {
+                generation: stale,
+                cue_index: 0,
+                outcome: FrameOutcome::Ready(test_protocol()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frame().is_some()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn test_protocol() -> Box<ratatui_image::protocol::Protocol> {
+        Box::new(
+            ratatui_image::picker::Picker::halfblocks()
+                .new_protocol(
+                    image::DynamicImage::new_rgb8(40, 40),
+                    ratatui::layout::Size::new(10, 5),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks should encode any image"),
+        )
+    }
+
+    /// A track's cues arriving is what starts the background pass, and the worker cannot
+    /// see the page — so the request has to carry the whole track, the media it burns
+    /// onto, and how much cache it may fill.
+    #[test]
+    fn preparing_a_track_should_start_rendering_every_cue_in_the_background() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let cues = vec![
+            crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "one".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            },
+            crate::cue::Cue {
+                index: 1,
+                start: Duration::from_secs(5),
+                end: Duration::from_secs(7),
+                text: "two".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            },
+        ];
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready {
+                    cues: cues.clone(),
+                    style: CueStyle::SubRip,
+                },
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        let request = warms.try_recv().expect("the whole track should be queued");
+        assert_that!(request.generation).is_equal_to(generation);
+        assert_that!(request.cues.clone()).is_equal_to(cues);
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(request.source.media.clone()).is_equal_to(state.media().to_path_buf());
+        assert_that!(request.source.workspace.clone()).is_equal_to(state.workspace().to_path_buf());
+        assert_that!(request.duration).is_equal_to(state.duration);
+        assert_that!(request.cache_tracks)
+            .is_equal_to(crate::config::Config::default().preview_cache_tracks);
+        // And the page starts counting, so the status line appears with the first frame
+        // rather than after it.
+        assert_that!(state.warm).is_equal_to(WarmState::Working {
+            done: 0,
+            total: 2,
+            rendered: 0,
+        });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Frames are cached, so they cannot be rendered to fit the pane — they are rendered
+    /// at the source's own resolution, within a cap.
+    #[test]
+    fn a_background_pass_should_render_at_the_sources_resolution() {
+        // Arrange
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 640, "height": 360},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 1);
+        let directory = app.directory.clone();
+
+        // Act
+        app.open_subtitle_edit();
+
+        // Assert: the source's own size, which is inside the cache's cap — not the cap,
+        // and not the pane, which is not even measured yet.
+        let state = app.subtitle_edit.as_ref().unwrap();
+        assert_that!(state.frames.pixels).is_equal_to((640, 360));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A thousand accurate seeks across NFS is not a trade the user made by opening a
+    /// page, so the pass is off there — and the page says so, because the absence is not
+    /// their doing. The frames they actually land on are still rendered on demand.
+    #[test]
+    fn a_network_mount_should_say_why_it_is_not_rendering_frames_in_the_background() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_settings(PreviewSettings {
+            prefetch: false,
+            network: true,
+            ..PreviewSettings::default()
+        });
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        let state = prepared_page(&mut app);
+
+        // Assert
+        assert_that!(warms.try_recv().is_err()).is_true();
+        assert_that!(state).is_equal_to(WarmState::OffForNetwork);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Turned off in `config.toml` on a local disk, there is nothing to explain — the
+    /// page says nothing rather than reporting a setting back at the user who set it.
+    #[test]
+    fn prefetching_turned_off_should_be_silent() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_settings(PreviewSettings {
+            prefetch: false,
+            network: false,
+            ..PreviewSettings::default()
+        });
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act
+        let state = prepared_page(&mut app);
+
+        // Assert
+        assert_that!(warms.try_recv().is_err()).is_true();
+        assert_that!(state).is_equal_to(WarmState::Off);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An FFmpeg that cannot burn a cue in would make every frame the pass rendered a
+    /// failure, and an empty track has nothing to render at all.
+    #[test]
+    fn nothing_should_be_rendered_in_the_background_without_cues_or_the_tools_to_draw_them() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let warms = preview.warm_rx;
+        app.set_preview_handles(Some(preview.handles));
+
+        // Act / Assert: cues, but no libass.
+        assert_that!(prepared_page(&mut app)).is_equal_to(WarmState::Off);
+        assert_that!(warms.try_recv().is_err()).is_true();
+
+        // Act / Assert: libass, but a track with no cues in it.
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.back();
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready {
+                    cues: Vec::new(),
+                    style: CueStyle::SubRip,
+                },
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().warm).is_equal_to(WarmState::Off);
+        assert_that!(warms.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Opens a page and hands it two cues, answering with what the background pass made
+    /// of them.
+    fn prepared_page(app: &mut App) -> WarmState {
+        app.open_subtitle_edit();
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Prepared {
+                generation,
+                outcome: PrepareOutcome::Ready {
+                    style: CueStyle::SubRip,
+                    cues: vec![
+                        crate::cue::Cue {
+                            index: 0,
+                            start: Duration::from_secs(1),
+                            end: Duration::from_secs(3),
+                            text: "one".into(),
+                            dialogue: Vec::new(),
+                            events: 1,
+                        },
+                        crate::cue::Cue {
+                            index: 1,
+                            start: Duration::from_secs(5),
+                            end: Duration::from_secs(7),
+                            text: "two".into(),
+                            dialogue: Vec::new(),
+                            events: 1,
+                        },
+                    ],
+                },
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        app.subtitle_edit.as_ref().unwrap().warm
+    }
+
+    /// The count on screen comes from the worker, and a count for a page the user has
+    /// already left has to be dropped like every other stale result.
+    #[test]
+    fn receive_preview_events_should_count_only_for_the_page_that_is_open() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app_ready_for_a_frame(&mut app);
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Warming {
+                generation,
+                done: 1,
+                total: 2,
+                rendered: 1,
+            })
+            .unwrap();
+        sender
+            .send(PreviewEvent::Warming {
+                generation: generation.wrapping_sub(1),
+                done: 2,
+                total: 2,
+                rendered: 2,
+            })
+            .unwrap();
+        let drained = app.receive_preview_events(&receiver);
+
+        // Assert: the live page's count landed and the older page's did not overwrite it.
+        assert_that!(drained).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().warm).is_equal_to(WarmState::Working {
+            done: 1,
+            total: 2,
+            rendered: 1,
+        });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span, sized for the cell area a request asked for, so it can be handed straight
+    /// back through `PreviewEvent::Playback` as the worker would.
+    fn decoded_span(request: &PlaybackRequest, count: usize) -> crate::preview::PlaybackFrames {
+        let stride = (request.pixels.0 as usize) * (request.pixels.1 as usize) * 3;
+        crate::preview::PlaybackFrames::new(
+            vec![7; stride * count],
+            crate::preview::SpanShape {
+                pixels: request.pixels,
+
+                cells: request.cells,
+                picker: ratatui_image::picker::Picker::halfblocks(),
+            },
+            request.fps,
+            request.speed,
+            request.span_start,
+            Vec::new(),
+        )
+    }
+
+    /// The worker cannot see the page, so everything a span needs has to be in the request:
+    /// which media, which cue, the stretch of it either side, the rate, and the exact size
+    /// the frames come back at — which the slicing depends on being exact.
+    #[test]
+    fn toggling_playback_should_ask_for_the_span_around_the_selected_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.subtitle_edit.as_mut().unwrap().select(1);
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: the cue under the cursor, with a second either side of it.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cue(1));
+        assert_that!(request.span_start).is_equal_to(Duration::from_secs(4));
+        assert_that!(request.span_end).is_equal_to(Duration::from_secs(8));
+        assert_that!(request.fps).is_equal_to(30);
+        // The pane is 40x20 cells; a 1920x1080 source fitted into it proportionally is
+        // 40 cells wide and 11 tall, which at the test picker's 10x20 cell is 400x220
+        // pixels — the resolution the terminal will actually draw.
+        assert_that!(request.cells).is_equal_to(ratatui::layout::Size::new(40, 11));
+        assert_that!(request.pixels).is_equal_to((400, 220));
+        assert_that!(request.source.media.clone())
+            .is_equal_to(app.subtitle_edit.as_ref().unwrap().media().to_path_buf());
+        // And the worker is told this is the span it should be decoding for.
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Assert: the page says it is waiting, so `p` does not look like it did nothing.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cue(1)));
+        assert_that!(app.playback_active()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An audio `-map` on media with no audio fails the whole run, and the optional `?`
+    /// form leaves an output file with no streams in it, which fails just as hard. So the
+    /// question is settled from the probe before the command is built — and a video with no
+    /// sound plays as a silent slideshow rather than not at all.
+    #[test]
+    fn a_span_should_only_ask_for_sound_when_the_media_has_some() {
+        // Arrange: the ordinary case, which `app_with_subtitle_codec` gives an audio track.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_audio_format(crate::audio::OutputFormat {
+            sample_rate: 44_100,
+            channels: 1,
+        });
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert: the device's own format, so the callback copies rather than
+        // resamples.
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.audio).is_equal_to(Some(crate::preview::AudioTrack {
+            stream: 1,
+            format: crate::audio::OutputFormat {
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        }));
+
+        // Arrange: the same page against media with no audio track at all.
+        app.toggle_playback();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 1);
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.audio).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span is a stretch of the film, so what is burned into it is everything that appears
+    /// in that stretch — not the selected line with the rest of the screen deleted.
+    ///
+    /// It matters most for the tracks this page is hardest on: a typeset or karaoke line is
+    /// routinely a dozen events sharing a moment, each drawing part of one effect, so playing
+    /// the selected one alone plays a fraction of a picture nobody will ever see.
+    #[test]
+    fn a_span_should_burn_in_every_cue_that_appears_in_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+        let cue = |index: usize, start: u64, end: u64, text: &str| crate::cue::Cue {
+            index,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            text: text.into(),
+            dialogue: Vec::new(),
+            events: 1,
+        };
+        let state = app.subtitle_edit.as_mut().unwrap();
+        // The selected line, two effect cues over its middle, and one far enough away that
+        // even a second of padding either side cannot reach it.
+        state.apply_prepared(
+            vec![
+                cue(0, 4000, 6000, "under"),
+                cue(1, 4400, 4600, "effect one"),
+                cue(2, 4400, 4600, "effect two"),
+                cue(3, 20_000, 21_000, "elsewhere"),
+            ],
+            CueStyle::SubRip,
+        );
+        state.set_preview_cells(ratatui::layout::Size::new(40, 20));
+
+        // Act
+        app.toggle_playback();
+
+        // Assert
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(
+            request
+                .on_screen
+                .iter()
+                .map(|cue| cue.text.clone())
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec![
+            "under".to_string(),
+            "effect one".to_string(),
+            "effect two".to_string(),
+        ]);
+        // Still the span *for* the selected cue, whatever else plays inside it.
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cue(0));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// With the timeline holding the cursor there is no selected cue anywhere on the page,
+    /// so `p` cannot mean "play the selection" — it plays the moment being pointed at, which
+    /// is the only thing the reader is moving. The span is a second around it plus whatever
+    /// padding is configured, and what is burned in is what a viewer would see there rather
+    /// than the nearest line dragged in to keep it company.
+    #[test]
+    fn playing_from_the_timeline_should_cover_the_cursors_moment_rather_than_a_cue() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        // Padding out of the way, so what is left is the second the moment is given — the
+        // test below is the one about the two adding up.
+        app.preview_settings.playback_pad = Duration::ZERO;
+        app.subtitle_edit.as_mut().unwrap().duration = Duration::from_secs(30);
+        // Onto the timeline, then out to a moment neither cue (1 s–3 s and 5 s–7 s) covers.
+        app.focus_timeline();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor()).is_some();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        while state.cursor() != Some(Duration::from_secs(10)) {
+            assert_that!(state.move_cursor(1, crate::subtitle_edit::TIMELINE_STEP)).is_true();
+        }
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: anchored on the moment, and a second wide around it.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.anchor).is_equal_to(PlaybackAnchor::Cursor(Duration::from_secs(10)));
+        assert_that!(request.span_start).is_equal_to(Duration::from_millis(9_500));
+        assert_that!(request.span_end).is_equal_to(Duration::from_millis(10_500));
+
+        // Assert: bare picture burns nothing in — no cue is dragged onto a moment the
+        // viewer would see none at.
+        assert_that!(request.on_screen).is_empty();
+
+        // Assert: and the page is waiting for that span rather than for a cue's.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cursor(Duration::from_secs(10))));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The padding the popup sets is added to the second the cursor's playback is given
+    /// rather than replacing it, so a reader who widened it sees the same extra either side
+    /// of a moment as they do either side of a cue.
+    #[test]
+    fn the_cursors_span_should_carry_the_configured_padding_on_top_of_its_own_second() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.preview_settings.playback_pad = Duration::from_secs(2);
+        app.subtitle_edit.as_mut().unwrap().duration = Duration::from_secs(30);
+        app.focus_timeline();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().cursor()).is_some();
+        let state = app.subtitle_edit.as_mut().unwrap();
+        while state.cursor() != Some(Duration::from_secs(10)) {
+            assert_that!(state.move_cursor(1, crate::subtitle_edit::TIMELINE_STEP)).is_true();
+        }
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: two and a half seconds either side, not two.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.span_start).is_equal_to(Duration::from_millis(7_500));
+        assert_that!(request.span_end).is_equal_to(Duration::from_millis(12_500));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup is a view onto the settings in force, not a form with its own copy, so
+    /// what it changes has to reach the very next request — speed, padding, rate and sound
+    /// all at once.
+    #[test]
+    fn the_session_settings_should_decide_how_the_next_span_is_decoded() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.open_preview_settings();
+
+        // Act: half speed, looping, silent, no padding, and a lower rate.
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        pick(&mut app, PreviewSettingsField::Loop, "Yes");
+        pick(&mut app, PreviewSettingsField::Sound, "No");
+        pick(&mut app, PreviewSettingsField::Padding, "0.00 s");
+        pick(&mut app, PreviewSettingsField::FrameRate, "24 fps");
+        app.escape_preview_settings();
+        app.toggle_playback();
+
+        // Assert: the span is the cue itself with no run-up, at half speed, and the rate is
+        // the one asked for.
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.speed).is_equal_to(PlaybackSpeed::HALF);
+        assert_that!(request.span_start).is_equal_to(Duration::from_secs(5));
+        assert_that!(request.span_end).is_equal_to(Duration::from_secs(7));
+        assert_that!(request.fps).is_equal_to(24);
+        // Muting asks for no sound at all rather than for silenced sound, which is what puts
+        // it on the same path as media with no audio track.
+        assert_that!(request.audio).is_none();
+        assert_that!(app.preview_settings().playback_loop).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Chooses a named value for a field the way the keys do: walk to the row, `Enter` to
+    /// open the dropdown (or to flip a toggle), walk to the value, `Enter` to commit.
+    ///
+    /// By label rather than by index, so a test says which speed it wanted and a changed
+    /// list fails loudly instead of quietly selecting its neighbour.
+    fn pick(app: &mut App, field: PreviewSettingsField, value: &str) {
+        app.move_preview_settings_to_endpoint(false);
+        while app
+            .preview_settings_popup
+            .expect("the popup should be open")
+            .field
+            != field
+        {
+            app.move_preview_settings_cursor(1);
+        }
+        let choices = app.preview_choices(field);
+        let index = choices
+            .iter()
+            .position(|choice| choice == value)
+            .unwrap_or_else(|| panic!("{field:?} should offer {value}, got {choices:?}"));
+        if field.is_toggle() {
+            // Two buttons and no list: `Enter` flips, so it is pressed only when the value
+            // asked for is not the one already lit.
+            if app.preview_choice_cursor(field) != index {
+                app.activate_preview_setting();
+            }
+            return;
+        }
+        app.activate_preview_setting();
+        app.move_preview_settings_to_endpoint(false);
+        for _ in 0..index {
+            app.move_preview_settings_cursor(1);
+        }
+        app.activate_preview_setting();
+    }
+
+    /// The popup needs no media and no workers — it edits settings, and the page it belongs
+    /// to is only a gate on opening it. Returns the scratch directory to clean up with.
+    fn preview_settings_app() -> (App, PathBuf) {
+        let app = test_app(media(
+            serde_json::json!([{"index": 0, "codec_type": "video", "codec_name": "h264"}]),
+        ));
+        let directory = app.directory.clone();
+        (app, directory)
+    }
+
+    /// A dropdown opens on the value in force and commits the one under the cursor, so
+    /// `Enter` `Enter` must change nothing — a list that opened at the top would quietly
+    /// hand back its first entry to anyone who glanced at it and pressed on.
+    #[test]
+    fn a_preview_dropdown_should_open_on_the_value_in_force_and_commit_the_one_chosen() {
+        // Arrange
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleEdit;
+        app.open_preview_settings();
+        // Down past the three track rows to the speed.
+        for _ in 0..3 {
+            app.move_preview_settings_cursor(1);
+        }
+
+        // Act / Assert: opening and committing without moving changes nothing.
+        let settled = app.preview_settings();
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Dropdown));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(3));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings()).is_equal_to(settled);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+
+        // Act / Assert: the cursor stops at both ends of an open list rather than wrapping.
+        app.activate_preview_setting();
+        for _ in 0..20 {
+            app.move_preview_settings_cursor(-1);
+        }
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(0));
+        for _ in 0..20 {
+            app.move_preview_settings_cursor(1);
+        }
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(6));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::SLOWEST);
+
+        // Act / Assert: Esc closes an open list without closing the popup — one level at a
+        // time, like every other settings dialog — and leaves the value alone.
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(-1);
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::SLOWEST);
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_none();
+
+        // Act / Assert: the two toggles flip on Enter rather than opening anything, and
+        // `Sound` reads as sound rather than as muting.
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Loop, "Yes");
+        assert_that!(app.preview_settings().playback_loop).is_true();
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_loop).is_false();
+        pick(&mut app, PreviewSettingsField::Sound, "No");
+        assert_that!(app.preview_settings().playback_muted).is_true();
+        pick(&mut app, PreviewSettingsField::Sound, "Yes");
+        assert_that!(app.preview_settings().playback_muted).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// Each field offers the values it should, and a value the config file asked for that is
+    /// not one of them is merged in rather than being unreachable — otherwise a user who set
+    /// `fps = 25` could try 30 and never get back without `r`.
+    #[test]
+    fn a_preview_dropdown_should_offer_its_values_and_whatever_the_config_file_asked_for() {
+        // Arrange: a config holding a rate and a padding the popup does not offer.
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleEdit;
+        app.set_preview_settings(PreviewSettings {
+            playback_fps: 25,
+            playback_pad: Duration::from_millis(750),
+            ..PreviewSettings::default()
+        });
+        app.open_preview_settings();
+
+        // Act / Assert: the offered lists, with the config's own values merged into place
+        // rather than appended to the end.
+        assert_that!(app.preview_choices(PreviewSettingsField::Speed)).is_equal_to(vec![
+            "2x".to_string(),
+            "1.5x".to_string(),
+            "1.25x".to_string(),
+            "1x".to_string(),
+            "0.75x".to_string(),
+            "0.5x".to_string(),
+            "0.25x".to_string(),
+        ]);
+        assert_that!(app.preview_choices(PreviewSettingsField::Loop))
+            .is_equal_to(vec!["Yes".to_string(), "No".to_string()]);
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "60 fps".to_string(),
+            "48 fps".to_string(),
+            "30 fps".to_string(),
+            "25 fps".to_string(),
+            "24 fps".to_string(),
+            "15 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+        assert_that!(app.preview_choices(PreviewSettingsField::Padding)).is_equal_to(vec![
+            "5.00 s".to_string(),
+            "3.00 s".to_string(),
+            "2.00 s".to_string(),
+            "1.50 s".to_string(),
+            "1.00 s".to_string(),
+            "0.75 s".to_string(),
+            "0.50 s".to_string(),
+            "0.25 s".to_string(),
+            "0.00 s".to_string(),
+        ]);
+
+        // Act / Assert: and the merged value is still reachable after moving off it.
+        pick(&mut app, PreviewSettingsField::FrameRate, "60 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(60);
+        pick(&mut app, PreviewSettingsField::FrameRate, "25 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(25);
+
+        // Act / Assert: every offered value is one the config loader would also accept, so
+        // the popup cannot put the session somewhere a restart could not.
+        for fps in app.playback_fps_choices() {
+            assert_that!(
+                (crate::config::MIN_PLAYBACK_FPS..=crate::config::MAX_PLAYBACK_FPS).contains(&fps)
+            )
+            .is_true();
+        }
+        for pad in app.playback_pad_choices() {
+            assert_that!(pad <= crate::config::MAX_PLAYBACK_PAD).is_true();
+        }
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// A reset restores what `config.toml` asked for, not what the code's own defaults are —
+    /// otherwise `r` on a user who set `fps = 24` would hand them 30 and look like a bug.
+    #[test]
+    fn a_reset_should_restore_the_config_files_answer_rather_than_the_built_in_one() {
+        // Arrange: a config that differs from the built-in defaults.
+        let (mut app, settings_directory) = preview_settings_app();
+        app.layer = Layer::SubtitleEdit;
+        app.set_preview_settings(PreviewSettings {
+            playback_fps: 24,
+            playback_pad: Duration::from_millis(1_500),
+            ..PreviewSettings::default()
+        });
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Speed, "0.75x");
+        pick(&mut app, PreviewSettingsField::FrameRate, "30 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+
+        // Act: reset the focused field only.
+        app.reset_preview_setting();
+
+        // Assert: the file's rate is back, and the speed is left as it was.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::STEPS[4]);
+
+        // Act / Assert: every field resets on its own, not only the one the reset-all path
+        // happens to reach — `r` is per-field, and a row that quietly ignored it would look
+        // exactly like a row whose value was already the default. From a clean slate, so
+        // that each field is the only thing differing when its turn comes.
+        app.reset_preview_settings();
+        for (field, value) in [
+            (PreviewSettingsField::Speed, "2x"),
+            (PreviewSettingsField::Loop, "Yes"),
+            (PreviewSettingsField::Sound, "No"),
+            (PreviewSettingsField::Padding, "3.00 s"),
+            (PreviewSettingsField::FrameRate, "60 fps"),
+        ] {
+            pick(&mut app, field, value);
+            assert_that!(app.preview_settings() != app.preview_defaults()).is_true();
+            app.reset_preview_setting();
+            assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+        }
+
+        // Act / Assert: a reset inside an open list moves the highlight back onto the value
+        // it restored, so `Enter` commits what is now in force rather than putting the
+        // discarded value straight back.
+        pick(&mut app, PreviewSettingsField::FrameRate, "60 fps");
+        app.activate_preview_setting();
+        app.reset_preview_setting();
+        app.activate_preview_setting();
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+
+        // Act: reset the lot.
+        pick(&mut app, PreviewSettingsField::Speed, "1.5x");
+        app.reset_preview_settings();
+
+        // Assert: every playback field is back to the file's answer.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_pad).is_equal_to(Duration::from_millis(1_500));
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::NORMAL);
+        assert_that!(app.preview_settings()).is_equal_to(app.preview_defaults());
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// The frame-rate setting is a ceiling, and the source is the other one. Asking a 24 fps
+    /// film for 30 decodes 30 frames a second of which six are copies the `fps` filter made,
+    /// costing a quarter more memory for exactly the same picture — and every assertion
+    /// short of the request's own rate still passes.
+    #[test]
+    fn a_span_should_not_be_asked_for_more_frames_than_its_source_holds() {
+        // Arrange: a 24 fps source, against the default thirty-a-second ceiling.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24/1"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert: the source's own rate, not the setting's.
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(24);
+        app.toggle_playback();
+
+        // Act / Assert: at half speed one output second covers half a second of media, so
+        // there are only twelve distinct frames to ask for — which is exactly the case where
+        // the memory budget is tightest, since a slowed span holds twice as many.
+        app.open_preview_settings();
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        app.escape_preview_settings();
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(12);
+        app.toggle_playback();
+
+        // Act / Assert: and a setting below what the source holds is still honoured — this
+        // only ever lowers a rate.
+        app.open_preview_settings();
+        app.reset_preview_settings();
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        app.escape_preview_settings();
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup must not offer a rate the open track cannot deliver. Capping only the
+    /// request left `60 fps` selectable on a 23.976 fps film — a row stating a rate that
+    /// cannot happen, with nothing on screen to say so.
+    #[test]
+    fn the_frame_rate_dropdown_should_offer_only_what_the_source_can_deliver() {
+        // Arrange: the NTSC film rate, which is the case that reads worst — 23.976 must
+        // offer 24 rather than being rounded down out of its own list.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24000/1001"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleEdit;
+        app.open_preview_settings();
+
+        // Act / Assert: nothing above the source's own rate is on the list.
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "24 fps".to_string(),
+            "15 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+
+        // Act / Assert: and the row shows what the track will play at rather than the
+        // thirty the config file asked for — but is not marked as a value the *user*
+        // changed, because they did not.
+        assert_that!(app.effective_playback_fps()).is_equal_to(24);
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::FrameRate)).is_equal_to(0);
+
+        // Act / Assert: choosing from the list still sets the session's own ceiling.
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(10);
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same defect one level down: a 24 fps film at quarter speed has six distinct
+    /// frames to give each second of playback, so offering 24/15/10/5 there is offering four
+    /// rows that play identically. The list has to follow the speed, not just the source.
+    #[test]
+    fn the_frame_rate_dropdown_should_follow_the_speed_as_well_as_the_source() {
+        // Arrange: the NTSC film rate again, and the config file's default of thirty.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "24000/1001"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleEdit;
+        app.open_preview_settings();
+
+        // Act / Assert: half speed halves the ceiling. Twelve is on no curated list, but it
+        // is what the row will play at, so it has to be offered and the cursor has to find
+        // it.
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate)).is_equal_to(vec![
+            "12 fps".to_string(),
+            "10 fps".to_string(),
+            "5 fps".to_string(),
+        ]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(12);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::FrameRate)).is_equal_to(0);
+
+        // Act / Assert: and quarter speed leaves two rows, both of them real.
+        pick(&mut app, PreviewSettingsField::Speed, "0.25x");
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate))
+            .is_equal_to(vec!["6 fps".to_string(), "5 fps".to_string()]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(6);
+
+        // Act / Assert: none of that wrote over the setting. The thirty the config file
+        // asked for is still there, so coming back reads twenty-four rather than the six the
+        // detour went through.
+        assert_that!(app.preview_settings().playback_fps).is_equal_to(30);
+        pick(&mut app, PreviewSettingsField::Speed, "1x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(24);
+
+        // Act / Assert: a rate the user picks *below* the ceiling stays theirs when the
+        // speed drops — the escape hatch for a terminal that cannot keep up is not something
+        // slowing a playback down is allowed to take away. The speed only ever lowers a
+        // rate; it never chooses one.
+        pick(&mut app, PreviewSettingsField::FrameRate, "10 fps");
+        pick(&mut app, PreviewSettingsField::Speed, "0.5x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+        pick(&mut app, PreviewSettingsField::Speed, "0.25x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(6);
+        pick(&mut app, PreviewSettingsField::Speed, "1x");
+        assert_that!(app.effective_playback_fps()).is_equal_to(10);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A source slower than anything on offer still gets a list — its own rate — rather than
+    /// an empty dropdown with nothing to put the cursor on.
+    #[test]
+    fn a_source_slower_than_every_offered_rate_should_still_offer_its_own() {
+        // Arrange: a timelapse at two frames a second.
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "avg_frame_rate": "2/1"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        select_embedded_row(&mut app, 2);
+        let directory = app.directory.clone();
+        app.layer = Layer::SubtitleEdit;
+        app.open_preview_settings();
+
+        // Act / Assert
+        assert_that!(app.preview_choices(PreviewSettingsField::FrameRate))
+            .is_equal_to(vec!["2 fps".to_string()]);
+        assert_that!(app.effective_playback_fps()).is_equal_to(2);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Media whose frame rate ffprobe will not describe caps nothing: guessing a rate would
+    /// make a playback choppier for a file that was merely unreadable.
+    #[test]
+    fn a_source_with_no_stated_frame_rate_should_leave_the_setting_alone() {
+        // Arrange: the ordinary fixture, whose streams carry no frame rate at all.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act
+        app.toggle_playback();
+
+        // Assert
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(request.fps).is_equal_to(30);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A popup cannot be layered over a playback: the span's pixels reach the terminal
+    /// through its image protocol rather than through the cell buffer the dialog is drawn
+    /// into, so a dialog raised over one is painted once and wiped by the next frame —
+    /// leaving a popup that is open, swallowing every key, and invisible.
+    ///
+    /// Asserted for the span being *decoded* as well as the one playing: a popup opened a
+    /// moment before the span starts is in exactly the same position a moment later.
+    ///
+    /// Automatic sync's `Dialog::AutoSyncing` is covered alongside the other two, even
+    /// though it draws nothing of its own that a span's image would wipe — it is refused for
+    /// the reason every other dialog on this page is, not because it would be invisible.
+    #[test]
+    fn no_dialog_should_open_over_a_playback() {
+        // Arrange: a page with a span on the way.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(app.playback_in_progress()).is_true();
+
+        // Act / Assert: neither popup opens while the span is still decoding, and neither
+        // does automatic sync's — it is a dialog too, even though it draws nothing of a
+        // span's own and only dispatches a background request.
+        app.open_preview_settings();
+        app.show_keybindings();
+        app.auto_sync_track();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Arrange: and now the span is actually playing.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                anchor: request.anchor,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.playback_active()).is_true();
+
+        // Act / Assert: still refused.
+        app.open_preview_settings();
+        app.show_keybindings();
+        app.auto_sync_track();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+        assert_that!(preview.sync_rx.try_recv().is_err()).is_true();
+
+        // Act / Assert: and once the playback is stopped, all three open again — the gate is
+        // the playback, not the page.
+        app.toggle_playback();
+        assert_that!(app.playback_in_progress()).is_false();
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        app.escape_preview_settings();
+        app.show_keybindings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+        app.dialog = None;
+        app.auto_sync_track();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::AutoSyncing));
+        assert_that!(preview.sync_rx.try_recv().is_ok()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The conflict notice raises itself, so it cannot be refused the way `:` and `?` are —
+    /// a staged file changing on disk is not something to hold back until the user happens
+    /// to stop watching a two-second span. The playback gives way instead.
+    #[test]
+    fn a_self_raising_dialog_should_stop_a_playback_rather_than_be_refused() {
+        // Arrange: a page with a span playing, and a staged file that has changed under it.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                anchor: request.anchor,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.playback_active()).is_true();
+        let path = app.directory.join("movie.mkv");
+        let mut edit = staged_edit(
+            crate::files::FileFingerprint {
+                length: 1,
+                modified: None,
+            },
+            vec![0, 1],
+        );
+        edit.conflict_groups.insert("subtitle");
+        app.staged_edits.insert(path, edit);
+
+        // Act
+        let opened = app.maybe_open_conflict_dialog();
+
+        // Assert: the notice is up and the playback has gone, rather than the notice being
+        // drawn under a span that is still repainting over it.
+        assert_that!(opened).is_true();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ResolveConflicts));
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.playback_in_progress()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The popup belongs to the subtitle edit page, and every settings popup in the application
+    /// refuses to open over another one.
+    #[test]
+    fn the_preview_settings_popup_should_open_only_from_the_edit_page() {
+        // Arrange
+        let (mut app, settings_directory) = preview_settings_app();
+
+        // Act / Assert: not from the file list.
+        app.layer = Layer::Files;
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Act / Assert: not over another dialog.
+        app.layer = Layer::SubtitleEdit;
+        app.dialog = Some(Dialog::Keybindings);
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+
+        // Act / Assert: and from the page itself, it opens on the first field.
+        app.dialog = None;
+        app.open_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::PreviewSettings));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::VideoTrack));
+
+        // Act / Assert: the cursor walks the fields and stops at both ends.
+        app.move_preview_settings_cursor(-1);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::VideoTrack));
+        app.move_preview_settings_to_endpoint(true);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::FrameRate));
+        app.move_preview_settings_cursor(1);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::FrameRate));
+        app.move_preview_settings_to_endpoint(false);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(PreviewSettingsField::VideoTrack));
+
+        // Act / Assert: closing leaves the settings in force — there is nothing to discard.
+        pick(&mut app, PreviewSettingsField::Speed, "0.75x");
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_none();
+        assert_that!(app.preview_settings_popup.is_none()).is_true();
+        assert_that!(app.preview_settings().playback_speed).is_equal_to(PlaybackSpeed::STEPS[4]);
+
+        // Act / Assert: and with no popup open, every one of its actions is inert rather
+        // than reaching into the settings from wherever the user actually is.
+        let settled = app.preview_settings();
+        app.move_preview_settings_cursor(1);
+        app.move_preview_settings_to_endpoint(true);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        app.set_preview_toggle(true);
+        app.reset_preview_setting();
+        app.reset_preview_settings();
+        assert_that!(app.preview_settings()).is_equal_to(settled);
+        assert_that!(app.dialog).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(settings_directory).unwrap();
+    }
+
+    /// Points a track row at row `row` of its dropdown, the way `Enter` `j` `Enter` does.
+    fn pick_track(app: &mut App, field: PreviewSettingsField, row: usize) {
+        app.preview_settings_popup = app
+            .preview_settings_popup
+            .map(|popup| PreviewSettingsPopup { field, ..popup });
+        app.activate_preview_setting();
+        let from = app.preview_choice_cursor(field);
+        for _ in from..row {
+            app.move_preview_settings_cursor(1);
+        }
+        app.activate_preview_setting();
+    }
+
+    /// Hands the open page two cues, which is what a `PrepareRequest` coming back does.
+    fn ready_cues(app: &mut App) {
+        let state = app.subtitle_edit.as_mut().expect("a page should be open");
+        state.apply_prepared(
+            vec![
+                crate::cue::Cue {
+                    index: 0,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(3),
+                    text: "one".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+                crate::cue::Cue {
+                    index: 1,
+                    start: Duration::from_secs(5),
+                    end: Duration::from_secs(7),
+                    text: "two".into(),
+                    dialogue: Vec::new(),
+                    events: 1,
+                },
+            ],
+            CueStyle::SubRip,
+        );
+    }
+
+    /// A file with everything the three track dropdowns have to say something about: two
+    /// video streams and a piece of cover art, two audio streams, two SubRip tracks and one
+    /// the page cannot read at all.
+    fn multi_track_app() -> App {
+        let mut app = test_file_app(&["movie.mkv"]);
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+                {"index": 2, "codec_type": "video", "codec_name": "hevc",
+                 "width": 640, "height": 360},
+                {"index": 3, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+                 "tags": {"language": "eng"}},
+                {"index": 4, "codec_type": "audio", "codec_name": "ac3", "channels": 6,
+                 "tags": {"language": "eng", "title": "Commentary"}},
+                {"index": 5, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}},
+                {"index": 6, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "nld"}},
+                {"index": 7, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                 "tags": {"language": "fre"}},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        select_embedded_row(&mut app, 5);
+        app
+    }
+
+    /// The rows have to name the file's own streams, in a form that tells two of a kind
+    /// apart — which is the whole reason to offer the choice. Cover art is the one thing
+    /// left out of the video list: it is a still, so a page previewing against one would
+    /// draw the same frame for every cue in the track.
+    #[test]
+    fn the_track_dropdowns_should_list_the_files_own_streams() {
+        // Arrange
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.open_preview_settings();
+
+        // Act
+        let video = app.preview_choices(PreviewSettingsField::VideoTrack);
+        let audio = app.preview_choices(PreviewSettingsField::AudioTrack);
+        let subtitle = app.preview_choices(PreviewSettingsField::SubtitleTrack);
+
+        // Assert: the two real video streams and not the cover art.
+        assert_that!(video.as_slice()).contains_exactly_in_given_order([
+            "#1 · H264 · 1920×1080".to_string(),
+            "#2 · HEVC · 640×360".to_string(),
+        ]);
+        // The language and the title are what tell a commentary track from the feature.
+        assert_that!(audio.as_slice()).contains_exactly_in_given_order([
+            "#3 · AAC · 2 ch · ENG".to_string(),
+            "#4 · AC3 · 6 ch · ENG · Commentary".to_string(),
+        ]);
+        assert_that!(subtitle.len()).is_equal_to(3);
+        assert_that!(subtitle[0].clone()).is_equal_to("#5 · SRT · ENG".to_string());
+        assert_that!(subtitle[1].clone()).is_equal_to("#6 · SRT · NLD".to_string());
+
+        // Assert: the cursor opens on what the page is actually previewing, so `Enter`
+        // `Enter` changes nothing.
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::VideoTrack)).is_equal_to(0);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::AudioTrack)).is_equal_to(0);
+        assert_that!(app.preview_choice_cursor(PreviewSettingsField::SubtitleTrack)).is_equal_to(0);
+        // And the page opened on the first *real* video stream rather than on the cover art,
+        // which is what `-map 0:v:0` would have grabbed.
+        assert_that!(app.subtitle_edit.as_ref().unwrap().frames.video_stream).is_equal_to(1);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track the page would refuse is listed and greyed rather than left out. A reader who
+    /// can see the track is there and is not on offer has been answered; one who cannot find
+    /// it goes looking for a bug. The cursor then has to step over it, or `Enter` would
+    /// close the popup onto a page that cannot be built.
+    #[test]
+    fn a_subtitle_track_the_page_refuses_should_be_listed_and_unchoosable() {
+        // Arrange: the PGS track carries pictures rather than text, and the Dutch one is
+        // marked to be taken out of the file.
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.deleted_streams.insert(6);
+        app.open_subtitle_edit();
+        app.open_preview_settings();
+
+        // Act
+        let choices = app.preview_track_choices(PreviewSettingsField::SubtitleTrack);
+
+        // Assert: both are on the list, both say why, and neither can be chosen.
+        assert_that!(choices[1].label.as_str()).is_equal_to("#6 · SRT · NLD · marked for deletion");
+        assert_that!(choices[1].enabled).is_false();
+        assert_that!(choices[2].label.as_str()).is_equal_to("#7 · PGS · FRA · cannot be previewed");
+        assert_that!(choices[2].enabled).is_false();
+
+        // Act / Assert: the cursor cannot rest on either, so `G` stays on the one track that
+        // can be chosen rather than landing on the last row.
+        app.preview_settings_popup = Some(PreviewSettingsPopup {
+            field: PreviewSettingsField::SubtitleTrack,
+            mode: PreviewSettingsMode::Dropdown,
+            ..PreviewSettingsPopup::default()
+        });
+        app.move_preview_settings_to_endpoint(true);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(0));
+        app.move_preview_settings_cursor(1);
+        assert_that!(app.preview_settings_popup.map(|popup| popup.cursor)).is_equal_to(Some(0));
+
+        // Act / Assert: and committing one anyway is refused rather than staged.
+        app.set_preview_choice(PreviewSettingsField::SubtitleTrack, 2);
+        assert_that!(app.preview_track_pending(PreviewSettingsField::SubtitleTrack)).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Media with no sound is the one dropdown in this popup that can be empty, and a cursor
+    /// put into a list with no rows would swallow every key until `Esc` — on a popup whose
+    /// other rows still have work to do.
+    #[test]
+    fn an_audio_dropdown_with_no_streams_should_not_open() {
+        // Arrange: a video with no audio at all.
+        let mut app = test_file_app(&["silent.mkv"]);
+        let directory = app.directory.clone();
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        select_embedded_row(&mut app, 1);
+        app.open_subtitle_edit();
+        app.open_preview_settings();
+        app.preview_settings_popup = Some(PreviewSettingsPopup {
+            field: PreviewSettingsField::AudioTrack,
+            ..PreviewSettingsPopup::default()
+        });
+
+        // Act
+        app.activate_preview_setting();
+
+        // Assert: the row stays closed, and there is nothing for a playback to ask for.
+        assert_that!(app.preview_settings_popup.map(|popup| popup.mode))
+            .is_equal_to(Some(PreviewSettingsMode::Summary));
+        assert_that!(app.preview_audio_stream()).is_none();
+        assert_that!(app.non_default_audio_stream()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The audio stream is chosen per playback, so it lands on the next `p` for free. The
+    /// video stream and the subtitle track are read when the page is *built* — the first is
+    /// in every cache key, the second is the extraction the cue list comes from — so putting
+    /// either into force means standing the page up again.
+    #[test]
+    fn closing_the_popup_should_reopen_the_page_only_for_the_picture_and_the_cues() {
+        // Arrange
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let opened = app.subtitle_edit.as_ref().unwrap().generation;
+
+        // Act: the commentary track, and nothing else.
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::AudioTrack, 1);
+        app.escape_preview_settings();
+
+        // Assert: in force for the next playback, with the page left exactly as it was.
+        assert_that!(app.preview_audio_stream()).is_equal_to(Some(4));
+        assert_that!(app.non_default_audio_stream()).is_equal_to(Some(4));
+        assert_that!(app.subtitle_edit.as_ref().unwrap().generation).is_equal_to(opened);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act: the second video stream, with the cursor parked on the second cue.
+        ready_cues(&mut app);
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::VideoTrack, 1);
+        app.escape_preview_settings();
+
+        // Assert: a fresh page on the same track, grabbing from the chosen stream and sized
+        // by *its* geometry — and once the cues come back the reader is where they were,
+        // since the list is the same one.
+        let state = app
+            .subtitle_edit
+            .as_ref()
+            .expect("the page should come back");
+        assert_that!(state.generation).is_not_equal_to(opened);
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(5));
+        assert_that!(state.frames.video_stream).is_equal_to(2);
+        assert_that!(state.frames.pixels).is_equal_to((640, 360));
+        ready_cues(&mut app);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(1);
+
+        // Act: and the other subtitle track, from the second cue.
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::SubtitleTrack, 1);
+        app.escape_preview_settings();
+
+        // Assert: the page is about the other track now, and the cursor does not carry over —
+        // a position in one track's list says nothing about another's.
+        let state = app
+            .subtitle_edit
+            .as_ref()
+            .expect("the page should come back");
+        assert_that!(state.source.clone()).is_equal_to(SubtitleSource::Embedded(6));
+        assert_that!(state.frames.video_stream).is_equal_to(2);
+        ready_cues(&mut app);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().selected).is_equal_to(0);
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Switching tracks leaves this track's page as surely as `Esc` does: the cue list is
+    /// rebuilt from the file and staged rewrites are re-applied to nothing, so carrying them
+    /// across would leave the reader with words they can no longer see and a `Ctrl+S` that
+    /// still writes them. So the same question is asked, in words naming what is about to
+    /// happen.
+    #[test]
+    fn switching_the_subtitle_track_with_unsaved_cue_edits_should_ask_first() {
+        // Arrange: a cue rewritten but not written out.
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        ready_cues(&mut app);
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+
+        // Act
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::SubtitleTrack, 1);
+        app.escape_preview_settings();
+
+        // Assert: the question is up, the popup is gone, and nothing has switched yet.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        assert_that!(app.switching_subtitle_track()).is_true();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Embedded(5));
+
+        // Act / Assert: staying keeps the edits and drops the switch — a refused switch is
+        // not one to carry forward into the next question.
+        app.resolve_leave_subtitle_edit(false);
+        assert_that!(app.has_unsaved_cue_edits()).is_true();
+        assert_that!(app.switching_subtitle_track()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Embedded(5));
+
+        // Act: ask again, and discard this time.
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::SubtitleTrack, 1);
+        app.escape_preview_settings();
+        app.resolve_leave_subtitle_edit(true);
+
+        // Assert: the edits are gone and the page is on the other track rather than back on
+        // the track list, which is what `Esc` would have done.
+        assert_that!(app.has_unsaved_cue_edits()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().source.clone())
+            .is_equal_to(SubtitleSource::Embedded(6));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `config.toml` has nothing to say about tracks, so the only thing `r` can put a track
+    /// row back to is the choice this visit has not made — which leaves the page exactly as
+    /// the reader found it, and closing the popup then does nothing at all.
+    #[test]
+    fn resetting_a_track_row_should_leave_the_page_on_the_track_it_is_on() {
+        // Arrange
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        let opened = app.subtitle_edit.as_ref().unwrap().generation;
+        app.open_preview_settings();
+
+        // Act: point all three somewhere else, then take one back with `r` and the rest
+        // with `R`.
+        pick_track(&mut app, PreviewSettingsField::VideoTrack, 1);
+        pick_track(&mut app, PreviewSettingsField::AudioTrack, 1);
+        pick_track(&mut app, PreviewSettingsField::SubtitleTrack, 1);
+        assert_that!(app.preview_track_pending(PreviewSettingsField::VideoTrack)).is_true();
+        app.preview_settings_popup = app
+            .preview_settings_popup
+            .map(|popup| PreviewSettingsPopup {
+                field: PreviewSettingsField::VideoTrack,
+                mode: PreviewSettingsMode::Summary,
+                ..popup
+            });
+        app.reset_preview_setting();
+        assert_that!(app.preview_track_pending(PreviewSettingsField::VideoTrack)).is_false();
+        assert_that!(app.preview_track_pending(PreviewSettingsField::SubtitleTrack)).is_true();
+        app.reset_preview_settings();
+
+        // Assert: nothing is pending, so closing changes nothing — same page, same track,
+        // same audio stream.
+        for field in PreviewSettingsField::ORDER {
+            assert_that!(app.preview_track_pending(field)).is_false();
+        }
+        app.escape_preview_settings();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().generation).is_equal_to(opened);
+        assert_that!(app.preview_audio_stream()).is_equal_to(Some(3));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A stream index means nothing on another file, so the choice is dropped when the
+    /// selection changes — and a probe refreshed under an open page can drop a stream, which
+    /// falls back to the first rather than to a `-map` that fails the whole run.
+    #[test]
+    fn a_stream_the_probe_no_longer_holds_should_fall_back_to_the_first() {
+        // Arrange: previewing against the second video stream and the commentary track.
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        app.open_subtitle_edit();
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::VideoTrack, 1);
+        pick_track(&mut app, PreviewSettingsField::AudioTrack, 1);
+        app.escape_preview_settings();
+        assert_that!(app.preview_video_stream()).is_equal_to(Some(2));
+        assert_that!(app.preview_audio_stream()).is_equal_to(Some(4));
+
+        // Act: a re-probe that no longer holds either of them, under the open page.
+        set_media(
+            &mut app,
+            serde_json::json!([
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+            ]),
+        );
+
+        // Assert: the file's own first streams, rather than nothing.
+        assert_that!(app.preview_video_stream()).is_equal_to(Some(0));
+        assert_that!(app.preview_audio_stream()).is_equal_to(Some(1));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An index means nothing on another file — stream three of one is stream three of
+    /// nothing in particular in the next — so moving the cursor off the file drops the
+    /// choice along with the page it was made on.
+    #[test]
+    fn moving_to_another_file_should_drop_the_streams_the_page_was_previewing() {
+        // Arrange
+        let mut app = multi_track_app();
+        let directory = app.directory.clone();
+        std::fs::write(directory.join("other.mkv"), b"media").unwrap();
+        app.open_subtitle_edit();
+        app.open_preview_settings();
+        pick_track(&mut app, PreviewSettingsField::VideoTrack, 1);
+        pick_track(&mut app, PreviewSettingsField::AudioTrack, 1);
+        app.escape_preview_settings();
+        assert_that!(app.preview_video_stream()).is_equal_to(Some(2));
+
+        // Act: back to the file list, and on to another file.
+        app.reconcile_files(scan_directory(&directory).unwrap());
+        app.layer = Layer::Files;
+        app.select_next();
+
+        // Assert: the page is gone and so are the streams it was previewing against.
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.preview_video_stream()).is_none();
+        assert_that!(app.preview_audio_stream()).is_none();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `a` writes a zero-byte sidecar the moment its popup is answered, and leaving without
+    /// typing a line takes it back off the disk. A close that is only the first half of
+    /// re-opening the page is not leaving — deleting the file there would pull it out from
+    /// under the page about to open on it — but re-opening on a *different* track is leaving
+    /// this one, and the file goes exactly as it would on the way to the track list.
+    #[test]
+    fn page_exit_should_keep_a_new_empty_track_only_when_the_page_comes_back_to_it() {
+        // Arrange
+        let created = PathBuf::from("/media/movie.und.srt");
+        let other = SubtitleSource::Sidecar(PathBuf::from("/media/movie.nl.srt"));
+
+        // Assert
+        assert_that!(
+            PageExit::Reopening(&SubtitleSource::Sidecar(created.clone()))
+                .keeps_new_track(Some(&created))
+        )
+        .is_true();
+        assert_that!(PageExit::Reopening(&other).keeps_new_track(Some(&created))).is_false();
+        assert_that!(
+            PageExit::Reopening(&SubtitleSource::Embedded(2)).keeps_new_track(Some(&created))
+        )
+        .is_false();
+        assert_that!(PageExit::Leaving.keeps_new_track(Some(&created))).is_false();
+        assert_that!(PageExit::Reopening(&SubtitleSource::Sidecar(created)).keeps_new_track(None))
+            .is_false();
+    }
+
+    /// The same key is the way in and the way out, including during the second or two a
+    /// span takes to decode — otherwise pressing it by mistake means sitting through a
+    /// playback you have already decided you do not want.
+    #[test]
+    fn toggling_playback_again_should_stop_it_and_tell_the_worker() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+
+        // Act
+        app.toggle_playback();
+
+        // Assert: stopped, the worker told, and nothing new asked for.
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A terminal that cannot draw images has nothing to show a slideshow with, and a build
+    /// that cannot burn subtitles in would play a span with no line on it — which on this
+    /// page is not a degraded playback, it is the wrong answer to the only question asked.
+    #[test]
+    fn playback_should_be_refused_without_the_tools_to_draw_it() {
+        // Arrange: a page with the frame workers, but an FFmpeg that cannot burn. Stated
+        // rather than left to the default, since `App::new` reads the real one off this
+        // machine and a developer's build very much can burn.
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = ToolCapabilities {
+            ffmpeg_filters: BTreeSet::from(["scale".to_string()]),
+            ..full_subtitle_capabilities()
+        };
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+        assert_that!(app.playback_active()).is_false();
+
+        // Arrange / Act / Assert: and with no image protocol at all.
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_handles(None);
+        app.toggle_playback();
+        assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The renderer has not measured the pane on the first frame after the page opens, and
+    /// a track whose cues have not arrived has no cue to play. Either would become a
+    /// `scale=0:0` that fails, or a request for a cue that does not exist.
+    #[test]
+    fn playback_should_wait_for_something_to_play_and_somewhere_to_play_it() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app.open_subtitle_edit();
+
+        // Act / Assert: cues have not arrived.
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+
+        // Arrange / Act / Assert: cues, but a pane nobody has measured.
+        app.subtitle_edit.as_mut().unwrap().apply_prepared(
+            vec![crate::cue::Cue {
+                index: 0,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(3),
+                text: "one".into(),
+                dialogue: Vec::new(),
+                events: 1,
+            }],
+            CueStyle::SubRip,
+        );
+        app.toggle_playback();
+        assert_that!(playbacks.try_recv().is_err()).is_true();
+        assert_that!(app.playback_active()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Two gates, not one. The generation says the span is for the playback still wanted;
+    /// the cue index says the cursor has not moved since — which it can have, because
+    /// moving it is one of the things that stops a playback.
+    #[test]
+    fn a_span_should_only_play_for_the_request_that_is_still_wanted() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let playbacks = preview.playback_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act / Assert: a span from an older playback is dropped.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation.wrapping_sub(1),
+                anchor: request.anchor,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .playback_frame()
+                .is_none()
+        )
+        .is_true();
+
+        // Act / Assert: so is one for a cue the page is no longer waiting on.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                anchor: PlaybackAnchor::Cue(1),
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+        assert_that!(app.subtitle_edit.as_ref().unwrap().preparing_playback())
+            .is_equal_to(Some(PlaybackAnchor::Cue(0)));
+
+        // Act: the one that was actually asked for.
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                anchor: request.anchor,
+                outcome: PlaybackOutcome::Ready(decoded_span(&request, 4)),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert: playing, and drawing a picture once stepped.
+        assert_that!(app.advance_playback()).is_true();
+        assert_that!(
+            app.subtitle_edit
+                .as_ref()
+                .unwrap()
+                .playback_frame()
+                .is_some()
+        )
+        .is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span that could not be decoded leaves nothing running, so the worker has to be
+    /// told at the point the failure lands — `advance_playback` would not fire, since there
+    /// is no playback left to advance.
+    #[test]
+    fn a_span_that_failed_should_report_it_and_release_the_worker() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Act
+        sender
+            .send(PreviewEvent::Playback {
+                generation: request.generation,
+                anchor: request.anchor,
+                outcome: PlaybackOutcome::Failed("Could not play this cue: nope".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.subtitle_edit.as_ref().unwrap().playback_error())
+            .is_equal_to(Some("Could not play this cue: nope"));
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The page drops a playback on its own when the cursor moves or the pane resizes, and
+    /// this is the one place that becomes a running `ffmpeg` being killed rather than left
+    /// decoding seconds of video nobody will watch.
+    #[test]
+    fn a_playback_the_page_dropped_should_release_the_worker_on_the_next_step() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed))
+            .is_equal_to(request.generation);
+
+        // Act: the cursor moves, which `SubtitleEditState` drops the playback for without
+        // knowing anything about the worker.
+        app.subtitle_edit.as_mut().unwrap().select(1);
+        app.advance_playback();
+
+        // Assert
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        // And a second step does not keep bumping it, which would abandon each new playback
+        // the moment it was asked for.
+        let settled = live.load(std::sync::atomic::Ordering::Relaxed);
+        app.advance_playback();
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed)).is_equal_to(settled);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Esc peels one layer at a time, the same way it backs out of a file search before
+    /// leaving the file list: a playback is something on screen the user may want gone
+    /// without also losing the page they spent a second opening.
+    #[test]
+    fn escape_should_stop_a_playback_before_it_closes_the_page() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+
+        // Act / Assert: the playback goes, the page stays.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.playback_active()).is_false();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: and again closes it.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.subtitle_edit.is_none()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A span still decoding when the page closes would run to completion with nowhere to
+    /// go — seconds of `ffmpeg` for a page nobody is looking at.
+    #[test]
+    fn closing_the_page_should_stop_a_span_still_being_decoded() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let (playbacks, live) = (preview.playback_rx, preview.live_playback);
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_playback();
+        let request = playbacks.try_recv().expect("a span should be asked for");
+
+        // Act: straight out of the page, without stopping the playback first.
+        app.close_subtitle_edit(PageExit::Leaving);
+
+        // Assert
+        assert_that!(live.load(std::sync::atomic::Ordering::Relaxed) == request.generation)
+            .is_false();
+        // And stepping a page that is gone reports nothing rather than panicking.
+        assert_that!(app.advance_playback()).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Fifty milliseconds is a twenty-hertz ceiling, which would turn a thirty-frame-a-
+    /// second playback into a judder — the loop would wake on whichever side of a frame
+    /// boundary it happened to. A playback is the one thing here whose picture is timed
+    /// rather than merely animated.
+    #[test]
+    fn the_loop_should_wake_faster_only_while_something_is_playing() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+
+        // Act / Assert
+        assert_that!(app.poll_interval()).is_equal_to(IDLE_POLL_INTERVAL);
+        assert_that!(app.is_animating()).is_false();
+        app.toggle_playback();
+        assert_that!(app.poll_interval()).is_equal_to(PLAYBACK_POLL_INTERVAL);
+        // And the loop keeps repainting, or the page would freeze on whatever was on
+        // screen when the key was pressed.
+        assert_that!(app.is_animating()).is_true();
+        app.toggle_playback();
+        assert_that!(app.poll_interval()).is_equal_to(IDLE_POLL_INTERVAL);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The worker cannot see the cursor any more than it can see the cue list, so the moment
+    /// and everything on screen at it have to travel in the request. A moment that has never
+    /// been drawn waits out the debounce, which is what stops a held `l` starting an accurate
+    /// seek per repeat.
+    #[test]
+    fn start_pending_preview_should_ask_for_the_moment_the_cursor_stands_on() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        frames
+            .try_recv()
+            .expect("the selected cue is asked for first");
+
+        // Act: into the timeline, then two presses to 2:00 — inside the first cue, 1s to 3s.
+        app.focus_timeline();
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
+
+        // Assert: the moment does not go out until the cursor has settled. A request may
+        // still leave carrying the neighbours, which are cache-only and cost nothing —
+        // holding those back behind the expensive grab is exactly what the window exists to
+        // avoid — but it must not carry the moment.
+        app.start_pending_preview();
+        while let Ok(early) = frames.try_recv() {
+            assert_that!(early.scrub.is_none()).is_true();
+        }
+
+        // Act
+        std::thread::sleep(crate::subtitle_edit::FRAME_DEBOUNCE + Duration::from_millis(20));
+        app.start_pending_preview();
+
+        // Assert
+        let request = frames.try_recv().expect("the moment should be asked for");
+        let scrub = request.scrub.expect("the request should name the moment");
+        assert_that!(scrub.at).is_equal_to(Duration::from_secs(2));
+        assert_that!(scrub.on_screen.len()).is_equal_to(1);
+        assert_that!(scrub.on_screen[0].text.as_str()).is_equal_to("one");
+
+        // Act / Assert: and a settled cursor asks exactly once.
+        app.start_pending_preview();
+        assert_that!(frames.try_recv().is_err()).is_true();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A moment already in the frame cache skips the debounce, exactly as a cached cue does.
+    /// The wait is there to stop one `ffmpeg` per keystroke, and a moment the reader has been
+    /// to before costs a file read — making them wait a tenth of a second for it is a tenth
+    /// of a second of stale pane for nothing, on precisely the movement (scrubbing back over
+    /// ground already covered) this cache was added for.
+    #[test]
+    fn start_pending_preview_should_not_make_a_cached_moment_wait() {
+        // Arrange
+        let _guard = crate::framecache::testing::one_key();
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        let frames = preview.frame_rx;
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.start_pending_preview();
+        while frames.try_recv().is_ok() {}
+        app.focus_timeline();
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
+        // Seed the cache with whatever this moment's picture would be filed under.
+        let state = app.subtitle_edit.as_ref().expect("the page is open");
+        let target = state.scrub_target().expect("the timeline holds the cursor");
+        let (media, key) = state.frames.moment_key(&target);
+        assert_that!(framecache::store(&media, &key, &[7u8; 64])).is_true();
+
+        // Act: no sleep at all, so the debounce has certainly not expired.
+        app.start_pending_preview();
+
+        // Assert
+        let scrub = frames
+            .try_iter()
+            .find_map(|request| request.scrub)
+            .expect("the cached moment should go out at once");
+        assert_that!(scrub.at).is_equal_to(Duration::from_secs(2));
+
+        // Act / Assert: and it is still asked for only once.
+        app.start_pending_preview();
+        assert_that!(frames.try_iter().any(|request| request.scrub.is_some())).is_false();
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A frame for a moment the cursor has left is dropped rather than drawn under a moment
+    /// it is not of — and one for a page the reader has already closed is dropped too.
+    #[test]
+    fn receive_preview_events_should_take_a_frame_only_for_the_moment_the_cursor_is_on() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        let preview = crate::preview::test_handles();
+        app.set_preview_handles(Some(preview.handles));
+        app_ready_for_a_frame(&mut app);
+        app.focus_timeline();
+        app.move_timeline_cursor(2, crate::subtitle_edit::TIMELINE_STEP);
+        let generation = app.subtitle_edit.as_ref().unwrap().generation;
+        let (events, receiver) = std::sync::mpsc::channel();
+
+        // Act: a reason reported against a moment already left.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation,
+                at: Duration::from_secs(45),
+                outcome: FrameOutcome::Failed("stale".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().scrub_error()).is_none();
+
+        // Act: and one against the moment the cursor is actually on.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation,
+                at: Duration::from_secs(2),
+                outcome: FrameOutcome::Failed("Could not draw this frame".to_string()),
+            })
+            .unwrap();
+        // ...along with one for a page opening the reader has left, which says nothing.
+        events
+            .send(PreviewEvent::ScrubFrame {
+                generation: generation.wrapping_add(1),
+                at: Duration::from_secs(2),
+                outcome: FrameOutcome::Failed("another page".to_string()),
+            })
+            .unwrap();
+        app.receive_preview_events(&receiver);
+
+        // Assert
+        assert_that!(app.subtitle_edit.as_ref().unwrap().scrub_error())
+            .is_equal_to(Some("Could not draw this frame"));
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `Esc`/`q` peel one layer at a time, and the timeline cursor is not one of them: the
+    /// two panes are one page, so a reader who moved the cursor into the timeline is no
+    /// deeper in than one who never did. The timing mode still peels, ahead of the page.
+    #[test]
+    fn back_should_leave_the_timing_mode_and_then_the_page_whoever_holds_the_cursor() {
+        // Arrange
+        let mut app = app_with_subtitle_codec("subrip");
+        let directory = app.directory.clone();
+        app.subtitle_capabilities = full_subtitle_capabilities();
+        app.set_preview_handles(Some(crate::preview::test_handles().handles));
+        app_ready_for_a_frame(&mut app);
+        app.toggle_cue_timing_mode();
+        app.focus_timeline();
+
+        // Act / Assert: the first press leaves the mode and nothing else — the cursor stays
+        // where the reader put it.
+        assert_that!(app.back()).is_true();
+        assert_that!(matches!(app.timing_scope(), TimingScope::Cue(_))).is_false();
+        assert_that!(app.timeline_focused()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::SubtitleEdit);
+
+        // Act / Assert: and the second leaves the page rather than the timeline pane.
+        assert_that!(app.back()).is_true();
+        assert_that!(app.layer).is_equal_to(Layer::Streams);
+        assert_that!(app.timeline_focused()).is_false();
+
+        // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

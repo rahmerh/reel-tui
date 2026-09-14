@@ -13,13 +13,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 use std::sync::mpsc::Receiver;
+use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui_image::picker::Picker;
 use reel_tui::app::{
     App, AudioSettingsField, AudioSettingsMode, ContainerSettingsField, ContainerSettingsMode,
     Dialog, Layer, ResolutionChoiceValue, SubtitleSettingsField, SubtitleSettingsMode, TrackRef,
@@ -28,6 +29,7 @@ use reel_tui::app::{
 use reel_tui::edit::{EditEvent, VideoRotation, spawn_edit_worker_pools};
 use reel_tui::files::{DirectorySnapshot, spawn_directory_monitor};
 use reel_tui::input::{InputOutcome, InputState, handle_key};
+use reel_tui::preview::{PreviewEvent, spawn_preview_workers};
 use reel_tui::probe::{
     ProbeOutcome, ProbeResponse, spawn_conflict_probe_worker, spawn_probe_worker,
 };
@@ -62,6 +64,29 @@ fn redirect_cache_dir() {
             std::env::set_var("XDG_CACHE_HOME", &dir);
         }
     });
+}
+
+/// Serialises the scenarios that share the preview frame cache.
+///
+/// `XDG_CACHE_HOME` is process-global (see [`redirect_cache_dir`]), so every scenario in
+/// this binary renders into **one** frame cache — and the subtitle edit page prunes that cache to
+/// `cache_tracks` whole media directories at the start of every background pass. Run in
+/// parallel, the scenarios therefore evict each other's frames: one that walks a cue list
+/// expecting the cache to answer waits forever for frames another scenario has just
+/// deleted. `a_full_cache_should_evict_whole_tracks_and_never_the_open_one` is the sharpest
+/// case, since it deliberately prunes to a single track.
+///
+/// A lock rather than `--test-threads=1`, because the invocation is not ours to control —
+/// CI runs a bare `cargo test --test e2e` — and because the rest of the suite has no reason
+/// to give up its parallelism. It costs nothing in wall clock: these scenarios are `ffmpeg`
+/// waiting on `ffmpeg`, which is already using every core.
+///
+/// Poisoning is ignored on purpose. The lock guards nothing but ordering, so a scenario
+/// that panicked while holding it has left no state for the next one to be confused by —
+/// and a poisoned lock would turn one real failure into a cascade of unrelated ones.
+pub fn frame_cache_lock() -> MutexGuard<'static, ()> {
+    static FRAME_CACHE: Mutex<()> = Mutex::new(());
+    FRAME_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A temp directory that cleans itself up even when a test panics — unlike the manual
@@ -105,20 +130,43 @@ pub struct Harness {
     probe_rx: Receiver<ProbeResponse>,
     conflict_rx: Receiver<ProbeResponse>,
     edit_rx: Receiver<EditEvent>,
+    preview_rx: Receiver<PreviewEvent>,
     /// Declared last so the directory outlives the `App` and workers on drop.
     scratch: Scratch,
 }
 
 impl Harness {
     /// Wires up exactly what `main()` does, against an already-populated directory.
+    ///
+    /// The picker stands in for a terminal that offered a real image protocol. Halfblocks
+    /// is the stand-in because it is the only protocol whose output `TestBackend` can be
+    /// asserted on — it draws ordinary cells with colours where kitty, sixel and iTerm2
+    /// write escape sequences the buffer never stores — and because
+    /// `Picker::from_query_stdio` would write to the real terminal and wait for a reply no
+    /// test runner sends. Everything the page does with a frame is protocol-agnostic; only
+    /// the encoder differs. A terminal that offered *nothing* is
+    /// [`Self::start_without_image_protocol`], which is what `preview::drawing_picker`
+    /// produces for a real halfblocks terminal.
     pub fn start(scratch: Scratch) -> Self {
+        Self::start_with_picker(scratch, Some(Picker::halfblocks()))
+    }
+
+    /// A terminal that offered no image protocol at all, so the subtitle edit page can never draw
+    /// a frame and says so instead of rendering one nobody could read.
+    pub fn start_without_image_protocol(scratch: Scratch) -> Self {
+        Self::start_with_picker(scratch, None)
+    }
+
+    fn start_with_picker(scratch: Scratch, picker: Option<Picker>) -> Self {
         redirect_cache_dir();
         let directory = scratch.path().to_path_buf();
         let directory_rx = spawn_directory_monitor(directory.clone());
         let (request_tx, probe_rx) = spawn_probe_worker();
         let (conflict_tx, conflict_rx) = spawn_conflict_probe_worker();
         let (transcode_tx, remux_tx, edit_rx) = spawn_edit_worker_pools(1, 1);
-        let app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
+        let (preview_handles, preview_rx) = spawn_preview_workers(picker);
+        let mut app = App::new(directory, request_tx, conflict_tx, transcode_tx, remux_tx).unwrap();
+        app.set_preview_handles(Some(preview_handles));
         Self {
             app,
             input: InputState::default(),
@@ -127,6 +175,7 @@ impl Harness {
             probe_rx,
             conflict_rx,
             edit_rx,
+            preview_rx,
             scratch,
         }
     }
@@ -146,7 +195,12 @@ impl Harness {
         self.app.receive_probe_results(&self.probe_rx);
         self.app.receive_conflict_probe_results(&self.conflict_rx);
         self.app.receive_edit_results(&self.edit_rx);
+        self.app.receive_preview_events(&self.preview_rx);
         self.app.start_pending_probe();
+        self.app.start_pending_preview();
+        // In the same place and the same order `main`'s loop has it: after the drains, so a
+        // span that arrived this iteration is stepped in the pass it landed in.
+        self.app.advance_playback();
         self.app.maybe_open_conflict_dialog();
         let app = &mut self.app;
         self.terminal.draw(|frame| ui::render(frame, app)).unwrap();
@@ -1139,6 +1193,67 @@ impl Harness {
         }
     }
 
+    /// Everything drawn reversed, as one string.
+    ///
+    /// The cue panel marks a search hit by reversing the matched run rather than by
+    /// colouring it — the page already spends five colours, and reversing is legible
+    /// against each of them — so "which words matched" is a question about a modifier
+    /// that only the buffer can answer. The only other reversed cells are the timeline's
+    /// handles on the ends of the cue being timed, which exist only while the timing mode is
+    /// on — so a scenario reading this with the mode off reads the search hits alone.
+    pub fn reversed_text(&self) -> String {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| {
+                cell.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// Everything drawn on the selection's fill, as one string.
+    ///
+    /// The subtitle edit page marks the selected cue by filling its block rather than by putting
+    /// a character beside it, so "which cue is selected" is a question about colour that
+    /// only the buffer can answer.
+    pub fn filled_selection(&self) -> String {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.style().bg == Some(ratatui::style::Color::Cyan))
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The distinct image colours on screen, which is as much of a rendered frame as
+    /// `TestBackend` can be asked about.
+    ///
+    /// Its `Buffer` stores a symbol and a style per cell and never exposes the backend's
+    /// writer, so kitty, sixel and iTerm2 escape sequences are invisible to it entirely.
+    /// The halfblocks protocol the harness picks is the one that draws through ordinary
+    /// cells, and an `Rgb` background is something no part of this UI paints except an
+    /// image — so "more than one" means a decoded picture rather than a blank pane or a
+    /// solid fill.
+    pub fn preview_shades(&self) -> BTreeSet<(u8, u8, u8)> {
+        self.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter_map(|cell| match cell.style().bg {
+                Some(ratatui::style::Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The terminal contents as one string, for assertions and failure messages.
     pub fn screen(&self) -> String {
         let buffer = self.terminal.backend().buffer();
@@ -1204,6 +1319,12 @@ pub fn key(code: KeyCode) -> KeyEvent {
 
 pub fn ctrl(code: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)
+}
+
+/// A terminal sends `Alt+x` as an `Esc` prefix rather than as a bit on the byte. Scenarios use
+/// it to prove that `Alt+H`/`Alt+L`, which once shrank a cue, are bound to nothing now.
+pub fn alt(code: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(code), KeyModifiers::ALT)
 }
 
 /// Mirrors `require_tools` in `src/edit.rs`'s test module, which integration tests

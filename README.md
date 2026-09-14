@@ -51,10 +51,15 @@ reel /path/to/media
 - **Container & Track Editing**: Convert container formats (MKV, MP4, MOV, WebM), reorder or remove audio/video/subtitle tracks, and modify stream metadata without re-encoding.
 - **Video Transcoding & Resizing**: Re-encode video streams to supported codecs (H.264, HEVC, AV1) and adjust resolutions with dynamic scaling and aspect-ratio fitting; edit language, title, default, commentary, and rotation metadata on individual video tracks without re-encoding, so a sideways clip is corrected in seconds.
 - **Audio Track Editing**: Convert individual audio tracks to AAC, AC-3, E-AC-3, Opus, FLAC, ALAC, MP3, or Vorbis; downmix channels; and edit language, title, default, and role metadata.
-- **Subtitle Management**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit metadata for both embedded subtitle tracks and external sidecars.
+- **Subtitle Editing**: Import, export, convert, and OCR subtitle tracks between text and image-based formats. Edit and re-time tracks (SRT only).
+  - **Subtitle Timing & Preview**: Edit subtitle tracks and retime cues all from the terminal. Has a preview pane and preview playback to see how the subtitle looks on screen. Needs a terminal with kitty, iTerm2, or sixel graphics.
 - **Network Share Support**: Work efficiently on local storage or remote network shares (NFS, SMB) with adaptive monitoring and metadata caching.
 - **Desktop Notifications**: Get notified when a file finishes processing, sent only while `reel` isn't the focused window.
 
 ## Future planned
 
-- **Subtitle editing**: More in depth editing of subtitles, timing, text, style and hopefully more.
+- **Advanced subtitle editing**: More in depth editing of subtitles: timing, text, style and hopefully more.
+  - **Waveform visualizer**: An audio waveform on the subtitle edit page, so a cue's timing can be judged against the speech it belongs to rather than against the picture alone.
+  - **ASS/SSA cue editing**: Add support for in depth ASS/SSA subtitle track editing and styling.
+- **Track importing and exporting**: Importing and exporting of any track, using a file picker.
+- **Automatic subtitle syncing**: Automatic syncing of subtitles to an audio track, maybe using AI?
