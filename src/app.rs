@@ -12584,6 +12584,106 @@ pub(crate) fn describe_track_groups(groups: &BTreeSet<&'static str>) -> String {
     format!("{joined} tracks")
 }
 
+/// A verb for the save summary's cue lines, as it reads leading a line and as it reads after
+/// another verb.
+type CueVerb = (&'static str, &'static str);
+
+const MOVING: CueVerb = ("Moving", "moving");
+const LENGTHENING: CueVerb = ("Lengthening", "lengthening");
+const SHORTENING: CueVerb = ("Shortening", "shortening");
+const REWORDING: CueVerb = ("Rewording", "rewording");
+
+/// The cue work staged against one track, as the save confirmation lists it: one line per kind
+/// of change with a count — `Moving 100 cues in movie.eng.srt`, `Moving and lengthening 5 cues
+/// in …`, `Shortening 1 cue in …` — then `Adding …` and `Deleting …`.
+///
+/// **Counts rather than a line per cue**, because a whole-track retime is a thousand cues and
+/// the question the dialog answers is what kind of work the save is about to do, not which
+/// line. Kinds are listed in the order the track first shows them, so the lines read in the
+/// order the reader did the work on a track they worked through top to bottom.
+///
+/// **A cue both rewritten and marked to go is counted only as deleted**, which is what the
+/// save does to it: the rewrite lands on a line the writer then drops.
+fn cue_change_summary(cues: &crate::subtitle::CueChanges, source: &str) -> Vec<String> {
+    let mut kinds: Vec<(Vec<CueVerb>, usize)> = Vec::new();
+    for (position, edit) in &cues.edits {
+        if cues.deletes.contains_key(position) {
+            continue;
+        }
+        let verbs = cue_edit_verbs(edit);
+        match kinds.iter_mut().find(|(kind, _)| *kind == verbs) {
+            Some((_, count)) => *count += 1,
+            None => kinds.push((verbs, 1)),
+        }
+    }
+    let mut lines: Vec<String> = kinds
+        .into_iter()
+        .map(|(verbs, count)| {
+            format!(
+                "{} {count} {} in {source}",
+                join_cue_verbs(&verbs),
+                cue_noun(count)
+            )
+        })
+        .collect();
+    let added = cues.inserts.len();
+    if added > 0 {
+        lines.push(format!("Adding {added} {} to {source}", cue_noun(added)));
+    }
+    let deleted = cues.deletes.len();
+    if deleted > 0 {
+        lines.push(format!(
+            "Deleting {deleted} {} from {source}",
+            cue_noun(deleted)
+        ));
+    }
+    lines
+}
+
+/// What one rewrite does to its cue, in the order the summary names it.
+///
+/// **"Moving" means both ends changed.** One end alone is lengthening or shortening, because
+/// that is how dragging an edge reads to the reader who did it — a cue whose start was pulled
+/// in is a shorter line, not a line somewhere else. Both ends by different amounts is both.
+fn cue_edit_verbs(edit: &crate::subtitle::CueEdit) -> Vec<CueVerb> {
+    let mut verbs = Vec::new();
+    if edit.start != edit.original.start && edit.end != edit.original.end {
+        verbs.push(MOVING);
+    }
+    let before = edit.original.end.saturating_sub(edit.original.start);
+    let after = edit.end.saturating_sub(edit.start);
+    if after > before {
+        verbs.push(LENGTHENING);
+    } else if after < before {
+        verbs.push(SHORTENING);
+    }
+    if edit.text != edit.original.text {
+        verbs.push(REWORDING);
+    }
+    verbs
+}
+
+/// "Moving", "Moving and shortening", "Moving, shortening and rewording".
+fn join_cue_verbs(verbs: &[CueVerb]) -> String {
+    verbs
+        .iter()
+        .enumerate()
+        .map(|(index, (leading, following))| {
+            if index == 0 {
+                (*leading).to_string()
+            } else if index + 1 == verbs.len() {
+                format!(" and {following}")
+            } else {
+                format!(", {following}")
+            }
+        })
+        .collect()
+}
+
+fn cue_noun(count: usize) -> &'static str {
+    if count == 1 { "cue" } else { "cues" }
+}
+
 /// Builds the human-readable list of changes staged for one file — container
 /// conversion/metadata, video re-encodes, subtitle import/export/metadata edits, and
 /// track moves/deletes/default changes — shown in the `ConfirmProcessAll` dialog
@@ -12749,6 +12849,11 @@ fn staged_edit_summary_entries(
                 .unwrap_or("subtitle sidecar")
                 .to_string(),
         };
+        // First, because cue edits are applied to the file before it is converted, imported
+        // or exported — a cue line after `Importing` would read as the import being edited.
+        for line in cue_change_summary(&change.cues, &source) {
+            lines.push(("subtitle", line));
+        }
         if change.import_into_media {
             let target = change.embedded_target.unwrap_or(change.source_format);
             lines.push((
@@ -14650,6 +14755,124 @@ mod tests {
                 .any(|line| line == "Exporting subtitle track #2 as WebVTT"),
             "an export must be described as leaving the media: {lines:?}",
         );
+    }
+
+    /// Ctrl+S has to say what the cue work is before it does it, in counts rather than cue by
+    /// cue: one line per kind of change per track. A save that retimed a thousand cues was
+    /// confirmed by a dialog naming the file and nothing else.
+    #[test]
+    fn the_summary_should_count_cue_changes_by_what_happened_to_them() {
+        // Arrange: every cue the file has runs 1.0s → 2.0s and reads "line".
+        use crate::subtitle::{CueEdit, CueInsert, CueSnapshot};
+        let at = Duration::from_millis;
+        let file_cue = || CueSnapshot {
+            text: "line".to_string(),
+            start: at(1000),
+            end: at(2000),
+        };
+        let edit = |start: u64, end: u64, text: &str| CueEdit {
+            original: file_cue(),
+            text: text.to_string(),
+            start: at(start),
+            end: at(end),
+        };
+        let info = media(serde_json::json!([
+            {"index": 0, "codec_type": "video"},
+            {"index": 3, "codec_type": "subtitle", "codec_name": "subrip"}
+        ]));
+        let fingerprint = crate::files::FileFingerprint {
+            length: 10,
+            modified: None,
+        };
+        let mut staged = staged_edit(fingerprint, vec![0, 3]);
+        staged.original_stream_order = vec![0, 3];
+        let change = |source: SubtitleSource,
+                      cues: crate::subtitle::CueChanges,
+                      import_into_media: bool| SubtitleChange {
+            cues,
+            source,
+            source_format: SubtitleFormat::SubRip,
+            embedded_target: None,
+            export_target: None,
+            import_into_media,
+            ocr_language: None,
+            metadata: None,
+        };
+        let sidecar = PathBuf::from("/videos/movie.eng.srt");
+        let worked = crate::subtitle::CueChanges {
+            edits: BTreeMap::from([
+                // Both ends by the same amount, twice: one line counting two.
+                (0, edit(1500, 2500, "line")),
+                (1, edit(1500, 2500, "line")),
+                // The start pulled in: a shorter line, not a moved one.
+                (2, edit(1200, 2000, "line")),
+                // The end pushed out.
+                (3, edit(1000, 2600, "line")),
+                // Both ends, by different amounts.
+                (4, edit(900, 2400, "line")),
+                // The words alone.
+                (5, edit(1000, 2000, "reworded")),
+                // All three at once.
+                (6, edit(1100, 1700, "reworded")),
+                // Moved, but also marked to go — so it is only deleted.
+                (7, edit(1500, 2500, "line")),
+            ]),
+            inserts: BTreeMap::from([(
+                0,
+                CueInsert {
+                    text: "new".to_string(),
+                    start: at(5000),
+                    end: at(6000),
+                },
+            )]),
+            deletes: BTreeMap::from([(7, file_cue()), (8, file_cue())]),
+        };
+        // A whole-track retime on an embedded track: only moves, nothing added or deleted.
+        let retimed = crate::subtitle::CueChanges {
+            edits: (0..3).map(|cue| (cue, edit(500, 1500, "line"))).collect(),
+            ..Default::default()
+        };
+        staged.subtitle_changes = BTreeMap::from([
+            (
+                SubtitleSource::Sidecar(sidecar.clone()),
+                change(SubtitleSource::Sidecar(sidecar), worked, true),
+            ),
+            (
+                SubtitleSource::Embedded(3),
+                change(SubtitleSource::Embedded(3), retimed, false),
+            ),
+        ]);
+
+        // Act
+        let lines = staged_edit_summary(Path::new("/videos/movie.mkv"), &info, &staged);
+
+        // Assert: the sidecar's cue work, one line per kind, in the order the track shows
+        // them — and the import after it, since the cue edits land on the file first.
+        let sidecar_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains("movie.eng.srt"))
+            .collect();
+        assert_that!(sidecar_lines[..8].to_vec()).is_equal_to(vec![
+            "Moving 2 cues in movie.eng.srt",
+            "Shortening 1 cue in movie.eng.srt",
+            "Lengthening 1 cue in movie.eng.srt",
+            "Moving and lengthening 1 cue in movie.eng.srt",
+            "Rewording 1 cue in movie.eng.srt",
+            "Moving, shortening and rewording 1 cue in movie.eng.srt",
+            "Adding 1 cue to movie.eng.srt",
+            "Deleting 2 cues from movie.eng.srt",
+        ]);
+        assert_that!(sidecar_lines.len()).is_equal_to(9);
+        assert_that!(sidecar_lines[8]).starts_with("Importing movie.eng.srt");
+
+        // Assert: the embedded track says only what happened to it.
+        let embedded_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains("subtitle track #3"))
+            .collect();
+        assert_that!(embedded_lines).is_equal_to(vec!["Moving 3 cues in subtitle track #3"]);
     }
 
     #[test]

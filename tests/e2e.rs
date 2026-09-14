@@ -4967,8 +4967,21 @@ fn global_retiming_should_stage_every_cue_and_ctrl_s_should_write_it() {
         "Esc should take the scale rather than the page"
     );
 
+    // Act / Assert: Ctrl+S says what it is about to do — every cue moved, counted once
+    // rather than listed cue by cue.
+    app.press(ctrl('s'));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmProcessAll));
+    app.pump();
+    let screen = app.screen();
+    let name = sidecar.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        screen.contains(&format!("Moving 2 cues in {name}")),
+        "the save confirmation should count the moved cues:\n{screen}"
+    );
+
     // Act: write it.
-    app.process_all();
+    app.press(key(KeyCode::Enter));
+    app.wait_until("the batch to finish", |app| app.active_batch.is_none());
     app.wait_until("the subtitle edit page to come back", |app| {
         app.layer == Layer::SubtitleEdit
             && app
@@ -5356,8 +5369,21 @@ fn resizing_a_cue_should_stage_its_new_length_and_ctrl_s_should_write_it() {
         "Esc should take the mode rather than the page"
     );
 
+    // Act / Assert: Ctrl+S says what it is about to do to the cue before doing it. Both ends
+    // moved, by different amounts, and the line got shorter.
+    app.press(ctrl('s'));
+    assert_eq!(app.app.dialog, Some(Dialog::ConfirmProcessAll));
+    app.pump();
+    let screen = app.screen();
+    let name = sidecar.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        screen.contains(&format!("Moving and shortening 1 cue in {name}")),
+        "the save confirmation should describe the cue work:\n{screen}"
+    );
+
     // Act: write it.
-    app.process_all();
+    app.press(key(KeyCode::Enter));
+    app.wait_until("the batch to finish", |app| app.active_batch.is_none());
     app.wait_until("the subtitle edit page to come back", |app| {
         app.layer == Layer::SubtitleEdit
             && app
