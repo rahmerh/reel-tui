@@ -33,7 +33,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Size;
 use ratatui_image::FontSize;
@@ -219,10 +219,22 @@ pub enum PrepareOutcome {
 pub struct FrameSource {
     /// The video frames are grabbed from.
     pub media: PathBuf,
-    /// The media's length and mtime, in the cache key so that re-encoding a file in place
-    /// does not serve the old file's frames under the new one's path.
-    pub media_length: u64,
-    pub media_modified: Option<SystemTime>,
+    /// Which of that media's video streams they are grabbed from, as an **absolute**
+    /// ffprobe stream index — the convention [`PrepareRequest::stream_index`] and
+    /// `edit.rs` already use, never the `0:v:N` per-type form.
+    ///
+    /// Named rather than left to `-map 0:v:0` because the reader can choose it from the
+    /// preview-settings popup, and because `0:v:0` and [`video_identity`] disagreed about
+    /// which stream that was: `0:v:0` counts cover art as a video stream and the identity
+    /// deliberately skips it, so on a file whose first video stream is an attached picture
+    /// the frames drawn were not the frames the cache key described.
+    pub video_stream: u64,
+    /// What that video stream *is*, from [`video_identity`]. In the cache key so that
+    /// re-encoding a file in place does not serve the old picture under the new one's
+    /// path — and so that a remux, which changes the file but not the picture, does not
+    /// throw the frames away. It moves with [`Self::video_stream`], so two video streams
+    /// of one file cache into two directories rather than over each other.
+    pub video_identity: String,
     /// The size every frame for this media is rendered at, from [`target_pixels`].
     pub pixels: (u32, u32),
     /// How this track's cues are written back out for libass, which for ASS is most of
@@ -364,8 +376,7 @@ impl FrameSource {
     pub fn media_key(&self) -> String {
         framecache::media_key(FrameKeyParts {
             media: &self.media,
-            media_length: self.media_length,
-            media_modified: self.media_modified,
+            video_identity: &self.video_identity,
             pixels: self.pixels,
         })
     }
@@ -505,6 +516,9 @@ pub struct WarmRequest {
     pub duration: Duration,
     /// How many media files' frames the cache may hold, pruned to before the pass starts.
     pub cache_tracks: usize,
+    /// The disk backstop for the same prune, in bytes. See [`framecache::prune`] for why
+    /// there are two bounds rather than one.
+    pub cache_bytes: u64,
 }
 
 /// One track to measure against its own audio, for automatic sync (`A`).
@@ -517,6 +531,15 @@ pub struct WarmRequest {
 pub struct SyncRequest {
     pub generation: u64,
     pub media: PathBuf,
+    /// Which audio stream to align the cues against, as an **absolute** ffprobe stream
+    /// index, or `None` when the media has no audio at all.
+    ///
+    /// The reader's own choice from the preview-settings popup, because a sync run against
+    /// the commentary track when they are listening to the feature would report an offset
+    /// for speech they are not hearing — and the two tracks are not the same length in
+    /// practice. `None` is answered as [`SyncOutcome::Failed`] by the worker, which is what
+    /// an audio `-map` on such a file already produced.
+    pub audio_stream: Option<u64>,
     pub cues: Vec<Cue>,
     pub duration: Duration,
 }
@@ -532,8 +555,9 @@ pub enum SyncOutcome {
     /// is in fact already in sync are all indistinguishable from here, so the page reports
     /// this the same way for all of them.
     NotConfident,
-    /// The audio could not be decoded at all — commonly, the file has no audio track for
-    /// `-map 0:a:0` to find. Carries `ffmpeg`'s own complaint, which already says so.
+    /// The audio could not be decoded at all — commonly, the file has no audio track to
+    /// align against, which [`sync_track`] answers before running anything. Otherwise it
+    /// carries `ffmpeg`'s own complaint, which already says why.
     Failed(String),
 }
 
@@ -596,13 +620,31 @@ pub struct PlaybackRequest {
     pub pixels: (u32, u32),
     /// The cell area those pixels fill, which is what they are encoded into for drawing.
     pub cells: Size,
-    /// The rate and channel count to emit sound at, or `None` when this media has no audio
-    /// track to emit.
+    /// Which stream to take the sound from and what format to emit it in, or `None` when
+    /// this playback is to be silent.
     ///
-    /// The device's own format, so the callback copies rather than resamples. `None` is not
-    /// a failure — a video with no sound plays as a silent slideshow at the right rate,
-    /// which is the same path a machine with no output device takes.
-    pub audio: Option<crate::audio::OutputFormat>,
+    /// `None` is not a failure — media with no audio track, a machine with no output
+    /// device, and a playback the reader muted all take it, and all three play as a silent
+    /// slideshow at the right rate. See [`AudioTrack`] for why the two halves travel
+    /// together.
+    pub audio: Option<AudioTrack>,
+}
+
+/// Which audio stream a span's sound comes from, and the format it is emitted in.
+///
+/// One value rather than two fields for the reason [`SpanShape`] is one: the stream and the
+/// format have to agree, and a `-map` naming a stream that is not there fails the whole run
+/// — picture included — while a format that is not the device's makes the audio callback
+/// resample on the one thread that must never be late. Travelling together is what makes
+/// them one decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioTrack {
+    /// The **absolute** ffprobe stream index, the convention [`FrameSource::video_stream`]
+    /// and `edit.rs` use — never the `0:a:N` per-type form.
+    pub stream: u64,
+    /// The device's own rate and channel count, so the callback copies rather than
+    /// resamples.
+    pub format: crate::audio::OutputFormat,
 }
 
 /// How one span's frames are shaped.
@@ -810,10 +852,16 @@ pub enum PreviewEvent {
     /// it found already cached, and ones it could not draw — a cue is "done" when it is no
     /// longer outstanding, not when it succeeded. `done == total` therefore means the pass
     /// is over however it ended, which is exactly what the status line needs to know.
+    ///
+    /// `rendered` is the subset of those that actually cost an `ffmpeg` run. It is the one
+    /// number that distinguishes a cache doing its job from a cache being rebuilt from
+    /// scratch — the two are identical in `done`, in the cue list and in the pictures, and
+    /// telling them apart by reading the source is what this page's users kept having to do.
     Warming {
         generation: u64,
         done: usize,
         total: usize,
+        rendered: usize,
     },
     /// A span, decoded and ready to play, or why there is none.
     ///
@@ -1168,6 +1216,144 @@ fn newest_frame(request: FrameRequest, receiver: &Receiver<FrameRequest>) -> Fra
         request = newer;
     }
     request
+}
+
+/// The fields of the primary video stream that decide what a grabbed frame looks like.
+///
+/// This is the media half of [`framecache::media_key`], and it exists to answer "is this
+/// the same picture" rather than "is this the same file". The two used to be conflated: the
+/// key hashed the file's byte length and mtime, so every save — which is always a remux —
+/// orphaned the whole directory of frames the previewing page had just rendered, and the
+/// repair was a directory rename performed by whichever caller believed its edit had
+/// preserved the picture. That belief was a hand-maintained list of edit kinds, and keeping
+/// it correct is what kept failing. A remux copies the video stream through byte for byte,
+/// so every field below is identical on both sides of one and the key simply does not move.
+///
+/// Read off the probe the application already ran, so this costs no subprocess. **The
+/// stream is the one named by `stream`, because that is the stream `frame_command` actually
+/// grabs from** — the reader chooses it from the preview-settings popup, and describing a
+/// different one would file each stream's frames under the other's name. An index naming
+/// nothing falls back to [`crate::edit::primary_video_resolution`]'s rule, the first video
+/// stream that is not cover art, which is what a page opens on.
+///
+/// **A field ffprobe does not report contributes an empty string rather than being skipped**,
+/// so the shape of the identity is fixed and two files cannot align their present fields
+/// against each other's absent ones. Matroska in particular omits `duration`, `nb_frames`
+/// and `bit_rate` per stream, which is why the format's own duration is the fallback and
+/// why there are this many fields rather than two or three.
+///
+/// What it cannot tell apart: a *different* video written to the *same path* with an
+/// identical codec, profile, geometry, pixel format, frame rate, duration, bit rate and
+/// extradata size. Re-encoding moves `bit_rate` and `extradata_size` in practice, and a
+/// re-encode that moved none of these produced the same picture anyway. That is a far
+/// narrower hole than the one it replaces, where the *correct* case — a remux — was the
+/// one being got wrong.
+/// Whether a stream is one a frame can be grabbed from: video, and not cover art.
+///
+/// An attached picture is a still, so a page previewing against one would draw the same
+/// frame for every cue in the track. It is `codec_type: video` all the same, which is why
+/// the test is needed rather than the kind alone.
+fn is_preview_video(stream: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+        && !crate::probe::is_attached_picture(stream)
+}
+
+/// The video stream a page previews against unless the reader chooses another: the first
+/// one that is not cover art.
+///
+/// The rule [`crate::edit::primary_video_resolution`] and [`video_identity`] have always
+/// followed, written down once now that it has to be an index like any other — "the reader
+/// has not chosen" and "the reader chose the first one" must describe the same page, or the
+/// frames of the two would be cached apart.
+pub fn default_video_stream(info: &crate::probe::MediaInfo) -> Option<u64> {
+    video_stream_index(info, None)
+}
+
+/// The index of the video stream a page previews against, given what the reader chose.
+///
+/// **The one answer to "which stream", and every other question about the picture asks it
+/// first** — the `-map`, the identity in the cache key, and the size frames are rendered at.
+/// A choice naming no video stream falls back to the default, so the answer is always one
+/// the file actually holds: a stale index would otherwise reach `ffmpeg` as a `-map` that
+/// fails the whole run.
+pub fn video_stream_index(info: &crate::probe::MediaInfo, chosen: Option<u64>) -> Option<u64> {
+    chosen
+        .and_then(|index| video_stream(info, index))
+        .or_else(|| info.streams.iter().find(|stream| is_preview_video(stream)))
+        .and_then(crate::edit::stream_index)
+}
+
+/// The named video stream, or the default one when the index names no video stream.
+///
+/// A stale index falls back rather than answering with nothing: the choice is cleared when
+/// the file changes, but a probe refreshed under an open page can drop a stream, and the
+/// first video stream is a better answer than a `-map` that fails the whole run.
+fn video_stream(
+    info: &crate::probe::MediaInfo,
+    index: u64,
+) -> Option<&std::collections::BTreeMap<String, serde_json::Value>> {
+    info.streams
+        .iter()
+        .find(|stream| is_preview_video(stream) && crate::edit::stream_index(stream) == Some(index))
+        .or_else(|| info.streams.iter().find(|stream| is_preview_video(stream)))
+}
+
+/// The pixel size of the video stream a page is previewing against.
+///
+/// [`crate::edit::primary_video_resolution`] answers the same question for the *first*
+/// stream and is what the remux planner wants; this one follows the reader's choice,
+/// because `pixels` is in the cache key and rendering a second stream at the first's target
+/// size would file one shape of picture under a key describing another.
+pub fn video_resolution(info: &crate::probe::MediaInfo, stream: u64) -> Option<(u32, u32)> {
+    let stream = video_stream(info, stream)?;
+    let field = |name: &str| match stream.get(name) {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.parse().ok(),
+        _ => None,
+    };
+    let width = u32::try_from(field("width")?).ok()?;
+    let height = u32::try_from(field("height")?).ok()?;
+    Some((width, height))
+}
+
+pub fn video_identity(info: &crate::probe::MediaInfo, stream: u64) -> String {
+    let Some(stream) = video_stream(info, stream) else {
+        return String::new();
+    };
+    // Every value is rendered the way ffprobe reported it, numbers included: this is only
+    // ever compared with itself, so parsing them into a normal form would add a way for two
+    // runs to disagree without adding a way to tell two files apart.
+    let render = |value: Option<&serde_json::Value>| match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(value) => value.to_string(),
+    };
+    let field = |name: &str| render(stream.get(name));
+    // The stream's own duration, or the `DURATION` tag Matroska stores on each stream in
+    // place of one — never the file's. A file's duration is the longest of all its streams,
+    // so a remux that moves an audio track's end by a few milliseconds moves it too, and
+    // FFmpeg 8.1 does exactly that to AAC while copying the picture through untouched.
+    let duration = match field("duration") {
+        empty if empty.is_empty() => {
+            render(stream.get("tags").and_then(|tags| tags.get("DURATION")))
+        }
+        reported => reported,
+    };
+    [
+        field("codec_name"),
+        field("codec_tag_string"),
+        field("profile"),
+        field("width"),
+        field("height"),
+        field("pix_fmt"),
+        field("avg_frame_rate"),
+        duration,
+        field("bit_rate"),
+        field("extradata_size"),
+    ]
+    // A unit separator, because every field above is free-form text out of ffprobe and a
+    // codec name or profile is entitled to hold a comma or a space.
+    .join("\u{1f}")
 }
 
 /// The size to render a frame at, given the source's own resolution.
@@ -1806,6 +1992,7 @@ fn scrub(source: &FrameSource, target: &ScrubTarget, abandoned: Abandoned<'_>) -
     };
     let mut command = frame_command(
         &source.media,
+        source.video_stream,
         target.at,
         source.pixels,
         &source.workspace,
@@ -1970,6 +2157,7 @@ fn render(
     }
     let mut command = frame_command(
         &source.media,
+        source.video_stream,
         target.seek,
         source.pixels,
         &source.workspace,
@@ -2225,7 +2413,10 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: Option<&s
         .arg(format!("{:.3}", span.as_secs_f64()))
         .arg("-i")
         .arg(&request.source.media)
-        .args(["-map", "0:v:0", "-an", "-vf"])
+        // The absolute stream index rather than `0:v:0`, so the span is decoded from the
+        // stream the stills are grabbed from — see [`frame_command`].
+        .args(["-map", &format!("0:{}", request.source.video_stream)])
+        .args(["-an", "-vf"])
         .arg(video_filters(request, staged))
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
     // A second output, from the same seek and the same decode — which is what makes the
@@ -2241,10 +2432,11 @@ fn playback_command(request: &PlaybackRequest, span: Duration, staged: Option<&s
     // the video pipe is being drained on a thread that knows nothing about the other.
     if let Some(audio) = request.audio {
         command
-            .args(["-map", "0:a:0", "-vn", "-f", "f32le", "-ar"])
-            .arg(audio.sample_rate.to_string())
+            .args(["-map", &format!("0:{}", audio.stream)])
+            .args(["-vn", "-f", "f32le", "-ar"])
+            .arg(audio.format.sample_rate.to_string())
             .arg("-ac")
-            .arg(audio.channels.to_string());
+            .arg(audio.format.channels.to_string());
         // Pitch-preserving, which is the whole reason speech at half speed is still speech
         // and a line can still be judged against it. A resample would drop it an octave.
         if !request.speed.is_normal() {
@@ -2355,12 +2547,15 @@ const SYNC_SAMPLE_RATE: u32 = 16_000;
 /// The whole track's audio, decoded once to mono `f32le` — no video, and nothing written
 /// to a file: unlike the scrub playback, this is the only stream this decode produces, so
 /// there is no second output to deadlock a pipe against.
-fn sync_extract_command(media: &Path) -> Command {
+fn sync_extract_command(media: &Path, audio_stream: u64) -> Command {
     let mut command = Command::new("ffmpeg");
     command
         .args(["-v", "error", "-nostdin", "-y", "-i"])
         .arg(media)
-        .args(["-map", "0:a:0", "-vn", "-ac", "1", "-ar"])
+        // The stream the reader is listening to, by absolute index — an offset measured
+        // against the commentary track is an offset for speech they cannot hear.
+        .args(["-map", &format!("0:{audio_stream}")])
+        .args(["-vn", "-ac", "1", "-ar"])
         .arg(SYNC_SAMPLE_RATE.to_string())
         .args(["-f", "f32le", "-"]);
     command
@@ -2374,7 +2569,18 @@ fn sync_track(request: &SyncRequest, live_generation: &AtomicU64) -> Option<Prev
     if abandoned() {
         return None;
     }
-    let mut command = sync_extract_command(&request.media);
+    // Answered here rather than by a `-map` that cannot resolve: media with no audio track
+    // is the commonest reason this fails, and saying so beats `ffmpeg`'s complaint about a
+    // stream specifier.
+    let Some(audio_stream) = request.audio_stream else {
+        return Some(PreviewEvent::Sync {
+            generation: request.generation,
+            outcome: SyncOutcome::Failed(
+                "This file has no audio track to sync the cues against.".to_string(),
+            ),
+        });
+    };
+    let mut command = sync_extract_command(&request.media, audio_stream);
     let outcome = match run_cancellable(&mut command, &abandoned) {
         RunOutcome::Abandoned => return None,
         RunOutcome::Failed(message) => SyncOutcome::Failed(message),
@@ -2453,14 +2659,14 @@ fn warm_track(
     framecache::touch(&media_key);
     // Before rendering, not after: the pass is about to add a frame per cue, and pruning
     // first is what keeps the cache inside its limit rather than over it until next time.
-    framecache::prune(request.cache_tracks, Some(&media_key));
+    framecache::prune(request.cache_tracks, request.cache_bytes, Some(&media_key));
 
     let total = request.cues.len();
     let progress = Mutex::new(WarmProgress::new(request.generation, total));
     if !progress
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .publish(events, 0)
+        .publish(events, 0, 0)
     {
         return false;
     }
@@ -2470,6 +2676,9 @@ fn warm_track(
     // finish cues out of order — which is why nothing may infer *which* cues are done
     // from it.
     let done = AtomicUsize::new(0);
+    // How many of those actually cost an `ffmpeg` run, as against being found in the cache.
+    // Shared for the reason `done` is: it describes the track, not a slice.
+    let rendered = AtomicUsize::new(0);
     // `div_ceil`, so the last slice is the short one and no worker is handed an empty
     // slice while cues are left over.
     let per_worker = total.div_ceil(workers).max(1);
@@ -2477,6 +2686,7 @@ fn warm_track(
         for (worker, cues) in request.cues.chunks(per_worker).enumerate() {
             let progress = &progress;
             let done = &done;
+            let rendered = &rendered;
             let slice = WarmSlice {
                 cues,
                 // Where this slice starts in the track, which `chunks` does not report.
@@ -2484,7 +2694,7 @@ fn warm_track(
                 worker,
             };
             scope.spawn(move || {
-                warm_slice(request, slice, abandoned, events, progress, done);
+                warm_slice(request, slice, abandoned, events, progress, done, rendered);
             });
         }
     });
@@ -2506,7 +2716,7 @@ fn warm_track(
     progress
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .publish(events, total)
+        .publish(events, total, rendered.load(Ordering::Relaxed))
 }
 
 /// One worker's share of a track: which cues it renders, and where they sit in the whole.
@@ -2536,6 +2746,7 @@ fn warm_slice(
     events: &Sender<PreviewEvent>,
     progress: &Mutex<WarmProgress>,
     done: &AtomicUsize,
+    rendered: &AtomicUsize,
 ) {
     let slot = CueSlot::Warm(slice.worker);
     let mut failures = 0;
@@ -2559,7 +2770,16 @@ fn warm_slice(
         // Checked per cue as the pass reaches it, rather than filtered up front, because
         // the interactive worker may have rendered this very cue since the pass started.
         match cache_frame(&request.source, &target, slot, abandoned) {
-            CacheOutcome::Cached | CacheOutcome::Rendered => failures = 0,
+            CacheOutcome::Cached => failures = 0,
+            CacheOutcome::Rendered => {
+                failures = 0;
+                // Counted apart from `done` because the two answer different questions, and
+                // the difference is the only thing on screen that says whether the cache is
+                // working: a pass that renders nothing is the cache doing its job, and one
+                // that renders the whole track twice running is the defect this page kept
+                // having. Without it the two are indistinguishable from the outside.
+                rendered.fetch_add(1, Ordering::Relaxed);
+            }
             CacheOutcome::Abandoned => return,
             CacheOutcome::Failed => {
                 failures += 1;
@@ -2578,7 +2798,7 @@ fn warm_slice(
         // publish a number another worker is publishing a larger version of would be
         // waiting to say something already out of date.
         if let Ok(mut progress) = progress.try_lock() {
-            progress.publish(events, counted);
+            progress.publish(events, counted, rendered.load(Ordering::Relaxed));
         }
     }
 }
@@ -2599,9 +2819,9 @@ impl WarmProgress {
         }
     }
 
-    /// Publishes `done`, unless it is neither the first nor the last and the previous one
-    /// was too recent. Returns whether anyone is still listening.
-    fn publish(&mut self, events: &Sender<PreviewEvent>, done: usize) -> bool {
+    /// Publishes `done` and `rendered`, unless it is neither the first nor the last and the
+    /// previous one was too recent. Returns whether anyone is still listening.
+    fn publish(&mut self, events: &Sender<PreviewEvent>, done: usize, rendered: usize) -> bool {
         let due = self
             .last_published
             .is_none_or(|at| at.elapsed() >= WARM_PROGRESS_INTERVAL);
@@ -2614,6 +2834,7 @@ impl WarmProgress {
                 generation: self.generation,
                 done,
                 total: self.total,
+                rendered,
             })
             .is_ok()
     }
@@ -2653,6 +2874,7 @@ fn srt_of(timed: &[(&Cue, Duration, Duration)]) -> String {
 /// text out against the source resolution — its `PlayRes` — before anything shrinks it.
 fn frame_command(
     media: &Path,
+    video_stream: u64,
     seek: Duration,
     pixels: (u32, u32),
     workspace: &Path,
@@ -2675,7 +2897,10 @@ fn frame_command(
         .arg(format!("{:.3}", seek.as_secs_f64()))
         .arg("-i")
         .arg(media)
-        .args(["-map", "0:v:0", "-frames:v", "1", "-vf"])
+        // The absolute stream index rather than `0:v:0`, which counts cover art as a video
+        // stream where [`video_identity`] — the same picture's cache key — does not.
+        .args(["-map", &format!("0:{video_stream}")])
+        .args(["-frames:v", "1", "-vf"])
         .arg(filters)
         // `-q:v 2` is mjpeg's near-lossless end. The frame is judged by eye against a
         // burned-in subtitle, so visible compression artefacts would be read as the
@@ -3161,13 +3386,20 @@ mod tests {
         source.key(cue, std::slice::from_ref(cue))
     }
 
+    /// The identity of the stream a page opens on, which is what every test about the
+    /// identity's *shape* is asking after — the choice of stream is its own question, with
+    /// its own tests below.
+    fn identity(info: &crate::probe::MediaInfo) -> String {
+        video_identity(info, default_video_stream(info).unwrap_or_default())
+    }
+
     /// A source whose key is unique to the caller, so tests sharing the one cache
     /// directory cannot collide on a key or read each other's frames.
     fn source(media: &Path, workspace: &Path) -> FrameSource {
         FrameSource {
             media: media.to_path_buf(),
-            media_length: 4096,
-            media_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            video_stream: 0,
+            video_identity: "h264\u{1f}64\u{1f}48".to_string(),
             pixels: (64, 48),
             style: Arc::new(CueStyle::SubRip),
             workspace: workspace.to_path_buf(),
@@ -3755,6 +3987,7 @@ mod tests {
             cues: vec![cue(0, 1000, "unused")],
             duration: Duration::from_secs(6),
             cache_tracks: usize::MAX,
+            cache_bytes: u64::MAX,
         });
         let request = |generation| PrepareRequest {
             generation,
@@ -3957,6 +4190,7 @@ mod tests {
         // Act
         let command = frame_command(
             Path::new("/media/it's a show; [2024].mkv"),
+            0,
             Duration::from_millis(2500),
             (640, 480),
             Path::new("/tmp/reel-tui-preview/7-1"),
@@ -3981,7 +4215,7 @@ mod tests {
                 "-i",
                 "/media/it's a show; [2024].mkv",
                 "-map",
-                "0:v:0",
+                "0:0",
                 "-frames:v",
                 "1",
                 "-vf",
@@ -4987,6 +5221,344 @@ mod tests {
         assert_that!(target_pixels(Some((1, 1)))).is_equal_to((2, 2));
     }
 
+    /// The reason this exists: a remux rewrites the container and copies the video stream
+    /// through, so a file's length and mtime move while every one of these fields stays
+    /// exactly as it was. Keying the frame cache on the file was what made every save throw
+    /// away the frames the previewing page had just rendered.
+    #[test]
+    fn a_remux_should_not_move_the_video_identity() {
+        // Arrange: the same stream, as an MKV and as the MP4 it was remuxed into. The
+        // container's own fields differ; the video stream's do not.
+        let mkv = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000", "size": "10485760"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "profile": "High",
+                 "width": 1920, "height": 1080, "pix_fmt": "yuv420p",
+                 "avg_frame_rate": "24000/1001", "extradata_size": 42},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+            ],
+        }))
+        .unwrap();
+        let mp4 = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000", "size": "10493952"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "profile": "High",
+                 "width": 1920, "height": 1080, "pix_fmt": "yuv420p",
+                 "avg_frame_rate": "24000/1001", "extradata_size": 42},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"},
+            ],
+        }))
+        .unwrap();
+
+        // Act / Assert: the imported subtitle track and the new container change nothing.
+        assert_that!(identity(&mkv).as_str()).is_equal_to(identity(&mp4).as_str());
+        assert_that!(identity(&mkv).is_empty()).is_false();
+    }
+
+    /// Matroska reports no per-stream `duration`, only a `DURATION` tag on each stream, and a
+    /// file's own duration is the longest of *all* its streams. FFmpeg 8.1 remuxing an AAC
+    /// track moves that track's end by a few milliseconds, and the file's duration with it,
+    /// while the video stream is copied through untouched — so falling back to the file's
+    /// duration filed a track's frames under a new key on every save.
+    #[test]
+    fn a_remux_that_moves_the_files_duration_should_not_move_the_video_identity() {
+        // Arrange: ffprobe's own figures for one MKV before and after an FFmpeg 8.1 remux.
+        let probed = |file_duration: &str, audio_duration: &str, video_duration: &str| {
+            crate::probe::MediaInfo::from_json(serde_json::json!({
+                "format": {"duration": file_duration},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 320, "height": 240, "extradata_size": 46,
+                     "tags": {"DURATION": video_duration}},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                     "tags": {"DURATION": audio_duration}},
+                ],
+            }))
+            .unwrap()
+        };
+        let before = identity(&probed(
+            "7.023000",
+            "00:00:07.023000000",
+            "00:00:07.000000000",
+        ));
+        let after = identity(&probed(
+            "7.035000",
+            "00:00:07.035000000",
+            "00:00:07.000000000",
+        ));
+
+        // Act / Assert: the key is the video stream's, so it holds still.
+        assert_that!(after.as_str()).is_equal_to(before.as_str());
+
+        // And the tag still tells two lengths of the stream apart, standing in for the
+        // duration Matroska does not report.
+        let longer = identity(&probed(
+            "9.023000",
+            "00:00:09.023000000",
+            "00:00:09.000000000",
+        ));
+        assert_that!(longer.as_str()).is_not_equal_to(before.as_str());
+    }
+
+    /// …and the other half of the same rule: anything that really does change the picture
+    /// has to move the identity, or the cache serves one file's frames for another's.
+    #[test]
+    fn a_re_encode_should_move_the_video_identity() {
+        // Arrange
+        let stream = |changed: serde_json::Value| {
+            let mut video = serde_json::json!({
+                "index": 0, "codec_type": "video", "codec_name": "h264", "profile": "High",
+                "width": 1920, "height": 1080, "pix_fmt": "yuv420p",
+                "avg_frame_rate": "24000/1001", "duration": "84.000000",
+                "bit_rate": "4000000", "extradata_size": 42,
+            });
+            for (key, value) in changed.as_object().unwrap() {
+                video[key] = value.clone();
+            }
+            crate::probe::MediaInfo::from_json(serde_json::json!({
+                "format": {"duration": "84.000000"},
+                "streams": [video],
+            }))
+            .unwrap()
+        };
+        let base = identity(&stream(serde_json::json!({})));
+
+        // Act / Assert: every field that decides what a grabbed frame looks like.
+        for change in [
+            serde_json::json!({"codec_name": "hevc"}),
+            serde_json::json!({"codec_tag_string": "hvc1"}),
+            serde_json::json!({"profile": "Main"}),
+            serde_json::json!({"width": 1280}),
+            serde_json::json!({"height": 720}),
+            serde_json::json!({"pix_fmt": "yuv420p10le"}),
+            serde_json::json!({"avg_frame_rate": "25/1"}),
+            serde_json::json!({"duration": "84.500000"}),
+            serde_json::json!({"bit_rate": "2000000"}),
+            serde_json::json!({"extradata_size": 43}),
+        ] {
+            assert_that!(identity(&stream(change)).as_str()).is_not_equal_to(base.as_str());
+        }
+    }
+
+    /// Matroska reports no per-stream `duration`, `bit_rate` or `nb_frames`, which is the
+    /// common case rather than a corner. An absent field has to hold its place in the
+    /// identity, or two files could align their present fields against each other's absent
+    /// ones and share a cache directory.
+    #[test]
+    fn an_identity_should_keep_its_shape_when_ffprobe_omits_fields() {
+        // Arrange: no stream duration and no duration tag, so that column stays empty
+        // rather than borrowing the file's; no bit rate at all.
+        let sparse = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+            ],
+        }))
+        .unwrap();
+
+        // Act / Assert: the file's duration is not used, and every field keeps its column.
+        let sparse_identity = identity(&sparse);
+        assert_that!(sparse_identity.split('\u{1f}').count()).is_equal_to(10);
+        assert_that!(sparse_identity.split('\u{1f}').nth(7)).is_equal_to(Some(""));
+
+        // Two files whose fields could otherwise slide past one another stay apart.
+        let shifted = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "codec_tag_string": "1920", "width": 1080, "height": 0},
+            ],
+        }))
+        .unwrap();
+        assert_that!(identity(&shifted).as_str()).is_not_equal_to(sparse_identity.as_str());
+
+        // A duration stated as a number rather than a string is still read. ffprobe quotes
+        // it, but `MediaInfo` is built from whatever JSON arrives, and a duration silently
+        // dropped here would let two lengths of the same film collide. The files' durations
+        // agree, so only the stream's can tell the two apart.
+        let numeric = |duration: f64| {
+            crate::probe::MediaInfo::from_json(serde_json::json!({
+                "format": {"duration": "100.000000"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264",
+                     "width": 1920, "height": 1080, "duration": duration},
+                ],
+            }))
+            .unwrap()
+        };
+        assert_that!(identity(&numeric(84.0)).contains("84")).is_true();
+        assert_that!(identity(&numeric(84.0)).as_str())
+            .is_not_equal_to(identity(&numeric(96.0)).as_str());
+    }
+
+    /// Cover art is a video stream ffprobe reports like any other, and it is not the stream
+    /// a frame is grabbed from. A file with no describable video stream at all keys on its
+    /// path alone rather than failing.
+    #[test]
+    fn the_identity_should_come_from_the_stream_a_grab_actually_reads() {
+        // Arrange: an attached picture ahead of the real video track.
+        let with_cover = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "mjpeg",
+                 "width": 600, "height": 600, "disposition": {"attached_pic": 1}},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+            ],
+        }))
+        .unwrap();
+
+        // Act / Assert: the h264 track, not the cover.
+        let cover_identity = identity(&with_cover);
+        assert_that!(cover_identity.contains("h264")).is_true();
+        assert_that!(cover_identity.contains("mjpeg")).is_false();
+
+        // And a file whose streams say nothing about video answers with nothing.
+        let bare = crate::probe::MediaInfo::from_json_unchecked(serde_json::json!({
+            "format": {},
+            "streams": [{"index": 0, "codec_type": "audio", "codec_name": "aac"}],
+        }))
+        .unwrap();
+        assert_that!(identity(&bare).as_str()).is_equal_to("");
+    }
+
+    /// The reader can point the page at another video stream, and everything about the
+    /// picture has to follow: the `-map`, the identity its frames are keyed by, and the size
+    /// they are rendered at. If the identity did not move, the second stream's frames would
+    /// be filed under the first's name and served for it — the one mistake this cache cannot
+    /// recover from.
+    #[test]
+    fn a_chosen_video_stream_should_carry_its_own_identity_size_and_cache_directory() {
+        // Arrange: cover art, then two real video streams of different shapes.
+        let info = crate::probe::MediaInfo::from_json(serde_json::json!({
+            "format": {"duration": "84.000000"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "mjpeg",
+                 "width": 600, "height": 600, "disposition": {"attached_pic": 1}},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080},
+                {"index": 2, "codec_type": "video", "codec_name": "hevc",
+                 "width": 640, "height": 360},
+            ],
+        }))
+        .unwrap();
+
+        // Act / Assert: the default is the first stream that is not cover art, and naming it
+        // gives the same answer — "unchosen" and "chosen the first one" are one page.
+        assert_that!(default_video_stream(&info)).is_equal_to(Some(1));
+        assert_that!(video_stream_index(&info, Some(1))).is_equal_to(Some(1));
+        assert_that!(video_stream_index(&info, Some(2))).is_equal_to(Some(2));
+        // Cover art is not a stream a page can preview against, so asking for it falls back.
+        assert_that!(video_stream_index(&info, Some(0))).is_equal_to(Some(1));
+        // And so does an index the file does not hold, rather than reaching `ffmpeg` as a
+        // `-map` that fails the whole run.
+        assert_that!(video_stream_index(&info, Some(9))).is_equal_to(Some(1));
+
+        // Act / Assert: each stream describes itself, and is sized by its own geometry.
+        let first = video_identity(&info, 1);
+        let second = video_identity(&info, 2);
+        assert_that!(first.contains("h264")).is_true();
+        assert_that!(second.contains("hevc")).is_true();
+        assert_that!(first.as_str()).is_not_equal_to(second.as_str());
+        assert_that!(video_resolution(&info, 1)).is_equal_to(Some((1920, 1080)));
+        assert_that!(video_resolution(&info, 2)).is_equal_to(Some((640, 360)));
+
+        // Assert: so the two cache into directories of their own, off one file.
+        let source = |stream: u64| FrameSource {
+            media: PathBuf::from("/media/two-angles.mkv"),
+            video_stream: stream,
+            video_identity: video_identity(&info, stream),
+            pixels: target_pixels(video_resolution(&info, stream)),
+            style: Arc::new(CueStyle::SubRip),
+            workspace: PathBuf::from("/tmp/reel-tui-preview/two-angles"),
+        };
+        assert_that!(source(1).media_key()).is_not_equal_to(source(2).media_key());
+    }
+
+    /// The grab, the span and the sync run all name their streams by absolute index. `0:v:0`
+    /// and `0:a:0` cannot say which stream the reader chose — and `0:v:0` counts cover art as
+    /// a video stream where [`video_identity`] never did, so on a file whose first video
+    /// stream is an attached picture the two disagreed about which picture was being cached.
+    #[test]
+    fn every_command_should_map_the_streams_it_was_given() {
+        // Arrange
+        let workspace = Path::new("/tmp/reel-tui-preview/mapped-streams");
+        let mut request = playback_request(
+            Path::new("/media/two-angles.mkv"),
+            workspace,
+            cue(2000, 3000, "line"),
+        );
+        request.source.video_stream = 2;
+        request.audio = Some(AudioTrack {
+            stream: 4,
+            format: crate::audio::OutputFormat::FALLBACK,
+        });
+
+        // Act
+        let still = arguments_of(&frame_command(
+            Path::new("/media/two-angles.mkv"),
+            2,
+            Duration::from_secs(1),
+            (640, 360),
+            workspace,
+            Some("cue.srt"),
+        ));
+        let span = arguments_of(&playback_command(
+            &request,
+            Duration::from_secs(1),
+            Some("playback.srt"),
+        ));
+        let sync = arguments_of(&sync_extract_command(Path::new("/media/two-angles.mkv"), 3));
+
+        // Assert: the picture comes from the chosen stream in both paths, and never from the
+        // per-type form that cannot name it.
+        assert_that!(still.iter().any(|argument| argument == "0:2")).is_true();
+        assert_that!(span.iter().any(|argument| argument == "0:2")).is_true();
+        assert_that!(still.iter().any(|argument| argument == "0:v:0")).is_false();
+        assert_that!(span.iter().any(|argument| argument == "0:v:0")).is_false();
+
+        // And the sound comes from the stream the reader is listening to, in the playback and
+        // in the sync run alike.
+        assert_that!(span.iter().any(|argument| argument == "0:4")).is_true();
+        assert_that!(span.iter().any(|argument| argument == "0:a:0")).is_false();
+        assert_that!(sync.iter().any(|argument| argument == "0:3")).is_true();
+        assert_that!(sync.iter().any(|argument| argument == "0:a:0")).is_false();
+    }
+
+    /// The commonest reason automatic sync fails is a file with no audio track at all, and
+    /// saying so beats `ffmpeg`'s complaint about a stream specifier — which is what a `-map`
+    /// with nothing to name would produce, after spawning a subprocess to produce it.
+    #[test]
+    fn sync_should_answer_a_file_with_no_audio_rather_than_running_ffmpeg() {
+        // Arrange
+        let request = SyncRequest {
+            generation: 7,
+            media: PathBuf::from("/media/silent.mkv"),
+            audio_stream: None,
+            cues: vec![cue(0, 1000, "line")],
+            duration: Duration::from_secs(10),
+        };
+        let live = AtomicU64::new(7);
+
+        // Act
+        let event = sync_track(&request, &live).expect("a live page should be answered");
+
+        // Assert
+        let PreviewEvent::Sync {
+            generation,
+            outcome,
+        } = event
+        else {
+            panic!("the sync worker should answer with a sync event");
+        };
+        assert_that!(generation).is_equal_to(7);
+        assert_that!(outcome).is_equal_to(SyncOutcome::Failed(
+            "This file has no audio track to sync the cues against.".to_string(),
+        ));
+    }
+
     /// The interactive path and the background pass have to seek to the same instant for
     /// the same cue, or the two would write different pictures under one cache key.
     #[test]
@@ -5012,9 +5584,11 @@ mod tests {
             source: source(media, workspace),
             cues,
             duration: Duration::from_secs(6),
-            // Deliberately unbounded: `warm` prunes the cache it shares with every other
-            // test in this binary, and a real limit here would delete their frames.
+            // Deliberately unbounded, both bounds: `warm` prunes the cache it shares with
+            // every other test in this binary, and a real limit here would delete their
+            // frames.
             cache_tracks: usize::MAX,
+            cache_bytes: u64::MAX,
         }
     }
 
@@ -5022,6 +5596,25 @@ mod tests {
         let mut progress = Vec::new();
         while let Ok(PreviewEvent::Warming { done, total, .. }) = events.try_recv() {
             progress.push((done, total));
+        }
+        progress
+    }
+
+    /// The same drain, carrying `rendered` as well — `(done, total, rendered)` per event.
+    ///
+    /// Kept beside [`warmed`] rather than replacing it, because most of these tests are
+    /// about the *sequence* of counts and would only be made harder to read by a third
+    /// number they say nothing about.
+    fn warm_progress(events: &Receiver<PreviewEvent>) -> Vec<(usize, usize, usize)> {
+        let mut progress = Vec::new();
+        while let Ok(PreviewEvent::Warming {
+            done,
+            total,
+            rendered,
+            ..
+        }) = events.try_recv()
+        {
+            progress.push((done, total, rendered));
         }
         progress
     }
@@ -5119,9 +5712,13 @@ mod tests {
         for cue in &cues {
             assert_that!(cached(&request.source, cue)).is_true();
         }
-        let progress = warmed(&events);
-        assert_that!(progress.first().copied()).is_equal_to(Some((0, 2)));
-        assert_that!(progress.last().copied()).is_equal_to(Some((2, 2)));
+        // The count starts at zero so the line appears with the first frame rather than
+        // after it, and ends reporting that both cues had to be drawn — the other half of
+        // `the_background_pass_should_skip_cues_that_are_already_cached`'s claim, which
+        // needs a pass that really did render to be worth anything.
+        let progress = warm_progress(&events);
+        assert_that!(progress.first().copied()).is_equal_to(Some((0, 2, 0)));
+        assert_that!(progress.last().copied()).is_equal_to(Some((2, 2, 2)));
 
         // Cleanup
         for cue in &cues {
@@ -5152,8 +5749,10 @@ mod tests {
         warm(&request, &live(1), &events_tx);
 
         // Assert: it got all the way to the end without staging a cue, which is the first
-        // thing any real grab does.
-        assert_that!(warmed(&events).last().copied()).is_equal_to(Some((2, 2)));
+        // thing any real grab does — and said so, by reporting that it rendered none of
+        // them. That count is the only thing separating this from a pass that redrew the
+        // whole track, which is what the page is asked about when the cache stops working.
+        assert_that!(warm_progress(&events).last().copied()).is_equal_to(Some((2, 2, 0)));
         assert_that!(directory.join(warm_cue_file(0)).exists()).is_false();
 
         // Cleanup
@@ -5378,19 +5977,19 @@ mod tests {
         let mut progress = WarmProgress::new(7, 3);
 
         // Act
-        progress.publish(&events_tx, 0);
-        progress.publish(&events_tx, 1);
-        progress.publish(&events_tx, 2);
-        progress.publish(&events_tx, 3);
+        progress.publish(&events_tx, 0, 0);
+        progress.publish(&events_tx, 1, 0);
+        progress.publish(&events_tx, 2, 0);
+        progress.publish(&events_tx, 3, 0);
 
         // Assert: the first and the last, not the two in between.
         assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 3), (3, 3)]);
 
         // Act / Assert: and once the interval has passed, reporting resumes.
         let mut progress = WarmProgress::new(7, 3);
-        progress.publish(&events_tx, 0);
+        progress.publish(&events_tx, 0, 0);
         std::thread::sleep(WARM_PROGRESS_INTERVAL + Duration::from_millis(20));
-        progress.publish(&events_tx, 1);
+        progress.publish(&events_tx, 1, 0);
         assert_that!(warmed(&events).as_slice()).contains_exactly_in_given_order([(0, 3), (1, 3)]);
     }
 
@@ -5402,9 +6001,9 @@ mod tests {
         let mut progress = WarmProgress::new(1, 1);
 
         // Act / Assert
-        assert_that!(progress.publish(&events_tx, 0)).is_true();
+        assert_that!(progress.publish(&events_tx, 0, 0)).is_true();
         drop(events);
-        assert_that!(progress.publish(&events_tx, 1)).is_false();
+        assert_that!(progress.publish(&events_tx, 1, 1)).is_false();
     }
 
     /// The worker loop itself: one request per page opening, coalesced down to the page
@@ -5437,6 +6036,7 @@ mod tests {
                 generation,
                 done,
                 total,
+                ..
             } = event
             else {
                 panic!("a warm request should answer with progress");
@@ -6165,7 +6765,10 @@ mod tests {
             cue(2000, 3000, "line"),
             PlaybackSpeed::HALF,
         );
-        request.audio = Some(crate::audio::OutputFormat::FALLBACK);
+        request.audio = Some(AudioTrack {
+            stream: 1,
+            format: crate::audio::OutputFormat::FALLBACK,
+        });
 
         // Act
         let arguments = arguments_of(&playback_command(
@@ -6520,7 +7123,7 @@ mod tests {
         assert_that!(arguments.iter().any(|argument| argument == "rgb24")).is_true();
         assert_that!(command.get_current_dir()).is_equal_to(Some(directory.as_path()));
 
-        // Assert: no audio output at all when the media has none. `-map 0:a:0` on such a
+        // Assert: no audio output at all when the media has none. An audio `-map` on such a
         // file fails the whole run, and the optional `0:a:0?` form leaves an output with no
         // streams in it, which fails just as hard — so it is left out rather than made
         // conditional inside `ffmpeg`.
@@ -6540,9 +7143,12 @@ mod tests {
             &directory,
             cue(2000, 3000, "line"),
         );
-        request.audio = Some(crate::audio::OutputFormat {
-            sample_rate: 44_100,
-            channels: 1,
+        request.audio = Some(AudioTrack {
+            stream: 1,
+            format: crate::audio::OutputFormat {
+                sample_rate: 44_100,
+                channels: 1,
+            },
         });
 
         // Act
@@ -6645,9 +7251,12 @@ mod tests {
         let mut request = playback_request(&media, &directory, cue(2000, 3000, "line"));
         request.span_start = Duration::from_secs(1);
         request.span_end = Duration::from_secs(3);
-        request.audio = Some(crate::audio::OutputFormat {
-            sample_rate: 48_000,
-            channels: 2,
+        request.audio = Some(AudioTrack {
+            stream: 1,
+            format: crate::audio::OutputFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
         });
         let never = || false;
 
@@ -6662,7 +7271,7 @@ mod tests {
         let samples = frames.take_samples();
         // Two seconds of stereo at 48 kHz, give or take how the seek lands on a frame.
         let format = request.audio.unwrap();
-        let played = format.duration_of(samples.len());
+        let played = format.format.duration_of(samples.len());
         assert_that!(played >= Duration::from_millis(1900)).is_true();
         assert_that!(played <= Duration::from_millis(2100)).is_true();
         // And it is a tone rather than silence, which is what a mapping that pulled the
@@ -6868,9 +7477,12 @@ mod tests {
         request.fps = 10;
         request.cells = cells;
         request.pixels = playback_pixels(cells, test_picker().font_size());
-        request.audio = Some(crate::audio::OutputFormat {
-            sample_rate: 48_000,
-            channels: 2,
+        request.audio = Some(AudioTrack {
+            stream: 1,
+            format: crate::audio::OutputFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
         });
         let never = || false;
 
@@ -6953,7 +7565,7 @@ mod tests {
         request.fps = 25;
         request.cells = cells;
         request.pixels = playback_pixels(cells, test_picker().font_size());
-        request.audio = Some(format);
+        request.audio = Some(AudioTrack { stream: 1, format });
         let never = || false;
 
         // Act
@@ -7222,6 +7834,7 @@ mod tests {
         // Act
         let burned = frame_command(
             Path::new("/media/clip.mkv"),
+            0,
             Duration::from_millis(2500),
             (640, 480),
             workspace,
@@ -7229,6 +7842,7 @@ mod tests {
         );
         let bare = frame_command(
             Path::new("/media/clip.mkv"),
+            0,
             Duration::from_millis(2500),
             (640, 480),
             workspace,

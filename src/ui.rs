@@ -158,7 +158,11 @@ const TICK_TARGET: u64 = 6;
 fn render_subtitle_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     // Read before the page is borrowed, because `App`'s accessors take the whole of it
     // while `subtitle_edit` is held mutably below.
-    let badge = playback_settings_badge(app.preview_settings(), app.preview_defaults());
+    let badge = playback_settings_badge(
+        app.preview_settings(),
+        app.preview_defaults(),
+        app.non_default_audio_stream(),
+    );
     let dialog_open = app.dialog.is_some();
     // Which of this track's cues have been rewritten but not written out. Read here for the
     // same reason the badge is, and shown on the cue panel: a staged edit is invisible once
@@ -383,11 +387,20 @@ fn edit_status_line(state: &SubtitleEditState, notice: Option<&str>) -> Option<(
 /// to decode rather than what it looks like, and a title listing all five would be longer
 /// than most panes are wide. This is a status line, not control help — the keybindings
 /// popup (`?`) remains the only place this application documents its keys.
+///
+/// `audio` is the chosen audio track, when it is not the file's first. A preview playing the
+/// commentary track sounds like the wrong film and there is nothing else on screen to say
+/// why. The *video* track is left out for the opposite reason: the picture is its own
+/// evidence.
 fn playback_settings_badge(
     settings: crate::app::PreviewSettings,
     defaults: crate::app::PreviewSettings,
+    audio: Option<u64>,
 ) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(stream) = audio {
+        parts.push(format!("audio #{stream}"));
+    }
     if settings.playback_speed != defaults.playback_speed {
         parts.push(settings.playback_speed.to_string());
     }
@@ -633,14 +646,27 @@ fn render_edit_cues(
     // colour its rows wear: they are different work with different consequences, and a single
     // number would make the reader open the panel to find out which they had. Each half is
     // dropped at zero, so the ordinary case of one kind of edit reads exactly as it did.
-    if let WarmState::Working { done, total } = state.warm {
-        block = block.title(
-            Line::styled(
-                format!(" [{done}/{total}] "),
-                Style::default().fg(Color::Cyan),
-            )
-            .right_aligned(),
-        );
+    //
+    // The pass also says how many of those frames it had to *render*, because `done` alone
+    // cannot tell a cache that is working from one that is being rebuilt: both count to the
+    // same total at the same rate. It is the difference between `[400/1200]` on a revisited
+    // track — nothing rendered, the cache doing exactly its job — and `[400/1200 · 400 new]`,
+    // which says every frame is being drawn again and is the symptom of a key that moved.
+    // Dropped at zero rather than shown as `· 0 new`, so the ordinary case stays the short
+    // one and the count only appears when there is something to notice.
+    if let WarmState::Working {
+        done,
+        total,
+        rendered,
+    } = state.warm
+    {
+        let progress = if rendered > 0 {
+            format!(" [{done}/{total} · {rendered} new] ")
+        } else {
+            format!(" [{done}/{total}] ")
+        };
+        block =
+            block.title(Line::styled(progress, Style::default().fg(Color::Cyan)).right_aligned());
     } else if let Some(counts) = staged_cue_counts(marks) {
         block = block.title(counts.right_aligned());
     }
@@ -2771,6 +2797,10 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         render_create_track_dialog(frame, app);
         return;
     }
+    if dialog == Dialog::AutoSyncing {
+        render_auto_sync_dialog(frame, app);
+        return;
+    }
     // Matched exhaustively rather than falling through to the error popup: every dialog
     // above returns, so a new `Dialog` variant that forgets to must fail to compile here
     // instead of silently rendering itself as an editing error.
@@ -2789,6 +2819,7 @@ fn render_dialog(frame: &mut Frame, app: &mut App, dialog: Dialog) {
         | Dialog::EditCue
         | Dialog::CueLength
         | Dialog::CreateTrack
+        | Dialog::AutoSyncing
         | Dialog::ConfirmLeaveCues => unreachable!("handled and returned above"),
         Dialog::Error => (
             " Error ",
@@ -3421,9 +3452,18 @@ const CUE_LENGTH_HEIGHT: u16 = 4;
 
 /// "Leaving discards them" — the question `Esc` asks on the way off the subtitle edit page.
 fn render_confirm_leave_cues_dialog(frame: &mut Frame, app: &App) {
+    // The same question for two departures, and the second half names which. Switching to
+    // another subtitle track leaves this track's page as surely as `Esc` does — the cue list
+    // is rebuilt from the file — so saying "leaving" there would describe something the
+    // reader did not press.
+    let consequence = if app.switching_subtitle_track() {
+        "Ctrl+S writes them; switching tracks discards them."
+    } else {
+        "Ctrl+S writes them; leaving discards them."
+    };
     let lines = vec![
         Line::from("Cue edits are staged but not written yet.").centered(),
-        Line::from("Ctrl+S writes them; leaving discards them.").centered(),
+        Line::from(consequence).centered(),
         Line::from(""),
         Line::from(vec![
             action_option(
@@ -3653,7 +3693,9 @@ fn keybindings_text() -> Text<'static> {
     keybinding(
         &mut lines,
         ":",
-        "Preview settings for this session: speed, loop, sound, padding, frame rate",
+        "Preview settings for this session: speed, loop, sound, padding, frame rate, and which \
+         video, audio and subtitle track the page previews. Closing it opens the page again on \
+         the chosen tracks",
     );
     keybinding(
         &mut lines,
@@ -3780,6 +3822,39 @@ fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
         Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
         Span::raw(description.to_string()),
     ]));
+}
+
+/// `Dialog::AutoSyncing`: the one dialog on the subtitle edit page with nothing to
+/// choose and nowhere to back out of, up for as long as the background decode takes and
+/// not a moment longer. Modelled on `render_progress_dialog`'s indeterminate loader —
+/// there is no measured progress here at all, since a whole-track audio decode reports
+/// no fraction along the way — but smaller, since there is no label line to fit a
+/// filename into.
+fn render_auto_sync_dialog(frame: &mut Frame, app: &App) {
+    let area = centered_fixed(frame.area(), 46, 5);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Auto sync ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+        .margin(1)
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("Syncing subtitles to audio…")
+            .centered()
+            .style(Style::default().fg(Color::Cyan).bold()),
+        rows[0],
+    );
+    let tick = (app
+        .sync_started
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(0)
+        / 80) as usize;
+    frame.render_widget(Paragraph::new(loader_line(tick)).centered(), rows[1]);
 }
 
 /// The original single-file design: one centered box, one label line, one gauge (or
@@ -5755,6 +5830,15 @@ fn preview_field_help_text(field: PreviewSettingsField) -> Text<'static> {
         PreviewSettingsField::FrameRate => {
             "How many frames a second the preview aims for. A ceiling, not a promise."
         }
+        PreviewSettingsField::VideoTrack => {
+            "Which of the file's video streams the preview is drawn from. Cover art is left out — a still image would show the same frame for every cue.\n\nThe page is opened again on the chosen stream when this popup closes, so its frames are rendered afresh."
+        }
+        PreviewSettingsField::AudioTrack => {
+            "Which of the file's audio streams the preview plays, and which one automatic sync measures against. A commentary track is rarely the one a subtitle should be judged by.\n\nTakes effect on the next preview playback."
+        }
+        PreviewSettingsField::SubtitleTrack => {
+            "Which subtitle track this page is editing. Choosing another opens the page on it when this popup closes, so two tracks can be compared against the same picture.\n\nGreyed tracks cannot be previewed: they are marked for deletion, or they hold pictures rather than text. Cue edits that have not been written are asked about first."
+        }
     };
     help_paragraphs(vec![(
         description.to_string(),
@@ -5772,7 +5856,14 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
     let mut lines = Vec::new();
     let mut focus_line = 0;
 
-    for field in PreviewSettingsField::ORDER {
+    for (row, field) in PreviewSettingsField::ORDER.into_iter().enumerate() {
+        // A blank row where the tracks end and the playback settings begin: *what* is being
+        // previewed and *how* it plays are two questions, and run together the popup reads
+        // as one list of eight. Found from the order rather than pinned to a field, so
+        // rearranging either half cannot leave the gap in the wrong place.
+        if row > 0 && PreviewSettingsField::ORDER[row - 1].is_track() && !field.is_track() {
+            lines.push(Line::from(""));
+        }
         let selected = field == popup.field;
         let (value, changed) = match field {
             PreviewSettingsField::Speed => (
@@ -5799,6 +5890,23 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
                 format!("{} fps", app.effective_playback_fps()),
                 settings.playback_fps != defaults.playback_fps,
             ),
+            // A track row's value is the label of whatever it names, and *changed* means the
+            // reader has pointed it somewhere else in this visit — `config.toml` has nothing
+            // to say about tracks, so there is no default to compare against. The choice is
+            // pending until the popup closes, which is exactly what the marker says.
+            PreviewSettingsField::VideoTrack
+            | PreviewSettingsField::AudioTrack
+            | PreviewSettingsField::SubtitleTrack => {
+                let choices = app.preview_choices(field);
+                let cursor = app.preview_choice_cursor(field);
+                (
+                    choices
+                        .get(cursor)
+                        .cloned()
+                        .unwrap_or_else(|| "None".to_string()),
+                    app.preview_track_pending(field),
+                )
+            }
         };
         if selected && !(expanded && !field.is_toggle()) {
             focus_line = lines.len();
@@ -5831,7 +5939,7 @@ fn render_preview_settings_dialog(frame: &mut Frame, app: &App) {
                 choice,
                 index == popup.cursor,
                 index == in_force,
-                true,
+                app.preview_choice_enabled(field, index),
                 index == in_force && changed,
                 index == last,
             ));
@@ -7904,6 +8012,9 @@ mod tests {
             Dialog::ConfirmReset => {
                 app.request_reset_current_file();
             }
+            Dialog::AutoSyncing => {
+                app.sync_started = Some(std::time::Instant::now());
+            }
             Dialog::ResolveConflicts => {
                 let path = app.directory.join("movie.mkv");
                 let fingerprint = crate::files::FileFingerprint {
@@ -7941,7 +8052,7 @@ mod tests {
     fn render_should_draw_every_layer_and_dialog() {
         // Arrange: the whole application, not a single widget — `render` is the only
         // entry point the binary uses, and nothing below it was reachable from a test.
-        const DIALOGS: [(Dialog, &str); 15] = [
+        const DIALOGS: [(Dialog, &str); 16] = [
             (Dialog::Keybindings, "Keybindings"),
             (Dialog::ContainerSettings, "Container settings"),
             (Dialog::PreviewSettings, "Preview settings"),
@@ -7960,6 +8071,7 @@ mod tests {
             (Dialog::EditCue, "Hello there"),
             (Dialog::CueLength, "On screen for"),
             (Dialog::ConfirmLeaveCues, "Cue edits are staged"),
+            (Dialog::AutoSyncing, "Syncing subtitles to audio"),
         ];
 
         // Act / Assert: each dialog names itself on screen.
@@ -13116,9 +13228,10 @@ mod tests {
         // "Move track down / up", "Mark or unmark track for deletion", "Add a new subtitle
         // track", the four that match on "tracks" — the SRT timing preview, the cue editor,
         // the timing mode, and marking a cue for deletion — global retiming, which names
-        // both a track that is out of sync and the SubRip tracks it works on, and automatic
-        // sync, which names both this track and the SubRip tracks it works on too.
-        assert_eq!(count, 9);
+        // both a track that is out of sync and the SubRip tracks it works on, automatic
+        // sync, which names both this track and the SubRip tracks it works on too, and the
+        // preview settings, which now name the three tracks the page can be pointed at.
+        assert_eq!(count, 10);
     }
 
     #[test]
@@ -13749,6 +13862,9 @@ mod tests {
                 mode: crate::app::PreviewSettingsMode::Summary,
                 help_visible: true,
                 cursor: 0,
+                video: None,
+                audio: None,
+                subtitle: None,
             });
             let help = preview_field_help_text(field);
             fits(format!("{field:?}"), &help, &|frame| {
@@ -16449,15 +16565,24 @@ mod tests {
         // Act / Assert: nothing to say before the pass starts.
         assert_that!(drawn(80, 24, |frame| render(frame, &mut app)).contains("/2]")).is_false();
 
-        // Act / Assert: counting while it runs...
-        app.subtitle_edit.as_mut().unwrap().apply_warming(3, 42);
+        // Act / Assert: counting while it runs, and saying nothing about frames it did not
+        // have to draw — a fully cached track is the ordinary case and reads as the short
+        // form.
+        app.subtitle_edit.as_mut().unwrap().apply_warming(3, 42, 0);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
         assert_that!(screen.contains("[3/42]")).is_true();
 
+        // Frames it did have to draw are said out loud, because that is the only thing on
+        // screen that tells a working cache from one being rebuilt.
+        app.subtitle_edit.as_mut().unwrap().apply_warming(4, 42, 4);
+        let screen = drawn(80, 24, |frame| render(frame, &mut app));
+        assert_that!(screen.contains("[4/42 · 4 new]")).is_true();
+
         // ...and silent again once it is over.
-        app.subtitle_edit.as_mut().unwrap().apply_warming(42, 42);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(42, 42, 4);
         let screen = drawn(80, 24, |frame| render(frame, &mut app));
         assert_that!(screen.contains("[42/42]")).is_false();
+        assert_that!(screen.contains("4 new")).is_false();
 
         // Cleanup
         drop(app);
@@ -17070,7 +17195,7 @@ mod tests {
     fn the_page_should_say_that_a_playback_is_being_prepared() {
         // Arrange
         let (mut app, directory) = edit_page_app("edit-preparing", vec![edit_cue(1000, 3000, "a")]);
-        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4, 0);
 
         // Act
         app.subtitle_edit
@@ -17096,7 +17221,7 @@ mod tests {
         // Arrange
         let (mut app, directory) =
             edit_page_app("edit-playback-failed", vec![edit_cue(1000, 3000, "a")]);
-        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4);
+        app.subtitle_edit.as_mut().unwrap().apply_warming(1, 4, 0);
 
         // Act
         app.subtitle_edit.as_mut().unwrap().fail_playback(
@@ -17132,7 +17257,16 @@ mod tests {
 
         // Assert: every row, with the values in force.
         assert_that!(screen.contains("Preview settings")).is_true();
-        for row in ["Speed", "Loop", "Sound", "Padding", "Frame rate"] {
+        for row in [
+            "Speed",
+            "Loop",
+            "Sound",
+            "Padding",
+            "Frame rate",
+            "Video track",
+            "Audio track",
+            "Subtitle track",
+        ] {
             assert_that!(screen.contains(row)).is_true();
         }
         assert_that!(screen.contains("[ 1x ]")).is_true();
@@ -17140,11 +17274,30 @@ mod tests {
         // The file's rate, not the built-in thirty.
         assert_that!(screen.contains("[ 24 fps ]")).is_true();
         // The two switches are button pairs rather than a value in brackets, so both answers
-        // are on the row and the lit one is the state in force.
+        // are on the row and the lit one is the state in force. The third `No` is the audio
+        // row reading `None` — this fixture is a video with no sound, which is the one
+        // dropdown in this popup that can be empty.
         assert_that!(screen.matches("Yes").count()).is_equal_to(2);
-        assert_that!(screen.matches("No").count()).is_equal_to(2);
+        assert_that!(screen.matches("No").count()).is_equal_to(3);
+        assert_that!(screen.contains("[ None ]")).is_true();
 
-        // Act: open the speed dropdown.
+        // Assert: the three tracks come first and run together, and one blank row separates
+        // them from the speed.
+        let rows = draw(&mut app, 140, 40);
+        let row_of = |label: &str| {
+            rows.iter()
+                .position(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("the {label} row should be drawn"))
+        };
+        let subtitle_row = row_of("Subtitle track");
+        assert_that!(row_of("Video track")).is_equal_to(subtitle_row - 2);
+        assert_that!(row_of("Audio track")).is_equal_to(subtitle_row - 1);
+        assert_that!(row_of("Speed")).is_equal_to(subtitle_row + 2);
+
+        // Act: open the speed dropdown, the row after the three tracks.
+        for _ in 0..3 {
+            app.move_preview_settings_cursor(1);
+        }
         app.activate_preview_setting();
         let open = draw(&mut app, 140, 40).join(" ");
 
@@ -17182,6 +17335,111 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A track row is *changed* when the reader has pointed it somewhere else in this visit,
+    /// which is the honest thing to say: nothing has happened yet, and closing the popup is
+    /// what will make it happen. A track the page would refuse is greyed rather than hidden,
+    /// so a reader who can see it is there has been answered.
+    #[test]
+    fn the_track_rows_should_mark_a_pending_choice_and_grey_a_refused_one() {
+        // Arrange: a second subtitle track the page cannot read, beside the one it is on.
+        let (mut app, directory) = edit_page_app("preview-tracks", vec![edit_cue(0, 2000, "a")]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.open_preview_settings();
+
+        // Act: open the subtitle list.
+        app.preview_settings_popup =
+            app.preview_settings_popup
+                .map(|popup| crate::app::PreviewSettingsPopup {
+                    field: crate::app::PreviewSettingsField::SubtitleTrack,
+                    ..popup
+                });
+        app.activate_preview_setting();
+        let open = draw(&mut app, 140, 40).join(" ");
+
+        // Assert: both tracks are on the list, and the one that cannot be previewed says so.
+        assert_that!(open.contains("Subtitle track")).is_true();
+        assert_that!(open.contains("#1 · SRT")).is_true();
+        assert_that!(open.contains("#2 · PGS")).is_true();
+        assert_that!(open.contains("cannot be previewed")).is_true();
+        // The refused row is drawn inert, which is the one thing that tells it apart.
+        assert_that!(
+            app.preview_choice_enabled(crate::app::PreviewSettingsField::SubtitleTrack, 1)
+        )
+        .is_false();
+
+        // Act / Assert: an untouched row is not marked as changed — the reader opening a
+        // list and picking what was already there has not asked for a switch.
+        app.activate_preview_setting();
+        assert_that!(app.preview_track_pending(crate::app::PreviewSettingsField::SubtitleTrack))
+            .is_false();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The same question is raised by two departures, and the second half of it names which:
+    /// switching tracks leaves this track's page as surely as `Esc` does, so saying "leaving"
+    /// there would describe something the reader did not press.
+    #[test]
+    fn the_unsaved_cue_edits_prompt_should_name_the_departure_it_is_about() {
+        // Arrange: two SubRip tracks and a cue rewritten but not written out.
+        let (mut app, directory) =
+            edit_page_app("leave-cues-wording", vec![edit_cue(0, 2000, "a")]);
+        app.outcome = Some(ProbeOutcome::Video(
+            MediaInfo::from_json(serde_json::json!({
+                "format": {"format_name": "matroska,webm", "duration": "120.0"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "subtitle", "codec_name": "subrip"},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        app.stream_order = vec![0, 1, 2];
+        app.open_cue_editor();
+        app.cue_editor_insert('!');
+        app.close_cue_editor();
+
+        // Act / Assert: `Esc` on the page raises it about leaving.
+        app.request_leave_subtitle_edit();
+        let leaving = draw(&mut app, 100, 30).join(" ");
+        assert_that!(leaving.contains("leaving discards them")).is_true();
+        app.resolve_leave_subtitle_edit(false);
+
+        // Act / Assert: and the popup naming another track raises it about switching.
+        app.open_preview_settings();
+        app.preview_settings_popup =
+            app.preview_settings_popup
+                .map(|popup| crate::app::PreviewSettingsPopup {
+                    field: crate::app::PreviewSettingsField::SubtitleTrack,
+                    ..popup
+                });
+        app.activate_preview_setting();
+        app.move_preview_settings_cursor(1);
+        app.activate_preview_setting();
+        app.escape_preview_settings();
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::ConfirmLeaveCues));
+        let switching = draw(&mut app, 100, 30).join(" ");
+        assert_that!(switching.contains("switching tracks discards them")).is_true();
+
+        // Cleanup
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// `K` explains the row under the cursor, and keeps explaining as the cursor moves — it
     /// is a panel you leave up while reading down the rows, not a per-field prompt.
     #[test]
@@ -17203,14 +17461,14 @@ mod tests {
         let screen = draw(&mut app, 160, 40).join(" ");
 
         // Assert: titled for the focused row, and explaining that row rather than the popup.
-        assert_that!(screen.contains("Information about Speed")).is_true();
-        assert_that!(screen.contains("How fast the preview runs")).is_true();
+        assert_that!(screen.contains("Information about Video track")).is_true();
+        assert_that!(screen.contains("Which of the file's video streams")).is_true();
 
         // Act / Assert: it follows the cursor rather than staying on the row it opened over.
         app.move_preview_settings_cursor(1);
         let moved = draw(&mut app, 160, 40).join(" ");
-        assert_that!(moved.contains("Information about Loop")).is_true();
-        assert_that!(moved.contains("Information about Speed")).is_false();
+        assert_that!(moved.contains("Information about Audio track")).is_true();
+        assert_that!(moved.contains("Information about Video track")).is_false();
 
         // Act / Assert: and every row has something to say, with its own title.
         for field in PreviewSettingsField::ORDER {
@@ -17288,8 +17546,11 @@ mod tests {
         assert_that!(plain.contains("Preview ·")).is_false();
 
         // Act: half speed, looping, muted. The speed list runs fastest first, so half is the
-        // second row from the *end*.
+        // second row from the *end*. The speed is the row after the three tracks.
         app.open_preview_settings();
+        for _ in 0..3 {
+            app.move_preview_settings_cursor(1);
+        }
         app.activate_preview_setting();
         app.move_preview_settings_to_endpoint(true);
         app.move_preview_settings_cursor(-1);
@@ -17331,7 +17592,7 @@ mod tests {
         };
 
         // Act / Assert: matching the defaults says nothing.
-        assert_that!(playback_settings_badge(settings, settings)).is_none();
+        assert_that!(playback_settings_badge(settings, settings, None)).is_none();
 
         // Act / Assert: and going against them names both, in the words of what is now true.
         let changed = crate::app::PreviewSettings {
@@ -17339,8 +17600,15 @@ mod tests {
             playback_muted: false,
             ..settings
         };
-        assert_that!(playback_settings_badge(changed, settings))
+        assert_that!(playback_settings_badge(changed, settings, None))
             .is_equal_to(Some("once · sound".to_string()));
+
+        // Act / Assert: and a chosen audio track leads, because a preview playing the
+        // commentary sounds like the wrong film and nothing else on screen would say why.
+        assert_that!(playback_settings_badge(settings, settings, Some(4)))
+            .is_equal_to(Some("audio #4".to_string()));
+        assert_that!(playback_settings_badge(changed, settings, Some(4)))
+            .is_equal_to(Some("audio #4 · once · sound".to_string()));
     }
 
     /// The playback takes the pane while it runs, and the still frame is what is left when

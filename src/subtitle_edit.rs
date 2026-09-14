@@ -220,10 +220,19 @@ pub enum WarmState {
     /// frame per cue means a thousand accurate seeks across the network. Said out loud on
     /// the page, since the frames the user does land on still appear.
     OffForNetwork,
-    /// `done` counts cues the pass has finished with, however it finished with them.
+    /// `done` counts cues the pass has finished with, however it finished with them, and
+    /// `rendered` how many of those cost an `ffmpeg` run rather than being found in the
+    /// cache.
+    ///
+    /// The second is on screen because the first cannot answer the question the reader
+    /// actually has about this page. A pass over a fully cached track and a pass rebuilding
+    /// one from scratch produce the same `done`, the same cue list and the same pictures,
+    /// and differ only in how long they take and how much disk they burn — so a cache that
+    /// had quietly stopped working looked exactly like one that was working.
     Working {
         done: usize,
         total: usize,
+        rendered: usize,
     },
     Done,
 }
@@ -857,11 +866,15 @@ impl SubtitleEditState {
     /// `done == total` is "the pass is over", not "every cue was rendered" — a cue it
     /// could not draw is finished with too. The status line only reports a count while
     /// there is still one to report.
-    pub fn apply_warming(&mut self, done: usize, total: usize) {
+    pub fn apply_warming(&mut self, done: usize, total: usize, rendered: usize) {
         self.warm = if done >= total {
             WarmState::Done
         } else {
-            WarmState::Working { done, total }
+            WarmState::Working {
+                done,
+                total,
+                rendered,
+            }
         };
         // The pass has cached frames the window may have been missing when it was last
         // asked for. Without this the neighbours are only ever refilled by the cursor
@@ -2629,8 +2642,8 @@ mod tests {
             1,
             FrameSource {
                 media: PathBuf::from("/media/show.mkv"),
-                media_length: 4096,
-                media_modified: None,
+                video_stream: 0,
+                video_identity: "h264\u{1f}960\u{1f}540".to_string(),
                 pixels: (960, 540),
                 style: Arc::new(CueStyle::SubRip),
                 workspace: PathBuf::from("/tmp/reel-tui-preview/state"),
@@ -4331,18 +4344,28 @@ mod tests {
         assert_that!(state.warm).is_equal_to(WarmState::Off);
 
         // Act / Assert
-        state.apply_warming(0, 4);
-        assert_that!(state.warm).is_equal_to(WarmState::Working { done: 0, total: 4 });
-        state.apply_warming(3, 4);
-        assert_that!(state.warm).is_equal_to(WarmState::Working { done: 3, total: 4 });
-        state.apply_warming(4, 4);
+        state.apply_warming(0, 4, 0);
+        assert_that!(state.warm).is_equal_to(WarmState::Working {
+            done: 0,
+            total: 4,
+            rendered: 0,
+        });
+        // How many of them had to be drawn is carried alongside the count, not derived from
+        // it: a pass finding every frame cached and one drawing every frame count alike.
+        state.apply_warming(3, 4, 2);
+        assert_that!(state.warm).is_equal_to(WarmState::Working {
+            done: 3,
+            total: 4,
+            rendered: 2,
+        });
+        state.apply_warming(4, 4, 0);
         assert_that!(state.warm).is_equal_to(WarmState::Done);
         // A pass that gave up early reports everything left as finished at once, which
         // must read as done rather than as a count past the end.
-        state.apply_warming(9, 4);
+        state.apply_warming(9, 4, 0);
         assert_that!(state.warm).is_equal_to(WarmState::Done);
         // An empty track has nothing to count and is over before it starts.
-        state.apply_warming(0, 0);
+        state.apply_warming(0, 0, 0);
         assert_that!(state.warm).is_equal_to(WarmState::Done);
     }
 
@@ -4358,7 +4381,7 @@ mod tests {
         state.clear_frame_request();
 
         // Act / Assert: a missing neighbour is worth going back to the cache for.
-        state.apply_warming(1, 3);
+        state.apply_warming(1, 3, 0);
         assert_that!(state.any_frame_requested()).is_true();
 
         // Arrange: fill the window, and the selection with it.
@@ -4369,14 +4392,14 @@ mod tests {
         state.clear_frame_request();
 
         // Act
-        state.apply_warming(2, 3);
+        state.apply_warming(2, 3, 0);
 
         // Assert: nothing to fetch, so nothing is asked for.
         assert_that!(state.any_frame_requested()).is_false();
 
         // Act / Assert: and a window that loses a frame starts asking again.
         state.fail_frame(2, "ffmpeg exploded".to_string());
-        state.apply_warming(3, 3);
+        state.apply_warming(3, 3, 0);
         assert_that!(state.any_frame_requested()).is_true();
     }
 
@@ -4391,7 +4414,7 @@ mod tests {
         state.clear_frame_request();
 
         // Act
-        state.apply_warming(1, 1);
+        state.apply_warming(1, 1, 0);
 
         // Assert
         assert_that!(state.any_frame_requested()).is_false();
@@ -4519,7 +4542,7 @@ mod tests {
     fn a_failed_track_should_stop_reporting_a_background_pass() {
         // Arrange
         let mut state = ready(3);
-        state.apply_warming(1, 3);
+        state.apply_warming(1, 3, 0);
 
         // Act
         state.fail("ffmpeg exploded".to_string());

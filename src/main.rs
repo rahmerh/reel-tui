@@ -68,6 +68,7 @@ fn run(target_dir: PathBuf) -> Result<()> {
         prefetch: app_config.effective_prefetch(is_network_mount),
         network: is_network_mount,
         cache_tracks: app_config.preview_cache_tracks,
+        cache_bytes: app_config.preview_cache_bytes,
         playback_fps: app_config.playback_fps,
         playback_pad: app_config.playback_pad,
         // Session-only, and so not in the config file: these start where a fresh run starts

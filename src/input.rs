@@ -995,6 +995,11 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
             }
             _ => {}
         },
+        // Takes no key at all, not even a back key — see `Dialog::AutoSyncing`'s own
+        // doc comment for why there is nothing here to cancel.
+        Some(Dialog::AutoSyncing) => {
+            input.reset_sequence();
+        }
         None => return handle_layer_key(app, input, key),
     }
     InputOutcome::Continue
@@ -5113,8 +5118,11 @@ mod tests {
         );
         handle_key(&mut app, &mut input, key(KeyCode::Char(':')));
 
-        // Act: the page's own keys, pressed into the popup.
-        handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        // Act: the page's own keys, pressed into the popup — `j` down past the three track
+        // rows and the speed onto the loop switch.
+        for _ in 0..4 {
+            handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        }
         handle_key(&mut app, &mut input, key(KeyCode::Char('p')));
 
         // Assert: the cursor stayed on the first cue and nothing started playing — `j` moved
@@ -5190,6 +5198,11 @@ mod tests {
             .is_equal_to(app.preview_defaults().playback_fps);
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
         handle_key(&mut app, &mut input, key(KeyCode::Char('g')));
+        assert_that!(app.preview_settings_popup.map(|popup| popup.field))
+            .is_equal_to(Some(crate::app::PreviewSettingsField::VideoTrack));
+        for _ in 0..3 {
+            handle_key(&mut app, &mut input, key(KeyCode::Char('j')));
+        }
         assert_that!(app.preview_settings_popup.map(|popup| popup.field))
             .is_equal_to(Some(crate::app::PreviewSettingsField::Speed));
         handle_key(&mut app, &mut input, key(KeyCode::Enter));

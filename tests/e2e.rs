@@ -1413,6 +1413,10 @@ fn preview_settings_should_change_how_the_next_playback_is_decoded() {
         screen.contains("Preview settings") && screen.contains("Speed"),
         "`:` should open the preview settings popup:\n{screen}"
     );
+    // The popup opens on the three track rows; Speed is the first playback row below them.
+    for _ in 0..3 {
+        app.press(key(KeyCode::Char('j')));
+    }
     // `K` explains the row under the cursor, in the panel every other settings popup uses.
     app.press(key(KeyCode::Char('K')));
     app.pump();
@@ -4600,12 +4604,17 @@ fn editing_a_cue_should_stage_it_and_ctrl_s_should_write_it_to_the_file() {
 
 /// Saving a cue edit on an embedded track keeps the frames the page already rendered.
 ///
-/// Writing an embedded track means remuxing the file, which moves its length and mtime —
-/// and those are in the frame cache's media key, so every frame the page rendered is filed
-/// under a name that no longer describes anything. Left alone, saving one word costs a
-/// feature-length track its entire cache and the page spends the next several minutes
-/// rendering it again, every save. The frames move with the file instead, because the remux
-/// copies the video stream through untouched.
+/// Writing an embedded track means remuxing the file, which moves its length and mtime.
+/// Those used to be in the frame cache's media key, so every frame the page had rendered
+/// was filed under a name that no longer described anything: saving one word cost a
+/// feature-length track its entire cache, and the page spent the next several minutes
+/// rendering it again, on every save. The repair was to rename the directory afterwards,
+/// which meant deciding in advance which edits preserve the picture — and that decision is
+/// what kept coming undone.
+///
+/// The key describes the video stream instead (`preview::video_identity`), which a remux
+/// copies through byte for byte, so there is no move to get wrong: the frames are still
+/// where they were because the picture is still what it was.
 ///
 /// Asserted on the cached files rather than on a count of `ffmpeg` runs: the frame for the
 /// cue that was rewritten *should* be rendered again — its picture changed — and it is the
@@ -4619,14 +4628,16 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
     require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
 
     let scratch = Scratch::new("subtitle-cue-edit-cache");
+    let media = scratch.join("clip.mkv");
     write_media(
-        &scratch.join("clip.mkv"),
+        &media,
         &MediaSpec::mkv()
             .size(320, 240)
             .duration(7.0)
             .audio(&["eng"])
             .subtitles(vec![SubtitleSpec::new("eng", "subrip").cues(CACHED_CUES)]),
     );
+    let before_save = fs::metadata(&media).expect("the fixture should exist");
 
     let mut app = Harness::start(scratch);
     app.open("clip.mkv");
@@ -4664,26 +4675,36 @@ fn saving_a_cue_edit_should_keep_the_frames_the_page_already_rendered() {
                 .is_some_and(|state| !state.cues.is_empty())
     });
 
-    // Assert: the file really was rewritten, so this is not passing on an unchanged key.
+    // Assert: the file really was rewritten, so this is not passing because nothing
+    // happened. Both halves of the key it *used* to be built from have moved.
+    let after_save = fs::metadata(&media).expect("the rewritten file should exist");
+    assert_ne!(
+        (before_save.len(), before_save.modified().ok()),
+        (after_save.len(), after_save.modified().ok()),
+        "the save should have remuxed the file, moving its length or mtime"
+    );
+
+    // Assert: and the key did not move with it, so the whole directory of frames is still
+    // the one the page was rendering into before the save.
     let state = app.app.subtitle_edit.as_ref().unwrap();
     let new_track = track_dir(&state.frames.media_key());
-    assert_ne!(
+    assert_eq!(
         new_track, old_track,
-        "remuxing the file should move its frame-cache key"
+        "a remux copies the video stream through, so it must not move the frame-cache key"
     );
     assert!(
-        !old_track.exists(),
-        "the frames should have moved rather than been copied: {}",
+        old_track.exists(),
+        "the track's frames should still be where they were: {}",
         old_track.display()
     );
 
-    // Assert: and the untouched cue's frame is there, under the new key, byte for byte —
-    // the same picture, not a re-render that happens to look the same.
+    // Assert: and the untouched cue's frame is still there, byte for byte — the same
+    // picture, not a re-render that happens to look the same.
     let carried = cached_frame(state, 0);
     assert_eq!(
         carried.parent(),
         Some(new_track.as_path()),
-        "the surviving frame should be filed under the rewritten file's key"
+        "the surviving frame should still be filed under the track's key"
     );
     assert_eq!(
         fs::read(&carried).ok(),
@@ -5031,13 +5052,13 @@ fn auto_sync_should_measure_the_tracks_offset_from_its_audio_and_ctrl_s_should_w
     // Act: ask for it.
     app.press(key(KeyCode::Char('A')));
 
-    // Assert: the page says it is working before the (real, background) decode has had a
-    // chance to answer — checked before any further pump, so the assertion cannot race the
-    // worker.
+    // Assert: the page raises its blocking dialog before the (real, background) decode has
+    // had a chance to answer — checked before any further pump, so the assertion cannot race
+    // the worker.
     assert_eq!(
-        app.app.notice.as_deref(),
-        Some("Syncing subtitles to audio…"),
-        "the page should say it is working while the worker decodes the audio"
+        app.app.dialog,
+        Some(reel_tui::app::Dialog::AutoSyncing),
+        "the page should block on its own dialog while the worker decodes the audio"
     );
 
     // Act: wait for the worker's real answer.
@@ -5046,6 +5067,12 @@ fn auto_sync_should_measure_the_tracks_offset_from_its_audio_and_ctrl_s_should_w
             .as_ref()
             .is_some_and(|state| !state.syncing)
     });
+
+    // Assert: the dialog closed the moment the answer landed, with no key needed to close it.
+    assert_eq!(
+        app.app.dialog, None,
+        "the blocking dialog should close itself once the worker answers"
+    );
 
     // Assert: the cue moved close enough to 10s that a viewer would call it aligned, and
     // the page said so.
@@ -5143,8 +5170,12 @@ fn auto_sync_should_refuse_a_track_with_no_audio_to_measure_against() {
     );
     let notice = app.app.notice.clone().unwrap_or_default();
     assert!(
-        !notice.is_empty() && notice != "Syncing subtitles to audio…",
+        !notice.is_empty(),
         "the page should explain the refusal rather than leave the key looking broken:\n{notice}"
+    );
+    assert_eq!(
+        app.app.dialog, None,
+        "a refusal to align should leave no dialog standing"
     );
 }
 
@@ -6710,4 +6741,144 @@ fn brightest_preview_shade(app: &Harness) -> u8 {
         .flat_map(|(red, green, blue)| [red, green, blue])
         .max()
         .unwrap_or(0)
+}
+
+const FIRST_TRACK_CUES: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirsttrackopener\n\n\
+                                2\n00:00:03,000 --> 00:00:04,000\nFirsttrackcloser\n\n";
+
+const SECOND_TRACK_CUES: &str = "1\n00:00:01,500 --> 00:00:02,500\nSecondtrackopener\n\n\
+                                 2\n00:00:03,500 --> 00:00:04,500\nSecondtrackmiddle\n\n\
+                                 3\n00:00:05,000 --> 00:00:05,800\nSecondtrackcloser\n\n";
+
+/// The preview-settings popup (`:`) can point the page at another subtitle track, and at
+/// another audio stream, and closing it is what puts them into force.
+///
+/// **The two halves apply differently and that is the whole design.** The cue list comes
+/// out of an extraction settled when the page is *built*, so naming another subtitle track
+/// means standing the page up again; the sound is chosen per playback, so an audio change
+/// costs nothing and must not disturb the page — the background pass, the frames already
+/// rendered and the reader's place in the list all survive it.
+///
+/// Driven through real keypresses against a real two-subtitle, two-audio Matroska file,
+/// because every layer short of this agrees while the feature is broken: the popup opens
+/// either way, and a page rebuilt on the wrong extraction still draws a perfectly good list
+/// of somebody else's cues.
+#[test]
+fn switching_tracks_from_the_preview_settings_should_reopen_the_page_on_them() {
+    // Serialised against the other frame-cache scenarios: they share one cache and prune
+    // each other's tracks — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "switching_tracks_from_the_preview_settings_should_reopen_the_page_on_them";
+    require_tools(test, &["ffmpeg:libx264"]);
+
+    let scratch = Scratch::new("preview-settings-tracks");
+    write_media(
+        &scratch.join("clip.mkv"),
+        &MediaSpec::mkv()
+            .duration(6.0)
+            .audio(&["eng", "fra"])
+            .subtitles(vec![
+                SubtitleSpec::new("eng", "subrip").cues(FIRST_TRACK_CUES),
+                SubtitleSpec::new("nld", "subrip").cues(SECOND_TRACK_CUES),
+            ]),
+    );
+
+    let mut app = Harness::start(scratch);
+    app.open("clip.mkv");
+    let first_track = app
+        .app
+        .track_rows()
+        .iter()
+        .position(|track| *track == TrackRef::Embedded(3))
+        .expect("the first subtitle track should have a row");
+    app.select_track_row(first_track);
+    app.press(key(KeyCode::Char('c')));
+    assert_eq!(app.app.layer, Layer::SubtitleEdit, "c should open the page");
+    app.wait_until("the first track's cues to be read", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| !state.cues.is_empty())
+    });
+    let opened = app.app.subtitle_edit.as_ref().unwrap().generation;
+    assert!(
+        app.screen().contains("Firsttrackopener"),
+        "the page should open on the track the cursor was on:\n{}",
+        app.screen()
+    );
+
+    // Act: `:` opens on the video track, the popup's first row; `j` `j` down to the subtitle
+    // track, `Enter` to open its list, `j` onto the second track, `Enter` to choose it, `Esc`
+    // to close the popup.
+    app.press(key(KeyCode::Char(':')));
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::PreviewSettings),
+        "`:` should open the preview settings"
+    );
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Esc));
+
+    // Assert: the page came back on the other track rather than dropping the reader on the
+    // track list, and it is the *other track's* cues that are drawn.
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "closing the popup should leave the reader on the page:\n{}",
+        app.screen()
+    );
+    app.wait_until("the second track's cues to be read", |app| {
+        app.subtitle_edit
+            .as_ref()
+            .is_some_and(|state| state.cues.len() == 3)
+    });
+    let state = app.app.subtitle_edit.as_ref().unwrap();
+    assert_eq!(
+        state.source,
+        SubtitleSource::Embedded(4),
+        "the page should be about the track the popup named"
+    );
+    assert_ne!(
+        state.generation, opened,
+        "a new subtitle track is a new extraction, so the page has to be built again"
+    );
+    let screen = app.screen();
+    assert!(
+        screen.contains("Secondtrackopener") && !screen.contains("Firsttrackopener"),
+        "the panel should list the chosen track's cues and not the one it left:\n{screen}"
+    );
+
+    // Act: the other audio stream, on the popup's second row.
+    let switched = app.app.subtitle_edit.as_ref().unwrap().generation;
+    app.press(key(KeyCode::Char(':')));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Char('j')));
+    app.press(key(KeyCode::Enter));
+    app.press(key(KeyCode::Esc));
+
+    // Assert: nothing was rebuilt — the sound is chosen per playback, so the page, its cue
+    // list and its background pass carry on untouched.
+    let state = app
+        .app
+        .subtitle_edit
+        .as_ref()
+        .expect("the page should stay");
+    assert_eq!(
+        state.generation, switched,
+        "an audio change is read by the next playback, so it must not rebuild the page"
+    );
+    assert_eq!(state.cues.len(), 3, "the cue list should be untouched");
+
+    // And the pane's title says which track is playing, since a preview of the wrong
+    // language is otherwise unexplained.
+    app.wait_until("the popup to close", |app| app.dialog.is_none());
+    let screen = app.screen();
+    assert!(
+        screen.contains("audio #2"),
+        "the preview pane should name an audio track that is not the file's first:\n{screen}"
+    );
 }

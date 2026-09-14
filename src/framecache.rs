@@ -65,7 +65,16 @@ pub const FRAME_EXTENSION: &str = "jpg";
 /// Version 4 is [`crate::preview::seek_for`] moving from the cue's midpoint to its start:
 /// the key covers the cue's timing, which did not change, so every frame already on disk
 /// would keep being served for a moment the page no longer grabs.
-const CACHE_FORMAT_VERSION: u32 = 4;
+///
+/// Version 5 is [`media_key`] giving up the file's length and mtime for the video stream's
+/// own identity. Directories written under the old scheme are keyed by a rule this one no
+/// longer applies, so they have to miss rather than be served.
+///
+/// Version 6 is the grab naming its video stream by absolute index instead of `-map 0:v:0`.
+/// The two disagree on a file whose first video stream is cover art — `0:v:0` counts an
+/// attached picture and [`crate::preview::video_identity`] never did — so frames stored
+/// under the old scheme can be of a different stream from the one their key describes.
+const CACHE_FORMAT_VERSION: u32 = 6;
 
 /// Records when a media directory was last *used*, by its own mtime.
 ///
@@ -84,18 +93,29 @@ const MOMENT_TAG: u32 = 1;
 
 /// Everything about the media a cached frame depends on, hashed into its directory name.
 ///
-/// The media's length and mtime are in here as well as its path: re-encoding a file in
-/// place leaves the path identical while every frame in it moves, and serving the old
-/// file's pictures for the new one is exactly the kind of silent wrongness a preview must
-/// not have. `pixels` is in here because the stored frame is rendered at that size, so
-/// changing the cap must miss rather than hand back mis-sized images.
+/// `video_identity` describes the **picture** rather than the file — see
+/// [`crate::preview::video_identity`], which builds it out of the probe the application
+/// already ran. It replaced the file's byte length and mtime, and that swap is the whole
+/// point of this struct.
+///
+/// The length and mtime were the honest answer to "has this file been rewritten", and that
+/// turned out to be the wrong question. Every save here is a remux, so every save moved
+/// both, and a cache keyed on them was orphaned by the edit the previewing page had itself
+/// started — a one-word cue change costing a feature-length track's frames. The repair was
+/// a directory rename performed by whichever caller believed it had preserved the picture,
+/// which meant a hand-maintained list of which edits those are. The question worth asking
+/// is "is this the same picture", and the video stream's own codec, geometry and duration
+/// answer it directly: a remux copies every one of them through untouched, so it is not a
+/// rewrite as far as this key is concerned, and no one has to say so.
+///
+/// `pixels` is in here because the stored frame is rendered at that size, so changing the
+/// cap must miss rather than hand back mis-sized images.
 ///
 /// All of it is per-media rather than per-cue, which is what lets it name a directory.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameKeyParts<'a> {
     pub media: &'a Path,
-    pub media_length: u64,
-    pub media_modified: Option<SystemTime>,
+    pub video_identity: &'a str,
     pub pixels: (u32, u32),
 }
 
@@ -108,19 +128,14 @@ pub struct FrameKeyParts<'a> {
 /// among the few thousand frames a film's subtitle track produces far below the odds of
 /// the disk lying about the bytes.
 pub fn media_key(parts: FrameKeyParts<'_>) -> String {
-    // The path is variable-length and goes in first, followed by the separator: without it
-    // a path ending where the next field begins would hash the same as a different pair.
+    // Two variable-length fields, each followed by the separator: without it a path ending
+    // where the identity begins would hash the same as the pair split the other way.
     // Everything after is fixed width and so delimits itself.
     let mut hash = Hasher::new();
     hash.bytes(parts.media.as_os_str().as_encoded_bytes());
     hash.separator();
-    hash.number(u128::from(parts.media_length));
-    hash.number(u128::from(
-        parts
-            .media_modified
-            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |since| since.as_nanos() as u64),
-    ));
+    hash.bytes(parts.video_identity.as_bytes());
+    hash.separator();
     hash.number(u128::from(parts.pixels.0));
     hash.number(u128::from(parts.pixels.1));
     hash.number(u128::from(CACHE_FORMAT_VERSION));
@@ -284,56 +299,28 @@ pub fn store_in(directory: &Path, media: &str, cue: &str, bytes: &[u8]) -> bool 
     true
 }
 
-/// Moves a media's whole directory of frames from one key to another.
-///
-/// The one place anything is *claimed* about two keys naming the same pictures, and the
-/// claim is the caller's: [`media_key`] covers the file's length and mtime precisely so that
-/// a file rewritten in place cannot serve its old frames, and a remux rewrites the file. But
-/// this application's remux copies the video stream through untouched, so the frames it
-/// grabbed are still the frames the new file would give — the container moved, the pictures
-/// did not. Without this, saving a one-word cue edit throws away every rendered frame of a
-/// feature-length track and the page spends the next several minutes rendering them again.
-///
-/// Deliberately not an equivalence baked into the key. Keying on something that survives a
-/// remux would mean guessing which rewrites preserve the picture; moving the directory means
-/// only the caller that *performed* the rewrite gets to say so, for the one file it just
-/// wrote. `App::frames_survive_edit` is where that is decided.
-///
-/// Best-effort, like everything else here: a failure is a page that renders again, which is
-/// exactly where it was without this.
-pub fn migrate(from: &str, to: &str) -> bool {
-    directory().is_some_and(|directory| migrate_in(&directory, from, to))
-}
-
-pub fn migrate_in(directory: &Path, from: &str, to: &str) -> bool {
-    if from == to {
-        return true;
-    }
-    let source = directory.join(from);
-    if !source.is_dir() {
-        return false;
-    }
-    let destination = directory.join(to);
-    if destination.exists() {
-        // The new file already has frames of its own — rendered before this landed, or by
-        // another `reel`. They are the same pictures, so the older set is simply stale disk;
-        // dropping it here is what keeps a run of saves from leaving a directory apiece.
-        return fs::remove_dir_all(&source).is_ok();
-    }
-    fs::rename(&source, &destination).is_ok()
-}
-
-/// Deletes least-recently-used media directories until at most `tracks` remain, never the
-/// one named by `open`.
+/// Deletes least-recently-used media directories until at most `tracks` remain and the
+/// whole cache fits in `bytes`, never touching the one named by `open`.
 ///
 /// Called once per page opening, from the background worker rather than the event loop: it
-/// stats every entry in the cache root.
+/// stats every entry in the cache root and every frame inside it.
 ///
-/// **Whole directories, never part of one.** That is the policy, not an implementation
-/// detail: what the user opens is a track, and a track missing some of its frames is
-/// re-rendered on every visit, so evicting a fraction of one buys disk at the cost of the
-/// work the cache exists to avoid. Counting tracks rather than bytes is what makes that
-/// expressible — a byte budget has no way to stop at a track boundary.
+/// **Whole directories, never part of one — including for the byte budget.** That is the
+/// policy, not an implementation detail: what the user opens is a track, and a track
+/// missing some of its frames is re-rendered on every visit, so evicting a fraction of one
+/// buys disk at the cost of the work the cache exists to avoid. Every cache bug this module
+/// has had came from evicting individual frames, so the budget is spent by discarding the
+/// least recently used *directory* until the total fits, rather than by picking frames out
+/// of one. Note that a media directory holds every subtitle track of that film, so there is
+/// no way to bisect a directory that does not risk bisecting the open track.
+///
+/// **Two bounds rather than one, because they fail differently.** `tracks` is the honest
+/// unit — a count of films whose frames are worth keeping — but it says nothing about size,
+/// and the directories are not comparable: a densely subtitled three-hour film runs to a
+/// few hundred megabytes where a short one is a few tens. Ten of the former is several
+/// gigabytes, which is how a cache reaches the point of failing an unrelated save with
+/// `No space left on device`. `bytes` is the backstop for that and nothing else, so it is
+/// set high enough that the count is normally what bites.
 ///
 /// Ranked by the [`USED_MARKER`]'s mtime, falling back to the directory's own for one
 /// written before the marker existed, so this is genuine least-recently-*used* rather than
@@ -342,23 +329,28 @@ pub fn migrate_in(directory: &Path, from: &str, to: &str) -> bool {
 /// `open` is excluded outright rather than merely ranked last. It cannot be the right
 /// answer: the pass is about to render into it, so evicting it guarantees the re-render
 /// this whole module exists to prevent. With `tracks = 0` that means the open track's
-/// frames survive until the page closes and something else prunes.
+/// frames survive until the page closes and something else prunes — and for the same
+/// reason its bytes are *counted* against the budget but never reclaimed, so a single track
+/// larger than the whole budget empties the rest of the cache and then stops.
 ///
 /// Also sweeps anything in the root that is *not* a media directory. That is where the old
 /// flat `{key}.jpg` layout's files sit, so the first prune after this change clears them;
 /// it is also the only rule needed for any other stray. In-flight temporaries live inside a
 /// media directory, so the sweep cannot race a write.
-pub fn prune(tracks: usize, open: Option<&str>) {
+pub fn prune(tracks: usize, bytes: u64, open: Option<&str>) {
     if let Some(directory) = directory() {
-        prune_in(&directory, tracks, open);
+        prune_in(&directory, tracks, bytes, open);
     }
 }
 
-pub fn prune_in(directory: &Path, tracks: usize, open: Option<&str>) {
+pub fn prune_in(directory: &Path, tracks: usize, bytes: u64, open: Option<&str>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut cached: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut cached: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    // Counted but never evicted, so the budget describes the disk actually in use rather
+    // than only the part of it this call is allowed to reclaim.
+    let mut total = 0u64;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(metadata) = entry.metadata() else {
@@ -369,18 +361,46 @@ pub fn prune_in(directory: &Path, tracks: usize, open: Option<&str>) {
             let _ = fs::remove_file(&path);
             continue;
         }
+        let size = directory_size(&path);
+        total = total.saturating_add(size);
         if path.file_name().and_then(|name| name.to_str()) == open {
             continue;
         }
-        cached.push((used_at(&path, &metadata), path));
+        cached.push((used_at(&path, &metadata), size, path));
     }
 
     // The open track was skipped above, but it still occupies one of the `tracks` slots.
     let keep = tracks.saturating_sub(usize::from(open.is_some()));
-    cached.sort_by_key(|(used, _)| *used);
-    for (_, path) in cached.iter().take(cached.len().saturating_sub(keep)) {
-        let _ = fs::remove_dir_all(path);
+    cached.sort_by_key(|(used, _, _)| *used);
+    let over_count = cached.len().saturating_sub(keep);
+    for (index, (_, size, path)) in cached.iter().enumerate() {
+        // Least recently used first, so the two bounds are satisfied by one walk: everything
+        // the count condemns goes, and then as much again as the budget needs.
+        if index >= over_count && total <= bytes {
+            break;
+        }
+        if fs::remove_dir_all(path).is_ok() {
+            total = total.saturating_sub(*size);
+        }
     }
+}
+
+/// What one media directory occupies, for [`prune_in`]'s byte budget.
+///
+/// One level deep, because that is the shape of the cache: frames and the used marker sit
+/// directly in a media directory and nothing nests below it. An entry that will not stat is
+/// counted as nothing rather than abandoning the sum — undercounting delays an eviction,
+/// where giving up on the whole directory would exempt it from the budget entirely.
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(fs::Metadata::is_file)
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 /// When a media directory was last used: its marker's mtime, or its own if it has none.
@@ -473,11 +493,14 @@ mod tests {
     /// A stand-in media directory, for the storage tests that are not about hashing.
     const MEDIA: &str = "media-key";
 
+    /// A byte budget nothing can reach, so a test about the *count* bound is only ever
+    /// exercising the count bound.
+    const UNBOUNDED: u64 = u64::MAX;
+
     fn parts(media: &Path) -> FrameKeyParts<'_> {
         FrameKeyParts {
             media,
-            media_length: 1_000,
-            media_modified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            video_identity: "h264\u{1f}High\u{1f}1920\u{1f}1080",
             pixels: (960, 540),
         }
     }
@@ -544,9 +567,9 @@ mod tests {
 
         // Act / Assert: and every media-level difference moves the directory.
         assert_that!(media_key(parts(&other)).as_str()).is_not_equal_to(base.as_str());
-        let mut relength = parts(&media);
-        relength.media_length = 1_001;
-        assert_that!(media_key(relength).as_str()).is_not_equal_to(base.as_str());
+        let mut reencoded = parts(&media);
+        reencoded.video_identity = "hevc\u{1f}Main\u{1f}1920\u{1f}1080";
+        assert_that!(media_key(reencoded).as_str()).is_not_equal_to(base.as_str());
         let mut smaller = parts(&media);
         smaller.pixels = (640, 360);
         assert_that!(media_key(smaller).as_str()).is_not_equal_to(base.as_str());
@@ -657,19 +680,18 @@ mod tests {
         // The media it is burned onto.
         assert_that!(key(parts(&other), &cue(1000, 2000, "hello")).as_str())
             .is_not_equal_to(base.as_str());
-        // The media's content, at the same path: a re-encode in place.
-        let mut relength = parts(&media);
-        relength.media_length = 1_001;
-        assert_that!(key(relength, &cue(1000, 2000, "hello")).as_str())
+        // The picture at the same path: a re-encode in place, which moves the codec, the
+        // geometry or the bit rate, and so moves the identity `video_identity` builds.
+        let mut reencoded = parts(&media);
+        reencoded.video_identity = "hevc\u{1f}Main\u{1f}1920\u{1f}1080";
+        assert_that!(key(reencoded, &cue(1000, 2000, "hello")).as_str())
             .is_not_equal_to(base.as_str());
-        let mut retimed = parts(&media);
-        retimed.media_modified = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_001));
-        assert_that!(key(retimed, &cue(1000, 2000, "hello")).as_str())
-            .is_not_equal_to(base.as_str());
-        // A file whose mtime cannot be read at all is its own case, not "epoch".
-        let mut undated = parts(&media);
-        undated.media_modified = None;
-        assert_that!(key(undated, &cue(1000, 2000, "hello")).as_str())
+        // A file whose video stream ffprobe could not describe at all is its own case, not
+        // the same directory as every other undescribable file at other paths — the path is
+        // still in the key, which is what keeps those apart.
+        let mut unknown = parts(&media);
+        unknown.video_identity = "";
+        assert_that!(key(unknown, &cue(1000, 2000, "hello")).as_str())
             .is_not_equal_to(base.as_str());
         // And the size the frame was rendered at.
         let mut smaller = parts(&media);
@@ -699,8 +721,8 @@ mod tests {
             let mut hash = Hasher::new();
             hash.bytes(media.as_os_str().as_encoded_bytes());
             hash.separator();
-            hash.number(u128::from(1_000u64));
-            hash.number(u128::from(1_700_000_000_000_000_000u64));
+            hash.bytes(parts(&media).video_identity.as_bytes());
+            hash.separator();
             hash.number(u128::from(960u32));
             hash.number(u128::from(540u32));
             hash.number(u128::from(version));
@@ -715,18 +737,28 @@ mod tests {
             .is_not_equal_to(composed(CACHE_FORMAT_VERSION + 1).as_str());
     }
 
-    /// The two variable-length fields are separated rather than run together, so a path
-    /// that ends where the next cue's text begins cannot collide with the pair the other
-    /// way round.
+    /// Variable-length fields are separated rather than run together, so a field that ends
+    /// where the next one begins cannot collide with the pair split the other way round.
+    ///
+    /// Both keys have such a pair, and the media key has had two of them since the file's
+    /// fixed-width length and mtime gave way to the video stream's identity.
     #[test]
     fn fields_should_not_run_into_one_another() {
         // Arrange
         let first = PathBuf::from("/media/ab");
         let second = PathBuf::from("/media/a");
 
-        // Act / Assert
+        // Act / Assert: the cue key's path-and-text pair.
         assert_that!(key(parts(&first), &cue(1000, 2000, "c")).as_str())
             .is_not_equal_to(key(parts(&second), &cue(1000, 2000, "bc")).as_str());
+
+        // And the media key's own path-and-identity pair, which would otherwise file two
+        // different files' frames in one directory.
+        let mut short_path = parts(&second);
+        short_path.video_identity = "bh264";
+        let mut long_path = parts(&first);
+        long_path.video_identity = "h264";
+        assert_that!(media_key(short_path).as_str()).is_not_equal_to(media_key(long_path).as_str());
     }
 
     #[test]
@@ -880,7 +912,7 @@ mod tests {
         track(&directory, "newest", 3, 1);
 
         // Act: room for two of the three.
-        prune_in(&directory, 2, None);
+        prune_in(&directory, 2, UNBOUNDED, None);
 
         // Assert: the least recently used one went entirely, and the others are intact —
         // *every* frame of them, which is the property a byte budget could not offer.
@@ -889,7 +921,7 @@ mod tests {
         assert_that!(holds(&directory, "newest", 3)).is_true();
 
         // Act / Assert: and a cache already inside its limit is left entirely alone.
-        prune_in(&directory, 2, None);
+        prune_in(&directory, 2, UNBOUNDED, None);
         assert_that!(holds(&directory, "middle", 2)).is_true();
         assert_that!(holds(&directory, "newest", 3)).is_true();
 
@@ -910,7 +942,7 @@ mod tests {
         assert_that!(touch_in(&directory, "watched")).is_true();
 
         // Act: room for one.
-        prune_in(&directory, 1, None);
+        prune_in(&directory, 1, UNBOUNDED, None);
 
         // Assert
         assert_that!(holds(&directory, "watched", 2)).is_true();
@@ -933,7 +965,7 @@ mod tests {
         track(&directory, "another", 2, 1);
 
         // Act: room for two, one of which the open track takes.
-        prune_in(&directory, 2, Some("open"));
+        prune_in(&directory, 2, UNBOUNDED, Some("open"));
 
         // Assert: the open track stayed despite being oldest, and only one other survived.
         assert_that!(holds(&directory, "open", 2)).is_true();
@@ -942,7 +974,7 @@ mod tests {
 
         // Act / Assert: and at zero it is still the one thing kept, since the pass is
         // rendering into it — everything else goes.
-        prune_in(&directory, 0, Some("open"));
+        prune_in(&directory, 0, UNBOUNDED, Some("open"));
         assert_that!(holds(&directory, "open", 2)).is_true();
         assert_that!(directory.join("another").exists()).is_false();
 
@@ -964,12 +996,133 @@ mod tests {
         fs::write(&stray, b"?").unwrap();
 
         // Act: a limit generous enough that no track is at risk.
-        prune_in(&directory, 10, None);
+        prune_in(&directory, 10, UNBOUNDED, None);
 
         // Assert: the leftovers went and the track did not.
         assert_that!(flat.exists()).is_false();
         assert_that!(stray.exists()).is_false();
         assert_that!(holds(&directory, "kept", 2)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The count is the honest unit but says nothing about size, and the directories are
+    /// not comparable — a densely subtitled feature runs to hundreds of megabytes where a
+    /// short film is tens. The budget is the backstop, and it spends itself the same way the
+    /// count does: whole tracks, least recently used first.
+    #[test]
+    fn pruning_should_also_stop_at_a_byte_budget() {
+        // Arrange: three tracks of 400, 200 and 300 bytes, used oldest-first.
+        let directory = scratch("prune-bytes");
+        track(&directory, "oldest", 4, 3);
+        track(&directory, "middle", 2, 2);
+        track(&directory, "newest", 3, 1);
+
+        // Act: room for all three by count, but only 500 of the 900 bytes they occupy.
+        prune_in(&directory, 10, 500, None);
+
+        // Assert: the oldest went, which is exactly enough, and it went whole.
+        assert_that!(directory.join("oldest").exists()).is_false();
+        assert_that!(holds(&directory, "middle", 2)).is_true();
+        assert_that!(holds(&directory, "newest", 3)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The open track is what the pass is about to render into, so evicting it guarantees
+    /// the re-render this module exists to prevent. Its bytes are still *counted*, or the
+    /// budget would describe less disk than is actually in use.
+    #[test]
+    fn a_byte_budget_should_count_the_open_track_but_never_evict_it() {
+        // Arrange: an open track of 400 bytes and an older one of 200.
+        let directory = scratch("prune-bytes-open");
+        track(&directory, "old", 2, 3);
+        track(&directory, "open", 4, 1);
+
+        // Act: a budget smaller than the open track by itself.
+        prune_in(&directory, 10, 100, Some("open"));
+
+        // Assert: everything evictable went, and the pass keeps its own frames even though
+        // the cache is still over budget afterwards.
+        assert_that!(directory.join("old").exists()).is_false();
+        assert_that!(holds(&directory, "open", 4)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory the eviction cannot actually delete must not be credited against the
+    /// budget, or the walk stops early believing it has reclaimed disk that is still in use —
+    /// and the cache stays over its bound with nothing left to say so.
+    #[test]
+    fn a_directory_that_will_not_delete_should_not_count_as_reclaimed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Arrange: 400 bytes that cannot be unlinked, because their own directory is not
+        // writable, and 100 bytes that can. The stubborn one is the older, so it is the first
+        // thing the walk condemns.
+        let directory = scratch("prune-undeletable");
+        track(&directory, "stubborn", 4, 5);
+        track(&directory, "young", 1, 1);
+        let stubborn = directory.join("stubborn");
+        // Still readable and searchable, so it is sized and ranked like any other.
+        fs::set_permissions(&stubborn, fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Act: a budget of 100 against the 500 bytes held.
+        prune_in(&directory, 10, 100, None);
+
+        // Assert: the failed removal left the budget where it was, so the walk went on to the
+        // next track. Had those 400 bytes been credited, the budget would have looked met and
+        // `young` would have been spared by disk that was never actually reclaimed.
+        assert_that!(holds(&directory, "stubborn", 4)).is_true();
+        assert_that!(directory.join("young").exists()).is_false();
+
+        // Cleanup
+        fs::set_permissions(&stubborn, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The two bounds are satisfied in one walk, so a cache over both loses what the count
+    /// condemns *and* as much again as the budget needs.
+    #[test]
+    fn the_two_bounds_should_compose_rather_than_one_masking_the_other() {
+        // Arrange: four tracks of 100, 200, 300 and 400 bytes, used oldest-first.
+        let directory = scratch("prune-both");
+        track(&directory, "first", 1, 4);
+        track(&directory, "second", 2, 3);
+        track(&directory, "third", 3, 2);
+        track(&directory, "fourth", 4, 1);
+
+        // Act: the count alone would drop only `first`; the budget then takes two more.
+        prune_in(&directory, 3, 400, None);
+
+        // Assert
+        assert_that!(directory.join("first").exists()).is_false();
+        assert_that!(directory.join("second").exists()).is_false();
+        assert_that!(directory.join("third").exists()).is_false();
+        assert_that!(holds(&directory, "fourth", 4)).is_true();
+
+        // Cleanup
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A directory that will not read counts as nothing rather than abandoning the sum:
+    /// undercounting delays an eviction, where giving up would exempt it from the budget.
+    #[test]
+    fn measuring_a_directory_should_answer_for_what_it_cannot_read() {
+        // Arrange
+        let directory = scratch("prune-size");
+        track(&directory, "media", 3, 1);
+        // A nested directory is not a frame and is not counted; only files are.
+        fs::create_dir_all(directory.join("media").join("nested")).unwrap();
+        fs::write(directory.join("media").join("nested").join("x"), [0u8; 500]).unwrap();
+
+        // Act / Assert: three frames of a hundred bytes, plus the empty used marker.
+        assert_that!(directory_size(&directory.join("media"))).is_equal_to(300);
+        // And something that is not a directory at all measures as nothing.
+        assert_that!(directory_size(&directory.join("media").join("cue-0.jpg"))).is_equal_to(0);
 
         // Cleanup
         fs::remove_dir_all(directory).unwrap();
@@ -988,7 +1141,7 @@ mod tests {
         fs::write(&temporary, [0u8; 100]).unwrap();
 
         // Act
-        prune_in(&directory, 10, Some("busy"));
+        prune_in(&directory, 10, UNBOUNDED, Some("busy"));
 
         // Assert
         assert_that!(temporary.exists()).is_true();
@@ -1006,7 +1159,7 @@ mod tests {
         let directory = parent.join("never-created");
 
         // Act / Assert: no panic, and nothing created.
-        prune_in(&directory, 0, None);
+        prune_in(&directory, 0, UNBOUNDED, None);
         assert_that!(directory.exists()).is_false();
 
         // Cleanup
@@ -1034,78 +1187,7 @@ mod tests {
         assert_that!(read(MEDIA, "frame")).is_equal_to(Some(vec![0u8; 100]));
         assert_that!(touch(MEDIA)).is_true();
         // Nothing open, so the one track there is goes.
-        prune(0, None);
-        assert_that!(is_cached(MEDIA, "frame")).is_false();
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    /// A save rewrites the container around a video stream it copied through untouched, so
-    /// the file's key moves while its pictures do not. The frames go with the key, whole
-    /// track at a time, or the page re-renders every one of them after every save.
-    #[test]
-    fn migrating_a_track_should_carry_its_whole_directory_to_the_new_key() {
-        // Arrange: a track's frames, and its used marker.
-        let _guard = one_key();
-        let directory = scratch("migrate");
-        assert!(store_in(&directory, "before", "one", &[1u8; 64]));
-        assert!(store_in(&directory, "before", "two", &[2u8; 64]));
-        assert!(touch_in(&directory, "before"));
-
-        // Act
-        assert_that!(migrate_in(&directory, "before", "after")).is_true();
-
-        // Assert: every frame is there under the new key, and nothing under the old one.
-        assert_that!(read_in(&directory, "after", "one")).is_equal_to(Some(vec![1u8; 64]));
-        assert_that!(read_in(&directory, "after", "two")).is_equal_to(Some(vec![2u8; 64]));
-        assert_that!(directory.join("after").join(USED_MARKER).exists()).is_true();
-        assert_that!(directory.join("before").exists()).is_false();
-
-        // Cleanup
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// The cases that are not a move: nothing to move, a key that did not change, and a
-    /// destination that already holds the same pictures — which is stale disk to drop
-    /// rather than a reason to keep two directories of one track.
-    #[test]
-    fn migrating_should_answer_for_a_key_that_did_not_move_or_has_nothing_behind_it() {
-        // Arrange
-        let _guard = one_key();
-        let directory = scratch("migrate-edges");
-        assert!(store_in(&directory, "here", "one", &[3u8; 64]));
-
-        // Act / Assert
-        assert_that!(migrate_in(&directory, "here", "here")).is_true();
-        assert_that!(read_in(&directory, "here", "one")).is_equal_to(Some(vec![3u8; 64]));
-        assert_that!(migrate_in(&directory, "missing", "elsewhere")).is_false();
-        assert_that!(directory.join("elsewhere").exists()).is_false();
-
-        // A destination that already exists keeps its own frames and loses the old set.
-        assert!(store_in(&directory, "newer", "one", &[4u8; 64]));
-        assert_that!(migrate_in(&directory, "here", "newer")).is_true();
-        assert_that!(read_in(&directory, "newer", "one")).is_equal_to(Some(vec![4u8; 64]));
-        assert_that!(directory.join("here").exists()).is_false();
-
-        // Cleanup
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// The directory-resolving half of the move, which is the one production calls.
-    #[test]
-    fn the_resolved_migration_should_move_frames_inside_the_real_cache_directory() {
-        // Arrange
-        let _guard = whole_directory();
-        let directory = directory().expect("the test binary always has a cache directory");
-        let _ = fs::remove_dir_all(&directory);
-        assert_that!(store(MEDIA, "frame", &[9u8; 32])).is_true();
-
-        // Act
-        assert_that!(migrate(MEDIA, "moved")).is_true();
-
-        // Assert
-        assert_that!(read("moved", "frame")).is_equal_to(Some(vec![9u8; 32]));
+        prune(0, UNBOUNDED, None);
         assert_that!(is_cached(MEDIA, "frame")).is_false();
 
         // Cleanup

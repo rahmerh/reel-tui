@@ -20,6 +20,15 @@ pub struct Config {
     /// How many media files' preview frames the subtitle edit page's cache may hold before the
     /// least recently used one is dropped.
     pub preview_cache_tracks: usize,
+    /// The most disk those frames may occupy, in bytes, before the least recently used
+    /// media file's are dropped as well.
+    ///
+    /// A backstop for `preview_cache_tracks` rather than a second way of saying the same
+    /// thing: a count of tracks is the unit that matches how the cache is used, but the
+    /// tracks are not the same size as each other, and ten long, densely subtitled films
+    /// run to several gigabytes. Written in the file as `cache_megabytes`, since a byte
+    /// count at this scale is not a number anyone can read back.
+    pub preview_cache_bytes: u64,
     /// Whether opening the subtitle edit page renders every cue's frame in the background.
     pub preview_prefetch: bool,
     /// The same, for media on a network mount. Off by default: a feature-length track is
@@ -48,6 +57,7 @@ impl Default for Config {
             network_transcode_workers: 1,
             network_remux_workers: 1,
             preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
+            preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
             preview_prefetch: true,
             network_preview_prefetch: false,
             playback_fps: DEFAULT_PLAYBACK_FPS,
@@ -112,6 +122,23 @@ const DEFAULT_PREVIEW_CACHE_TRACKS: usize = 10;
 /// disk — the open track is never evicted, since the pass is about to render into it.
 const MAX_PREVIEW_CACHE_TRACKS: usize = 1024;
 
+/// The disk backstop, in megabytes, for when [`DEFAULT_PREVIEW_CACHE_TRACKS`] tracks turn
+/// out to be much larger than the estimate above.
+///
+/// Two gigabytes is deliberately above what ten ordinary films come to, so the track count
+/// stays the bound that normally bites and this only catches the case it was added for: a
+/// cache that had grown unbounded and eventually failed a save with `No space left on
+/// device`. Measured at roughly a hundred kilobytes a frame and one or two thousand frames
+/// a track, this is a couple of dozen tracks' worth.
+const DEFAULT_PREVIEW_CACHE_MEGABYTES: u64 = 2048;
+
+/// A ceiling a mistyped value cannot cross, in megabytes — a petabyte, which is to say
+/// nothing a real disk will reach, since the point is only to keep the multiplication below
+/// from overflowing. Zero is allowed and means the same as `cache_tracks = 0`.
+const MAX_PREVIEW_CACHE_MEGABYTES: u64 = 1024 * 1024 * 1024;
+
+const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
+
 #[derive(Deserialize, Default)]
 struct RawConfig {
     notifications: Option<RawNotifications>,
@@ -134,6 +161,7 @@ struct RawWorkers {
 #[derive(Deserialize, Default)]
 struct RawPreview {
     cache_tracks: Option<usize>,
+    cache_megabytes: Option<u64>,
     prefetch: Option<RawPrefetch>,
     playback: Option<RawPlayback>,
 }
@@ -228,6 +256,13 @@ impl Config {
                 .cache_tracks
                 .unwrap_or(defaults.preview_cache_tracks)
                 .min(MAX_PREVIEW_CACHE_TRACKS),
+            // Clamped before the multiplication rather than after, so a mistyped value
+            // cannot overflow its way to a budget of nearly nothing.
+            preview_cache_bytes: preview
+                .cache_megabytes
+                .map_or(defaults.preview_cache_bytes, |megabytes| {
+                    megabytes.min(MAX_PREVIEW_CACHE_MEGABYTES) * BYTES_PER_MEGABYTE
+                }),
             preview_prefetch: prefetch.enabled.unwrap_or(defaults.preview_prefetch),
             network_preview_prefetch: prefetch
                 .network
@@ -333,6 +368,7 @@ mod tests {
                 network_transcode_workers: 3,
                 network_remux_workers: 4,
                 preview_cache_tracks: 4,
+                preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
                 preview_prefetch: false,
                 network_preview_prefetch: true,
                 playback_fps: 24,
@@ -549,6 +585,7 @@ mod tests {
             network_transcode_workers: 1,
             network_remux_workers: 1,
             preview_cache_tracks: DEFAULT_PREVIEW_CACHE_TRACKS,
+            preview_cache_bytes: DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE,
             preview_prefetch: true,
             network_preview_prefetch: false,
             playback_fps: DEFAULT_PLAYBACK_FPS,
@@ -624,6 +661,43 @@ mod tests {
         let config = Config::load_from(&path);
 
         assert_eq!(config.preview_cache_tracks, MAX_PREVIEW_CACHE_TRACKS);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The byte budget is the backstop for the track count, since ten tracks can be a few
+    /// hundred megabytes or a few gigabytes depending on how long and how densely subtitled
+    /// the films are. Written in megabytes, because a byte count at this scale is not a
+    /// number anyone can read back.
+    #[test]
+    fn the_frame_cache_should_also_have_a_disk_backstop() {
+        let directory = scratch("cache-bytes");
+        let path = directory.join("config.toml");
+
+        // The default is stated in megabytes and stored in bytes.
+        assert_eq!(
+            Config::default().preview_cache_bytes,
+            DEFAULT_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE
+        );
+
+        // A configured value is converted…
+        fs::write(&path, b"[preview]\ncache_megabytes = 512\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).preview_cache_bytes,
+            512 * BYTES_PER_MEGABYTE
+        );
+
+        // …zero is a real answer, the same as `cache_tracks = 0`…
+        fs::write(&path, b"[preview]\ncache_megabytes = 0\n").unwrap();
+        assert_eq!(Config::load_from(&path).preview_cache_bytes, 0);
+
+        // …and a value large enough to overflow the multiplication is clamped before it,
+        // so a mistype cannot wrap around to a budget of nearly nothing.
+        fs::write(&path, b"[preview]\ncache_megabytes = 184467440737095516\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).preview_cache_bytes,
+            MAX_PREVIEW_CACHE_MEGABYTES * BYTES_PER_MEGABYTE
+        );
+
         fs::remove_dir_all(directory).unwrap();
     }
 
