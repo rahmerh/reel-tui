@@ -30,7 +30,7 @@ This repository builds a Rust 2024 library, `reel_tui` (`src/lib.rs`), and one b
 - `src/mount.rs`: Network mount detection via `/proc/mounts` (NFS, SMB/CIFS, SSHFS, Rclone, Ceph, etc.) and `REEL_NETWORK_MODE` environment variable overrides.
 - `src/cache.rs`: Persistent on-disk probe metadata cache (`DiskCache`) stored at `$XDG_CACHE_HOME/reel-tui/probe_cache.json`.
 
-Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. End-to-end tests live in `tests/e2e.rs` with helpers in `tests/e2e/`. Release publishing is defined in `.github/workflows/publish.yml`.
+Unit tests live beside their implementation in `#[cfg(test)] mod tests` blocks. End-to-end tests live in `tests/e2e.rs` with helpers in `tests/e2e/`. Release publishing is defined in `.builds/publish.yml`.
 
 ## End-to-End Test Suite
 
@@ -88,7 +88,7 @@ It also raises no conflict (`container_conflict_entries`), which is what an unto
 
 - **`pkg-config` and the ALSA headers** — a *build* dependency, not a runtime one, and not versioned. `cpal` pulls in `alsa-sys`, whose build script is a bare `pkg_config::probe_library("alsa")`, so without them the crate does not compile and no suite runs at all. A machine with the headers but no sound *device* is fine: `audio::open` falls back to `SilentOutput`, which is the same production path a user without a sound card takes, so CI needs no audio hardware.
 
-CI installs these from `.github/actions/media-tools`, never from the runner's distribution packages — `ubuntu-latest` ships FFmpeg 6.1.1, which is below the floor. `.github/workflows/ci.yml` runs both suites on every push and pull request to `main`; `publish.yml` runs on release tags only and is not a substitute for it.
+CI installs these with `.builds/media-tools.sh`, never from the build image's distribution packages — Ubuntu 24.04 ships FFmpeg 6.1.1, which is below the floor. `.builds/ci.yml` runs both suites on every push to any branch; `.builds/publish.yml` publishes release tags only and is not a substitute for it.
 
 ## Editing a Cue Is a Staged Edit Like Any Other
 
