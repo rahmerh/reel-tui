@@ -19,6 +19,10 @@ fi
 # in Bootstrap.Initialize the moment it has to render a subtitle image.
 tesseract --version | head -1
 
+# A font. libass burns cues into preview frames and seconv renders subtitle
+# images, and both draw nothing at all without one; the Arch image ships none.
+fc-list | grep -q . || { echo "No fonts installed" >&2; exit 1; }
+
 # The ALSA headers cpal builds against
 # A build dependency, not a runtime one: `alsa-sys`'s build script is a bare
 # `pkg_config::probe_library("alsa")`, so without these the crate fails to

@@ -12,6 +12,7 @@ packages:
   - rust
   - tesseract
   - tesseract-data-eng
+  - ttf-dejavu
   - python
 sources:
   - https://git.sr.ht/~rahmerh/reel-tui
