@@ -88,7 +88,7 @@ It also raises no conflict (`container_conflict_entries`), which is what an unto
 
 - **`pkg-config` and the ALSA headers** — a *build* dependency, not a runtime one, and not versioned. `cpal` pulls in `alsa-sys`, whose build script is a bare `pkg_config::probe_library("alsa")`, so without them the crate does not compile and no suite runs at all. A machine with the headers but no sound *device* is fine: `audio::open` falls back to `SilentOutput`, which is the same production path a user without a sound card takes, so CI needs no audio hardware.
 
-CI installs these with `.builds/media-tools.sh`, never from the build image's distribution packages — Ubuntu 24.04 ships FFmpeg 6.1.1, which is below the floor. `.builds/ci.yml` runs both suites on every push to any branch; `.builds/publish.yml` publishes release tags only and is not a substitute for it.
+CI takes these from the Arch build image's packages, and `.builds/media-tools.sh` fails the build if any is below its floor and installs seconv, which SubtitleEdit publishes only as a GitHub release. `.builds/ci.yml` runs both suites on every push to any branch; `.builds/publish.yml` publishes release tags only and is not a substitute for it.
 
 ## Editing a Cue Is a Staged Edit Like Any Other
 

@@ -2,34 +2,33 @@
 # on release tags, so the first time a change met CI was the moment it was being
 # published. Two failures reached `main` that way and only surfaced when a tag
 # was cut. builds.sr.ht runs this on every push, to any branch.
-image: ubuntu/24.04
+image: archlinux
 packages:
-  - build-essential
+  - alsa-lib
   - curl
-  - xz-utils
+  - ffmpeg
+  - icu
+  - pkgconf
+  - rust
+  - tesseract
+  - tesseract-data-eng
 sources:
   - https://git.sr.ht/~rahmerh/reel-tui
 tasks:
   - media-tools: |
       cd reel-tui
       bash .builds/media-tools.sh
-  - rust: |
-      curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
   - fmt: |
-      . ~/.cargo/env
       cd reel-tui
       cargo fmt --check
   - clippy: |
-      . ~/.cargo/env
       cd reel-tui
       cargo clippy --locked --all-targets -- -D warnings
   - unit-tests: |
-      . ~/.cargo/env
       cd reel-tui
       cargo test --locked
   # A separate cargo target with `test = false`, so `cargo test` above does not
   # reach it. It is the only suite that exercises the real remux paths.
   - e2e-tests: |
-      . ~/.cargo/env
       cd reel-tui
       cargo test --locked --test e2e

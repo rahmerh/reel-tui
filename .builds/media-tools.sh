@@ -1,33 +1,22 @@
 #!/usr/bin/env bash
-# Installs the external tools reel requires, at or above the floors recorded in
-# AGENTS.md. The image's own packages are deliberately not used for FFmpeg:
-# Ubuntu 24.04 ships 6.1.1, which is below the 8.1 floor and which reel refuses
-# to run against.
+# Checks the external tools reel requires against the floors recorded in
+# AGENTS.md, and installs seconv. FFmpeg, Tesseract, libicu and the ALSA headers
+# come from the Arch image's packages (listed in each manifest); this fails
+# loudly if any of them is below its floor rather than letting the suite run
+# against something no user can.
 set -euo pipefail
 
 # FFmpeg 8.1+
-# BtbN publishes per-branch static GPL builds. `n8.1-latest` tracks the 8.1
-# release branch, so this stays at the floor rather than drifting onto master
-# and testing something no user has.
-url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz"
-curl -fsSL "$url" | tar -xJ
-sudo install -m 0755 ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg /usr/local/bin/ffmpeg
-sudo install -m 0755 ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffprobe /usr/local/bin/ffprobe
-rm -rf ffmpeg-n8.1-latest-linux64-gpl-8.1
-# /usr/local/bin precedes /usr/bin, but an apt ffmpeg arriving later would
-# silently shadow this, so fail loudly now.
 ffmpeg -version | head -1
 ffprobe -version | head -1
-case "$(ffprobe -version | head -1)" in
-  *"version n8.1"*|*"version n8.2"*|*"version n9"*) ;;
-  *) echo "Resolved ffprobe is below the 8.1 floor" >&2; exit 1 ;;
-esac
+read -r major minor < <(ffprobe -version | head -1 | sed -E 's/^ffprobe version n?([0-9]+)\.([0-9]+).*/\1 \2/')
+if (( major < 8 || (major == 8 && minor < 1) )); then
+  echo "Resolved ffprobe is below the 8.1 floor" >&2
+  exit 1
+fi
 
-# Tesseract 4.0+ and libicu
-sudo apt-get update
-# libicu is seconv's, not Tesseract's: without it seconv aborts in
-# Bootstrap.Initialize the moment it has to render a subtitle image.
-sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libicu-dev
+# Tesseract 4.0+. libicu is seconv's, not Tesseract's: without it seconv aborts
+# in Bootstrap.Initialize the moment it has to render a subtitle image.
 tesseract --version | head -1
 
 # The ALSA headers cpal builds against
@@ -37,15 +26,16 @@ tesseract --version | head -1
 # does not need one — the timing page's playback falls back to
 # `audio::SilentOutput`, which is the same production path a user without a
 # sound card takes.
-sudo apt-get install -y pkg-config libasound2-dev
 pkg-config --modversion alsa
 
 # seconv 5.1.0+
 # Pinned rather than tracking latest: seconv ships beta releases daily, and a
-# release-time publish is the wrong place to discover one broke.
+# release-time publish is the wrong place to discover one broke. SubtitleEdit
+# publishes it only as a GitHub release, so this is the one download CI still
+# makes from outside the image's package servers.
 url="https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.1.0/SeConv-Linux-x64.tar.gz"
 sudo mkdir -p /opt/seconv
-curl -fsSL "$url" | sudo tar -xz -C /opt/seconv
+curl -fsSL --retry 5 --retry-all-errors "$url" | sudo tar -xz -C /opt/seconv
 sudo chmod +x /opt/seconv/seconv
 # A symlink, not a copy: seconv loads libSkiaSharp.so from beside its real
 # path, and resolves that through the link.

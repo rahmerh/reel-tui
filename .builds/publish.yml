@@ -2,12 +2,17 @@
 # every push and has no tag filter, so the first task ends the build early
 # unless the push was a release tag. The crates.io token is a builds.sr.ht file
 # secret written to ~/.cargo/credentials.toml.
-image: ubuntu/24.04
+image: archlinux
 packages:
-  - build-essential
+  - alsa-lib
   - curl
-  - python3
-  - xz-utils
+  - ffmpeg
+  - icu
+  - pkgconf
+  - rust
+  - tesseract
+  - tesseract-data-eng
+  - python
 sources:
   - https://git.sr.ht/~rahmerh/reel-tui
 secrets:
@@ -29,41 +34,31 @@ tasks:
   - media-tools: |
       cd reel-tui
       bash .builds/media-tools.sh
-  - rust: |
-      curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
   - set-version: |
-      . ~/.cargo/env
       cd reel-tui
       python3 .builds/set-version.py
       git diff --check
   - fmt: |
-      . ~/.cargo/env
       cd reel-tui
       cargo fmt --check
   - clippy: |
-      . ~/.cargo/env
       cd reel-tui
       cargo clippy --locked --all-targets -- -D warnings
   - unit-tests: |
-      . ~/.cargo/env
       cd reel-tui
       cargo test --locked
   # A separate cargo target with `test = false`, so the run above does not reach
   # it. Publishing without it would ship the real remux paths untested.
   - e2e-tests: |
-      . ~/.cargo/env
       cd reel-tui
       cargo test --locked --test e2e
   - build-release: |
-      . ~/.cargo/env
       cd reel-tui
       cargo build --release --locked
   - verify-package: |
-      . ~/.cargo/env
       cd reel-tui
       cargo publish --dry-run --locked --allow-dirty
   - publish: |
-      . ~/.cargo/env
       cd reel-tui
       if [ ! -f ~/.cargo/credentials.toml ]; then
         echo "The crates.io token secret is not configured." >&2
