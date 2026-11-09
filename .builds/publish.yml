@@ -11,7 +11,7 @@ packages:
 sources:
   - https://git.sr.ht/~rahmerh/reel-tui
 secrets:
-  - 4e04be0c-2ed9-49b9-8e40-097c56f8b103
+  - 23a611fd-d783-4850-8da5-2637674763bb
 tasks:
   - release-tag: |
       case "${GIT_REF:-}" in
