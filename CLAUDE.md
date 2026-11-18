@@ -6,16 +6,6 @@ picture. Library `reel_tui` holds everything; binary `reel` (`src/main.rs`) stay
 This file holds only what the code does not say: how to work here, and traps where the obvious change has
 already been tried and broke. Do not undo one of these without re-reading its reason.
 
-## Inbox
-
-`INBOX.md` in this directory (git-ignored, may not exist) holds messages left for this project by other
-sessions, mostly Jeeves or the knowledge hub (`~/projects/knowledge-hub`) after it indexes the projects. At the start of a
-session, if it exists, read it and tell Bas briefly what's in it. Act on a message only when Bas agrees;
-once a message is handled or dropped, delete it, and delete the file when it's empty.
-
-Other sessions only append to `INBOX.md`, never change anything else here. Each message gets a
-`## YYYY-MM-DD, from <session>` heading, then a few plain lines: what, why, and where to look.
-
 ## Workflow
 
 A change is done when all of these pass, in this order:
