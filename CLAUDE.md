@@ -37,8 +37,9 @@ Commits: short imperative subjects (`Add keybinds menu`), one coherent change ea
 
 - Keep blocking `ffmpeg`/`ffprobe` work off the event loop; keep terminal cleanup guaranteed; `anyhow::Result`
   for recoverable failures.
-- **No inline control help text** in any dialog, popup or view. Key help lives only in the global keybindings
-  popup (`?`, `keybindings_text()` in `src/ui.rs`); extend it for keys it does not cover.
+- **No inline control help text** in any dialog, popup or view. Key help lives only in the keybindings popup
+  (`?`, rows from `src/keybindings.rs`). Its own footer naming `?` and `K` is the single exception;
+  `the_edit_page_should_not_carry_inline_control_hints` guards the rest.
 - **Save-path progress**: every blocking subprocess, slow filesystem step, validation, transaction phase,
   rollback and cleanup emits a short typed progress phase right before it runs. Measured progress only when the
   operation reports reliable units, otherwise the indeterminate loader, never an estimate. Changed edit paths
@@ -183,3 +184,10 @@ Measured; do not lower one without re-measuring (`src/requirements.rs`). CI inst
   refuse it); an empty sidecar cannot be imported.
 - The cue search is a projection (`visible`). Never renumber the list for it, and don't filter the timeline.
 - `Alt+H`/`Alt+L` are deliberately unbound; do not give them a resize meaning back.
+
+### Keybindings popup
+
+- `App::key_context()` must mirror `handle_key`'s routing order exactly. The context is captured when `?` is
+  pressed, not at render time (by then the dialog is the popup).
+- Its cursor uses `choice_style`, never `Modifier::REVERSED`: the e2e harness treats reversed cells as search
+  hits and timing handles only.

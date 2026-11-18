@@ -1010,6 +1010,20 @@ pub enum Dialog {
     AutoSyncing,
 }
 
+/// Which list `Dialog::Keybindings` is showing.
+///
+/// `?` from anywhere opens [`Self::Contextual`], which is the keys the page underneath
+/// actually answers; `?` from inside swaps to [`Self::Global`] and back. A swap rather than
+/// a second dialog because the two are one popup answering "what can I press" at two
+/// widths, and stacking them would make the reader press `Esc` twice to leave something
+/// they opened once.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KeybindingsScope {
+    #[default]
+    Contextual,
+    Global,
+}
+
 /// What an in-progress `Dialog::ConfirmReset` would discard if confirmed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResetScope {
@@ -1822,6 +1836,19 @@ pub struct App {
     pub details_max_scroll: u16,
     pub keybindings_scroll: u16,
     pub keybindings_max_scroll: u16,
+    /// Where the reader was standing when `?` was pressed.
+    ///
+    /// Captured on open rather than resolved at render time, because by then the dialog
+    /// *is* `Keybindings` and the popup would describe nothing but its own keys — the one
+    /// bug that would make the whole feature useless.
+    pub keybindings_context: crate::keybindings::KeyContext,
+    pub keybindings_scope: KeybindingsScope,
+    /// Which row the explanation panel is about, and the only row drawn highlighted.
+    ///
+    /// `None` normally: the popup is something to read, and a highlight with no `K` panel
+    /// and no search behind it claims a selection the reader never made.
+    pub keybindings_cursor: Option<usize>,
+    pub keybindings_help_visible: bool,
     /// Scroll offset (in rows, one `BatchItem` per row) for `Dialog::BatchProcessing`
     /// when more staged files are being processed than fit in the popup at once.
     /// Derived from `batch_cursor` at render time by `sync_batch_scroll`.
@@ -2044,6 +2071,10 @@ impl App {
             details_max_scroll: 0,
             keybindings_scroll: 0,
             keybindings_max_scroll: 0,
+            keybindings_context: crate::keybindings::KeyContext::Files { searching: false },
+            keybindings_scope: KeybindingsScope::default(),
+            keybindings_cursor: None,
+            keybindings_help_visible: false,
             batch_scroll: 0,
             batch_cursor: 0,
             confirm_process_all_scroll: 0,
@@ -7926,7 +7957,15 @@ impl App {
                     popup.cursor = 0;
                 }
             }
-            TextInputSite::KeybindingsSearch => self.keybindings_scroll = 0,
+            // The list narrows as the reader types, so the cursor goes back to the first
+            // hit rather than keeping an index into a list that no longer has that row.
+            TextInputSite::KeybindingsSearch => {
+                self.keybindings_scroll = 0;
+                self.sync_keybindings_cursor();
+                if self.keybindings_cursor.is_some() {
+                    self.keybindings_cursor = Some(0);
+                }
+            }
             // Rebuilding the projection is what makes the list narrow as the reader types,
             // and it is what puts the cursor back on a row that is still drawn.
             TextInputSite::CueSearch => {
@@ -10901,6 +10940,9 @@ impl App {
         self.dialog = None;
         self.edit_error = None;
         self.keybindings_search.clear();
+        self.keybindings_scope = KeybindingsScope::default();
+        self.keybindings_cursor = None;
+        self.keybindings_help_visible = false;
     }
 
     pub fn show_keybindings(&mut self) {
@@ -10908,22 +10950,216 @@ impl App {
             self.keybindings_scroll = 0;
             self.keybindings_max_scroll = 0;
             self.keybindings_search.clear();
+            // Read *before* the dialog is set, or the context resolves to this popup and
+            // the list describes its own keys instead of the page it was opened over.
+            self.keybindings_context = self.key_context();
+            self.keybindings_scope = KeybindingsScope::default();
+            self.keybindings_cursor = None;
+            self.keybindings_help_visible = false;
             self.dialog = Some(Dialog::Keybindings);
         }
+    }
+
+    /// Where the reader is, at the granularity that decides what a key does.
+    ///
+    /// The guards mirror `handle_key`'s routing exactly — every dialog first, in its own
+    /// order, then the two search bars `handle_layer_key` pre-checks, then the layer — for
+    /// the reason [`Self::active_text_input`] does the same: a list built from a context
+    /// the keys do not actually route to is a list that lies.
+    pub fn key_context(&self) -> crate::keybindings::KeyContext {
+        use crate::keybindings::KeyContext;
+        use crate::subtitle_edit::EditFocus;
+
+        match self.dialog {
+            Some(Dialog::EditCue) => KeyContext::EditCue,
+            Some(Dialog::CueLength) => KeyContext::CueLength,
+            Some(Dialog::ConfirmLeaveCues) => KeyContext::ConfirmLeaveCues,
+            Some(Dialog::CreateTrack) => KeyContext::CreateTrack {
+                searching: self
+                    .create_track_popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.open && popup.language_search.is_active),
+            },
+            Some(Dialog::ConfirmCancel) => KeyContext::ConfirmCancel,
+            Some(Dialog::ContainerSettings) => KeyContext::ContainerSettings {
+                editing: self
+                    .container_settings_popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.mode == ContainerSettingsMode::TextEdit),
+            },
+            Some(Dialog::PreviewSettings) => KeyContext::PreviewSettings,
+            Some(Dialog::AudioSettings) => KeyContext::AudioSettings {
+                mode: self.audio_key_mode(),
+            },
+            Some(Dialog::VideoSettings) => KeyContext::VideoSettings {
+                mode: self.video_key_mode(),
+            },
+            Some(Dialog::SubtitleSettings) => KeyContext::SubtitleSettings {
+                mode: self.subtitle_key_mode(),
+            },
+            Some(Dialog::Keybindings) => KeyContext::Keybindings {
+                searching: self.keybindings_search.is_active,
+            },
+            Some(Dialog::Error) => KeyContext::Error,
+            Some(Dialog::ConfirmProcessAll) => KeyContext::ConfirmProcessAll,
+            Some(Dialog::BatchProcessing) => KeyContext::BatchProcessing,
+            Some(Dialog::ConfirmReset) => KeyContext::ConfirmReset,
+            Some(Dialog::ResolveConflicts) => KeyContext::ResolveConflicts,
+            Some(Dialog::AutoSyncing) => KeyContext::AutoSyncing,
+            None => match self.layer {
+                Layer::Files => KeyContext::Files {
+                    searching: self.file_search.is_active,
+                },
+                Layer::Streams => KeyContext::Streams,
+                Layer::StreamDetails => KeyContext::StreamDetails,
+                Layer::SubtitleEdit => KeyContext::SubtitleEdit {
+                    searching: self.cue_search_active(),
+                    focus: if self.timeline_focused() {
+                        EditFocus::Timeline
+                    } else {
+                        EditFocus::Cues
+                    },
+                    timing: self.timing_scope(),
+                },
+            },
+        }
+    }
+
+    fn audio_key_mode(&self) -> crate::keybindings::SettingsKeyMode {
+        use crate::keybindings::SettingsKeyMode;
+        self.audio_settings_popup
+            .as_ref()
+            .map_or(SettingsKeyMode::Browsing, |popup| match popup.mode {
+                AudioSettingsMode::TitleEdit => SettingsKeyMode::Editing,
+                AudioSettingsMode::LanguageDropdown if popup.language_search.is_active => {
+                    SettingsKeyMode::LanguageSearch
+                }
+                AudioSettingsMode::LanguageDropdown => SettingsKeyMode::LanguageList,
+                _ => SettingsKeyMode::Browsing,
+            })
+    }
+
+    fn video_key_mode(&self) -> crate::keybindings::SettingsKeyMode {
+        use crate::keybindings::SettingsKeyMode;
+        // Ahead of the mode, exactly as `handle_key`'s own pre-check is: a live width or
+        // height field takes the text keys before the dialog's rows see anything.
+        if self.custom_resolution_input_active() {
+            return SettingsKeyMode::Editing;
+        }
+        self.video_settings_popup
+            .as_ref()
+            .map_or(SettingsKeyMode::Browsing, |popup| match popup.mode {
+                VideoSettingsMode::TitleEdit => SettingsKeyMode::Editing,
+                VideoSettingsMode::LanguageDropdown if popup.language_search.is_active => {
+                    SettingsKeyMode::LanguageSearch
+                }
+                VideoSettingsMode::LanguageDropdown => SettingsKeyMode::LanguageList,
+                VideoSettingsMode::CustomResolution => SettingsKeyMode::CustomResolution,
+                _ => SettingsKeyMode::Browsing,
+            })
+    }
+
+    fn subtitle_key_mode(&self) -> crate::keybindings::SettingsKeyMode {
+        use crate::keybindings::SettingsKeyMode;
+        self.subtitle_settings_popup
+            .as_ref()
+            .map_or(SettingsKeyMode::Browsing, |popup| match popup.mode {
+                SubtitleSettingsMode::TitleEdit => SettingsKeyMode::Editing,
+                SubtitleSettingsMode::LanguageDropdown if popup.language_search.is_active => {
+                    SettingsKeyMode::LanguageSearch
+                }
+                SubtitleSettingsMode::LanguageDropdown => SettingsKeyMode::LanguageList,
+                _ => SettingsKeyMode::Browsing,
+            })
+    }
+
+    /// The rows the popup draws: the scope's catalogue, narrowed by the search.
+    ///
+    /// Lives here rather than in `ui.rs` because the cursor is clamped against it and the
+    /// search counts it, so deriving it in the renderer would mean two answers to "how many
+    /// rows are there" that drift the moment one of them is filtered.
+    pub fn visible_keybindings(&self) -> Vec<crate::keybindings::KeySection> {
+        let sections = match self.keybindings_scope {
+            KeybindingsScope::Contextual => crate::keybindings::sections(self.keybindings_context),
+            KeybindingsScope::Global => crate::keybindings::global_sections(),
+        };
+        crate::keybindings::filter(sections, &self.keybindings_search.value)
+    }
+
+    /// The binding the explanation panel is about.
+    pub fn selected_keybinding(&self) -> Option<crate::keybindings::Keybinding> {
+        let cursor = self.keybindings_cursor?;
+        crate::keybindings::nth(&self.visible_keybindings(), cursor)
+    }
+
+    /// `?` from inside the popup: swaps between this page's keys and every key.
+    pub fn toggle_keybindings_scope(&mut self) {
+        self.keybindings_scope = match self.keybindings_scope {
+            KeybindingsScope::Contextual => KeybindingsScope::Global,
+            KeybindingsScope::Global => KeybindingsScope::Contextual,
+        };
+        // The other list is a different length, so a kept scroll or cursor would land
+        // somewhere unrelated to what the reader was reading.
+        self.keybindings_scroll = 0;
+        self.sync_keybindings_cursor();
+        self.clamp_keybindings_cursor();
+    }
+
+    /// `K`: opens or closes the panel explaining the highlighted key.
+    pub fn toggle_keybindings_help(&mut self) {
+        self.keybindings_help_visible = !self.keybindings_help_visible;
+        self.sync_keybindings_cursor();
+    }
+
+    /// The cursor exists only while the explanation panel is up or a search is in force —
+    /// the two states where a row has to be pointed at. Everywhere else the popup is
+    /// something to read, and a highlight would claim a selection nobody made.
+    fn sync_keybindings_cursor(&mut self) {
+        let wanted = self.keybindings_help_visible
+            || self.keybindings_search.is_active
+            || !self.keybindings_search.value.is_empty();
+        self.keybindings_cursor = match (wanted, self.keybindings_cursor) {
+            (true, Some(row)) => Some(row),
+            (true, None) => Some(0),
+            (false, _) => None,
+        };
+    }
+
+    fn clamp_keybindings_cursor(&mut self) {
+        let total = crate::keybindings::count(&self.visible_keybindings());
+        if let Some(row) = self.keybindings_cursor {
+            self.keybindings_cursor = Some(row.min(total.saturating_sub(1)));
+        }
+    }
+
+    /// Moves the cursor, answering whether there was a cursor to move — which is what lets
+    /// the same keys fall through to scrolling when there is not.
+    pub fn move_keybindings_cursor(&mut self, delta: isize) -> bool {
+        let Some(row) = self.keybindings_cursor else {
+            return false;
+        };
+        let total = crate::keybindings::count(&self.visible_keybindings());
+        let last = total.saturating_sub(1) as isize;
+        let next = (row as isize + delta).clamp(0, last).max(0) as usize;
+        self.keybindings_cursor = Some(next);
+        true
     }
 
     pub fn start_keybindings_search(&mut self) {
         self.clear_text_input_reject();
         self.keybindings_search.activate();
+        self.sync_keybindings_cursor();
     }
 
     pub fn finish_keybindings_search(&mut self) {
         self.keybindings_search.deactivate();
+        self.sync_keybindings_cursor();
     }
 
     pub fn clear_keybindings_search(&mut self) {
         self.keybindings_search.clear();
         self.keybindings_scroll = 0;
+        self.sync_keybindings_cursor();
     }
 
     pub fn start_file_search(&mut self) {
@@ -22000,6 +22236,153 @@ mod tests {
         // Assert
         assert_that!(app.layer).is_equal_to(Layer::StreamDetails);
         assert_that!(app.details_scroll).is_equal_to(0);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The resolver mirrors `handle_key`: a dialog decides outright, and only with none
+    /// open does the layer. A context the keys do not actually route to would make the
+    /// popup list keys that do nothing — worse than the flat list it replaced.
+    #[test]
+    fn the_key_context_should_let_a_dialog_outrank_the_layer_underneath_it() {
+        use crate::keybindings::{KeyContext, SettingsKeyMode};
+
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        let directory = app.directory.clone();
+
+        // Act / Assert: with nothing on top, the layer answers.
+        app.layer = Layer::Files;
+        assert_that!(app.key_context()).is_equal_to(KeyContext::Files { searching: false });
+        app.layer = Layer::Streams;
+        assert_that!(app.key_context()).is_equal_to(KeyContext::Streams);
+        app.layer = Layer::StreamDetails;
+        assert_that!(app.key_context()).is_equal_to(KeyContext::StreamDetails);
+
+        // Act / Assert: a dialog outranks whatever layer is underneath it.
+        app.dialog = Some(Dialog::ConfirmReset);
+        assert_that!(app.key_context()).is_equal_to(KeyContext::ConfirmReset);
+        app.dialog = Some(Dialog::Error);
+        assert_that!(app.key_context()).is_equal_to(KeyContext::Error);
+
+        // Act / Assert: a dialog's own sub-state decides too, because it changes which keys
+        // are live — a text field takes them before the dialog's rows see anything.
+        app.dialog = Some(Dialog::ContainerSettings);
+        app.container_settings_popup = Some(ContainerSettingsPopup {
+            field: ContainerSettingsField::Title,
+            mode: ContainerSettingsMode::Summary,
+            help_visible: false,
+            format_cursor: 0,
+            text_input: TextInputState::new(String::new()),
+        });
+        assert_that!(app.key_context())
+            .is_equal_to(KeyContext::ContainerSettings { editing: false });
+        if let Some(popup) = app.container_settings_popup.as_mut() {
+            popup.mode = ContainerSettingsMode::TextEdit;
+        }
+        assert_that!(app.key_context())
+            .is_equal_to(KeyContext::ContainerSettings { editing: true });
+
+        // Act / Assert: a settings dialog with no popup behind it still answers something
+        // rather than panicking, since a probe can drop one under an open dialog.
+        app.container_settings_popup = None;
+        app.dialog = Some(Dialog::AudioSettings);
+        assert_that!(app.key_context()).is_equal_to(KeyContext::AudioSettings {
+            mode: SettingsKeyMode::Browsing,
+        });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `?` records where the reader was standing, before the dialog is set.
+    ///
+    /// Resolved at render time instead, the context would be `Keybindings` and the popup
+    /// would describe nothing but its own keys — the one bug that would make the whole
+    /// feature useless, and one every other layer of the feature agrees with.
+    #[test]
+    fn showing_the_keybindings_should_capture_the_page_underneath() {
+        use crate::keybindings::KeyContext;
+
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+
+        // Act
+        app.show_keybindings();
+
+        // Assert: the popup is open, and it is about the track list rather than itself.
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+        assert_that!(app.keybindings_context).is_equal_to(KeyContext::Streams);
+        // Which is exactly what a render-time resolution would have produced instead.
+        assert_that!(app.key_context()).is_equal_to(KeyContext::Keybindings { searching: false });
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `?` from inside swaps lists rather than closing, and the other list is a different
+    /// length — so a kept scroll would land somewhere unrelated to what was being read.
+    #[test]
+    fn switching_the_keybindings_scope_should_reset_the_scroll_and_keep_the_popup_open() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.show_keybindings();
+        app.keybindings_scroll = 12;
+
+        // Act
+        app.toggle_keybindings_scope();
+
+        // Assert
+        assert_that!(app.keybindings_scope).is_equal_to(KeybindingsScope::Global);
+        assert_that!(app.keybindings_scroll).is_equal_to(0);
+        assert_that!(app.dialog).is_equal_to(Some(Dialog::Keybindings));
+        // The contextual list is still the track list's, so switching back costs nothing.
+        app.toggle_keybindings_scope();
+        assert_that!(app.keybindings_scope).is_equal_to(KeybindingsScope::Contextual);
+        assert_that!(app.keybindings_context).is_equal_to(crate::keybindings::KeyContext::Streams);
+
+        // Cleanup
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor is clamped against the list it is pointing into, not the one it was made
+    /// for: a filter can shorten the rows under it at any keystroke.
+    #[test]
+    fn the_keybindings_cursor_should_stay_inside_the_rows_it_points_at() {
+        // Arrange
+        let mut app = test_app(media(serde_json::json!([
+            {"index": 0, "codec_type": "video", "codec_name": "h264"}
+        ])));
+        let directory = app.directory.clone();
+        app.layer = Layer::Streams;
+        app.show_keybindings();
+
+        // Act / Assert: with no cursor, movement reports that there was none to move — which
+        // is what lets the same keys fall through to scrolling.
+        assert_that!(app.move_keybindings_cursor(1)).is_false();
+
+        // Act / Assert: with the panel open it moves, and stops at the ends.
+        app.toggle_keybindings_help();
+        assert_that!(app.move_keybindings_cursor(-1)).is_true();
+        assert_that!(app.keybindings_cursor).is_equal_to(Some(0));
+
+        let rows = crate::keybindings::count(&app.visible_keybindings());
+        for _ in 0..rows + 5 {
+            app.move_keybindings_cursor(1);
+        }
+        assert_that!(app.keybindings_cursor).is_equal_to(Some(rows - 1));
+        assert_that!(app.selected_keybinding()).is_some();
 
         // Cleanup
         std::fs::remove_dir_all(directory).unwrap();
