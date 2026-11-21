@@ -1,7 +1,19 @@
+<div align="center">
+
+<img src="assets/icon.png" width="128" alt="">
+
 # reel 🎞️
 
-> [!NOTE]
-> This project is 100% generated using AI, tested and used by a human.
+**A terminal interface for inspecting, editing, and converting media files**
+
+[![crates.io](https://img.shields.io/crates/v/reel-tui?style=flat-square)](https://crates.io/crates/reel-tui)
+[![license](https://img.shields.io/crates/l/reel-tui?style=flat-square)](LICENSE)
+
+<img src="https://img.shields.io/badge/%F0%9F%A4%96_100%25_AI_generated-tested_%26_used_by_a_human-8957e5?style=for-the-badge" alt="100% AI generated, tested and used by a human">
+
+</div>
+
+---
 
 A TUI for inspecting, editing, and converting media files. Uses ffprobe and ffmpeg to inspect
 and edit media files.
