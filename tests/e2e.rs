@@ -6360,6 +6360,135 @@ fn open_sidecar_edit_page(app: &mut Harness) {
     });
 }
 
+/// `?` lists only what the page under it answers, and `?` again switches to every key.
+///
+/// Every layer short of the drawn screen agrees while this is broken: the catalogue is
+/// right, the context type is right, `show_keybindings` still opens a popup, and the old
+/// flat list rendered perfectly well. What fails is *which* list the reader is shown — so
+/// this presses the real keys on four different contexts and reads the popup off the
+/// terminal each time.
+///
+/// The subtitle edit page is the case worth having: `j`/`k` are swallowed outright while
+/// the timeline holds the cursor (`input.rs`'s `timeline_focused` arm), so a popup that
+/// still offered them would be documenting keys that do nothing — which is the whole defect
+/// this feature exists to remove.
+#[test]
+fn the_keybindings_popup_should_show_only_what_the_current_page_answers() {
+    // Opening the subtitle edit page starts the background frame pass, which prunes the one
+    // process-global frame cache every scenario in this binary shares. Without this lock a
+    // parallel run deletes another scenario's frames, which reads as a hang in that feature
+    // rather than as interference — see `harness::frame_cache_lock`.
+    let _frame_cache = harness::frame_cache_lock();
+    let test = "the_keybindings_popup_should_show_only_what_the_current_page_answers";
+    require_tools(test, &["ffmpeg:libx264", "ffmpeg:aac"]);
+
+    let scratch = Scratch::new("keybindings-contextual");
+    write_media(&scratch.join("clip.mkv"), &MediaSpec::mkv().audio(&["eng"]));
+    fs::write(scratch.join("clip.eng.srt"), SIDECAR_CUES).unwrap();
+
+    let mut app = Harness::start(scratch);
+
+    // The file list: its sidecar fold chords are listed, and the track list's are not.
+    // `press` draws *before* it handles the key, so the buffer still holds the frame from
+    // before the keypress. Everything this scenario asserts is read off the terminal, so
+    // each press it is about is followed by a pump that draws the result.
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    let files = app.screen();
+    assert!(
+        files.contains("File list") && files.contains("Toggle, open, or close this fold"),
+        "the file list's popup should name the page and its fold chords:\n{files}"
+    );
+    assert!(
+        !files.contains("Mark for import or export"),
+        "the file list cannot mark a subtitle, so that key should not be listed:\n{files}"
+    );
+    app.press(key(KeyCode::Esc));
+
+    // The track list: the reverse.
+    app.open("clip.mkv");
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    let streams = app.screen();
+    assert!(
+        streams.contains("Track list") && streams.contains("Mark for import or export"),
+        "the track list's popup should name the page and its import/export key:\n{streams}"
+    );
+    assert!(
+        !streams.contains("Toggle, open, or close this fold"),
+        "the fold chords belong to the file list alone:\n{streams}"
+    );
+    app.press(key(KeyCode::Esc));
+
+    // The subtitle edit page, cue panel: the rows move up and down.
+    open_sidecar_edit_page(&mut app);
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    let cues = app.screen();
+    assert!(
+        cues.contains("Move down or up a row"),
+        "the cue panel walks the cue list, so j/k should be listed:\n{cues}"
+    );
+    app.press(key(KeyCode::Esc));
+
+    // The same page with the cursor in the timeline: j/k are inert there and so are gone,
+    // while the cursor's own steps have taken their place.
+    app.press(ctrl('j'));
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    let timeline = app.screen();
+    assert!(
+        timeline.contains("Subtitle edit · timeline"),
+        "the popup should say which pane holds the cursor:\n{timeline}"
+    );
+    assert!(
+        timeline.contains("Move the cursor half a second"),
+        "the timeline cursor's own step should be listed:\n{timeline}"
+    );
+    assert!(
+        !timeline.contains("Move down or up a row"),
+        "j/k are swallowed while the timeline holds the cursor, so listing them would \
+         document a key that does nothing:\n{timeline}"
+    );
+
+    // `K` explains the highlighted row, in the panel the settings dialogs use.
+    app.press(key(KeyCode::Char('K')));
+    app.pump();
+    let explained = app.screen();
+    assert!(
+        explained.contains("Information about"),
+        "K should open the explanation panel:\n{explained}"
+    );
+    app.press(key(KeyCode::Char('K')));
+
+    // `?` from inside switches to every key rather than closing the popup.
+    app.press(key(KeyCode::Char('?')));
+    app.pump();
+    let global = app.screen();
+    assert!(
+        global.contains("Keybindings · everything"),
+        "? inside the popup should switch to the global list:\n{global}"
+    );
+    assert!(
+        global.contains("Track editing") && global.contains("Subtitle editing"),
+        "the global list should carry every section again:\n{global}"
+    );
+    assert_eq!(
+        app.app.dialog,
+        Some(Dialog::Keybindings),
+        "? switches scope; it no longer closes the popup"
+    );
+
+    // And a back key still closes it, from either scope.
+    app.press(key(KeyCode::Esc));
+    assert_eq!(app.app.dialog, None, "Esc should close the popup");
+    assert_eq!(
+        app.app.layer,
+        Layer::SubtitleEdit,
+        "without leaving the page"
+    );
+}
+
 /// Pumps until the background pass is done, answering whether its count was ever drawn.
 ///
 /// Whether the cue panel's border is carrying the background pass's `[done/total]` count.

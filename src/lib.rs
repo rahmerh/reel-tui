@@ -12,6 +12,7 @@ pub mod edit;
 pub mod files;
 pub mod framecache;
 pub mod input;
+pub mod keybindings;
 pub mod mount;
 pub mod notification;
 pub mod preview;

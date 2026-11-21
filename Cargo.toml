@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal interface for inspecting, editing, and converting media files"
 license = "MIT"
-repository = "https://git.sr.ht/~rahmerh/reel-tui"
+repository = "https://github.com/rahmerh/reel-tui"
 
 [lib]
 name = "reel_tui"

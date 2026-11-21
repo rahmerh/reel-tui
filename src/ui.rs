@@ -3555,32 +3555,6 @@ fn action_option(label: impl Into<std::borrow::Cow<'static, str>>, style: Style)
     Span::styled(label.into(), style)
 }
 
-pub fn filter_keybindings_text(text: Text<'static>, query: &str) -> (Text<'static>, usize) {
-    let clean_query = query.trim().to_lowercase();
-    if clean_query.is_empty() {
-        let count = text.lines.iter().filter(|l| is_keybinding_entry(l)).count();
-        return (text, count);
-    }
-    let mut match_count = 0;
-    let filtered_lines: Vec<Line<'static>> = text
-        .lines
-        .into_iter()
-        .filter(|line| {
-            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let matches = plain.to_lowercase().contains(&clean_query);
-            if matches && is_keybinding_entry(line) {
-                match_count += 1;
-            }
-            matches
-        })
-        .collect();
-    (Text::from(filtered_lines), match_count)
-}
-
-fn is_keybinding_entry(line: &Line) -> bool {
-    line.spans.iter().any(|s| s.content.starts_with("  "))
-}
-
 /// Columns a search bar gives up to its label, its frame and the widest match-count
 /// suffix it might grow. Reserving the widest keeps the value window from shifting a
 /// column each time the count crosses a digit boundary.
@@ -3607,256 +3581,181 @@ fn search_line(search: &mut SearchState, area: Rect, reject: Option<InputReject>
     )
 }
 
+/// The popup, in whichever scope it is showing and with the explanation panel beside it.
+///
+/// The rows come from [`App::visible_keybindings`] rather than being built here, because the
+/// cursor is clamped against them and the search counts them — deriving the list a second
+/// time in the renderer would give two answers to "how many rows are there" that drift the
+/// moment one of them is filtered.
 fn render_keybindings_dialog(frame: &mut Frame, app: &mut App) {
-    let area = popup_area(frame.area(), 80, 80);
-    let full_text = keybindings_text();
-    let (filtered_text, count) = filter_keybindings_text(full_text, &app.keybindings_search.value);
-    app.keybindings_search.match_count = count;
-    let text = padded_popup_text(filtered_text);
+    let sections = app.visible_keybindings();
+    app.keybindings_search.match_count = crate::keybindings::count(&sections);
+    let (body, cursor_line) = keybindings_lines(&sections, app.keybindings_cursor);
+    let text = padded_popup_text(body);
+
+    // Resolved before anything takes `&mut app`: the panel owns its text and title, so the
+    // borrow ends here rather than running alongside the search bar's.
+    let help = app
+        .keybindings_help_visible
+        .then(|| app.selected_keybinding())
+        .flatten()
+        .map(|binding| {
+            (
+                keybinding_help_text(binding),
+                format!(" Information about {} ", binding.keys),
+            )
+        });
+
+    let main = popup_area(frame.area(), 80, 80);
+    let (area, help_area) = dialog_help_areas(frame.area(), main, help.as_ref().map(|(t, _)| t));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Keybindings ");
+        .title(keybindings_title(app));
 
     let inner = block.inner(area);
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, combined_popup_area(area, help_area));
     frame.render_widget(block, area);
 
-    if app.keybindings_search.is_active || !app.keybindings_search.value.is_empty() {
-        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    // The hint row is charged whether or not the search bar is up, so the list does not
+    // change height as the bar opens and the reader's place stays put.
+    let searching = app.keybindings_search.is_active || !app.keybindings_search.value.is_empty();
+    let chunks = if searching {
+        Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner)
+    };
+    let content = chunks[0];
 
-        app.set_keybindings_max_scroll(max_scroll(&text, chunks[0]));
+    app.set_keybindings_max_scroll(max_scroll(&text, content));
+    // A cursor drags the view to itself; without one the reader's own scroll is left alone.
+    if let Some(line) = cursor_line {
+        let wanted = scroll_to_show_line(&text, content, line, app.keybindings_scroll);
+        app.keybindings_scroll = wanted.min(app.keybindings_max_scroll);
+    }
 
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((app.keybindings_scroll, 0)),
-            chunks[0],
-        );
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.keybindings_scroll, 0)),
+        content,
+    );
 
+    if searching {
         let reject = app.text_input_reject(TextInputSite::KeybindingsSearch);
         let search = search_line(&mut app.keybindings_search, chunks[1], reject);
         frame.render_widget(Paragraph::new(search), chunks[1]);
-    } else {
-        app.set_keybindings_max_scroll(max_scroll(&text, inner));
+    }
 
+    frame.render_widget(
+        Paragraph::new(keybindings_hint(app.keybindings_scope)),
+        chunks[chunks.len() - 1],
+    );
+
+    if let (Some((help_text, help_title)), Some(help_area)) = (help, help_area) {
         frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((app.keybindings_scroll, 0)),
-            inner,
+            Paragraph::new(help_text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Blue))
+                        .title(help_title),
+                )
+                .wrap(Wrap { trim: false }),
+            help_area,
         );
     }
 }
 
-fn keybindings_text() -> Text<'static> {
-    let mut lines = Vec::new();
-    keybindings_section(&mut lines, "General");
-    keybinding(&mut lines, "?", "Open or close keybindings");
-    keybinding(
-        &mut lines,
-        "/",
-        "Search files, cues, keybindings, or languages",
-    );
-    keybinding(&mut lines, "Esc / q", "Close, go back, or quit");
-    keybinding(&mut lines, "j/k / Up/Down", "Move or scroll vertically");
-    keybinding(&mut lines, "h/l / Left/Right", "Change a horizontal choice");
-    keybinding(&mut lines, "gg / G", "Go to the first/top or last/bottom");
-    keybinding(&mut lines, "Ctrl-d / Ctrl-u", "Scroll ten lines");
-    keybinding(&mut lines, "Ctrl-n / Ctrl-p", "Move through search results");
-    keybinding(
-        &mut lines,
-        "za / zo / zc",
-        "Toggle / open / close sidecar fold",
-    );
-    keybinding(&mut lines, "zM / zR", "Close / open all sidecar folds");
-    keybinding(&mut lines, "Enter", "Open, select, or confirm");
-
-    keybindings_section(&mut lines, "Track editing");
-    keybinding(
-        &mut lines,
-        "Ctrl-j / Ctrl-k",
-        "Move track down / up within its type",
-    );
-    keybinding(
-        &mut lines,
-        "Ctrl-h / Ctrl-l",
-        "Mark subtitle for import / export",
-    );
-    keybinding(
-        &mut lines,
-        "Enter",
-        "Edit container, video, audio, or subtitle settings",
-    );
-    keybinding(
-        &mut lines,
-        "K",
-        "Explain the highlighted container, video, audio, subtitle, or preview field",
-    );
-    keybinding(&mut lines, "i", "Toggle container or stream information");
-    keybinding(&mut lines, "d", "Mark or unmark track for deletion");
-    keybinding(
-        &mut lines,
-        "a",
-        "Add a new subtitle track to this file, inside it or beside it, and open it for editing",
-    );
-    keybinding(
-        &mut lines,
-        "c / b",
-        "In the popup `a` opens: Create it, or Back out without doing so — the mnemonic \
-         letters picked out in cyan on those buttons, reachable from any row",
-    );
-    keybinding(
-        &mut lines,
-        "c",
-        "Edit a subtitle track: its text, its timing, and the frames they land on",
-    );
-    keybinding(&mut lines, "Ctrl-s", "Review and save pending edits");
-
-    // The page's navigation is the general `j/k`, `gg/G` and `Esc` above; this is the one
-    // key it adds. It lives here because this popup is the only place the application
-    // documents a key — see the no-inline-control-help rule in `AGENTS.md`.
-    keybindings_section(&mut lines, "Subtitle editing");
-    keybinding(
-        &mut lines,
-        "/",
-        "Filter the cue list to the lines whose words match, with the match highlighted; \
-         Esc drops the filter",
-    );
-    keybinding(
-        &mut lines,
-        "p",
-        "Play a few seconds around the selected cue — or around the timeline cursor",
-    );
-    keybinding(
-        &mut lines,
-        ":",
-        "Preview settings for this session: speed, loop, sound, padding, frame rate, and which \
-         video, audio and subtitle track the page previews. Closing it opens the page again on \
-         the chosen tracks",
-    );
-    keybinding(
-        &mut lines,
-        "t",
-        "Time the selected cue, starting with the whole cue selected (SubRip tracks); Esc \
-         leaves, Ctrl-s writes it",
-    );
-    keybinding(
-        &mut lines,
-        "T",
-        "Global retiming: move every cue's timing together, for a track that is out of sync \
-         throughout (SubRip tracks); Esc leaves, Ctrl-s writes it",
-    );
-    keybinding(
-        &mut lines,
-        "A",
-        "Auto sync: measure how far this track is out of sync with its own audio and stage \
-         the correction (SubRip tracks); Ctrl-s writes it",
-    );
-    keybinding(
-        &mut lines,
-        "Ctrl-j / Ctrl-k",
-        "Put the cursor in the timeline / back in the cue list",
-    );
-    keybinding(
-        &mut lines,
-        "h / l",
-        "Move the timeline cursor 0.5s back or on while it holds the cursor, otherwise move \
-         the selected part of the cue — or every cue, while retiming globally — 0.05s \
-         earlier or later while timing, otherwise move between cues that share a moment or \
-         choose Yes or No on a preview settings switch",
-    );
-    keybinding(
-        &mut lines,
-        "H / L",
-        "Move the timeline cursor five seconds back or on, or the selected part of the cue — \
-         or every cue — half a second earlier or later while timing",
-    );
-    keybinding(
-        &mut lines,
-        "Ctrl-h / Ctrl-l",
-        "Move the timeline cursor 0.05s back or on while it holds the cursor, the same step \
-         a cue is nudged by, otherwise select the cue's start, the whole cue or its end while \
-         timing — moving the start or end changes how long the cue is on screen",
-    );
-    keybinding(
-        &mut lines,
-        "D",
-        "Type exactly how long the selected cue is on screen, as mm:ss.mmm, while timing",
-    );
-    keybinding(
-        &mut lines,
-        "r",
-        "Put the cue back to the timing the file gives it — or every cue, while retiming \
-         globally — while timing",
-    );
-    keybinding(
-        &mut lines,
-        "i",
-        "Edit the selected cue's text, or add a cue at the timeline cursor (SubRip tracks); \
-         Esc keeps the edit, Ctrl-s writes it",
-    );
-    keybinding(
-        &mut lines,
-        "d",
-        "Mark or unmark the selected cue for deletion (SubRip tracks); Ctrl-s writes it",
-    );
-    keybinding(
-        &mut lines,
-        "R",
-        "Reset every preview setting, in the preview settings dialog",
-    );
-
-    keybindings_section(&mut lines, "Text input");
-    keybinding(
-        &mut lines,
-        "i",
-        "Edit the selected text or number field in a settings dialog",
-    );
-    keybinding(
-        &mut lines,
-        "/",
-        "Search the file list, the cue list, keybindings, or languages",
-    );
-    keybinding(&mut lines, "Left/Right", "Move the text cursor");
-    keybinding(
-        &mut lines,
-        "Home/End or Ctrl-a/Ctrl-e",
-        "Move to the start or end of text",
-    );
-    keybinding(
-        &mut lines,
-        "Backspace/Delete",
-        "Delete text around the cursor",
-    );
-    keybinding(&mut lines, "Ctrl-w", "Delete the word before the cursor");
-    keybinding(&mut lines, "Ctrl-u", "Delete everything before the cursor");
-    keybinding(&mut lines, "Paste", "Insert the clipboard as one edit");
-    keybinding(&mut lines, "Esc / Enter", "Finish or accept text input");
-    keybinding(
-        &mut lines,
-        "Esc",
-        "Discard a search query and leave the bar",
-    );
-    Text::from(lines)
-}
-
-fn keybindings_section(lines: &mut Vec<Line<'static>>, name: &str) {
-    if !lines.is_empty() {
-        lines.push(Line::from(""));
+/// Says which list is on screen, so a reader who switched scopes can see that they did.
+fn keybindings_title(app: &App) -> String {
+    match app.keybindings_scope {
+        crate::app::KeybindingsScope::Contextual => {
+            format!(" Keybindings · {} ", app.keybindings_context.title())
+        }
+        crate::app::KeybindingsScope::Global => " Keybindings · everything ".to_string(),
     }
-    lines.push(Line::styled(
-        name.to_string(),
-        Style::default().fg(Color::Cyan).bold(),
-    ));
 }
 
-fn keybinding(lines: &mut Vec<Line<'static>>, keys: &str, description: &str) {
-    lines.push(Line::from(vec![
+/// The popup's own two keys, greyed at its foot.
+///
+/// This is the one control hint in the application, and it is allowed precisely because it
+/// is *inside* the keybindings popup — the place `AGENTS.md` names as the sole home for
+/// keybinding help. `?` and `K` are the two keys that cannot document themselves anywhere
+/// else: `?` because the list it switches to is the one the reader is standing in, and `K`
+/// because its panel is what would have explained it.
+fn keybindings_hint(scope: crate::app::KeybindingsScope) -> Line<'static> {
+    let other = match scope {
+        crate::app::KeybindingsScope::Contextual => "? all keys",
+        crate::app::KeybindingsScope::Global => "? this page",
+    };
+    Line::styled(
+        format!("  {other}    K explain"),
+        Style::default().fg(Color::DarkGray),
+    )
+}
+
+/// Lays the sections out, answering which drawn line the cursor landed on so the view can
+/// be scrolled to it. `None` when there is no cursor, which is the ordinary case.
+fn keybindings_lines(
+    sections: &[crate::keybindings::KeySection],
+    cursor: Option<usize>,
+) -> (Text<'static>, Option<usize>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_line = None;
+    let mut row = 0usize;
+    for section in sections {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::styled(
+            section.name.to_string(),
+            Style::default().fg(Color::Cyan).bold(),
+        ));
+        for binding in &section.bindings {
+            let selected = cursor == Some(row);
+            if selected {
+                cursor_line = Some(lines.len());
+            }
+            lines.push(keybinding_line(binding.keys, binding.description, selected));
+            row += 1;
+        }
+    }
+    (Text::from(lines), cursor_line)
+}
+
+/// One row: the keys in yellow, then what they do.
+///
+/// The selected row gives its colours up to the cyan fill and keeps none of its own — the
+/// rule `CueRowState::text_style` already follows, because yellow on cyan is unreadable.
+/// Deliberately **not** `Modifier::REVERSED`: the e2e harness documents that the only
+/// reversed cells on screen are search hits and the timeline's timing handles, and a
+/// reversed cursor here would quietly falsify that.
+fn keybinding_line(keys: &str, description: &str, selected: bool) -> Line<'static> {
+    if selected {
+        return Line::from(vec![
+            Span::raw(format!("  {keys:<18}")),
+            Span::raw(description.to_string()),
+        ])
+        .style(choice_style(true, false, true));
+    }
+    Line::from(vec![
         Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
         Span::raw(description.to_string()),
-    ]));
+    ])
+}
+
+fn keybinding_help_text(binding: crate::keybindings::Keybinding) -> Text<'static> {
+    help_paragraphs(vec![(
+        binding.explanation.to_string(),
+        Style::default().fg(Color::White),
+    )])
 }
 
 /// `Dialog::AutoSyncing`: the one dialog on the subtitle edit page with nothing to
@@ -5292,8 +5191,9 @@ fn render_settings_dialog(frame: &mut Frame, dialog: SettingsDialog) {
         min_height,
     } = dialog;
     let height = (text.lines.len() as u16 + 2).max(min_height);
+    let main = centered_fixed(frame.area(), SUBTITLE_SETTINGS_WIDTH, height);
     let (area, help_area) =
-        subtitle_settings_dialog_areas(frame.area(), height, help.as_ref().map(|(text, _)| text));
+        dialog_help_areas(frame.area(), main, help.as_ref().map(|(text, _)| text));
 
     let visible_lines = area.height.saturating_sub(2) as usize;
     let scroll = (focus_line + 1).saturating_sub(visible_lines.saturating_sub(1)) as u16;
@@ -5425,12 +5325,18 @@ fn help_paragraphs(paragraphs: Vec<(String, Style)>) -> Text<'static> {
     padded_popup_text(Text::from(lines))
 }
 
-fn subtitle_settings_dialog_areas(
+/// Places a help panel beside a popup, or stacked below it when the terminal is too narrow.
+///
+/// Takes the main popup's rect rather than deriving one from a fixed width, so the
+/// keybindings popup — sized as a share of the terminal rather than to 86 columns — gets the
+/// same side-by-side placement, the same narrow-terminal fallback and the same
+/// [`combined_popup_area`] clear as the settings dialogs, instead of a second implementation
+/// of all three that would drift from this one.
+fn dialog_help_areas(
     frame_area: Rect,
-    editor_height: u16,
+    editor: Rect,
     help_text: Option<&Text<'_>>,
 ) -> (Rect, Option<Rect>) {
-    let editor = centered_fixed(frame_area, SUBTITLE_SETTINGS_WIDTH, editor_height);
     let Some(help_text) = help_text else {
         return (editor, None);
     };
@@ -5454,12 +5360,11 @@ fn subtitle_settings_dialog_areas(
         return (editor, Some(help));
     }
 
-    let width = SUBTITLE_SETTINGS_WIDTH
-        .min(frame_area.width.saturating_sub(2))
-        .max(1);
+    let width = editor.width.min(frame_area.width.saturating_sub(2)).max(1);
     let help_height = wrapped_popup_height(help_text, width);
     let available_height = frame_area.height.saturating_sub(2).max(1);
-    let desired_height = editor_height
+    let desired_height = editor
+        .height
         .saturating_add(1)
         .saturating_add(help_height)
         .min(available_height);
@@ -10237,7 +10142,8 @@ mod tests {
         )));
 
         let wide_frame = Rect::new(0, 0, 200, 30);
-        let (wide_editor, wide_help) = subtitle_settings_dialog_areas(wide_frame, 16, Some(&help));
+        let wide_main = centered_fixed(wide_frame, SUBTITLE_SETTINGS_WIDTH, 16);
+        let (wide_editor, wide_help) = dialog_help_areas(wide_frame, wide_main, Some(&help));
         let wide_help = wide_help.unwrap();
         assert_eq!(
             wide_editor,
@@ -10247,14 +10153,16 @@ mod tests {
         assert_eq!(wide_editor.height, wide_help.height);
         assert!(wide_editor.x + wide_editor.width < wide_help.x);
 
+        let narrow_frame = Rect::new(0, 0, 140, 30);
+        let narrow_main = centered_fixed(narrow_frame, SUBTITLE_SETTINGS_WIDTH, 16);
         let (narrow_editor, narrow_help) =
-            subtitle_settings_dialog_areas(Rect::new(0, 0, 140, 30), 16, Some(&help));
+            dialog_help_areas(narrow_frame, narrow_main, Some(&help));
         let narrow_help = narrow_help.unwrap();
         assert_eq!(narrow_editor.x, narrow_help.x);
         assert_eq!(narrow_editor.width, narrow_help.width);
         assert!(narrow_editor.y + narrow_editor.height < narrow_help.y);
 
-        let (closed_editor, closed_help) = subtitle_settings_dialog_areas(wide_frame, 16, None);
+        let (closed_editor, closed_help) = dialog_help_areas(wide_frame, wide_main, None);
         assert_eq!(closed_editor, wide_editor);
         assert!(closed_help.is_none());
 
@@ -13215,28 +13123,35 @@ mod tests {
         assert_that!(result).is_equal_to(0);
     }
 
+    /// The global list, rendered — which is what `?` from inside the popup switches to.
+    ///
+    /// A helper rather than a production function: the catalogue is the source of truth
+    /// now, and these assertions are about how it *draws*.
+    fn keybindings_text() -> Text<'static> {
+        keybindings_lines(&crate::keybindings::global_sections(), None).0
+    }
+
     #[test]
     fn keybindings_text_should_include_active_bindings_when_help_is_rendered() {
         // Arrange
         let expected = [
             "General",
             "Track editing",
-            "Text input",
-            "Esc",
+            "Subtitle editing",
+            "Text",
+            "Esc / q",
             "gg / G",
             "Ctrl-j / Ctrl-k",
             "Ctrl-s",
-            "Explain the highlighted container, video, audio, subtitle, or preview field",
-            "i",
+            "Explain the highlighted field",
             "Ctrl-d / Ctrl-u",
             "Ctrl-n / Ctrl-p",
-            "Home/End",
-            "Backspace/Delete",
-            "languages",
-            // The cue resize keys. This popup is the only place a key is documented, so a
-            // binding missing from here is a binding nobody can find.
+            "Home / End",
+            "Backspace / Delete",
+            "Edit a subtitle track",
+            // The cue resize keys. The global list is the only place every key is written
+            // down at once, so a binding missing from here is one nobody can browse to.
             "Ctrl-h / Ctrl-l",
-            "mm:ss.mmm",
         ];
 
         // Act
@@ -13251,30 +13166,160 @@ mod tests {
         assert_that!(&help).does_not_contain("Cancel processing");
     }
 
+    /// The old filter flattened rendered lines and re-detected entries by their leading
+    /// whitespace, which dropped every non-matching heading — so a filtered view left the
+    /// reader with hits and no idea what they belonged to.
     #[test]
-    fn filter_keybindings_text_should_match_substring_case_insensitively() {
-        let raw = keybindings_text();
-        let (filtered, count) = filter_keybindings_text(raw, "track");
-        let content = filtered.to_string();
+    fn filtering_should_match_case_insensitively_and_keep_each_hits_heading() {
+        let sections = crate::keybindings::filter(crate::keybindings::global_sections(), "TRACK");
 
-        assert_that!(&content).contains("Move track down / up");
-        assert_that!(&content).does_not_contain("Open or close keybindings");
-        // "Move track down / up", "Mark or unmark track for deletion", "Add a new subtitle
-        // track", the four that match on "tracks" — the SRT timing preview, the cue editor,
-        // the timing mode, and marking a cue for deletion — global retiming, which names
-        // both a track that is out of sync and the SubRip tracks it works on, automatic
-        // sync, which names both this track and the SubRip tracks it works on too, and the
-        // preview settings, which now name the three tracks the page can be pointed at.
-        assert_eq!(count, 10);
+        let described: Vec<&str> = sections
+            .iter()
+            .flat_map(|section| section.bindings.iter().map(|binding| binding.description))
+            .collect();
+        assert!(
+            described
+                .iter()
+                .any(|text| text.contains("Move a track down or up")),
+            "the track-reordering row should survive the filter: {described:?}"
+        );
+        assert!(
+            !described
+                .iter()
+                .any(|text| text.contains("Open or close keybindings")),
+            "a row that does not match should be filtered out: {described:?}"
+        );
+        assert!(crate::keybindings::count(&sections) > 0);
+        assert!(
+            sections.iter().all(|section| !section.bindings.is_empty()),
+            "a section that kept no rows should be dropped, not left empty"
+        );
     }
 
     #[test]
-    fn filter_keybindings_text_should_return_all_lines_when_query_is_empty() {
-        let raw = keybindings_text();
-        let (filtered, count) = filter_keybindings_text(raw.clone(), "");
+    fn filtering_should_return_everything_when_the_query_is_blank() {
+        let all = crate::keybindings::global_sections();
+        let filtered = crate::keybindings::filter(all.clone(), "   ");
 
-        assert_eq!(filtered.lines.len(), raw.lines.len());
-        assert!(count > 0);
+        assert_eq!(
+            crate::keybindings::count(&filtered),
+            crate::keybindings::count(&all)
+        );
+        assert_eq!(filtered.len(), all.len());
+    }
+
+    /// The popup answers for the page it was opened over rather than for itself.
+    ///
+    /// By render time the dialog *is* `Keybindings`, so a context resolved then would
+    /// describe nothing but the popup's own keys — which is why `show_keybindings` captures
+    /// it first. This is the assertion that holds that in place.
+    #[test]
+    fn the_keybindings_popup_should_list_the_page_it_was_opened_over() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-context", &["movie.mkv"]);
+        app.layer = Layer::Files;
+
+        // Act
+        app.show_keybindings();
+        let screen = drawn(120, 40, |frame| render(frame, &mut app));
+
+        // Assert: the file list's own keys, named as the file list.
+        assert_that!(&screen).contains("File list");
+        assert_that!(&screen).contains("Toggle, open, or close this fold");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// There is no row cursor until a search or `K` gives it a reason to exist. Everywhere
+    /// else the popup is something to read, and a highlight would claim a selection nobody
+    /// made.
+    #[test]
+    fn the_keybindings_cursor_should_appear_only_with_a_search_or_the_help_panel() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-cursor", &["movie.mkv"]);
+        app.show_keybindings();
+
+        // Assert: nothing pointed at to begin with.
+        assert_that!(app.keybindings_cursor).is_none();
+
+        // Act / Assert: `K` needs a row to be about.
+        app.toggle_keybindings_help();
+        assert_that!(app.keybindings_cursor).is_equal_to(Some(0));
+        app.toggle_keybindings_help();
+        assert_that!(app.keybindings_cursor).is_none();
+
+        // Act / Assert: so does a search, and leaving it takes the cursor away again.
+        app.start_keybindings_search();
+        assert_that!(app.keybindings_cursor).is_equal_to(Some(0));
+        app.finish_keybindings_search();
+        assert_that!(app.keybindings_cursor).is_none();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The cursor row gives its colours up to the cyan fill, and takes no `REVERSED`.
+    ///
+    /// `harness::reversed_text()` documents that the only reversed cells on screen are
+    /// search hits and the timeline's timing handles, so a reversed cursor here would
+    /// quietly falsify a contract the e2e suite reads by.
+    #[test]
+    fn the_keybindings_cursor_row_should_use_the_selection_fill_not_a_reversed_cell() {
+        // Act
+        let selected = keybinding_line("?", "Switch lists", true);
+        let plain = keybinding_line("?", "Switch lists", false);
+
+        // Assert
+        assert_eq!(selected.style.bg, Some(Color::Cyan));
+        assert!(!selected.style.add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            selected.spans.iter().all(|span| span.style.fg.is_none()),
+            "the selected row should keep no colour of its own: yellow on cyan is unreadable"
+        );
+        assert_eq!(plain.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    /// `?` inside the popup swaps lists rather than closing it, and the footer says which
+    /// way it will go next.
+    #[test]
+    fn the_keybindings_popup_should_switch_scopes_rather_than_close() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-scope", &["movie.mkv"]);
+        app.show_keybindings();
+
+        // Act
+        let contextual = drawn(120, 40, |frame| render(frame, &mut app));
+        app.toggle_keybindings_scope();
+        let global = drawn(120, 40, |frame| render(frame, &mut app));
+
+        // Assert: still open, showing the other list, with the hint pointing back.
+        assert_that!(app.dialog).contains(Dialog::Keybindings);
+        assert_that!(&contextual).contains("? all keys");
+        assert_that!(&contextual).contains("K explain");
+        assert_that!(&global).contains("Keybindings · everything");
+        assert_that!(&global).contains("? this page");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `K` opens the settings dialogs' own help panel, about the highlighted row.
+    #[test]
+    fn the_keybindings_help_panel_should_explain_the_highlighted_key() {
+        // Arrange
+        let (mut app, directory) = test_app("keybindings-help", &["movie.mkv"]);
+        app.show_keybindings();
+
+        // Act
+        app.toggle_keybindings_help();
+        let binding = app
+            .selected_keybinding()
+            .expect("the cursor should be on a row once the panel is open");
+        let screen = drawn(160, 45, |frame| render(frame, &mut app));
+
+        // Assert
+        assert_that!(&screen).contains("Information about");
+        assert_that!(&screen).contains(binding.keys);
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

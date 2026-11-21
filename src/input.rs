@@ -830,12 +830,16 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                     (KeyCode::Down, KeyModifiers::NONE)
                     | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
-                        app.scroll_keybindings_down(1);
+                        if !app.move_keybindings_cursor(1) {
+                            app.scroll_keybindings_down(1);
+                        }
                     }
                     (KeyCode::Up, KeyModifiers::NONE)
                     | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
-                        app.scroll_keybindings_up(1);
+                        if !app.move_keybindings_cursor(-1) {
+                            app.scroll_keybindings_up(1);
+                        }
                     }
                     _ => {
                         if handle_text_input_key(app, key) {
@@ -849,17 +853,32 @@ pub fn handle_key(app: &mut App, input: &mut InputState, key: KeyEvent) -> Input
                         input.reset_sequence();
                         app.start_keybindings_search();
                     }
+                    // `?` no longer closes the popup: it swaps between the keys this page
+                    // answers and every key in the application. Closing is `Esc`/`q`, which
+                    // is what backs out of everything else here.
                     (KeyCode::Char('?'), _) => {
                         input.reset_sequence();
-                        app.dismiss_dialog();
+                        app.toggle_keybindings_scope();
                     }
+                    // The same key the settings dialogs give their field help, doing the
+                    // same thing to the row the cursor is on.
+                    (KeyCode::Char('K'), _) => {
+                        input.reset_sequence();
+                        app.toggle_keybindings_help();
+                    }
+                    // A cursor exists only while searching or with the panel open, so these
+                    // fall through to scrolling in the ordinary case.
                     (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
                         input.reset_sequence();
-                        app.scroll_keybindings_down(1);
+                        if !app.move_keybindings_cursor(1) {
+                            app.scroll_keybindings_down(1);
+                        }
                     }
                     (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
                         input.reset_sequence();
-                        app.scroll_keybindings_up(1);
+                        if !app.move_keybindings_cursor(-1) {
+                            app.scroll_keybindings_up(1);
+                        }
                     }
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                         input.reset_sequence();
@@ -3730,7 +3749,10 @@ mod tests {
         handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
         assert_that!(app.dialog).contains(Dialog::Keybindings);
         assert_that!(app.file_search.value.as_str()).is_equal_to("beta");
-        handle_key(&mut app, &mut input, key(KeyCode::Char('?')));
+        // `?` inside the popup now switches scope rather than closing it, so the popup is
+        // dismissed with a back key before the file list's own Esc handling is exercised.
+        handle_key(&mut app, &mut input, key(KeyCode::Esc));
+        assert_that!(app.dialog).is_none();
 
         // Act and assert: first Esc clears the filter and keeps beta; second quits.
         let cleared = handle_key(&mut app, &mut input, key(KeyCode::Esc));
