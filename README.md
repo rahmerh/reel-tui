@@ -1,6 +1,7 @@
 # reel 🎞️
 
-> ❗ This project is 100% vibe coded using AI. I just wanted a tool quickly, I'll probably rewrite this myself in the future. ❗
+> [!NOTE]
+> This project is 100% generated using AI, tested and used by a human.
 
 A TUI for inspecting, editing, and converting media files. Uses ffprobe and ffmpeg to inspect
 and edit media files.
